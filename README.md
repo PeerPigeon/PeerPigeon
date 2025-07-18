@@ -786,12 +786,6 @@ console.log('WebSocket support:', mesh.hasWebSocketSupport());
 - **Connection Limits**: Configurable peer limits prevent resource exhaustion
 - **Smart Eviction**: Maintains optimal topology without unnecessary reconnections
 
-### Cost Optimization (AWS)
-- **WebSocket Efficiency**: Persistent connections reduce repeated handshake overhead
-- **Smart Discovery**: XOR distance filtering minimizes unnecessary peer notifications
-- **Auto-cleanup**: DynamoDB TTL automatically removes old messages
-- **Burst Handling**: Lambda scaling handles peer discovery spikes
-
 ### Performance Metrics
 Based on testing with browser networks:
 
@@ -846,15 +840,6 @@ http://your-signaling-server.com/signaling   # ❌ Insecure
 # Implement rate limiting
 POST /signaling
 X-Rate-Limit: 100 requests per minute per IP
-```
-
-#### AWS Infrastructure Security
-```hcl
-# terraform.tfvars security settings
-enable_cors = true
-allowed_origins = ["https://your-domain.com"]
-enable_api_key = true
-enable_throttling = true
 ```
 
 ### Security Best Practices
@@ -1043,7 +1028,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Kademlia DHT**: Inspired the XOR distance routing algorithm ([Paper](https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf))
 - **WebRTC Community**: For providing the foundation of peer-to-peer communication
 - **Gossip Protocols**: Epidemic algorithms research for reliable message propagation
-- **AWS**: For providing serverless infrastructure that scales automatically
 - **Open Source Community**: For feedback, testing, and continuous improvement
 
 ---
