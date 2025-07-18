@@ -13,17 +13,42 @@ A local WebSocket server for PeerPigeon development and testing.
 
 ## Quick Start
 
-### 1. Install Dependencies
+### Option 1: Using npm package
 
 ```bash
-cd websocket-server
-npm install
+# Install PeerPigeon
+npm install peerpigeon
+
+# Start the server
+node node_modules/peerpigeon/websocket-server/server.js
+
+# Or with custom configuration
+PORT=8080 HOST=0.0.0.0 node node_modules/peerpigeon/websocket-server/server.js
 ```
 
-### 2. Start the Server
+### Option 2: From source
 
 ```bash
-npm start
+# Clone the repository
+git clone https://github.com/draeder/peerpigeon.git
+cd peerpigeon
+
+# Start the server directly
+node websocket-server/server.js
+```
+
+### Option 3: Programmatic usage
+
+```javascript
+import { server, wss, connections } from 'peerpigeon/websocket-server/server.js';
+
+// Server starts automatically when imported
+console.log('Server running on default port 3000');
+
+// Access WebSocket server for custom handling
+wss.on('connection', (ws, req) => {
+    console.log('New peer connected');
+});
 ```
 
 The server will start on `ws://localhost:3000` by default.

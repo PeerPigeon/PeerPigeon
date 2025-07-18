@@ -2,6 +2,9 @@
 
 **A WebRTC-based peer-to-peer mesh networking library with intelligent routing, gossip protocol messaging, and automated peer management.**
 
+[![npm version](https://badge.fury.io/js/peerpigeon.svg)](https://badge.fury.io/js/peerpigeon)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 > **📊 Viewing Diagrams**: This README contains Mermaid diagrams. For proper visualization in VS Code, install the [Markdown Preview Mermaid Support](https://marketplace.visualstudio.com/items?itemName=bierner.markdown-mermaid) extension.
 
 ## 🌟 Features
@@ -62,10 +65,17 @@ graph TB
 
 ## 🚀 Quick Start
 
+### Installation
+
+```bash
+# Install PeerPigeon from npm
+npm install peerpigeon
+```
+
 ### Basic Setup
 
 ```javascript
-import { PeerPigeonMesh } from './src/PeerPigeonMesh.js';
+import { PeerPigeonMesh } from 'peerpigeon';
 
 // Create mesh instance
 const mesh = new PeerPigeonMesh({
@@ -76,6 +86,33 @@ const mesh = new PeerPigeonMesh({
 // Initialize and connect
 await mesh.init();
 await mesh.connect('ws://localhost:3000'); // Your signaling server URL
+```
+
+### Starting a WebSocket Server
+
+#### Option 1: Programmatic Server Setup
+
+```javascript
+import { server, wss } from 'peerpigeon/websocket-server/server.js';
+
+// The server starts automatically when imported
+// Access server instances for custom configuration
+console.log('Server running on port 3000');
+
+// Optional: Listen for connection events
+wss.on('connection', (ws, req) => {
+    console.log('New peer connected');
+});
+```
+
+#### Option 2: Standalone Server
+
+```bash
+# Run the WebSocket server directly
+node node_modules/peerpigeon/websocket-server/server.js
+
+# Or with custom port
+PORT=8080 node node_modules/peerpigeon/websocket-server/server.js
 ```
 
 ### Messaging Examples
@@ -176,14 +213,30 @@ console.log('Discovered peers:', status.discoveredCount);
 
 ### Local Development Server
 
+**Option 1: Using npm package**
 ```bash
+# Install PeerPigeon globally or in your project
+npm install peerpigeon
+
+# Start the signaling server
+node node_modules/peerpigeon/websocket-server/server.js
+
+# Or with custom configuration
+PORT=8080 HOST=0.0.0.0 node node_modules/peerpigeon/websocket-server/server.js
+```
+
+**Option 2: From source (for development)**
+```bash
+# Clone the repository
+git clone https://github.com/draeder/peerpigeon.git
+cd peerpigeon
+
 # Start the WebSocket signaling server
-cd websocket-server
-npm install
-npm start
+node websocket-server/server.js
 
 # Serve the browser example
 python3 -m http.server 8080
+```
 # Navigate to http://localhost:8080/examples/browser/
 
 # Test with query parameters
@@ -330,7 +383,47 @@ flowchart TD
     style AcceptNew fill:#e8f5e8,color:#000000
 ```
 
-## 📚 Core Components
+## � API Reference
+
+### WebSocket Server Exports
+
+When importing the WebSocket server, you get access to the following objects:
+
+```javascript
+import { server, wss, connections, peerData } from 'peerpigeon/websocket-server/server.js';
+```
+
+- **`server`** - The HTTP server instance (Node.js `http.Server`)
+- **`wss`** - The WebSocket server instance (`WebSocketServer` from 'ws')
+- **`connections`** - Map of active peer connections (`Map<peerId, WebSocket>`)
+- **`peerData`** - Map of peer metadata (`Map<peerId, PeerInfo>`)
+
+#### Example: Custom Server Configuration
+
+```javascript
+import { server, wss, connections } from 'peerpigeon/websocket-server/server.js';
+
+// Add custom middleware or modify server behavior
+wss.on('connection', (ws, req) => {
+    console.log('Custom handler: New connection');
+    
+    // Access peer connections
+    console.log(`Total connections: ${connections.size}`);
+});
+
+// The server starts automatically on port 3000 (or process.env.PORT)
+```
+
+### Client Library Exports
+
+```javascript
+import { PeerPigeonMesh } from 'peerpigeon';
+```
+
+- **`PeerPigeonMesh`** - Main mesh networking class
+- All other components are internal and managed by `PeerPigeonMesh`
+
+## �📚 Core Components
 
 ### PeerPigeonMesh
 Central coordinator that manages all mesh networking functionality and orchestrates the component interactions.
