@@ -258,11 +258,11 @@ npm start
 # Serve the browser examples
 npm run dev
 ```
-# Navigate to http://localhost:8080/examples/browser/
 
-# Test with query parameters
-# http://localhost:8080/examples/browser/?api=ws://localhost:3000
-```
+#### Navigate to http://localhost:8080/examples/browser/
+
+###### Test with query parameters
+http://localhost:8080/examples/browser/?api=ws://localhost:3000
 
 ## 🔄 System Flow Diagrams
 
