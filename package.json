@@ -1,15 +1,41 @@
 {
   "name": "peerpigeon",
   "version": "1.0.0",
-  "description": "WebRTC-based peer-to-peer mesh networking library with XOR distance routing",
-  "main": "src/PeerPigeonMesh.js",
+  "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
+  "main": "index.js",
+  "types": "types/index.d.ts",
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./types/index.d.ts",
+      "import": "./index.js"
+    },
+    "./server": {
+      "types": "./types/index.d.ts",
+      "import": "./server/index.js"
+    }
+  },
+  "bin": {
+    "peerpigeon-server": "./bin/peerpigeon-server.js"
+  },
   "scripts": {
     "dev": "http-server . -p 8080 -c-1",
-    "start": "npm run dev",
+    "start": "node bin/peerpigeon-server.js",
+    "server": "node bin/peerpigeon-server.js",
+    "test": "echo 'No tests configured yet'",
     "lint": "echo 'No linting configured yet'",
-    "test": "echo 'No tests configured yet'"
+    "prepublishOnly": "echo 'Ready for npm publish'"
   },
+  "files": [
+    "index.js",
+    "src/",
+    "server/",
+    "bin/",
+    "types/",
+    "README.md",
+    "LICENSE",
+    "docs/"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/draeder/peerpigeon.git"
@@ -21,7 +47,14 @@
     "networking",
     "decentralized",
     "kademlia",
-    "es6-modules"
+    "signaling",
+    "websocket",
+    "peer-to-peer",
+    "dht",
+    "gossip",
+    "mesh-network",
+    "xor-routing",
+    "webrtc-mesh"
   ],
   "author": "Daniel Raeder",
   "license": "MIT",
@@ -29,9 +62,15 @@
     "url": "https://github.com/draeder/peerpigeon/issues"
   },
   "homepage": "https://github.com/draeder/peerpigeon#readme",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
   "devDependencies": {
     "@koush/wrtc": "^0.5.3",
     "http-server": "^14.1.1"
+  },
+  "peerDependencies": {
+    "ws": "^8.0.0"
   },
   "engines": {
     "node": ">=14.0.0"

@@ -293,3 +293,6 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
     process.exit(1);
 });
+
+// Export for programmatic use
+export { server, wss, connections, peerData };
