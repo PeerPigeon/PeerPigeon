@@ -1433,9 +1433,11 @@ Request to remove processed signaling data.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MESSAGES_TABLE_NAME` | `pigion-messages` | DynamoDB table name |
-| `TTL_SECONDS` | `300` | Message time-to-live in seconds |
-| `MAX_MESSAGES_PER_POLL` | `50` | Maximum messages per poll request |
+| `PORT` | `3000` | WebSocket server port |
+| `HOST` | `localhost` | WebSocket server host |
+| `MAX_CONNECTIONS` | `1000` | Maximum concurrent connections |
+| `CLEANUP_INTERVAL` | `60000` | Cleanup interval in milliseconds |
+| `PEER_TIMEOUT` | `300000` | Peer timeout in milliseconds |
 
 ### Mesh Configuration
 

@@ -17,7 +17,7 @@
             <p>WebRTC P2P mesh networking with XOR-based routing</p>
             <div class="usage-hint">
                 <strong>Tip:</strong> You can pass the API Gateway URL via query parameter:<br>
-                <code>?api=https://your-api-gateway.execute-api.region.amazonaws.com/dev</code>
+                <code>?api=ws://localhost:3000</code>
             </div>
         </header>
 
@@ -183,7 +183,7 @@
                 <div class="input-group">
                     <label for="signaling-url">Signaling Server URL:</label>
                     <input type="url" id="signaling-url" 
-                           placeholder="https://your-api-gateway.execute-api.region.amazonaws.com/dev">
+                           placeholder="ws://localhost:3000">
                     <small class="input-help">
                         Auto-populated from ?api, ?url, or ?signaling query parameters. Enter base API Gateway URL (without /signaling path).
                     </small>

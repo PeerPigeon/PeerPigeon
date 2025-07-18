@@ -5,7 +5,7 @@ import { URL } from 'url';
 /**
  * Local WebSocket Server for PeerPigeon Development
  * 
- * This server mimics the AWS WebSocket API Gateway functionality
+ * This server provides WebSocket signaling functionality
  * for local development and testing of the PeerPigeon mesh network.
  */
 

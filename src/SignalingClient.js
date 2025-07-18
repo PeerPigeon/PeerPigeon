@@ -17,7 +17,7 @@ export class SignalingClient extends EventEmitter {
         this.reconnectTimeout = null;
         this.isReconnecting = false;
         
-        // Add keep-alive ping to prevent AWS WebSocket timeout (10 min idle limit)
+        // Add keep-alive ping to prevent WebSocket timeout
         this.keepAliveInterval = null;
         this.keepAliveIntervalMs = 9 * 60 * 1000; // Ping every 9 minutes for large safety margin
         
@@ -451,7 +451,7 @@ export class SignalingClient extends EventEmitter {
                 this.handleUnhealthyConnection();
             }, this.connectionQualityTimeout);
 
-            // Send ping as a regular message (Lambda will handle it)
+            // Send ping as a regular message (server will handle it)
             this.websocket.send(JSON.stringify({
                 type: 'ping',
                 data: { peerId: this.peerId, timestamp: this.lastPingTime }
