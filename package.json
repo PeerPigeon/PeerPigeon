@@ -1,27 +1,18 @@
 {
   "name": "peerpigeon",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
   "main": "index.js",
-  "types": "types/index.d.ts",
   "type": "module",
   "exports": {
     ".": {
-      "types": "./types/index.d.ts",
       "import": "./index.js"
-    },
-    "./server": {
-      "types": "./types/index.d.ts",
-      "import": "./server/index.js"
     }
-  },
-  "bin": {
-    "peerpigeon-server": "./bin/peerpigeon-server.js"
   },
   "scripts": {
     "dev": "http-server . -p 8080 -c-1",
-    "start": "node bin/peerpigeon-server.js",
-    "server": "node bin/peerpigeon-server.js",
+    "start": "node websocket-server/server.js",
+    "server": "node websocket-server/server.js",
     "test": "echo 'No tests configured yet'",
     "lint": "echo 'No linting configured yet'",
     "prepublishOnly": "echo 'Ready for npm publish'"
@@ -30,11 +21,10 @@
     "index.js",
     "src/",
     "server/",
-    "bin/",
-    "types/",
+    "websocket-server/",
+    "examples/",
     "README.md",
-    "LICENSE",
-    "docs/"
+    "LICENSE"
   ],
   "repository": {
     "type": "git",
@@ -68,9 +58,6 @@
   "devDependencies": {
     "@koush/wrtc": "^0.5.3",
     "http-server": "^14.1.1"
-  },
-  "peerDependencies": {
-    "ws": "^8.0.0"
   },
   "engines": {
     "node": ">=14.0.0"

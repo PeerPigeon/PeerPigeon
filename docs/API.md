@@ -1483,12 +1483,12 @@ PeerPigeon is organized into modular components:
 ### Direct Imports
 
 ```javascript
-// Import core mesh functionality
-import { PeerPigeonMesh } from './src/PeerPigeonMesh.js';
+// Import core mesh functionality from npm package
+import { PeerPigeonMesh } from 'peerpigeon';
 
-// Import signaling client separately if needed
-import { SignalingClient } from './src/SignalingClient.js';
+// Import signaling client separately if needed (for custom implementations)
+import { SignalingClient } from 'peerpigeon';
 
-// Import browser UI components
+// Import browser UI components (from source for examples)
 import { PeerPigeonUI } from './examples/browser/ui.js';
 ```
