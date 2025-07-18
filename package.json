@@ -7,9 +7,6 @@
   "scripts": {
     "dev": "http-server . -p 8080 -c-1",
     "start": "npm run dev",
-    "deploy": "cd terraform/aws/websocket && terraform apply",
-    "deploy-plan": "cd terraform/aws/websocket && terraform plan",
-    "deploy-destroy": "cd terraform/aws/websocket && terraform destroy",
     "lint": "echo 'No linting configured yet'",
     "test": "echo 'No tests configured yet'"
   },
