@@ -16,7 +16,6 @@
 - **💬 Messaging System**: Direct messages and broadcast gossip protocol messaging
 - **🔧 Modular Architecture**: Clean separation of concerns with event-driven components
 - **💰 Cost-Optimized**: XOR-based routing reduces signaling server costs by ~95%
-- **☁️ AWS Ready**: Production-ready serverless signaling infrastructure included
 - **🛡️ Memory Safe**: Comprehensive cleanup prevents memory leaks in long-running applications
 
 ## 🏗️ Architecture Overview
@@ -189,22 +188,6 @@ python3 -m http.server 8080
 
 # Test with query parameters
 # http://localhost:8080/examples/browser/?api=ws://localhost:3000
-```
-
-### Production Deployment
-
-Deploy the AWS infrastructure for production use:
-
-```bash
-cd terraform/aws/websocket
-terraform init
-terraform apply
-```
-
-Then connect to your deployed signaling server:
-
-```javascript
-await mesh.connect('wss://your-api-gateway.com/dev');
 ```
 
 ## 🔄 System Flow Diagrams
@@ -717,38 +700,7 @@ The WebSocket signaling supports these message types:
 
 ## 🚀 Deployment Options
 
-### Option 1: AWS Serverless Infrastructure (Recommended)
-
-The included Terraform configuration provides production-ready infrastructure:
-
-```bash
-# Deploy AWS infrastructure
-cd terraform/aws/websocket
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars with your AWS settings
-terraform init
-terraform apply
-```
-
-**Deployed Resources:**
-- **API Gateway**: WebSocket API with persistent connection support
-- **Lambda Function**: Message processing with XOR-based peer discovery optimization
-- **DynamoDB Table**: Temporary message storage with automatic TTL cleanup
-- **IAM Roles**: Minimal required permissions for security
-- **CloudWatch Logs**: Monitoring and debugging capabilities
-
-**Configuration Options:**
-```hcl
-# terraform.tfvars
-aws_region = "us-east-1"
-project_name = "peerpigeon-signaling"
-environment = "production"
-lambda_timeout = 30
-dynamodb_ttl_seconds = 300
-max_messages_per_poll = 50
-```
-
-### Option 2: Custom Signaling Server
+### Option 1: Custom Signaling Server
 
 Implement your own signaling server with these required endpoints:
 
@@ -768,7 +720,7 @@ wss://your-server.com/signaling?peerId={peerId}
 }
 ```
 
-### Option 3: Development/Testing Setup
+### Option 2: Development/Testing Setup
 
 For local development and testing:
 
