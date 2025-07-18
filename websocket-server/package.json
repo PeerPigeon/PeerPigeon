@@ -1,0 +1,17 @@
+{
+  "name": "local-websocket-server",
+  "version": "1.0.0",
+  "description": "Local WebSocket server for PeerPigeon development",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js --watch"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
