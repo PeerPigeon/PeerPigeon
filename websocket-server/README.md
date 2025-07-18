@@ -220,16 +220,6 @@ Browser Client 1    Browser Client 2    Browser Client N
                     (peers, connections)
 ```
 
-## Comparison with AWS
-
-| Feature | Local Server | AWS WebSocket |
-|---------|-------------|---------------|
-| Cost | Free | Pay per message |
-| Scalability | Single machine | Auto-scaling |
-| Persistence | In-memory | DynamoDB |
-| Deployment | Local only | Global |
-| Development | Instant | Deploy cycle |
-
 ## Troubleshooting
 
 ### Common Issues
