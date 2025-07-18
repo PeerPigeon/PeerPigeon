@@ -645,21 +645,6 @@ function getMetrics() {
 ```
 
 This deployment guide provides practical steps for deploying PeerPigeon with the actual WebSocket server included in the repository.
-aws_region = "us-east-1"
-project_name = "my-peerpigeon-mesh"
-environment = "production"
-
-# Advanced configuration
-ttl_seconds = 600                    # Message TTL (default: 300)
-max_connections = 1000              # WebSocket connection limit (default: 100)
-enable_cors = true                  # Enable CORS (default: true)
-cors_origins = ["https://myapp.com"] # Allowed origins (default: ["*"])
-
-# Resource configuration
-lambda_memory = 256                 # Lambda memory MB (default: 128)
-lambda_timeout = 30                 # Lambda timeout seconds (default: 15)
-api_throttle_burst = 2000          # API Gateway burst limit
-api_throttle_rate = 1000           # API Gateway rate limit
 ```
 
 ### Infrastructure Components
