@@ -90,29 +90,47 @@ await mesh.connect('ws://localhost:3000'); // Your signaling server URL
 
 ### Starting a WebSocket Server
 
-#### Option 1: Programmatic Server Setup
+#### Option 1: Programmatic Server Setup (Recommended)
 
 ```javascript
-import { server, wss } from 'peerpigeon/websocket-server/server.js';
+import { PeerPigeonServer } from 'peerpigeon';
 
-// The server starts automatically when imported
-// Access server instances for custom configuration
-console.log('Server running on port 3000');
+// Create and start the server
+const server = new PeerPigeonServer({
+    port: 3000,
+    host: 'localhost',
+    maxConnections: 1000,
+    cleanupInterval: 60000, // 1 minute
+    peerTimeout: 300000     // 5 minutes
+});
 
-// Optional: Listen for connection events
-wss.on('connection', (ws, req) => {
-    console.log('New peer connected');
+// Start the server
+await server.start();
+
+// Listen for events
+server.on('peerConnected', ({ peerId, totalConnections }) => {
+    console.log(`Peer ${peerId} connected. Total: ${totalConnections}`);
+});
+
+server.on('peerDisconnected', ({ peerId, totalConnections }) => {
+    console.log(`Peer ${peerId} disconnected. Total: ${totalConnections}`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+    await server.stop();
+    process.exit(0);
 });
 ```
 
 #### Option 2: Standalone Server
 
 ```bash
-# Run the WebSocket server directly
-node node_modules/peerpigeon/websocket-server/server.js
+# Run the standalone server (from npm package)
+npm start
 
-# Or with custom port
-PORT=8080 node node_modules/peerpigeon/websocket-server/server.js
+# Or run directly with custom configuration
+PORT=8080 HOST=0.0.0.0 npm start
 ```
 
 ### Messaging Examples
@@ -213,16 +231,19 @@ console.log('Discovered peers:', status.discoveredCount);
 
 ### Local Development Server
 
-**Option 1: Using npm package**
+**Option 1: Using npm package (Recommended)**
 ```bash
 # Install PeerPigeon globally or in your project
 npm install peerpigeon
 
 # Start the signaling server
-node node_modules/peerpigeon/websocket-server/server.js
+npm start
 
 # Or with custom configuration
-PORT=8080 HOST=0.0.0.0 node node_modules/peerpigeon/websocket-server/server.js
+PORT=8080 HOST=0.0.0.0 npm start
+
+# Serve the browser examples using the built-in server
+npm run dev
 ```
 
 **Option 2: From source (for development)**
@@ -232,10 +253,10 @@ git clone https://github.com/draeder/peerpigeon.git
 cd peerpigeon
 
 # Start the WebSocket signaling server
-node websocket-server/server.js
+npm start
 
-# Serve the browser example
-python3 -m http.server 8080
+# Serve the browser examples
+npm run dev
 ```
 # Navigate to http://localhost:8080/examples/browser/
 
@@ -385,43 +406,72 @@ flowchart TD
 
 ## � API Reference
 
-### WebSocket Server Exports
+### PeerPigeonServer Class
 
-When importing the WebSocket server, you get access to the following objects:
+When importing the server class, you can create and configure it programmatically:
 
 ```javascript
-import { server, wss, connections, peerData } from 'peerpigeon/websocket-server/server.js';
+import { PeerPigeonServer } from 'peerpigeon';
+
+const server = new PeerPigeonServer(options);
 ```
 
-- **`server`** - The HTTP server instance (Node.js `http.Server`)
-- **`wss`** - The WebSocket server instance (`WebSocketServer` from 'ws')
-- **`connections`** - Map of active peer connections (`Map<peerId, WebSocket>`)
-- **`peerData`** - Map of peer metadata (`Map<peerId, PeerInfo>`)
+#### Constructor Options
+
+- **`port`** (number) - Server port (default: 3000)
+- **`host`** (string) - Server host (default: 'localhost')
+- **`maxConnections`** (number) - Maximum concurrent connections (default: 1000)
+- **`cleanupInterval`** (number) - Cleanup interval in ms (default: 60000)
+- **`peerTimeout`** (number) - Peer timeout in ms (default: 300000)
+- **`corsOrigin`** (string) - CORS origin (default: '*')
+- **`maxMessageSize`** (number) - Max message size in bytes (default: 1MB)
+
+#### Methods
+
+- **`await server.start()`** - Start the server
+- **`await server.stop()`** - Stop the server
+- **`server.getStats()`** - Get server statistics
+- **`server.getPeers()`** - Get list of connected peers
+
+#### Events
+
+- **`started`** - Server started
+- **`stopped`** - Server stopped
+- **`peerConnected`** - Peer connected
+- **`peerDisconnected`** - Peer disconnected
+- **`peerAnnounced`** - Peer announced
+- **`peerGoodbye`** - Peer said goodbye
+- **`error`** - Server error
 
 #### Example: Custom Server Configuration
 
 ```javascript
-import { server, wss, connections } from 'peerpigeon/websocket-server/server.js';
+import { PeerPigeonServer } from 'peerpigeon';
 
-// Add custom middleware or modify server behavior
-wss.on('connection', (ws, req) => {
-    console.log('Custom handler: New connection');
-    
-    // Access peer connections
-    console.log(`Total connections: ${connections.size}`);
+const server = new PeerPigeonServer({
+    port: 8080,
+    maxConnections: 500,
+    cleanupInterval: 30000
 });
 
-// The server starts automatically on port 3000 (or process.env.PORT)
+server.on('peerConnected', ({ peerId, totalConnections }) => {
+    console.log(`New peer: ${peerId}, Total: ${totalConnections}`);
+});
+
+await server.start();
 ```
 
 ### Client Library Exports
 
 ```javascript
-import { PeerPigeonMesh } from 'peerpigeon';
+import { PeerPigeonMesh, PeerPigeonServer } from 'peerpigeon';
 ```
 
-- **`PeerPigeonMesh`** - Main mesh networking class
-- All other components are internal and managed by `PeerPigeonMesh`
+- **`PeerPigeonMesh`** - Main mesh networking class (browser)
+- **`PeerPigeonServer`** - WebSocket signaling server class (Node.js)
+- **`PeerConnection`** - WebRTC peer connection wrapper
+- **`SignalingClient`** - WebSocket signaling client
+- **`WebDHT`** - Distributed hash table implementation
 
 ## �📚 Core Components
 
@@ -818,12 +868,16 @@ wss://your-server.com/signaling?peerId={peerId}
 For local development and testing:
 
 ```bash
-# Quick local testing with Python
-python3 -m http.server 8080
+For local development and testing:
 
-# Or with Node.js
+```bash
+# Serve with npm (preferred)
+npm run dev
+
+# Or with Node.js http-server
 npm install -g http-server
 http-server -p 8080
+```
 
 # Use query parameters to pre-configure signaling
 open "http://localhost:8080/examples/browser/?api=wss://your-signaling-server.com/dev"
@@ -978,7 +1032,7 @@ X-Rate-Limit: 100 requests per minute per IP
 npm install
 
 # Start local development server
-python3 -m http.server 8080
+npm run dev
 # or
 npx http-server -p 8080
 
@@ -1082,7 +1136,7 @@ cd pigon
 git checkout -b feature/amazing-improvement
 
 # Make your changes and test thoroughly
-python3 -m http.server 8080
+npm run dev
 # Test with multiple browser instances
 
 # Commit with descriptive messages

@@ -78,8 +78,8 @@ The included WebSocket server provides:
 Serve the PeerPigeon files from any web server:
 
 ```bash
-# Using Python
-python3 -m http.server 8080
+# Using npm (recommended)
+npm run dev
 
 # Using Node.js http-server
 npx http-server -p 8080 -c-1
@@ -98,7 +98,7 @@ npx live-server --port=8080 --no-browser
 </head>
 <body>
     <script type="module">
-        import { PeerPigeonMesh } from './src/PeerPigeonMesh.js';
+        import { PeerPigeonMesh } from 'peerpigeon';
         
         const mesh = new PeerPigeonMesh();
         await mesh.init();
@@ -988,11 +988,11 @@ Host on a CDN for global distribution:
 ```html
 <!-- CloudFront example -->
 <script type="module">
-  import { PigionMesh } from 'https://d123.cloudfront.net/pigion/mesh.js';
-  import { PigionUI } from 'https://d123.cloudfront.net/pigion/ui.js';
+  import { PeerPigeonMesh } from 'peerpigeon';
+  import { PeerPigeonUI } from 'peerpigeon';
   
-  const mesh = new PigionMesh();
-  const ui = new PigionUI(mesh);
+  const mesh = new PeerPigeonMesh();
+  const ui = new PeerPigeonUI(mesh);
   
   await mesh.init();
   await mesh.connect('https://api.example.com/signaling');
@@ -1027,7 +1027,7 @@ module.exports = {
 
 ```javascript
 // src/app.js
-import { PeerPigeonMesh } from '../node_modules/peerpigeon/src/PeerPigeonMesh.js';
+import { PeerPigeonMesh } from 'peerpigeon';
 
 class MyApp {
   constructor() {
