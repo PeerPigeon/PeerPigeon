@@ -1,0 +1,47 @@
+{
+  "name": "peerpigeon",
+  "version": "1.0.0",
+  "description": "WebRTC-based peer-to-peer mesh networking library with XOR distance routing",
+  "main": "src/PeerPigeonMesh.js",
+  "type": "module",
+  "scripts": {
+    "dev": "http-server . -p 8080 -c-1",
+    "start": "npm run dev",
+    "deploy": "cd terraform/aws/websocket && terraform apply",
+    "deploy-plan": "cd terraform/aws/websocket && terraform plan",
+    "deploy-destroy": "cd terraform/aws/websocket && terraform destroy",
+    "lint": "echo 'No linting configured yet'",
+    "test": "echo 'No tests configured yet'"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/draeder/peerpigeon.git"
+  },
+  "keywords": [
+    "webrtc",
+    "p2p",
+    "mesh",
+    "networking",
+    "decentralized",
+    "kademlia",
+    "es6-modules"
+  ],
+  "author": "Daniel Raeder",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/draeder/peerpigeon/issues"
+  },
+  "homepage": "https://github.com/draeder/peerpigeon#readme",
+  "devDependencies": {
+    "@koush/wrtc": "^0.5.3",
+    "http-server": "^14.1.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "browserslist": [
+    "last 2 versions",
+    "not dead",
+    "> 1%"
+  ]
+}

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PeerPigeon - DHT Disabled Demo</title>
+    <link rel="icon" type="image/png" href="assets/images/favicon.png">
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .demo-notice {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 6px;
+            padding: 12px;
+            margin: 20px auto;
+            max-width: 600px;
+            text-align: center;
+            color: #856404;
+            font-weight: 500;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>
+                <img src="assets/images/pigeon.png" alt="PeerPigeon Logo">
+                PeerPigeon Demo - DHT Disabled
+            </h1>
+            <p>WebRTC-based peer-to-peer mesh networking with intelligent routing</p>
+            <div class="demo-notice">
+                🔧 <strong>Demo Mode:</strong> This demo shows PeerPigeon with WebDHT disabled. 
+                Check the Settings section to see the DHT status indicator.
+            </div>
+            <div class="usage-hint">
+                <strong>Quick Start:</strong> 
+                1. Open multiple browser tabs/windows with this page<br>
+                2. Enter a signaling server URL (or use <code>?api=your-api-gateway-url</code> in URL)<br>
+                3. Click Connect - all tabs will automatically discover and connect to each other<br>
+                4. Notice that DHT operations will show error messages since DHT is disabled
+            </div>
+        </header>
+
+        <main>
+            <!-- Include the same content as index.html but referencing the modified app.js -->
+            <!-- Copy the entire main content from index.html -->
+            <div class="peer-info">
+                <div class="section-header">
+                    <h2>
+                        <button id="peer-info-toggle" class="toggle-btn" aria-expanded="true">
+                            ▼ Peer Info
+                        </button>
+                    </h2>
+                </div>
+                <div id="peer-info-content" class="collapsible-content">
+                    <div class="info-group">
+                        <label>Peer ID:</label>
+                        <span id="peer-id">Not initialized</span>
+                    </div>
+                    <div class="info-group">
+                        <label>Status:</label>
+                        <span id="status" class="status disconnected">Disconnected</span>
+                    </div>
+                    <div class="info-group">
+                        <label>Connected Peers:</label>
+                        <span id="peer-count">0</span>
+                    </div>
+                    <div class="input-group">
+                        <label for="signaling-url-main">Signaling Server URL:</label>
+                        <div class="input-group horizontal">
+                            <input type="url" id="signaling-url-main" 
+                                   placeholder="https://your-api-gateway.execute-api.region.amazonaws.com/dev">
+                            <div class="button-group">
+                                <button id="connect-btn" class="btn primary">Connect</button>
+                                <button id="disconnect-btn" class="btn secondary" disabled>Disconnect</button>
+                            </div>
+                        </div>
+                        <small class="input-help">
+                            Auto-populated from ?api, ?url, or ?signaling query parameters
+                        </small>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Rest of the UI components would go here... -->
+            <!-- For brevity, showing just the key Settings section -->
+            
+            <div class="settings" aria-expanded="false">
+                <div class="section-header">
+                    <h2>
+                        <button id="settings-toggle" class="toggle-btn" aria-expanded="false">
+                            ▶ Settings
+                        </button>
+                    </h2>
+                </div>
+                <div id="settings-content" class="collapsible-content" style="display: none;">
+                    <div class="input-group">
+                        <label for="signaling-url">Signaling Server URL:</label>
+                        <input type="url" id="signaling-url" 
+                               placeholder="https://your-api-gateway.execute-api.region.amazonaws.com/dev">
+                        <small class="input-help">
+                            Auto-populated from ?api, ?url, or ?signaling query parameters. Enter base API Gateway URL (without /signaling path).
+                        </small>
+                    </div>
+                    
+                    <div class="auto-discovery-control">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="webdht-toggle" checked disabled>
+                            <span class="checkmark"></span>
+                            Enable WebDHT (Distributed Hash Table)
+                        </label>
+                        <small class="input-help">
+                            WebDHT status (configured at startup, restart required to change)
+                        </small>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script type="module" src="app-dht-disabled.js"></script>
+</body>
+</html>
