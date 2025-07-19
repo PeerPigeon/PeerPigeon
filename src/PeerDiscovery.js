@@ -1,4 +1,5 @@
 import { EventEmitter } from './EventEmitter.js';
+import { environmentDetector } from './EnvironmentDetector.js';
 
 export class PeerDiscovery extends EventEmitter {
     constructor(peerId, options = {}) {
@@ -210,9 +211,15 @@ export class PeerDiscovery extends EventEmitter {
     }
 
     startCleanupInterval() {
-        this.cleanupInterval = window.setInterval.call(window, () => {
-            this.cleanupStaleDiscoveredPeers();
-        }, 30000);
+        if (environmentDetector.isBrowser) {
+            this.cleanupInterval = window.setInterval(() => {
+                this.cleanupStaleDiscoveredPeers();
+            }, 30000);
+        } else {
+            this.cleanupInterval = setInterval(() => {
+                this.cleanupStaleDiscoveredPeers();
+            }, 30000);
+        }
     }
 
     cleanupStaleDiscoveredPeers() {

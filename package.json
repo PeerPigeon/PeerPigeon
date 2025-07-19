@@ -1,6 +1,6 @@
 {
   "name": "peerpigeon",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
   "main": "index.js",
   "type": "module",
@@ -53,10 +53,10 @@
   },
   "homepage": "https://github.com/draeder/peerpigeon#readme",
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "@koush/wrtc": "^0.5.3"
   },
   "devDependencies": {
-    "@koush/wrtc": "^0.5.3",
     "http-server": "^14.1.1"
   },
   "engines": {

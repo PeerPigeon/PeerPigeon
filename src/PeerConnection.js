@@ -1,4 +1,5 @@
 import { EventEmitter } from './EventEmitter.js';
+import { environmentDetector } from './EnvironmentDetector.js';
 
 export class PeerConnection extends EventEmitter {
     constructor(peerId, isInitiator = false, options = {}) {
@@ -34,6 +35,13 @@ export class PeerConnection extends EventEmitter {
     }
 
     async createConnection() {
+        // Validate WebRTC support before creating connection
+        if (!environmentDetector.hasWebRTC) {
+            const error = new Error('WebRTC not supported in this environment');
+            this.emit('connectionFailed', { peerId: this.peerId, reason: error.message });
+            throw error;
+        }
+
         this.connection = new RTCPeerConnection({
             iceServers: [
                 { urls: 'stun:stun.l.google.com:19302' },
@@ -138,11 +146,16 @@ export class PeerConnection extends EventEmitter {
         this.connection.onconnectionstatechange = () => {
             console.log(`🔗 Connection state with ${this.peerId}: ${this.connection.connectionState} (previous signaling: ${this.connection.signalingState})`);
             
-            // Log additional context about transceivers and media
-            const transceivers = this.connection.getTransceivers();
-            const audioSending = this.audioTransceiver && this.audioTransceiver.sender.track;
-            const videoSending = this.videoTransceiver && this.videoTransceiver.sender.track;
-            console.log(`🔗 Media context: Audio sending=${!!audioSending}, Video sending=${!!videoSending}, Transceivers=${transceivers.length}`);
+            // Log additional context about transceivers and media with Node.js compatibility
+            try {
+                const transceivers = this.connection.getTransceivers();
+                const audioSending = this.audioTransceiver && this.audioTransceiver.sender && this.audioTransceiver.sender.track;
+                const videoSending = this.videoTransceiver && this.videoTransceiver.sender && this.videoTransceiver.sender.track;
+                console.log(`🔗 Media context: Audio sending=${!!audioSending}, Video sending=${!!videoSending}, Transceivers=${transceivers.length}`);
+            } catch (error) {
+                // Handle Node.js WebRTC compatibility issues
+                console.log(`🔗 Media context: Unable to access transceiver details (${error.message})`);
+            }
             
             if (this.connection.connectionState === 'connected') {
                 // Clear any pending timeouts
@@ -249,14 +262,18 @@ export class PeerConnection extends EventEmitter {
             // Any renegotiation indicates a problem with our transceiver approach
             console.log('🚫 UNEXPECTED: Renegotiation triggered despite transceiver approach - investigating...');
             
-            // Log debug info about current transceivers
-            const transceivers = this.connection.getTransceivers();
-            console.log('� Transceivers state during unexpected negotiation:', transceivers.map(t => ({
-                kind: t.receiver.track?.kind || 'unknown',
-                direction: t.direction,
-                hasTrack: !!t.sender.track,
-                mid: t.mid
-            })));
+            // Log debug info about current transceivers (with error handling for Node.js WebRTC)
+            try {
+                const transceivers = this.connection.getTransceivers();
+                console.log('� Transceivers state during unexpected negotiation:', transceivers.map(t => ({
+                    kind: t.receiver?.track?.kind || 'unknown',
+                    direction: t.direction,
+                    hasTrack: !!t.sender?.track,
+                    mid: t.mid
+                })));
+            } catch (error) {
+                console.log('� Cannot inspect transceivers (Node.js WebRTC limitation):', error.message);
+            }
             
             // For now, ignore renegotiation to prevent connection issues
             // this.emit('renegotiationNeeded', { peerId: this.peerId });
