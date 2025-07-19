@@ -1,4 +1,4 @@
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import { URL } from 'url';
 
@@ -50,12 +50,55 @@ function findClosestPeers(targetPeerId, allPeerIds, maxPeers = 3) {
 
 function getActivePeers(excludePeerId = null) {
     const peers = [];
+    const stalePeers = [];
+    
     for (const [peerId, connection] of connections) {
-        if (peerId !== excludePeerId && connection.readyState === WebSocket.OPEN) {
-            peers.push(peerId);
+        if (peerId !== excludePeerId) {
+            if (connection.readyState === WebSocket.OPEN && isConnectionAlive(connection)) {
+                peers.push(peerId);
+            } else {
+                // Mark stale connections for cleanup
+                stalePeers.push(peerId);
+            }
         }
     }
+    
+    // Clean up stale connections
+    stalePeers.forEach(peerId => {
+        console.log(`🧹 Cleaning up stale connection: ${peerId.substring(0, 8)}...`);
+        connections.delete(peerId);
+        peerData.delete(peerId);
+    });
+    
     return peers;
+}
+
+function isConnectionAlive(connection) {
+    if (!connection || connection.readyState !== WebSocket.OPEN) {
+        return false;
+    }
+    
+    // Check if we've received a recent pong or if this is a fresh connection
+    const now = Date.now();
+    const lastPong = connection.lastPong || connection.connectedAt || now;
+    const timeSinceLastPong = now - lastPong;
+    
+    // Consider connection dead if no pong for more than 60 seconds
+    return timeSinceLastPong < 60000;
+}
+
+function pingConnection(peerId, connection) {
+    if (connection.readyState === WebSocket.OPEN) {
+        try {
+            connection.ping();
+            return true;
+        } catch (error) {
+            console.log(`🏓 Failed to ping ${peerId.substring(0, 8)}...:`, error.message);
+            cleanupPeer(peerId);
+            return false;
+        }
+    }
+    return false;
 }
 
 function sendToConnection(peerId, data) {
@@ -66,10 +109,37 @@ function sendToConnection(peerId, data) {
             return true;
         } catch (error) {
             console.error(`Error sending to ${peerId}:`, error);
+            // Clean up failed connection
+            cleanupPeer(peerId);
             return false;
         }
+    } else if (connection && (connection.readyState === WebSocket.CLOSED || connection.readyState === WebSocket.CLOSING)) {
+        // Clean up closed connection
+        cleanupPeer(peerId);
     }
     return false;
+}
+
+function cleanupPeer(peerId) {
+    const wasConnected = connections.has(peerId);
+    connections.delete(peerId);
+    peerData.delete(peerId);
+    
+    if (wasConnected) {
+        console.log(`🧹 Cleaned up peer: ${peerId.substring(0, 8)}...`);
+        
+        // Notify other peers about disconnection
+        const activePeers = getActivePeers();
+        activePeers.forEach(otherPeerId => {
+            sendToConnection(otherPeerId, {
+                type: 'peer-disconnected',
+                data: { peerId },
+                fromPeerId: 'system',
+                targetPeerId: otherPeerId,
+                timestamp: Date.now()
+            });
+        });
+    }
 }
 
 function broadcastToClosestPeers(fromPeerId, message, maxPeers = 5) {
@@ -95,6 +165,33 @@ const wss = new WebSocketServer({ server });
 
 console.log(`🚀 Starting PeerPigeon WebSocket server...`);
 
+// Periodic cleanup of stale connections
+setInterval(() => {
+    const totalConnections = connections.size;
+    const activePeers = getActivePeers(); // This will clean up stale connections
+    const cleanedUp = totalConnections - connections.size;
+    
+    if (cleanedUp > 0) {
+        console.log(`🧹 Periodic cleanup: removed ${cleanedUp} stale connections, ${connections.size} active`);
+    }
+}, 30000); // Clean up every 30 seconds
+
+// Heartbeat ping every 30 seconds
+setInterval(() => {
+    console.log(`🏓 Pinging ${connections.size} connections...`);
+    const stalePeers = [];
+    
+    for (const [peerId, connection] of connections) {
+        if (!pingConnection(peerId, connection)) {
+            stalePeers.push(peerId);
+        }
+    }
+    
+    if (stalePeers.length > 0) {
+        console.log(`🧹 Heartbeat cleanup: removed ${stalePeers.length} unresponsive connections`);
+    }
+}, 30000); // Ping every 30 seconds
+
 wss.on('connection', (ws, req) => {
     let peerId = null;
     
@@ -110,12 +207,35 @@ wss.on('connection', (ws, req) => {
     
     peerId = queryPeerId;
     
+    // Check if peerId is already connected
+    if (connections.has(peerId)) {
+        const existingConnection = connections.get(peerId);
+        if (existingConnection.readyState === WebSocket.OPEN) {
+            console.log(`⚠️  Peer ${peerId.substring(0, 8)}... already connected, closing duplicate`);
+            ws.close(1008, 'Peer already connected');
+            return;
+        } else {
+            // Clean up stale connection
+            console.log(`🔄 Replacing stale connection for ${peerId.substring(0, 8)}...`);
+            cleanupPeer(peerId);
+        }
+    }
+    
     // Store connection
     connections.set(peerId, ws);
     peerData.set(peerId, {
         peerId,
         timestamp: Date.now(),
         connected: true
+    });
+    
+    // Set up connection metadata
+    ws.connectedAt = Date.now();
+    ws.lastPong = Date.now();
+    
+    // Set up pong handler for heartbeat
+    ws.on('pong', () => {
+        ws.lastPong = Date.now();
     });
     
     console.log(`✅ Peer ${peerId.substring(0, 8)}... connected (${connections.size} total)`);
@@ -163,11 +283,25 @@ wss.on('connection', (ws, req) => {
                         connected: true
                     });
                     
+                    // Get active peers with immediate validation
                     const activePeers = getActivePeers(peerId);
-                    console.log(`📢 Announcing ${peerId.substring(0, 8)}... to ${activePeers.length} peers`);
                     
-                    // Send peer-discovered messages to other peers
-                    activePeers.forEach(otherPeerId => {
+                    // Double-check each active peer with a quick ping test
+                    const validatedPeers = [];
+                    for (const otherPeerId of activePeers) {
+                        const connection = connections.get(otherPeerId);
+                        if (connection && isConnectionAlive(connection)) {
+                            validatedPeers.push(otherPeerId);
+                        } else {
+                            console.log(`� Found dead connection during announce: ${otherPeerId.substring(0, 8)}...`);
+                            cleanupPeer(otherPeerId);
+                        }
+                    }
+                    
+                    console.log(`�📢 Announcing ${peerId.substring(0, 8)}... to ${validatedPeers.length} validated peers`);
+                    
+                    // Send peer-discovered messages to validated peers only
+                    validatedPeers.forEach(otherPeerId => {
                         sendToConnection(otherPeerId, {
                             type: 'peer-discovered',
                             data: { peerId, ...messageData },
@@ -177,8 +311,8 @@ wss.on('connection', (ws, req) => {
                         });
                     });
                     
-                    // Send existing peers to the new peer
-                    activePeers.forEach(existingPeerId => {
+                    // Send existing validated peers to the new peer
+                    validatedPeers.forEach(existingPeerId => {
                         const existingPeerData = peerData.get(existingPeerId);
                         ws.send(JSON.stringify({
                             type: 'peer-discovered',
@@ -235,20 +369,7 @@ wss.on('connection', (ws, req) => {
         console.log(`🔌 Peer ${peerId?.substring(0, 8)}... disconnected (${code}: ${reason})`);
         
         if (peerId) {
-            connections.delete(peerId);
-            peerData.delete(peerId);
-            
-            // Notify other peers
-            const activePeers = getActivePeers();
-            activePeers.forEach(otherPeerId => {
-                sendToConnection(otherPeerId, {
-                    type: 'peer-disconnected',
-                    data: { peerId },
-                    fromPeerId: 'system',
-                    targetPeerId: otherPeerId,
-                    timestamp: Date.now()
-                });
-            });
+            cleanupPeer(peerId);
         }
         
         console.log(`📊 Active connections: ${connections.size}`);
@@ -257,6 +378,11 @@ wss.on('connection', (ws, req) => {
     // Handle connection errors
     ws.on('error', (error) => {
         console.error(`❌ WebSocket error for ${peerId?.substring(0, 8)}...:`, error);
+        
+        // Clean up errored connection
+        if (peerId && (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING)) {
+            cleanupPeer(peerId);
+        }
     });
 });
 
