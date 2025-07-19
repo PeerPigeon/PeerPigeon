@@ -1,4 +1,5 @@
 import { EventEmitter } from './EventEmitter.js';
+import { environmentDetector } from './EnvironmentDetector.js';
 
 export class SignalingClient extends EventEmitter {
     constructor(peerId, maxPeers = 10, mesh = null) {
@@ -32,6 +33,39 @@ export class SignalingClient extends EventEmitter {
     setConnectionType(type) {
         // WebSocket-only implementation, ignore connection type setting
         console.log(`WebSocket-only implementation - connection type setting ignored: ${type}`);
+    }
+
+    createWebSocket(url) {
+        // Environment-aware WebSocket creation
+        if (environmentDetector.isNodeJS) {
+            // Check for globally injected WebSocket first (set by user)
+            if (typeof global !== 'undefined' && typeof global.WebSocket !== 'undefined') {
+                return new global.WebSocket(url);
+            }
+            if (typeof WebSocket !== 'undefined') {
+                return new WebSocket(url);
+            }
+            
+            // Try to use the 'ws' package if available
+            try {
+                if (typeof require !== 'undefined') {
+                    const WebSocket = require('ws');
+                    return new WebSocket(url);
+                } else {
+                    // In ES modules, dynamic import would be needed
+                    console.warn('WebSocket package detection not available in ES modules. Ensure "ws" is installed.');
+                    throw new Error('WebSocket not available in Node.js ES modules. Install the "ws" package and import it manually.');
+                }
+            } catch (error) {
+                console.warn('ws package not found in Node.js environment. Install with: npm install ws');
+                throw new Error('WebSocket not available in Node.js. Install the "ws" package.');
+            }
+        } else if (environmentDetector.isBrowser || environmentDetector.isWorker) {
+            // In browser or worker environments, use the native WebSocket
+            return new WebSocket(url);
+        } else {
+            throw new Error('WebSocket not supported in this environment');
+        }
     }
 
     async sendSignalingMessage(message) {
@@ -72,6 +106,13 @@ export class SignalingClient extends EventEmitter {
     }
 
     async connect(websocketUrl) {
+        // Validate WebSocket support before attempting connection
+        if (!environmentDetector.hasWebSocket) {
+            const error = new Error('WebSocket not supported in this environment');
+            this.emit('statusChanged', { type: 'error', message: error.message });
+            throw error;
+        }
+
         // Prevent multiple simultaneous connection attempts
         if (this.connectionPromise) {
             console.log('Connection already in progress, waiting for completion...');
@@ -100,7 +141,8 @@ export class SignalingClient extends EventEmitter {
         
         this.connectionPromise = new Promise((resolve, reject) => {
             try {
-                this.websocket = new WebSocket(url.toString());
+                // Create WebSocket with environment-specific handling
+                this.websocket = this.createWebSocket(url.toString());
                 
                 const connectTimeout = setTimeout(() => {
                     if (this.websocket.readyState === WebSocket.CONNECTING) {
@@ -324,7 +366,8 @@ export class SignalingClient extends EventEmitter {
         if (this.keepAliveInterval) return;
 
         console.log('Starting keep-alive pings every', this.keepAliveIntervalMs / 1000, 'seconds');
-        this.keepAliveInterval = window.setInterval.call(window, () => {
+        
+        const keepAliveCallback = () => {
             if (this.connected) {
                 // Check if this peer should send the ping
                 if (this.shouldSendKeepAlivePing()) {
@@ -339,7 +382,13 @@ export class SignalingClient extends EventEmitter {
                     console.log('Skipping keep-alive ping (not designated peer)');
                 }
             }
-        }, this.keepAliveIntervalMs);
+        };
+
+        if (environmentDetector.isBrowser) {
+            this.keepAliveInterval = window.setInterval(keepAliveCallback, this.keepAliveIntervalMs);
+        } else {
+            this.keepAliveInterval = setInterval(keepAliveCallback, this.keepAliveIntervalMs);
+        }
     }
 
     /**
@@ -386,7 +435,8 @@ export class SignalingClient extends EventEmitter {
         if (this.healthCheckInterval) return;
 
         console.log('Starting connection health monitoring');
-        this.healthCheckInterval = window.setInterval.call(window, () => {
+        
+        const healthCheckCallback = () => {
             // Check WebSocket state first
             if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
                 console.warn('WebSocket is not in OPEN state:', this.websocket?.readyState);
@@ -407,19 +457,22 @@ export class SignalingClient extends EventEmitter {
                 // Check if we have an old pong that indicates connection issues
                 if (this.lastPingTime && this.lastPongTime && 
                     (this.lastPingTime > this.lastPongTime) && 
-                    (now - this.lastPingTime) > this.connectionQualityTimeout) {
-                    console.warn('Connection health check failed - ping timeout');
+                    (now - this.lastPingTime > this.connectionQualityTimeout)) {
+                    console.warn('Connection unhealthy - ping/pong timeout');
                     this.handleUnhealthyConnection();
                     return;
                 }
-
-                // Send health check ping
+                
+                // Send health ping
                 this.sendHealthPing();
-            } else {
-                console.warn('Connection marked as disconnected but health monitoring still running');
-                this.handleUnhealthyConnection();
             }
-        }, 15000); // Check every 15 seconds for more responsive monitoring
+        };
+
+        if (environmentDetector.isBrowser) {
+            this.healthCheckInterval = window.setInterval(healthCheckCallback, 30000);
+        } else {
+            this.healthCheckInterval = setInterval(healthCheckCallback, 30000);
+        }
     }
 
     stopHealthMonitoring() {

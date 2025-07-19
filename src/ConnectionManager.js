@@ -1,5 +1,6 @@
 import { EventEmitter } from './EventEmitter.js';
 import { PeerConnection } from './PeerConnection.js';
+import { environmentDetector } from './EnvironmentDetector.js';
 
 /**
  * Manages individual peer connections, timeouts, and connection attempts
@@ -637,10 +638,16 @@ export class ConnectionManager extends EventEmitter {
             clearInterval(this.cleanupInterval);
         }
         
-        // Run cleanup every 30 seconds
-        this.cleanupInterval = window.setInterval.call(window, () => {
-            this.cleanupStalePeers();
-        }, 30000);
+        // Run cleanup every 30 seconds - environment-aware timer
+        if (environmentDetector.isBrowser) {
+            this.cleanupInterval = window.setInterval(() => {
+                this.cleanupStalePeers();
+            }, 30000);
+        } else {
+            this.cleanupInterval = setInterval(() => {
+                this.cleanupStalePeers();
+            }, 30000);
+        }
     }
 
     /**

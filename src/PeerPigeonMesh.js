@@ -10,10 +10,15 @@ import { StorageManager } from './StorageManager.js';
 import { GossipManager } from './GossipManager.js';
 import { MediaManager } from './MediaManager.js';
 import { WebDHT } from './WebDHT.js';
+import { environmentDetector } from './EnvironmentDetector.js';
 
 export class PeerPigeonMesh extends EventEmitter {
     constructor(options = {}) {
         super();
+        
+        // Validate environment capabilities
+        this.environmentReport = this.validateEnvironment(options);
+        
         this.peerId = null;
         this.providedPeerId = options.peerId || null;
         this.signalingClient = null;
@@ -102,6 +107,86 @@ export class PeerPigeonMesh extends EventEmitter {
         this.connectionManager.addEventListener('remoteStream', (data) => {
             this.emit('remoteStream', data);
         });
+    }
+
+    validateEnvironment(options = {}) {
+        const report = environmentDetector.getEnvironmentReport();
+        const warnings = [];
+        const errors = [];
+
+        // Log environment info
+        console.log('🔍 PeerPigeon Environment Detection:', {
+            runtime: `${report.runtime.isBrowser ? 'Browser' : ''}${report.runtime.isNodeJS ? 'Node.js' : ''}${report.runtime.isWorker ? 'Worker' : ''}`,
+            webrtc: report.capabilities.webrtc,
+            websocket: report.capabilities.webSocket,
+            browser: report.browser?.name || 'N/A'
+        });
+
+        // Check WebRTC support (required for peer connections)
+        if (!report.capabilities.webrtc) {
+            if (report.runtime.isBrowser) {
+                errors.push('WebRTC is not supported in this browser. PeerPigeon requires WebRTC for peer-to-peer connections.');
+            } else if (report.runtime.isNodeJS) {
+                warnings.push('WebRTC support not detected in Node.js environment. Consider using a WebRTC library like node-webrtc.');
+            }
+        }
+
+        // Check WebSocket support (required for signaling)
+        if (!report.capabilities.webSocket) {
+            if (report.runtime.isBrowser) {
+                errors.push('WebSocket is not supported in this browser. PeerPigeon requires WebSocket for signaling.');
+            } else if (report.runtime.isNodeJS) {
+                warnings.push('WebSocket support not detected. Install the "ws" package for WebSocket support in Node.js.');
+            }
+        }
+
+        // Check storage capabilities for persistent peer ID
+        if (report.runtime.isBrowser && !report.capabilities.localStorage && !report.capabilities.sessionStorage) {
+            warnings.push('No storage mechanism available. Peer ID will not persist between sessions.');
+        }
+
+        // Check crypto support for secure peer ID generation
+        if (!report.capabilities.randomValues) {
+            warnings.push('Crypto random values not available. Peer ID generation may be less secure.');
+        }
+
+        // Network connectivity checks
+        if (report.runtime.isBrowser && !report.network.online) {
+            warnings.push('Browser reports offline status. Mesh networking may not function properly.');
+        }
+
+        // Environment-specific warnings
+        if (report.runtime.isBrowser) {
+            // Browser-specific checks
+            const browser = report.browser;
+            if (browser && browser.name === 'ie') {
+                errors.push('Internet Explorer is not supported. Please use a modern browser.');
+            }
+            
+            // Check for secure context in production
+            if (typeof location !== 'undefined' && location.protocol === 'http:' && location.hostname !== 'localhost') {
+                warnings.push('Running on HTTP in production. Some WebRTC features may be limited. Consider using HTTPS.');
+            }
+        }
+
+        // Handle errors and warnings
+        if (errors.length > 0) {
+            const errorMessage = 'PeerPigeon environment validation failed:\n' + errors.join('\n');
+            console.error(errorMessage);
+            if (!options.ignoreEnvironmentErrors) {
+                throw new Error(errorMessage);
+            }
+        }
+
+        if (warnings.length > 0) {
+            console.warn('PeerPigeon environment warnings:\n' + warnings.join('\n'));
+        }
+
+        // Store capabilities for runtime checks
+        this.capabilities = report.capabilities;
+        this.runtimeInfo = report.runtime;
+
+        return report;
     }
 
     async init() {
@@ -458,7 +543,8 @@ export class PeerPigeonMesh extends EventEmitter {
             clearInterval(this.connectionMonitorInterval);
         }
         
-        this.connectionMonitorInterval = window.setInterval.call(window, () => {
+        // Environment-aware timer
+        const intervalCallback = () => {
             if (this.signalingClient) {
                 const stats = this.signalingClient.getConnectionStats();
                 console.log('Connection monitoring:', stats);
@@ -475,7 +561,13 @@ export class PeerPigeonMesh extends EventEmitter {
                 // Emit connection status for UI
                 this.emit('connectionStats', stats);
             }
-        }, 120000); // Every 2 minutes
+        };
+
+        if (environmentDetector.isBrowser) {
+            this.connectionMonitorInterval = window.setInterval(intervalCallback, 120000);
+        } else {
+            this.connectionMonitorInterval = setInterval(intervalCallback, 120000);
+        }
         
         console.log('Started connection monitoring');
     }
@@ -699,5 +791,98 @@ export class PeerPigeonMesh extends EventEmitter {
         }
         
         return this.connectionManager.connectToPeer(peerId);
+    }
+
+    /**
+     * Get the current environment report
+     * @returns {object} Complete environment detection report
+     */
+    getEnvironmentReport() {
+        return this.environmentReport;
+    }
+
+    /**
+     * Get runtime capabilities
+     * @returns {object} Capabilities detected during initialization
+     */
+    getCapabilities() {
+        return this.capabilities;
+    }
+
+    /**
+     * Get runtime information
+     * @returns {object} Runtime environment information
+     */
+    getRuntimeInfo() {
+        return this.runtimeInfo;
+    }
+
+    /**
+     * Check if a specific feature is supported
+     * @param {string} feature - The feature to check (e.g., 'webrtc', 'websocket', 'localstorage')
+     * @returns {boolean} True if the feature is supported
+     */
+    hasFeature(feature) {
+        return environmentDetector.hasFeature(feature);
+    }
+
+    /**
+     * Get environment-specific recommendations
+     * @returns {object} Recommendations based on current environment
+     */
+    getEnvironmentRecommendations() {
+        const recommendations = [];
+        const report = this.environmentReport;
+
+        if (report.runtime.isBrowser) {
+            if (!report.network.online) {
+                recommendations.push({
+                    type: 'warning',
+                    message: 'Browser is offline. Enable network connectivity for mesh functionality.'
+                });
+            }
+
+            if (typeof location !== 'undefined' && location.protocol === 'http:' && location.hostname !== 'localhost') {
+                recommendations.push({
+                    type: 'security',
+                    message: 'Consider using HTTPS for better WebRTC compatibility and security.'
+                });
+            }
+
+            if (report.browser && report.browser.name === 'safari') {
+                recommendations.push({
+                    type: 'compatibility',
+                    message: 'Safari has some WebRTC limitations. Test thoroughly for production use.'
+                });
+            }
+        }
+
+        if (report.runtime.isNodeJS) {
+            if (!report.capabilities.webSocket) {
+                recommendations.push({
+                    type: 'dependency',
+                    message: 'Install the "ws" package for WebSocket support: npm install ws'
+                });
+            }
+
+            if (!report.capabilities.webrtc) {
+                recommendations.push({
+                    type: 'dependency',
+                    message: 'Install "node-webrtc" or similar for WebRTC support in Node.js: npm install node-webrtc'
+                });
+            }
+        }
+
+        if (!report.capabilities.localStorage && !report.capabilities.sessionStorage) {
+            recommendations.push({
+                type: 'feature',
+                message: 'No persistent storage available. Peer ID will change on restart.'
+            });
+        }
+
+        return {
+            environment: report.runtime,
+            recommendations
+        };
     }
 }

@@ -1,4 +1,5 @@
 import { EventEmitter } from './EventEmitter.js';
+import { environmentDetector } from './EnvironmentDetector.js';
 
 /**
  * Manages gossip protocol for message propagation across the mesh network
@@ -379,9 +380,16 @@ export class GossipManager extends EventEmitter {
         if (this.cleanupTimer) {
             clearInterval(this.cleanupTimer);
         }
-        this.cleanupTimer = window.setInterval.call(window, () => {
-            this.cleanupExpiredMessages();
-        }, this.cleanupInterval);
+        
+        if (environmentDetector.isBrowser) {
+            this.cleanupTimer = window.setInterval(() => {
+                this.cleanupExpiredMessages();
+            }, this.cleanupInterval);
+        } else {
+            this.cleanupTimer = setInterval(() => {
+                this.cleanupExpiredMessages();
+            }, this.cleanupInterval);
+        }
     }
 
     cleanupExpiredMessages() {

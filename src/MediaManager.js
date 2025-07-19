@@ -1,4 +1,5 @@
 import { EventEmitter } from './EventEmitter.js';
+import { environmentDetector } from './EnvironmentDetector.js';
 
 export class MediaManager extends EventEmitter {
     constructor() {
@@ -30,6 +31,13 @@ export class MediaManager extends EventEmitter {
      * Initialize media devices and permissions
      */
     async init() {
+        // Check if media APIs are available
+        if (!environmentDetector.hasGetUserMedia) {
+            console.warn('getUserMedia not available in this environment');
+            this.emit('error', { type: 'init', error: new Error('getUserMedia not supported') });
+            return false;
+        }
+
         try {
             // Enumerate available devices
             await this.enumerateDevices();
@@ -45,6 +53,12 @@ export class MediaManager extends EventEmitter {
      * Get available media devices
      */
     async enumerateDevices() {
+        // Only available in browser environments with media device support
+        if (!environmentDetector.isBrowser || typeof navigator.mediaDevices === 'undefined') {
+            console.warn('Media device enumeration not available in this environment');
+            return;
+        }
+
         try {
             const devices = await navigator.mediaDevices.enumerateDevices();
             
