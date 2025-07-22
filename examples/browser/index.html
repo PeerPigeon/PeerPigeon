@@ -9,6 +9,8 @@
     <link rel="icon" type="image/png" sizes="16x16" href="assets/images/favicon.png">
     <link rel="apple-touch-icon" href="assets/images/favicon.png">
     <link rel="shortcut icon" href="assets/images/favicon.png">
+    <!-- Load unsea crypto library from CDN for browser environment -->
+    <script src="https://cdn.jsdelivr.net/npm/unsea@1.3.0/dist/sea.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -319,6 +321,165 @@
                     <div class="dht-results">
                         <h3>DHT Operations Log</h3>
                         <div id="dht-log" class="dht-log"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="crypto" aria-expanded="false">
+                <div class="section-header">
+                    <h2>
+                        <button id="crypto-toggle" class="toggle-btn" aria-expanded="false">
+                            ▶ Crypto - End-to-End Encryption
+                        </button>
+                    </h2>
+                </div>
+                <div id="crypto-content" class="collapsible-content" style="display: none;">
+                    <!-- Crypto Status -->
+                    <div class="crypto-status">
+                        <h3>Crypto Status</h3>
+                        <div class="info-group">
+                            <label>Encryption:</label>
+                            <span id="crypto-status" class="status">Disabled</span>
+                        </div>
+                        <div class="info-group">
+                            <label>Public Key:</label>
+                            <code id="crypto-public-key">None</code>
+                        </div>
+                        <div class="info-group">
+                            <label>Peer Keys:</label>
+                            <span id="crypto-peer-count">0</span>
+                        </div>
+                    </div>
+
+                    <!-- Key Management -->
+                    <div class="crypto-keys">
+                        <h3>Key Management</h3>
+                        <div class="button-group">
+                            <button id="crypto-generate-btn" class="btn primary">Generate New Keypair</button>
+                            <button id="crypto-reset-btn" class="btn warning">Reset Crypto</button>
+                            <button id="crypto-self-test-btn" class="btn tertiary">Run Self Test</button>
+                        </div>
+                        
+                        <div class="crypto-user-auth">
+                            <h4>User Authentication (Optional)</h4>
+                            <div class="input-group">
+                                <label for="crypto-alias">Alias:</label>
+                                <input type="text" id="crypto-alias" placeholder="Your username/alias">
+                            </div>
+                            <div class="input-group">
+                                <label for="crypto-password">Password:</label>
+                                <input type="password" id="crypto-password" placeholder="Your password">
+                            </div>
+                            <div class="button-group">
+                                <button id="crypto-login-btn" class="btn secondary">Login/Create Account</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Message Encryption -->
+                    <div class="crypto-messaging">
+                        <h3>Encrypted Messaging</h3>
+                        <div class="input-group">
+                            <label class="checkbox-label">
+                                <input type="checkbox" id="crypto-auto-encrypt">
+                                <span class="checkmark"></span>
+                                Auto-encrypt outgoing messages
+                            </label>
+                        </div>
+                        
+                        <div class="crypto-test-messaging">
+                            <h4>Test Encrypted Messages</h4>
+                            <div class="input-group horizontal">
+                                <input type="text" id="crypto-test-message" placeholder="Test message to encrypt">
+                                <input type="text" id="crypto-test-peer" placeholder="Target peer ID" maxlength="40">
+                                <button id="crypto-send-encrypted-btn" class="btn primary">Send Encrypted</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Group Encryption -->
+                    <div class="crypto-groups">
+                        <h3>Group Encryption</h3>
+                        <div class="input-group horizontal">
+                            <input type="text" id="crypto-group-id" placeholder="Group ID (e.g., 'chat-room-1')">
+                            <button id="crypto-create-group-btn" class="btn secondary">Create Group Key</button>
+                        </div>
+                        
+                        <div class="crypto-group-messaging">
+                            <div class="input-group horizontal">
+                                <input type="text" id="crypto-group-message" placeholder="Group message">
+                                <select id="crypto-group-select">
+                                    <option value="">Select group...</option>
+                                </select>
+                                <button id="crypto-send-group-btn" class="btn primary">Send to Group</button>
+                            </div>
+                        </div>
+                        
+                        <div id="crypto-groups-list" class="crypto-groups-list">
+                            <h4>Active Groups:</h4>
+                            <div class="empty-state">No groups created</div>
+                        </div>
+                    </div>
+
+                    <!-- Performance Stats -->
+                    <div class="crypto-stats">
+                        <h3>Performance Statistics</h3>
+                        <div class="stats-grid">
+                            <div class="stat-item">
+                                <label>Messages Encrypted:</label>
+                                <span id="crypto-stats-encrypted">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <label>Messages Decrypted:</label>
+                                <span id="crypto-stats-decrypted">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <label>Encryption Time (avg):</label>
+                                <span id="crypto-stats-encrypt-time">0ms</span>
+                            </div>
+                            <div class="stat-item">
+                                <label>Decryption Time (avg):</label>
+                                <span id="crypto-stats-decrypt-time">0ms</span>
+                            </div>
+                            <div class="stat-item">
+                                <label>Key Exchanges:</label>
+                                <span id="crypto-stats-key-exchanges">0</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Test Results -->
+                    <div class="crypto-test-results">
+                        <h3>Test Results</h3>
+                        <div id="crypto-test-log" class="test-log">
+                            <p class="empty-state">No tests run yet</p>
+                        </div>
+                    </div>
+
+                    <!-- Advanced Operations -->
+                    <div class="crypto-advanced">
+                        <h3>Advanced Operations</h3>
+                        <div class="button-group">
+                            <button id="crypto-export-key-btn" class="btn quaternary">Export Public Key</button>
+                            <button id="crypto-import-peer-key-btn" class="btn quaternary">Import Peer Key</button>
+                            <button id="crypto-benchmark-btn" class="btn tertiary">Run Benchmark</button>
+                        </div>
+                        
+                        <!-- Import peer key form -->
+                        <div id="crypto-import-form" class="crypto-import-form" style="display: none;">
+                            <div class="input-group">
+                                <label for="crypto-import-peer-id">Peer ID:</label>
+                                <input type="text" id="crypto-import-peer-id" placeholder="40-character peer ID" maxlength="40">
+                            </div>
+                            <div class="input-group">
+                                <label for="crypto-import-public-key">Public Key:</label>
+                                <textarea id="crypto-import-public-key" placeholder="Paste public key here" rows="3"></textarea>
+                            </div>
+                            <div class="button-group">
+                                <button id="crypto-import-confirm-btn" class="btn primary">Import Key</button>
+                                <button id="crypto-import-cancel-btn" class="btn secondary">Cancel</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
