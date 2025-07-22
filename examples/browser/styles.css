@@ -466,6 +466,7 @@ input[type="url"]:focus {
 .manual-connection[aria-expanded="false"] .section-header,
 .connected-peers[aria-expanded="false"] .section-header,
 .dht[aria-expanded="false"] .section-header,
+.crypto[aria-expanded="false"] .section-header,
 .media[aria-expanded="false"] .section-header {
     margin: 0;
     padding: 0;
@@ -476,6 +477,7 @@ input[type="url"]:focus {
 .manual-connection[aria-expanded="false"] h2,
 .connected-peers[aria-expanded="false"] h2,
 .dht[aria-expanded="false"] h2,
+.crypto[aria-expanded="false"] h2,
 .media[aria-expanded="false"] h2 {
     border-bottom: none !important;
     margin: 0 !important;
@@ -1285,4 +1287,218 @@ input[type="url"]:focus {
 .auto-discovery-control[title*="disabled"] .input-help {
     color: #dc3545;
     font-style: italic;
+}
+
+/* Crypto Section Styles */
+.crypto {
+    margin-bottom: 30px;
+}
+
+.crypto-status .info-group {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    padding: 8px 12px;
+    background: #f8f9fa;
+    border-radius: 4px;
+}
+
+.crypto-status .info-group label {
+    font-weight: 600;
+    margin: 0;
+}
+
+.crypto-status .status {
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    font-weight: 600;
+}
+
+.crypto-status .status.enabled {
+    background: #d4edda;
+    color: #155724;
+}
+
+.crypto-status .status.disabled {
+    background: #f8d7da;
+    color: #721c24;
+}
+
+#crypto-public-key {
+    max-width: 300px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 0.85em;
+    background: #e9ecef;
+    padding: 4px 6px;
+    border-radius: 3px;
+}
+
+.crypto-keys,
+.crypto-messaging,
+.crypto-groups,
+.crypto-stats,
+.crypto-test-results,
+.crypto-advanced {
+    margin-top: 25px;
+    padding-top: 20px;
+    border-top: 1px solid #e9ecef;
+}
+
+.crypto-user-auth {
+    margin-top: 15px;
+    padding: 15px;
+    background: #f8f9fa;
+    border-radius: 6px;
+    border: 1px solid #e9ecef;
+}
+
+.crypto-user-auth h4 {
+    margin-bottom: 15px;
+    color: #495057;
+}
+
+.crypto-test-messaging,
+.crypto-group-messaging {
+    margin-top: 15px;
+    padding: 15px;
+    background: #fff3cd;
+    border-radius: 6px;
+    border: 1px solid #ffeaa7;
+}
+
+.crypto-groups-list {
+    margin-top: 15px;
+    padding: 15px;
+    background: #f8f9fa;
+    border-radius: 6px;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 15px;
+    margin-top: 15px;
+}
+
+.stat-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px;
+    background: #e3f2fd;
+    border-radius: 6px;
+    border-left: 4px solid #2196f3;
+}
+
+.stat-item label {
+    font-weight: 600;
+    margin: 0;
+    color: #1565c0;
+}
+
+.stat-item span {
+    font-weight: 700;
+    color: #0d47a1;
+}
+
+.test-log {
+    background: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: 6px;
+    padding: 15px;
+    max-height: 300px;
+    overflow-y: auto;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+    font-size: 0.9em;
+}
+
+.test-log .test-result {
+    margin-bottom: 10px;
+    padding: 8px;
+    border-radius: 4px;
+}
+
+.test-log .test-result.success {
+    background: #d4edda;
+    border: 1px solid #c3e6cb;
+    color: #155724;
+}
+
+.test-log .test-result.error {
+    background: #f8d7da;
+    border: 1px solid #f5c6cb;
+    color: #721c24;
+}
+
+.test-log .test-result.info {
+    background: #d1ecf1;
+    border: 1px solid #bee5eb;
+    color: #0c5460;
+}
+
+.test-log .test-result.warning {
+    background: #fff3cd;
+    border: 1px solid #ffeaa7;
+    color: #856404;
+}
+
+.crypto-import-form {
+    margin-top: 15px;
+    padding: 20px;
+    background: #fff3cd;
+    border-radius: 6px;
+    border: 1px solid #ffeaa7;
+}
+
+.crypto-import-form .input-group {
+    margin-bottom: 15px;
+}
+
+.crypto-import-form textarea {
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+    font-size: 0.9em;
+}
+
+/* Encrypted message indicator */
+.message.encrypted {
+    position: relative;
+    padding-left: 40px;
+}
+
+.message.encrypted::before {
+    content: "🔐";
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: 1.2em;
+}
+
+.encryption-indicator {
+    color: #28a745;
+    font-size: 1.1em;
+    margin-right: 5px;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .stats-grid {
+        grid-template-columns: 1fr;
+    }
+    
+    .stat-item {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 5px;
+    }
+    
+    #crypto-public-key {
+        max-width: 200px;
+    }
 }

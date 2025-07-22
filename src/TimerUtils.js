@@ -9,16 +9,16 @@ import { environmentDetector } from './EnvironmentDetector.js';
 let originalSetInterval, originalSetTimeout, originalClearInterval, originalClearTimeout;
 
 if (environmentDetector.isBrowser) {
-    originalSetInterval = window.setInterval;
-    originalSetTimeout = window.setTimeout;
-    originalClearInterval = window.clearInterval;
-    originalClearTimeout = window.clearTimeout;
+  originalSetInterval = window.setInterval;
+  originalSetTimeout = window.setTimeout;
+  originalClearInterval = window.clearInterval;
+  originalClearTimeout = window.clearTimeout;
 } else {
-    // In Node.js or other environments, use global functions
-    originalSetInterval = setInterval;
-    originalSetTimeout = setTimeout;
-    originalClearInterval = clearInterval;
-    originalClearTimeout = clearTimeout;
+  // In Node.js or other environments, use global functions
+  originalSetInterval = setInterval;
+  originalSetTimeout = setTimeout;
+  originalClearInterval = clearInterval;
+  originalClearTimeout = clearTimeout;
 }
 
 /**
@@ -28,11 +28,11 @@ if (environmentDetector.isBrowser) {
  * @returns {number} - Interval ID
  */
 export function safeSetInterval(callback, delay) {
-    if (environmentDetector.isBrowser) {
-        return originalSetInterval.call(window, callback, delay);
-    } else {
-        return originalSetInterval(callback, delay);
-    }
+  if (environmentDetector.isBrowser) {
+    return originalSetInterval.call(window, callback, delay);
+  } else {
+    return originalSetInterval(callback, delay);
+  }
 }
 
 /**
@@ -42,11 +42,11 @@ export function safeSetInterval(callback, delay) {
  * @returns {number} - Timeout ID
  */
 export function safeSetTimeout(callback, delay) {
-    if (environmentDetector.isBrowser) {
-        return originalSetTimeout.call(window, callback, delay);
-    } else {
-        return originalSetTimeout(callback, delay);
-    }
+  if (environmentDetector.isBrowser) {
+    return originalSetTimeout.call(window, callback, delay);
+  } else {
+    return originalSetTimeout(callback, delay);
+  }
 }
 
 /**
@@ -54,11 +54,11 @@ export function safeSetTimeout(callback, delay) {
  * @param {number} id - Interval ID to clear
  */
 export function safeClearInterval(id) {
-    if (environmentDetector.isBrowser) {
-        return originalClearInterval.call(window, id);
-    } else {
-        return originalClearInterval(id);
-    }
+  if (environmentDetector.isBrowser) {
+    return originalClearInterval.call(window, id);
+  } else {
+    return originalClearInterval(id);
+  }
 }
 
 /**
@@ -66,9 +66,9 @@ export function safeClearInterval(id) {
  * @param {number} id - Timeout ID to clear
  */
 export function safeClearTimeout(id) {
-    if (environmentDetector.isBrowser) {
-        return originalClearTimeout.call(window, id);
-    } else {
-        return originalClearTimeout(id);
-    }
+  if (environmentDetector.isBrowser) {
+    return originalClearTimeout.call(window, id);
+  } else {
+    return originalClearTimeout(id);
+  }
 }
