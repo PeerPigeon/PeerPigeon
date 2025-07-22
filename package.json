@@ -1,6 +1,6 @@
 {
   "name": "peerpigeon",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
   "main": "index.js",
   "type": "module",
