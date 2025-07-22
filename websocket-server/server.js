@@ -83,8 +83,8 @@ function isConnectionAlive(connection) {
     const lastPong = connection.lastPong || connection.connectedAt || now;
     const timeSinceLastPong = now - lastPong;
     
-    // Consider connection dead if no pong for more than 60 seconds
-    return timeSinceLastPong < 60000;
+    // Consider connection dead if no pong for more than 12 minutes (since we ping every 9 minutes)
+    return timeSinceLastPong < 720000; // 12 minutes
 }
 
 function pingConnection(peerId, connection) {
@@ -176,21 +176,62 @@ setInterval(() => {
     }
 }, 30000); // Clean up every 30 seconds
 
-// Heartbeat ping every 30 seconds
+// DHT-based heartbeat ping every 9 minutes (540 seconds)
+// Use DHT logic to select a SINGLE peer to do the pinging instead of server pinging all
 setInterval(() => {
-    console.log(`🏓 Pinging ${connections.size} connections...`);
-    const stalePeers = [];
+    const activePeers = Array.from(connections.keys());
     
-    for (const [peerId, connection] of connections) {
-        if (!pingConnection(peerId, connection)) {
-            stalePeers.push(peerId);
+    if (activePeers.length === 0) {
+        console.log(`🏓 No peers to ping`);
+        return;
+    }
+    
+    // Use XOR distance to select the peer closest to a deterministic target
+    // This ensures the same peer is consistently selected across intervals
+    const pingTarget = '0000000000000000000000000000000000000000'; // Deterministic target for ping selection
+    const selectedPeer = selectPeerForPing(pingTarget, activePeers);
+    
+    if (selectedPeer) {
+        const connection = connections.get(selectedPeer);
+        console.log(`🏓 DHT-selected peer ${selectedPeer.substring(0, 8)}... for heartbeat ping (${activePeers.length} total peers)`);
+        
+        if (!pingConnection(selectedPeer, connection)) {
+            console.log(`🧹 DHT-selected peer ${selectedPeer.substring(0, 8)}... failed ping, cleaned up`);
+        }
+    }
+}, 540000); // Ping every 9 minutes (540 seconds)
+
+// DHT-based peer selection for ping duty
+function selectPeerForPing(target, peerIds) {
+    if (!peerIds || peerIds.length === 0) return null;
+    
+    // Use XOR distance to find the peer closest to the target
+    let closestPeer = null;
+    let closestDistance = Infinity;
+    
+    for (const peerId of peerIds) {
+        const distance = calculateXORDistance(target, peerId);
+        if (distance < closestDistance) {
+            closestDistance = distance;
+            closestPeer = peerId;
         }
     }
     
-    if (stalePeers.length > 0) {
-        console.log(`🧹 Heartbeat cleanup: removed ${stalePeers.length} unresponsive connections`);
+    return closestPeer;
+}
+
+// XOR distance calculation for DHT peer selection
+function calculateXORDistance(id1, id2) {
+    let distance = 0;
+    const minLength = Math.min(id1.length, id2.length);
+    
+    for (let i = 0; i < minLength; i++) {
+        const xor = parseInt(id1[i], 16) ^ parseInt(id2[i], 16);
+        distance += xor;
     }
-}, 30000); // Ping every 30 seconds
+    
+    return distance;
+}
 
 wss.on('connection', (ws, req) => {
     let peerId = null;

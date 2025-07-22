@@ -116,7 +116,11 @@ export class ConnectionManager extends EventEmitter {
             
             // Get current media stream if available
             const localStream = this.mesh.mediaManager.localStream;
-            const options = { localStream };
+            const options = { 
+                localStream,
+                enableAudio: hasMedia && localStream.getAudioTracks().length > 0,
+                enableVideo: hasMedia && localStream.getVideoTracks().length > 0
+            };
             
             const peerConnection = new PeerConnection(targetPeerId, true, options);
             

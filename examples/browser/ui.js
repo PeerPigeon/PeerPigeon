@@ -690,45 +690,121 @@ export class PeerPigeonUI {
         }
     }
 
+    // Media event handlers
+    handleLocalStreamStarted(data) {
+        console.log('Local stream started:', data);
+        this.addMessage('System', 'Local media stream started');
+        
+        // Display local video if it exists
+        const { stream } = data;
+        if (stream) {
+            const videoTracks = stream.getVideoTracks();
+            if (videoTracks.length > 0) {
+                this.displayLocalVideo(stream);
+            }
+        }
+        
+        this.updateMediaButtonStates();
+    }
+
+    handleLocalStreamStopped() {
+        console.log('Local stream stopped');
+        this.addMessage('System', 'Local media stream stopped');
+        
+        // Clear local video display
+        this.clearLocalVideo();
+        this.updateMediaButtonStates();
+    }
+
+    handleRemoteStream(data) {
+        const { peerId, stream } = data;
+        console.log('Remote stream received from:', peerId);
+        
+        // Validate the remote stream to prevent loops
+        if (this.validateRemoteStream(peerId, stream)) {
+            this.addMessage('System', `Received media stream from peer ${peerId.substring(0, 8)}...`);
+            this.displayRemoteVideo(peerId, stream);
+        } else {
+            console.warn('Remote stream validation failed for peer:', peerId);
+        }
+    }
+
+    /**
+     * Enhanced validation to prevent media stream synchronization loops in the UI
+     */
+    validateRemoteStream(peerId, stream) {
+        // Check 1: Prevent receiving our own stream
+        if (peerId === this.mesh.peerId) {
+            console.error('🚨 LOOPBACK DETECTED: Received our own stream as remote!');
+            console.error('Peer ID:', peerId, 'vs Our ID:', this.mesh.peerId);
+            return false;
+        }
+
+        // Check 2: Verify stream is marked as remote origin
+        if (stream._peerPigeonOrigin === 'local') {
+            console.error('🚨 SYNCHRONIZATION LOOP DETECTED: Stream marked as local origin!');
+            console.error('Stream ID:', stream.id, 'Origin:', stream._peerPigeonOrigin);
+            return false;
+        }
+
+        // Check 3: Compare with our local stream
+        const localStream = this.mesh.getLocalStream();
+        if (localStream && stream.id === localStream.id) {
+            console.error('🚨 STREAM ID COLLISION: Remote stream has same ID as local stream!');
+            console.error('Local stream ID:', localStream.id, 'Remote stream ID:', stream.id);
+            return false;
+        }
+
+        // Check 4: Track-level validation
+        if (localStream) {
+            const localTracks = localStream.getTracks();
+            const remoteTracks = stream.getTracks();
+            
+            for (const remoteTrack of remoteTracks) {
+                const isOwnTrack = localTracks.some(localTrack => localTrack.id === remoteTrack.id);
+                if (isOwnTrack) {
+                    console.error('🚨 TRACK LOOPBACK: Remote track matches local track!');
+                    console.error('Track ID:', remoteTrack.id, 'Kind:', remoteTrack.kind);
+                    return false;
+                }
+            }
+        }
+
+        console.log('✅ Remote stream validation passed for peer', peerId.substring(0, 8));
+        return true;
+    }
+
+    // Media control methods
     async startMedia() {
         try {
             const videoEnabled = document.getElementById('enable-video')?.checked || false;
             const audioEnabled = document.getElementById('enable-audio')?.checked || false;
             
-            // Initialize audio context for better audio support
-            if (audioEnabled && (window.AudioContext || window.webkitAudioContext)) {
-                const AudioContext = window.AudioContext || window.webkitAudioContext;
-                try {
-                    const audioContext = new AudioContext();
-                    if (audioContext.state === 'suspended') {
-                        await audioContext.resume();
-                        console.log('Audio context resumed for local media');
-                    }
-                    console.log('Audio context state:', audioContext.state);
-                } catch (e) {
-                    console.log('Could not initialize audio context:', e);
-                }
+            if (!videoEnabled && !audioEnabled) {
+                this.addMessage('System', 'Please enable at least video or audio before starting media', 'warning');
+                return;
             }
-            
-            const deviceIds = {};
+
+            // Get selected device IDs
             const cameraSelect = document.getElementById('camera-select');
             const micSelect = document.getElementById('microphone-select');
             
+            const deviceIds = {};
             if (cameraSelect?.value) {
                 deviceIds.camera = cameraSelect.value;
             }
-            
             if (micSelect?.value) {
                 deviceIds.microphone = micSelect.value;
             }
-            
-            await this.mesh.startMedia({
-                video: videoEnabled,
+
+            this.addMessage('System', 'Starting media stream...');
+            const stream = await this.mesh.startMedia({ 
+                video: videoEnabled, 
                 audio: audioEnabled,
-                deviceIds
+                deviceIds 
             });
             
-            this.addMessage('System', 'Media started successfully');
+            console.log('Media stream started successfully:', stream);
             this.updateMediaButtonStates();
             
         } catch (error) {
@@ -739,10 +815,9 @@ export class PeerPigeonUI {
 
     async stopMedia() {
         try {
+            this.addMessage('System', 'Stopping media stream...');
             await this.mesh.stopMedia();
-            this.addMessage('System', 'Media stopped');
             this.updateMediaButtonStates();
-            this.clearLocalVideo();
             
         } catch (error) {
             console.error('Failed to stop media:', error);
@@ -752,9 +827,10 @@ export class PeerPigeonUI {
 
     toggleVideo() {
         try {
-            const enabled = this.mesh.toggleVideo();
-            this.addMessage('System', `Video ${enabled ? 'enabled' : 'disabled'}`);
+            const isEnabled = this.mesh.toggleVideo();
+            this.addMessage('System', `Video ${isEnabled ? 'enabled' : 'disabled'}`);
             this.updateMediaButtonStates();
+            
         } catch (error) {
             console.error('Failed to toggle video:', error);
             this.addMessage('System', `Failed to toggle video: ${error.message}`, 'error');
@@ -763,1168 +839,151 @@ export class PeerPigeonUI {
 
     toggleAudio() {
         try {
-            const enabled = this.mesh.toggleAudio();
-            this.addMessage('System', `Audio ${enabled ? 'enabled' : 'disabled'}`);
+            const isEnabled = this.mesh.toggleAudio();
+            this.addMessage('System', `Audio ${isEnabled ? 'enabled' : 'disabled'}`);
             this.updateMediaButtonStates();
+            
         } catch (error) {
             console.error('Failed to toggle audio:', error);
             this.addMessage('System', `Failed to toggle audio: ${error.message}`, 'error');
         }
     }
 
-    async testAudio() {
+    testAudio() {
         try {
-            console.log('🔊 Starting audio test...');
-            this.addMessage('System', '🔊 Testing audio system...', 'info');
+            // Create a simple audio test tone
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
             
-            // First, run diagnostics to understand current state
-            this.logPeerDiagnostics();
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
             
-            // Test 0: Verify we have actual peer connections (not just self)
-            const allPeers = this.mesh.getPeers();
-            const connectedPeers = allPeers.filter(peer => peer.status === 'connected');
-            const peersWithMedia = allPeers.filter(peer => {
-                const peerConnection = this.mesh.connectionManager.getPeer(peer.peerId);
-                return peerConnection && (peerConnection.remoteStream || peerConnection.connection?.connectionState === 'connected');
-            });
+            oscillator.frequency.setValueAtTime(440, audioContext.currentTime); // A note
+            gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
             
-            console.log('🔊 All peers:', allPeers.length);
-            console.log('🔊 Connected peers (data channel):', connectedPeers.length);
-            console.log('🔊 Peers with media/WebRTC:', peersWithMedia.length);
+            oscillator.start(audioContext.currentTime);
+            oscillator.stop(audioContext.currentTime + 0.5); // Play for 0.5 seconds
             
-            // Log detailed peer status
-            allPeers.forEach(peer => {
-                const peerConnection = this.mesh.connectionManager.getPeer(peer.peerId);
-                console.log(`🔊 Peer ${peer.peerId.substring(0, 8)}:`, {
-                    status: peer.status,
-                    webrtcState: peerConnection?.connection?.connectionState,
-                    dataChannelState: peerConnection?.dataChannel?.readyState,
-                    hasRemoteStream: !!peerConnection?.remoteStream,
-                    hasLocalStream: !!peerConnection?.localStream
-                });
-            });
-            
-            this.addMessage('System', `🔊 Found ${allPeers.length} total peers (${connectedPeers.length} with data channel, ${peersWithMedia.length} with media)`, 'info');
-            
-            if (peersWithMedia.length === 0) {
-                this.addMessage('System', '❌ No peers with active media! You need to open this in TWO different browser tabs/windows and connect them.', 'error');
-                console.log('❌ NO PEERS WITH MEDIA: Open this URL in two different browser tabs and ensure they connect to each other');
-                return;
-            }
-            
-            // Test each peer connection individually
-            peersWithMedia.forEach((peer, index) => {
-                const connection = this.mesh.connectionManager.peers.get(peer.peerId);
-                if (connection) {
-                    console.log(`🔊 Peer ${index + 1} (${peer.peerId.substring(0, 8)}...):`);
-                    
-                    const localStream = connection.getLocalStream();
-                    const remoteStream = connection.getRemoteStream();
-                    
-                    // Check local stream
-                    if (localStream) {
-                        const localAudioTracks = localStream.getAudioTracks();
-                        console.log(`  - Local audio tracks: ${localAudioTracks.length}`);
-                        this.addMessage('System', `  Peer ${index + 1} - Local audio: ${localAudioTracks.length} tracks`, 'info');
-                        localAudioTracks.forEach((track, i) => {
-                            console.log(`    Track ${i}: enabled=${track.enabled}, id=${track.id.substring(0, 8)}...`);
-                        });
-                    } else {
-                        console.log('  - No local stream');
-                        this.addMessage('System', `  Peer ${index + 1} - No local stream`, 'warning');
-                    }
-                    
-                    // Check remote stream
-                    if (remoteStream) {
-                        const remoteAudioTracks = remoteStream.getAudioTracks();
-                        console.log(`  - Remote audio tracks: ${remoteAudioTracks.length}`);
-                        this.addMessage('System', `  Peer ${index + 1} - Remote audio: ${remoteAudioTracks.length} tracks`, remoteAudioTracks.length > 0 ? 'success' : 'warning');
-                        
-                        remoteAudioTracks.forEach((track, i) => {
-                            console.log(`    Track ${i}: enabled=${track.enabled}, id=${track.id.substring(0, 8)}..., readyState=${track.readyState}`);
-                        });
-                        
-                        // CRITICAL: Check if remote stream ID matches local stream ID (loopback detection)
-                        if (localStream && remoteStream.id === localStream.id) {
-                            console.error(`❌ LOOPBACK DETECTED: Remote stream ID matches local stream ID!`);
-                            this.addMessage('System', `❌ Peer ${index + 1} - LOOPBACK: Getting own audio back!`, 'error');
-                        } else {
-                            console.log(`✅ Stream IDs different: local=${localStream?.id.substring(0, 8) || 'none'}, remote=${remoteStream.id.substring(0, 8)}`);
-                            this.addMessage('System', `✅ Peer ${index + 1} - Stream IDs are different (good!)`, 'success');
-                        }
-                        
-                        // Check video elements playing this stream
-                        const videoElements = document.querySelectorAll('video');
-                        let foundVideoElement = false;
-                        videoElements.forEach(video => {
-                            if (video.srcObject === remoteStream) {
-                                foundVideoElement = true;
-                                console.log(`  - Video element: volume=${video.volume}, muted=${video.muted}, paused=${video.paused}, readyState=${video.readyState}`);
-                                this.addMessage('System', `  Peer ${index + 1} - Video element: volume=${video.volume}, muted=${video.muted}`, video.muted ? 'warning' : 'success');
-                            }
-                        });
-                        
-                        if (!foundVideoElement) {
-                            console.log(`  - ❌ No video element found for this remote stream`);
-                            this.addMessage('System', `  Peer ${index + 1} - ❌ No video element displaying this stream`, 'error');
-                        }
-                    } else {
-                        console.log('  - ❌ No remote stream');
-                        this.addMessage('System', `  Peer ${index + 1} - ❌ No remote stream received`, 'error');
-                    }
-                } else {
-                    console.log(`❌ No connection object found for peer ${peer.peerId}`);
-                    this.addMessage('System', `❌ No connection for peer ${index + 1}`, 'error');
-                }
-            });
-            
-            // Test 1: Audio Context
-            if (window.AudioContext || window.webkitAudioContext) {
-                const AudioContext = window.AudioContext || window.webkitAudioContext;
-                const audioContext = new AudioContext();
-                console.log('Audio context state:', audioContext.state);
-                
-                if (audioContext.state === 'suspended') {
-                    await audioContext.resume();
-                    console.log('Audio context resumed');
-                }
-                
-                // Generate a test tone
-                const oscillator = audioContext.createOscillator();
-                const gainNode = audioContext.createGain();
-                
-                oscillator.connect(gainNode);
-                gainNode.connect(audioContext.destination);
-                
-                oscillator.frequency.setValueAtTime(440, audioContext.currentTime); // A4 note
-                gainNode.gain.setValueAtTime(0.1, audioContext.currentTime); // Low volume
-                
-                oscillator.start();
-                oscillator.stop(audioContext.currentTime + 0.5); // Play for 0.5 seconds
-                
-                this.addMessage('System', '🔊 Audio test tone played (440Hz for 0.5s)', 'success');
-            } else {
-                this.addMessage('System', '❌ Audio context not supported', 'error');
-            }
-            
-            // Test 2: Check current media streams
-            const peers = this.mesh.getPeers();
-            console.log('Current peers:', peers.length);
-            
-            peers.forEach(peer => {
-                const connection = this.mesh.connectionManager.peers.get(peer.peerId);
-                if (connection) {
-                    const localStream = connection.getLocalStream();
-                    const remoteStream = connection.getRemoteStream();
-                    
-                    console.log(`Peer ${peer.peerId.substring(0, 8)}:`);
-                    if (localStream) {
-                        const audioTracks = localStream.getAudioTracks();
-                        console.log(`- Local audio tracks: ${audioTracks.length}`);
-                        audioTracks.forEach((track, i) => {
-                            console.log(`  Track ${i}: enabled=${track.enabled}, readyState=${track.readyState}, muted=${track.muted}`);
-                        });
-                    }
-                    
-                    if (remoteStream) {
-                        const audioTracks = remoteStream.getAudioTracks();
-                        console.log(`- Remote audio tracks: ${audioTracks.length}`);
-                        audioTracks.forEach((track, i) => {
-                            console.log(`  Track ${i}: enabled=${track.enabled}, readyState=${track.readyState}, muted=${track.muted}`);
-                        });
-                        
-                        // Check if there are video elements for this stream
-                        const videoElements = document.querySelectorAll('video');
-                        videoElements.forEach(video => {
-                            if (video.srcObject === remoteStream) {
-                                console.log(`- Video element: volume=${video.volume}, muted=${video.muted}, paused=${video.paused}`);
-                            }
-                        });
-                    }
-                }
-            });
-            
-            // Test 3: Check microphone access
-            try {
-                const testStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                console.log('✅ Microphone access working');
-                this.addMessage('System', '✅ Microphone access: OK', 'success');
-                testStream.getTracks().forEach(track => track.stop());
-            } catch (error) {
-                console.log('❌ Microphone access failed:', error);
-                this.addMessage('System', `❌ Microphone access failed: ${error.message}`, 'error');
-            }
+            this.addMessage('System', 'Playing audio test tone (440Hz for 0.5s)');
             
         } catch (error) {
-            console.error('Audio test failed:', error);
-            this.addMessage('System', `❌ Audio test failed: ${error.message}`, 'error');
+            console.error('Failed to test audio:', error);
+            this.addMessage('System', `Audio test failed: ${error.message}`, 'error');
         }
     }
 
-    handleLocalStreamStarted(data) {
-        this.updateMediaButtonStates();
-        
-        // Display local video if video is enabled
-        if (data.video) {
-            this.displayLocalVideo(data.stream);
-        }
-        
-        const mediaTypes = [];
-        if (data.video) mediaTypes.push('video');
-        if (data.audio) mediaTypes.push('audio');
-        
-        this.addMessage('System', `Local ${mediaTypes.join(' and ')} started`);
-    }
-
-    handleLocalStreamStopped() {
-        this.updateMediaButtonStates();
-        this.clearLocalVideo();
-        this.addMessage('System', 'Local media stopped');
-    }
-
+    // Video display methods
     displayLocalVideo(stream) {
-        const localVideoContainer = document.getElementById('local-video-container');
-        if (!localVideoContainer) return;
-        
-        let video = localVideoContainer.querySelector('video');
-        if (!video) {
-            video = document.createElement('video');
-            video.autoplay = true;
-            video.muted = true;
-            video.playsInline = true;
-            video.style.width = '100%';
-            video.style.borderRadius = '8px';
-            localVideoContainer.appendChild(video);
+        const container = document.getElementById('local-video-container');
+        if (!container) return;
+
+        // Remove existing video
+        const existingVideo = container.querySelector('video');
+        if (existingVideo) {
+            existingVideo.remove();
         }
+
+        // Create new video element
+        const videoElement = document.createElement('video');
+        videoElement.autoplay = true;
+        videoElement.playsInline = true;
+        videoElement.muted = true; // Prevent feedback
+        videoElement.style.width = '100%';
+        videoElement.style.height = 'auto';
+        videoElement.style.borderRadius = '8px';
         
-        video.srcObject = stream;
+        videoElement.srcObject = stream;
+        container.innerHTML = ''; // Clear placeholder text
+        container.appendChild(videoElement);
     }
 
     clearLocalVideo() {
-        const localVideoContainer = document.getElementById('local-video-container');
-        if (localVideoContainer) {
-            const video = localVideoContainer.querySelector('video');
-            if (video) {
-                video.srcObject = null;
-                video.remove();
-            }
+        const container = document.getElementById('local-video-container');
+        if (container) {
+            container.innerHTML = '<p class="video-placeholder">No video stream</p>';
         }
-    }
-
-    handleRemoteStream(data) {
-        console.log('🎵 Handling remote stream:', data);
-        const { peerId, stream } = data;
-        
-        // CRITICAL: Prevent audio loopback - check if this is our own stream
-        if (peerId === this.mesh.peerId) {
-            console.warn('🚨 LOOPBACK DETECTED: Received our own stream as remote! This should not happen.');
-            console.warn('Stream ID:', stream.id);
-            // Still display it but it will be muted by displayRemoteVideo
-        }
-        
-        // Detailed audio analysis
-        const audioTracks = stream.getAudioTracks();
-        const videoTracks = stream.getVideoTracks();
-        
-        console.log(`Stream from ${peerId.substring(0, 8)}: ${audioTracks.length} audio, ${videoTracks.length} video tracks`);
-        
-        audioTracks.forEach((track, i) => {
-            console.log(`🎵 Audio track ${i}:`, {
-                id: track.id,
-                kind: track.kind,
-                enabled: track.enabled,
-                readyState: track.readyState,
-                muted: track.muted,
-                label: track.label
-            });
-            
-            // Add track event listeners for state monitoring
-            track.addEventListener('ended', () => {
-                console.log(`🎵 Audio track ${i} from peer ${peerId.substring(0, 8)} ENDED`);
-            });
-            
-            track.addEventListener('mute', () => {
-                console.log(`🎵 Audio track ${i} from peer ${peerId.substring(0, 8)} MUTED`);
-            });
-            
-            track.addEventListener('unmute', () => {
-                console.log(`🎵 Audio track ${i} from peer ${peerId.substring(0, 8)} UNMUTED`);
-            });
-        });
-        
-        this.displayRemoteVideo(peerId, stream);
-        
-        // Audio data summary
-        const audioSummary = {
-            peerIdShort: peerId.substring(0, 8),
-            audioTrackCount: audioTracks.length,
-            videoTrackCount: videoTracks.length,
-            audioTracksEnabled: audioTracks.filter(t => t.enabled).length,
-            streamActive: stream.active,
-            streamId: stream.id
-        };
-        
-        console.log(`🎵 AUDIO DATA EXPECTATION for peer ${audioSummary.peerIdShort}:`, audioSummary);
-        
-        if (audioTracks.length > 0) {
-            console.log(`✅ EXPECTING AUDIO DATA from peer ${audioSummary.peerIdShort} - ${audioSummary.audioTracksEnabled}/${audioSummary.audioTrackCount} tracks enabled`);
-        } else {
-            console.log(`❌ NO AUDIO TRACKS from peer ${audioSummary.peerIdShort} - video only`);
-        }
-        
-        this.addMessage('System', `🎵 Remote stream received from ${peerId.substring(0, 8)}... (${audioTracks.length} audio, ${videoTracks.length} video)`);
     }
 
     displayRemoteVideo(peerId, stream) {
-        console.log(`Displaying remote video for ${peerId}:`, stream);
-        console.log('Stream tracks:', stream.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled })));
+        // Find or create remote videos container
+        const remoteVideosContainer = document.getElementById('remote-videos-container') || document.getElementById('remote-videos');
+        if (!remoteVideosContainer) {
+            console.warn('Remote videos container not found');
+            return;
+        }
+
+        // Remove placeholder if it exists
+        const placeholder = remoteVideosContainer.querySelector('.video-placeholder');
+        if (placeholder) {
+            placeholder.remove();
+        }
+
+        // Check if video element for this peer already exists
+        let videoElement = remoteVideosContainer.querySelector(`video[data-peer-id="${peerId}"]`);
         
-        // CRITICAL: Prevent audio loopback - check if this is our own stream
-        const isOwnStream = peerId === this.mesh.peerId;
-        if (isOwnStream) {
-            console.warn('🚨 LOOPBACK DETECTED: Received our own stream! Muting audio to prevent feedback.');
+        if (!videoElement) {
+            // Create new video element for this peer
+            videoElement = document.createElement('video');
+            videoElement.setAttribute('data-peer-id', peerId);
+            videoElement.autoplay = true;
+            videoElement.playsInline = true;
+            videoElement.controls = true;
+            videoElement.style.width = '300px';
+            videoElement.style.height = 'auto';
+            videoElement.style.margin = '10px';
+            videoElement.style.border = '2px solid #333';
+            videoElement.style.borderRadius = '8px';
+            videoElement.style.backgroundColor = '#000';
+            
+            // Add peer label
+            const peerLabel = document.createElement('div');
+            peerLabel.style.textAlign = 'center';
+            peerLabel.style.fontSize = '12px';
+            peerLabel.style.color = '#666';
+            peerLabel.style.marginBottom = '5px';
+            peerLabel.textContent = `Peer: ${peerId.substring(0, 8)}...`;
+            
+            // Create container for this peer's video
+            const peerContainer = document.createElement('div');
+            peerContainer.style.display = 'inline-block';
+            peerContainer.style.margin = '10px';
+            peerContainer.appendChild(peerLabel);
+            peerContainer.appendChild(videoElement);
+            
+            remoteVideosContainer.appendChild(peerContainer);
         }
         
-        const remoteVideosContainer = document.getElementById('remote-videos-container');
+        // Set the stream
+        videoElement.srcObject = stream;
+        
+        console.log(`Displaying remote video from peer ${peerId.substring(0, 8)}...`);
+    }
+
+    removeRemoteVideo(peerId) {
+        const remoteVideosContainer = document.getElementById('remote-videos-container') || document.getElementById('remote-videos');
         if (!remoteVideosContainer) return;
-        
-        let remoteVideoItem = remoteVideosContainer.querySelector(`[data-peer-id="${peerId}"]`);
-        
-        if (!remoteVideoItem) {
-            remoteVideoItem = document.createElement('div');
-            remoteVideoItem.className = 'remote-video-item';
-            remoteVideoItem.setAttribute('data-peer-id', peerId);
-            
-            const title = document.createElement('div');
-            title.className = 'video-title';
-            title.textContent = `Peer ${peerId.substring(0, 8)}...`;
-            
-            const video = document.createElement('video');
-            video.autoplay = true;
-            video.playsInline = true;
-            video.controls = true;
-            // CRITICAL: Mute if this is our own stream to prevent audio feedback
-            video.muted = isOwnStream; // Mute our own audio, unmute others
-            video.style.width = '100%';
-            video.style.borderRadius = '8px';
-            
-            // Enhanced audio debugging
-            video.addEventListener('loadedmetadata', () => {
-                console.log('Video element loaded metadata:', {
-                    duration: video.duration,
-                    audioTracks: video.audioTracks?.length || 'N/A',
-                    volume: video.volume,
-                    muted: video.muted
-                });
-                
-                video.play().then(() => {
-                    console.log('Video/audio playback started successfully');
-                    // Check audio context state
-                    if (window.AudioContext || window.webkitAudioContext) {
-                        const AudioContext = window.AudioContext || window.webkitAudioContext;
-                        const audioContext = new AudioContext();
-                        console.log('Audio context state:', audioContext.state);
-                        if (audioContext.state === 'suspended') {
-                            console.log('Audio context is suspended - may need user interaction');
-                        }
-                    }
-                    // Hide any play button if playback started
-                    const playButton = remoteVideoItem.querySelector('.manual-play-button');
-                    if (playButton) {
-                        playButton.style.display = 'none';
-                    }
-                }).catch(error => {
-                    console.log('Autoplay failed, user interaction required:', error);
-                    // Show a manual play button
-                    const playButton = document.createElement('button');
-                    playButton.className = 'manual-play-button';
-                    playButton.textContent = '▶ Click to Play Audio';
-                    playButton.style.cssText = 'position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 10; padding: 10px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer;';
-                    
-                    playButton.addEventListener('click', async () => {
-                        try {
-                            await video.play();
-                            playButton.style.display = 'none';
-                            console.log('Manual play successful');
-                        } catch (e) {
-                            console.error('Manual play failed:', e);
-                        }
-                    });
-                    
-                    remoteVideoItem.style.position = 'relative';
-                    remoteVideoItem.appendChild(playButton);
-                });
-            });
-            
-            // Add event listeners for audio debugging
-            video.addEventListener('play', () => {
-                console.log('Video element started playing');
-            });
-            
-            video.addEventListener('pause', () => {
-                console.log('Video element paused');
-            });
-            
-            video.addEventListener('volumechange', () => {
-                console.log('Volume changed:', video.volume, 'Muted:', video.muted);
-            });
-            
-            const status = document.createElement('div');
-            status.className = 'video-status';
-            
-            remoteVideoItem.appendChild(title);
-            remoteVideoItem.appendChild(video);
-            remoteVideoItem.appendChild(status);
-            
-            remoteVideosContainer.appendChild(remoteVideoItem);
-        }
-        
-        const video = remoteVideoItem.querySelector('video');
-        const status = remoteVideoItem.querySelector('.video-status');
-        
-        video.srcObject = stream;
-        
-        // EXPLICIT AUDIO DEBUGGING
-        console.log('🎵 Setting srcObject for video element:', {
-            stream: stream,
-            streamId: stream.id,
-            streamActive: stream.active,
-            videoElement: video,
-            videoMuted: video.muted,
-            videoVolume: video.volume,
-            isOwnStream: isOwnStream
-        });
-        
-        const audioTracks = stream.getAudioTracks();
-        const videoTracks = stream.getVideoTracks();
-        
-        console.log('🎵 Stream tracks assigned:', {
-            audioTracks: audioTracks.map(t => ({
-                id: t.id,
-                enabled: t.enabled,
-                readyState: t.readyState,
-                muted: t.muted
-            })),
-            videoTracks: videoTracks.map(t => ({
-                id: t.id,
-                enabled: t.enabled,
-                readyState: t.readyState,
-                muted: t.muted
-            }))
-        });
-        
-        // CRITICAL: Set audio state based on whether this is our own stream
-        if (isOwnStream) {
-            console.warn('🚨 Muting our own stream to prevent audio feedback');
-            video.muted = true;
-            video.volume = 0;
-        } else {
-            // Only unmute if this is NOT our own stream
-            video.muted = false;
-            video.volume = 1.0;
-            
-            // Setup audio playback monitoring for remote streams
-            this.setupAudioPlaybackMonitoring(video, peerId, audioTracks);
-        }
-        
-        // Update status based on stream tracks        
-        console.log(`Video tracks: ${videoTracks.length}, Audio tracks: ${audioTracks.length}`);
-        audioTracks.forEach((track, i) => {
-            console.log(`Audio track ${i}:`, { enabled: track.enabled, muted: track.muted, label: track.label });
-        });
-        
-        // For audio-only streams, ensure the video element is properly configured
-        if (audioTracks.length > 0 && videoTracks.length === 0) {
-            console.log('Audio-only stream detected - configuring for audio playback');
-            video.style.height = '60px'; // Smaller height for audio-only
-            video.style.backgroundColor = '#f0f0f0';
-            
-            // Force audio to play by trying to resume audio context
-            if (window.AudioContext || window.webkitAudioContext) {
-                const AudioContext = window.AudioContext || window.webkitAudioContext;
-                try {
-                    const audioContext = new AudioContext();
-                    if (audioContext.state === 'suspended') {
-                        audioContext.resume().then(() => {
-                            console.log('Audio context resumed for remote stream');
-                        });
-                    }
-                    
-                    // Test audio by creating a brief analysis
-                    try {
-                        const source = audioContext.createMediaStreamSource(stream);
-                        const analyser = audioContext.createAnalyser();
-                        source.connect(analyser);
-                        
-                        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-                        const checkAudio = () => {
-                            analyser.getByteFrequencyData(dataArray);
-                            const sum = dataArray.reduce((a, b) => a + b, 0);
-                            if (sum > 0) {
-                                console.log('Remote audio data detected! Sum:', sum);
-                            }
-                        };
-                        
-                        // Check audio data periodically
-                        const audioChecker = setInterval(checkAudio, 1000);
-                        setTimeout(() => clearInterval(audioChecker), 10000); // Stop after 10 seconds
-                        
-                    } catch (audioAnalysisError) {
-                        console.log('Could not analyze remote audio:', audioAnalysisError);
-                    }
-                } catch (e) {
-                    console.log('Could not create/resume audio context:', e);
-                }
-            }
-        }
-        
-        const statusText = [];
-        if (videoTracks.length > 0) statusText.push('Video');
-        if (audioTracks.length > 0) statusText.push('Audio');
-        
-        status.textContent = statusText.length > 0 ? statusText.join(' + ') : 'Audio only';
-        status.style.color = '#28a745';
-        
-        this.addMessage('System', `Receiving ${statusText.join(' + ')} from ${peerId.substring(0, 8)}...`);
-    }
 
-    /**
-     * Setup audio playback monitoring for video elements playing remote streams
-     */
-    setupAudioPlaybackMonitoring(videoElement, peerId, audioTracks) {
-        const peerIdShort = peerId.substring(0, 8);
-        console.log(`🎵 Setting up audio playback monitoring for peer ${peerIdShort}`);
-        
-        if (audioTracks.length === 0) {
-            console.log(`🎵 No audio tracks to monitor for peer ${peerIdShort}`);
-            return;
-        }
-        
-        try {
-            // Monitor video element audio events
-            videoElement.addEventListener('play', () => {
-                console.log(`🎵 Video element started playing for peer ${peerIdShort}`, {
-                    muted: videoElement.muted,
-                    volume: videoElement.volume,
-                    audioTracks: audioTracks.length
-                });
-            });
-            
-            videoElement.addEventListener('pause', () => {
-                console.log(`🎵 Video element paused for peer ${peerIdShort}`);
-            });
-            
-            videoElement.addEventListener('volumechange', () => {
-                console.log(`🎵 Volume changed for peer ${peerIdShort}:`, {
-                    volume: videoElement.volume,
-                    muted: videoElement.muted
-                });
-            });
-            
-            // Create audio context for monitoring actual audio data playback
-            const AudioContext = window.AudioContext || window.webkitAudioContext;
-            if (!AudioContext) {
-                console.warn('🎵 AudioContext not available - basic monitoring only');
-                return;
-            }
-            
-            // Wait for video to load before setting up audio analysis
-            const setupAudioAnalysis = () => {
-                try {
-                    const audioContext = new AudioContext();
-                    const source = audioContext.createMediaElementSource(videoElement);
-                    const analyser = audioContext.createAnalyser();
-                    const gainNode = audioContext.createGain();
-                    
-                    analyser.fftSize = 256;
-                    const bufferLength = analyser.frequencyBinCount;
-                    const dataArray = new Uint8Array(bufferLength);
-                    
-                    // Connect: source -> analyser -> gain -> destination
-                    source.connect(analyser);
-                    analyser.connect(gainNode);
-                    gainNode.connect(audioContext.destination);
-                    
-                    let lastLogTime = 0;
-                    let totalSamples = 0;
-                    let playbackSamples = 0;
-                    let maxPlaybackLevel = 0;
-                    
-                    const monitorPlayback = () => {
-                        if (videoElement.paused || videoElement.ended) {
-                            return; // Stop monitoring if playback stopped
-                        }
-                        
-                        analyser.getByteFrequencyData(dataArray);
-                        
-                        // Calculate playback audio level
-                        const average = dataArray.reduce((sum, value) => sum + value, 0) / bufferLength;
-                        const currentTime = Date.now();
-                        
-                        totalSamples++;
-                        if (average > 3) { // Lower threshold for playback detection
-                            playbackSamples++;
-                            maxPlaybackLevel = Math.max(maxPlaybackLevel, average);
-                        }
-                        
-                        // Log every 3 seconds
-                        if (currentTime - lastLogTime > 3000) {
-                            const playbackActivity = totalSamples > 0 ? (playbackSamples / totalSamples * 100) : 0;
-                            console.log(`🔊 Audio PLAYBACK from peer ${peerIdShort}:`, {
-                                videoElementMuted: videoElement.muted,
-                                videoElementVolume: videoElement.volume,
-                                currentPlaybackLevel: Math.round(average),
-                                maxPlaybackLevel: Math.round(maxPlaybackLevel),
-                                playbackActivityPercent: Math.round(playbackActivity),
-                                samplesAnalyzed: totalSamples,
-                                audioBeingPlayed: playbackSamples > 0,
-                                audioContextState: audioContext.state
-                            });
-                            
-                            lastLogTime = currentTime;
-                            totalSamples = 0;
-                            playbackSamples = 0;
-                            maxPlaybackLevel = 0;
-                        }
-                        
-                        // Continue monitoring
-                        if (!videoElement.paused && !videoElement.ended) {
-                            requestAnimationFrame(monitorPlayback);
-                        }
-                    };
-                    
-                    // Start monitoring when video plays
-                    videoElement.addEventListener('play', () => {
-                        console.log(`🔊 Starting audio playback monitoring for peer ${peerIdShort}`);
-                        if (audioContext.state === 'suspended') {
-                            audioContext.resume().then(() => {
-                                requestAnimationFrame(monitorPlayback);
-                            });
-                        } else {
-                            requestAnimationFrame(monitorPlayback);
-                        }
-                    });
-                    
-                    console.log(`🔊 Audio playback analysis setup complete for peer ${peerIdShort}`);
-                    
-                } catch (error) {
-                    console.error(`🔊 Failed to setup audio playback analysis for peer ${peerIdShort}:`, error);
-                }
-            };
-            
-            if (videoElement.readyState >= 1) {
-                // Video metadata already loaded
-                setupAudioAnalysis();
+        // Find and remove the video element for this peer
+        const videoElement = remoteVideosContainer.querySelector(`video[data-peer-id="${peerId}"]`);
+        if (videoElement) {
+            const peerContainer = videoElement.parentElement;
+            if (peerContainer) {
+                peerContainer.remove();
             } else {
-                // Wait for metadata to load
-                videoElement.addEventListener('loadedmetadata', setupAudioAnalysis, { once: true });
+                videoElement.remove();
             }
             
-        } catch (error) {
-            console.error(`🎵 Failed to setup audio playback monitoring for peer ${peerIdShort}:`, error);
-        }
-    }
-
-    /**
-     * Diagnostic method to log complete peer connection state
-     */
-    logPeerDiagnostics() {
-        console.log('🔍 PEER DIAGNOSTICS:');
-        const allPeers = this.mesh.getPeers();
-        
-        console.log(`📊 Total peers in mesh: ${allPeers.length}`);
-        
-        allPeers.forEach((peer, index) => {
-            const peerConnection = this.mesh.connectionManager.getPeer(peer.peerId);
+            console.log(`Removed remote video from peer ${peerId.substring(0, 8)}...`);
             
-            console.log(`\n🔍 Peer ${index + 1}: ${peer.peerId.substring(0, 8)}...`);
-            console.log(`   Status: ${peer.status}`);
-            
-            if (peerConnection) {
-                console.log(`   WebRTC Connection State: ${peerConnection.connection?.connectionState || 'none'}`);
-                console.log(`   ICE Connection State: ${peerConnection.connection?.iceConnectionState || 'none'}`);
-                console.log(`   Data Channel State: ${peerConnection.dataChannel?.readyState || 'none'}`);
-                console.log(`   Data Channel Ready: ${peerConnection.dataChannelReady}`);
-                console.log(`   Has Local Stream: ${!!peerConnection.localStream}`);
-                console.log(`   Has Remote Stream: ${!!peerConnection.remoteStream}`);
-                
-                if (peerConnection.localStream) {
-                    const audioTracks = peerConnection.localStream.getAudioTracks();
-                    const videoTracks = peerConnection.localStream.getVideoTracks();
-                    console.log(`   Local Stream Tracks: ${audioTracks.length} audio, ${videoTracks.length} video`);
-                }
-                
-                if (peerConnection.remoteStream) {
-                    const audioTracks = peerConnection.remoteStream.getAudioTracks();
-                    const videoTracks = peerConnection.remoteStream.getVideoTracks();
-                    console.log(`   Remote Stream Tracks: ${audioTracks.length} audio, ${videoTracks.length} video`);
-                }
-            } else {
-                console.log(`   ❌ No PeerConnection object found`);
-            }
-        });
-        
-        console.log('\n🔍 END PEER DIAGNOSTICS\n');
-    }
-
-    // Existing UI methods (keeping the rest of the original functionality)
-    async handleConnect() {
-        const url = document.getElementById('signaling-url').value.trim();
-        if (!url) {
-            this.addMessage('System', 'Please enter a signaling server URL', 'error');
-            return;
-        }
-
-        try {
-            this.updateButtonStates({ connecting: true });
-            await this.mesh.connect(url);
-        } catch (error) {
-            console.error('Connection failed:', error);
-            this.addMessage('System', `Connection failed: ${error.message}`, 'error');
-            this.updateButtonStates({ connecting: false });
-        }
-    }
-
-    async handleDisconnect() {
-        try {
-            this.updateButtonStates({ disconnecting: true });
-            await this.mesh.disconnect();
-        } catch (error) {
-            console.error('Disconnection failed:', error);
-            this.addMessage('System', `Disconnection failed: ${error.message}`, 'error');
-        } finally {
-            this.updateButtonStates({ disconnecting: false });
-        }
-    }
-
-    async handleCleanup() {
-        const now = Date.now();
-        const timeSinceLastCleanup = now - this.lastCleanupTime;
-        
-        if (timeSinceLastCleanup < 5000) {
-            const remaining = Math.ceil((5000 - timeSinceLastCleanup) / 1000);
-            this.addMessage('System', `Cleanup on cooldown (${remaining}s remaining)`, 'warning');
-            return;
-        }
-
-        try {
-            this.lastCleanupTime = now;
-            await this.mesh.cleanupSignalingData();
-            this.addMessage('System', 'Signaling data cleanup initiated');
-        } catch (error) {
-            console.error('Cleanup failed:', error);
-            this.addMessage('System', `Cleanup failed: ${error.message}`, 'error');
-        }
-    }
-
-    async handleHealthCheck() {
-        try {
-            const result = await this.mesh.performHealthCheck();
-            if (result.healthy) {
-                this.addMessage('System', 'Health check passed - all systems nominal', 'info');
-            } else {
-                this.addMessage('System', `Health check failed: ${result.issues.join(', ')}`, 'warning');
-            }
-        } catch (error) {
-            console.error('Health check failed:', error);
-            this.addMessage('System', `Health check error: ${error.message}`, 'error');
-        }
-    }
-
-    sendMessage() {
-        const messageInput = document.getElementById('message-input');
-        const dmTargetInput = document.getElementById('dm-target-input');
-        const message = messageInput.value.trim();
-        const dmTarget = dmTargetInput.value.trim();
-
-        if (!message) return;
-
-        try {
-            if (dmTarget) {
-                // Validate peer ID format
-                if (!window.PeerPigeonMesh.validatePeerId(dmTarget)) {
-                    this.addMessage('System', 'Invalid peer ID format. Must be 40-character SHA-1 hash.', 'error');
-                    return;
-                }
-                
-                // Send direct message
-                const success = this.mesh.sendDirectMessage(dmTarget, message);
-                if (success) {
-                    this.addMessage('You', `(DM to ${dmTarget.substring(0, 8)}...) ${message}`, 'own');
-                } else {
-                    this.addMessage('System', `Failed to send direct message to ${dmTarget.substring(0, 8)}...`, 'error');
-                }
-            } else {
-                // Send broadcast message
-                // this.mesh.broadcastMessage(message);
-                this.mesh.sendMessage(message);
-                this.addMessage('You', message, 'own');
-            }
-
-            messageInput.value = '';
-        } catch (error) {
-            console.error('Failed to send message:', error);
-            this.addMessage('System', `Failed to send message: ${error.message}`, 'error');
-        }
-    }
-
-    connectToPeer() {
-        const targetPeerInput = document.getElementById('target-peer');
-        const targetPeerId = targetPeerInput.value.trim();
-
-        if (!targetPeerId) {
-            this.addMessage('System', 'Please enter a peer ID', 'error');
-            return;
-        }
-
-        if (!window.PeerPigeonMesh.validatePeerId(targetPeerId)) {
-            this.addMessage('System', 'Invalid peer ID format. Must be 40-character SHA-1 hash.', 'error');
-            return;
-        }
-
-        if (targetPeerId === this.mesh.peerId) {
-            this.addMessage('System', 'Cannot connect to yourself', 'error');
-            return;
-        }
-
-        try {
-            this.mesh.connectToPeer(targetPeerId);
-            this.addMessage('System', `Attempting to connect to ${targetPeerId.substring(0, 8)}...`);
-            targetPeerInput.value = '';
-        } catch (error) {
-            console.error('Failed to initiate connection:', error);
-            this.addMessage('System', `Failed to connect: ${error.message}`, 'error');
-        }
-    }
-
-    /**
-     * Connect to peer from button click (for onclick handlers)
-     */
-    connectToPeerFromButton(button) {
-        const peerId = button.getAttribute('data-peer-id');
-        if (!peerId) {
-            this.addMessage('System', 'Invalid peer ID in button', 'error');
-            return;
-        }
-        
-        // Disable button to prevent double-clicks
-        button.disabled = true;
-        button.textContent = 'Connecting...';
-        
-        try {
-            this.mesh.connectToPeer(peerId);
-            this.addMessage('System', `Attempting to connect to ${peerId.substring(0, 8)}...`);
-            
-            // Re-enable button after a delay
-            setTimeout(() => {
-                button.disabled = false;
-                button.textContent = 'Connect';
-            }, 3000);
-            
-        } catch (error) {
-            console.error('Failed to initiate connection:', error);
-            this.addMessage('System', `Failed to connect: ${error.message}`, 'error');
-            
-            // Re-enable button immediately on error
-            button.disabled = false;
-            button.textContent = 'Connect';
-        }
-    }
-
-    updateUI() {
-        // Update peer ID display
-        const peerIdElement = document.getElementById('peer-id');
-        if (peerIdElement && this.mesh.peerId) {
-            peerIdElement.textContent = this.mesh.peerId;
-        }
-
-        // Update status
-        this.updateStatus();
-        
-        // Update button states
-        this.updateButtonStates();
-        
-        // Update peer lists
-        this.updateConnectedPeers();
-        this.updateDiscoveredPeers();
-        
-        // Update settings from mesh state
-        this.updateSettings();
-        
-        // Update DHT status
-        this.updateDHTStatus();
-    }
-
-    updateStatus() {
-        const statusElement = document.getElementById('status');
-        if (!statusElement) return;
-
-        const status = this.mesh.getStatus();
-        const connectionStatus = status.connected ? 'connected' : 'disconnected';
-        statusElement.textContent = connectionStatus.charAt(0).toUpperCase() + connectionStatus.slice(1);
-        statusElement.className = `status ${connectionStatus.toLowerCase()}`;
-    }
-
-    updateButtonStates(options = {}) {
-        const connectBtn = document.getElementById('connect-btn');
-        const disconnectBtn = document.getElementById('disconnect-btn');
-        const cleanupBtn = document.getElementById('cleanup-btn');
-        const healthCheckBtn = document.getElementById('health-check-btn');
-
-        const isConnected = this.mesh.connected;
-        const isConnecting = options.connecting || false;
-        const isDisconnecting = options.disconnecting || false;
-
-        if (connectBtn) {
-            connectBtn.disabled = isConnected || isConnecting;
-            connectBtn.textContent = isConnecting ? 'Connecting...' : 'Connect';
-        }
-
-        if (disconnectBtn) {
-            disconnectBtn.disabled = !isConnected || isDisconnecting;
-            disconnectBtn.textContent = isDisconnecting ? 'Disconnecting...' : 'Disconnect';
-        }
-
-        if (cleanupBtn) {
-            cleanupBtn.disabled = !isConnected;
-        }
-
-        if (healthCheckBtn) {
-            healthCheckBtn.disabled = !isConnected;
-        }
-    }
-
-    updateConnectedPeers() {
-        const peersList = document.getElementById('peers-list');
-        const connectedPeersCount = document.getElementById('connected-peers-count');
-        
-        if (!peersList || !connectedPeersCount) return;
-
-        const peers = this.mesh.getPeers();
-        connectedPeersCount.textContent = peers.length;
-
-        if (peers.length === 0) {
-            peersList.innerHTML = '<p class="empty-state">No peers connected</p>';
-            return;
-        }
-
-        peersList.innerHTML = peers.map(peer => {
-            // peer is a plain object: { peerId, status, isInitiator, connectionStartTime }
-            const statusClass = peer.status === 'connected' ? 'connected' : 'connecting';
-            const connectionTime = ((Date.now() - peer.connectionStartTime) / 1000).toFixed(1);
-            
-            return `
-                <div class="peer-item">
-                    <div class="peer-info">
-                        <span class="peer-id">${peer.peerId.substring(0, 16)}...</span>
-                        <span class="peer-status ${statusClass}">${peer.status}</span>
-                    </div>
-                    <div class="peer-details">
-                        <small>Connected: ${connectionTime}s ago</small>
-                        <small>Role: ${peer.isInitiator ? 'Initiator' : 'Receiver'}</small>
-                    </div>
-                </div>
-            `;
-        }).join('');
-    }
-
-    updateDiscoveredPeers() {
-        const discoveredPeersList = document.getElementById('discovered-peers-list');
-        const discoveredPeersCount = document.getElementById('discovered-peers-count');
-        
-        if (!discoveredPeersList || !discoveredPeersCount) return;
-
-        const discoveredPeers = this.mesh.getDiscoveredPeers();
-        const connectedPeerIds = this.mesh.getPeers().map(p => p.peerId);
-        
-        // Filter out already connected peers
-        const availablePeers = discoveredPeers.filter(peer => 
-            !connectedPeerIds.includes(peer.peerId) && peer.peerId !== this.mesh.peerId
-        );
-        
-        discoveredPeersCount.textContent = availablePeers.length;
-
-        if (availablePeers.length === 0) {
-            discoveredPeersList.innerHTML = '<p class="empty-state">No peers discovered</p>';
-            return;
-        }
-
-        discoveredPeersList.innerHTML = availablePeers.map(peer => {
-            const lastSeen = peer.lastSeen ? 
-                `${Math.round((Date.now() - peer.lastSeen) / 1000)}s ago` : 
-                'Unknown';
-            
-            return `
-                <div class="peer-item discovered">
-                    <div class="peer-info">
-                        <span class="peer-id">${peer.peerId.substring(0, 16)}...</span>
-                        <button class="btn small" data-peer-id="${peer.peerId}" onclick="window.peerPigeonUI.connectToPeerFromButton(this)">
-                            Connect
-                        </button>
-                    </div>
-                    <div class="peer-details">
-                        <small>Last seen: ${lastSeen}</small>
-                        <small>Distance: ${peer.distance || 'Unknown'}</small>
-                    </div>
-                </div>
-            `;
-        }).join('');
-    }
-
-    updateSettings() {
-        // Update form values to match mesh state
-        const minPeersInput = document.getElementById('min-peers');
-        const maxPeersInput = document.getElementById('max-peers');
-        const autoDiscoveryToggle = document.getElementById('auto-discovery-toggle');
-        const evictionStrategyToggle = document.getElementById('eviction-strategy-toggle');
-        const xorRoutingToggle = document.getElementById('xor-routing-toggle');
-        const webdhtToggle = document.getElementById('webdht-toggle');
-
-        if (minPeersInput) minPeersInput.value = this.mesh.minPeers;
-        if (maxPeersInput) maxPeersInput.value = this.mesh.maxPeers;
-        if (autoDiscoveryToggle) autoDiscoveryToggle.checked = this.mesh.autoDiscovery;
-        if (evictionStrategyToggle) evictionStrategyToggle.checked = this.mesh.evictionStrategy;
-        if (xorRoutingToggle) xorRoutingToggle.checked = this.mesh.xorRouting;
-        
-        // Update WebDHT status (read-only)
-        if (webdhtToggle) {
-            const isDHTEnabled = this.mesh && this.mesh.isDHTEnabled && this.mesh.isDHTEnabled();
-            webdhtToggle.checked = isDHTEnabled;
-            
-            // Update the visual styling based on status
-            const parent = webdhtToggle.closest('.auto-discovery-control');
-            if (parent) {
-                if (isDHTEnabled) {
-                    parent.style.opacity = '1';
-                    parent.title = 'WebDHT is enabled and running';
-                } else {
-                    parent.style.opacity = '0.6';
-                    parent.title = 'WebDHT is disabled (restart required to enable)';
-                }
+            // Add placeholder back if no more videos
+            const remainingVideos = remoteVideosContainer.querySelectorAll('video');
+            if (remainingVideos.length === 0) {
+                const placeholder = document.createElement('p');
+                placeholder.className = 'video-placeholder';
+                placeholder.textContent = 'No remote video streams';
+                remoteVideosContainer.appendChild(placeholder);
             }
         }
-    }
-
-    /**
-     * Add a message to the UI message log
-     * @param {string} sender - Message sender identifier
-     * @param {string} content - Message content
-     * @param {string} type - Message type ('info', 'error', 'warning', 'own', 'dm')
-     */
-    addMessage(sender, content, type = 'info') {
-        // System messages go to the system-messages container (below connection buttons)
-        // Chat messages go to the messages-log container (at the bottom)
-        if (sender === 'System') {
-            this.addSystemMessage(content, type);
-        } else {
-            this.addChatMessage(sender, content, type);
-        }
-    }
-
-    /**
-     * Add a system message to the system messages container below connection buttons
-     * @param {string} content - Message content
-     * @param {string} type - Message type ('info', 'error', 'warning')
-     */
-    addSystemMessage(content, type = 'info') {
-        const systemMessages = document.getElementById('system-messages');
-        if (!systemMessages) return;
-
-        const messageElement = document.createElement('div');
-        messageElement.className = `system-message ${type}`;
-        
-        const timestamp = new Date().toLocaleTimeString();
-        
-        messageElement.innerHTML = `
-            <div class="system-message-header">
-                <span class="system-message-time">${timestamp}</span>
-                <span class="system-message-type">${type.toUpperCase()}</span>
-            </div>
-            <div class="system-message-content">${content}</div>
-        `;
-        
-        systemMessages.appendChild(messageElement);
-        systemMessages.scrollTop = systemMessages.scrollHeight;
-        
-        // Limit message history to prevent memory issues
-        const messages = systemMessages.children;
-        if (messages.length > 50) {
-            systemMessages.removeChild(messages[0]);
-        }
-    }
-
-    /**
-     * Add a chat message to the messages log at the bottom
-     * @param {string} sender - Message sender identifier
-     * @param {string} content - Message content
-     * @param {string} type - Message type ('own', 'dm')
-     */
-    addChatMessage(sender, content, type = 'info') {
-        const messagesLog = document.getElementById('messages-log');
-        if (!messagesLog) return;
-
-        const messageElement = document.createElement('div');
-        messageElement.className = `message-item ${type}`;
-        
-        const timestamp = new Date().toLocaleTimeString();
-        const senderDisplay = sender === 'You' ? 'You' : sender.substring(0, 3);
-        
-        messageElement.innerHTML = `
-            <div class="avatar">${senderDisplay}</div>
-            <div class="message-body">
-                <div class="message-header">
-                    ${sender} • ${timestamp}
-                </div>
-                <div class="message-content">${content}</div>
-            </div>
-        `;
-        
-        messagesLog.appendChild(messageElement);
-        messagesLog.scrollTop = messagesLog.scrollHeight;
-        
-        // Limit message history to prevent memory issues
-        const messages = messagesLog.children;
-        if (messages.length > 100) {
-            messagesLog.removeChild(messages[0]);
-        }
-    }
-
-    /**
-     * Add an entry to the DHT log
-     * @param {string} message - The log message
-     */
-    addDHTLogEntry(message) {
-        const dhtLog = document.getElementById('dht-log');
-        if (!dhtLog) return;
-
-        const logEntry = document.createElement('div');
-        logEntry.className = 'dht-log-entry';
-        
-        const timestamp = new Date().toLocaleTimeString();
-        logEntry.innerHTML = `
-            <span class="dht-log-time">${timestamp}</span>
-            <span class="dht-log-message">${message}</span>
-        `;
-        
-        dhtLog.appendChild(logEntry);
-        dhtLog.scrollTop = dhtLog.scrollHeight;
-        
-        // Limit log entries to prevent memory issues
-        const entries = dhtLog.children;
-        if (entries.length > 100) {
-            dhtLog.removeChild(entries[0]);
-        }
-    }
-
-    /**
-     * Update the DHT status display
-     */
-    updateDHTStatus() {
-        const dhtStatusElement = document.getElementById('dht-status');
-        if (!dhtStatusElement) return;
-
-        const isDHTEnabled = this.mesh && this.mesh.isDHTEnabled && this.mesh.isDHTEnabled();
-        dhtStatusElement.textContent = isDHTEnabled ? 'Enabled' : 'Disabled';
-        dhtStatusElement.className = `status ${isDHTEnabled ? 'connected' : 'disconnected'}`;
     }
 }
