@@ -111,6 +111,9 @@ export class MediaManager extends EventEmitter {
             this.isVideoEnabled = video;
             this.isAudioEnabled = audio;
             
+            // Mark stream as local origin to prevent confusion with remote streams
+            this.markStreamAsLocal(this.localStream);
+            
             console.log('Local media stream started:', {
                 video: this.isVideoEnabled,
                 audio: this.isAudioEnabled,
@@ -234,6 +237,26 @@ export class MediaManager extends EventEmitter {
         } catch (error) {
             console.warn('Could not check media permissions:', error);
             return {};
+        }
+    }
+
+    /**
+     * Mark stream as local origin to prevent confusion with remote streams
+     */
+    markStreamAsLocal(stream) {
+        if (!stream) return;
+        
+        try {
+            Object.defineProperty(stream, '_peerPigeonOrigin', {
+                value: 'local',
+                writable: false,
+                enumerable: false,
+                configurable: false
+            });
+
+            console.log(`🔒 Stream ${stream.id} marked as local origin in MediaManager`);
+        } catch (error) {
+            console.warn('Could not mark stream as local origin:', error);
         }
     }
 }

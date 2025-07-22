@@ -22,6 +22,8 @@ export class PeerConnection extends EventEmitter {
         this.remoteStream = null;
         this.enableVideo = options.enableVideo || false;
         this.enableAudio = options.enableAudio || false;
+        this.audioTransceiver = null;
+        this.videoTransceiver = null;
     }
 
     /**
@@ -51,24 +53,35 @@ export class PeerConnection extends EventEmitter {
 
         this.setupConnectionHandlers();
 
-        // Pre-allocate placeholder transceivers for audio and video to avoid m-line order issues
-        // This ensures consistent SDP structure even when media is added later
-        console.log('🔄 Pre-allocating transceivers for stable media negotiation');
+        // Only pre-allocate transceivers if media is actually intended to be used
+        // This prevents unnecessary WebRTC negotiations for data-only connections
+        const hasLocalMedia = this.localStream && (this.localStream.getAudioTracks().length > 0 || this.localStream.getVideoTracks().length > 0);
+        const intendToUseMedia = this.enableVideo || this.enableAudio || hasLocalMedia;
         
-        // Add audio transceiver (inactive initially) - start with recvonly to avoid conflicts
-        this.audioTransceiver = this.connection.addTransceiver('audio', {
-            direction: 'recvonly'
-        });
-        
-        // Add video transceiver (inactive initially) - for future use
-        this.videoTransceiver = this.connection.addTransceiver('video', {
-            direction: 'recvonly'
-        });
+        if (intendToUseMedia) {
+            console.log('🔄 Pre-allocating transceivers for stable media negotiation');
+            
+            // Add audio transceiver only if audio is enabled or present
+            if (this.enableAudio || (this.localStream && this.localStream.getAudioTracks().length > 0)) {
+                this.audioTransceiver = this.connection.addTransceiver('audio', {
+                    direction: 'recvonly'
+                });
+            }
+            
+            // Add video transceiver only if video is enabled or present
+            if (this.enableVideo || (this.localStream && this.localStream.getVideoTracks().length > 0)) {
+                this.videoTransceiver = this.connection.addTransceiver('video', {
+                    direction: 'recvonly'
+                });
+            }
 
-        // Add local media stream if provided
-        if (this.localStream) {
-            console.log('Adding local stream tracks to existing transceivers');
-            await this.setLocalStreamToTransceivers(this.localStream);
+            // Add local media stream if provided
+            if (this.localStream) {
+                console.log('Adding local stream tracks to existing transceivers');
+                await this.setLocalStreamToTransceivers(this.localStream);
+            }
+        } else {
+            console.log('📡 Creating data-only connection (no media transceivers)');
         }
 
         if (this.isInitiator) {
@@ -107,12 +120,9 @@ export class PeerConnection extends EventEmitter {
             
             console.log(`🎵 Track received: kind=${track.kind}, id=${track.id}, enabled=${track.enabled}, readyState=${track.readyState}`);
             
-            // CRITICAL: Check if this is actually a remote stream or our own local stream
-            if (this.localStream && stream.id === this.localStream.id) {
-                console.error('❌ LOOPBACK DETECTED: Received our own local stream as remote!');
-                console.error('Local stream ID:', this.localStream.id);
-                console.error('Received stream ID:', stream.id);
-                return; // Don't process our own stream as remote
+            // CRITICAL: Enhanced loopback detection and stream validation
+            if (!this.validateRemoteStream(stream, track)) {
+                return; // Don't process invalid or looped back streams
             }
             
             if (stream) {
@@ -123,17 +133,11 @@ export class PeerConnection extends EventEmitter {
                 console.log(`🎵 Remote stream tracks: ${audioTracks.length} audio, ${videoTracks.length} video`);
                 console.log(`🎵 Remote stream ID: ${stream.id} (vs local: ${this.localStream?.id || 'none'})`);
                 
+                // Mark stream as genuinely remote to prevent future confusion
+                this.markStreamAsRemote(stream);
+                
                 audioTracks.forEach((audioTrack, index) => {
                     console.log(`🎵 Audio track ${index}: enabled=${audioTrack.enabled}, readyState=${audioTrack.readyState}, muted=${audioTrack.muted}, id=${audioTrack.id}`);
-                    
-                    // Check if this track ID matches any of our local tracks
-                    if (this.localStream) {
-                        const localAudioTracks = this.localStream.getAudioTracks();
-                        const isOwnTrack = localAudioTracks.some(localTrack => localTrack.id === audioTrack.id);
-                        if (isOwnTrack) {
-                            console.error('❌ LOOPBACK: This audio track is our own local track!');
-                        }
-                    }
                     
                     // Add audio data monitoring
                     this.setupAudioDataMonitoring(audioTrack, index);
@@ -411,6 +415,185 @@ export class PeerConnection extends EventEmitter {
     }
 
     /**
+     * Enhanced validation to ensure received stream is genuinely remote
+     */
+    validateRemoteStream(stream, track) {
+        // Check 1: Stream ID collision (basic loopback detection)
+        if (this.localStream && stream.id === this.localStream.id) {
+            console.error('❌ LOOPBACK DETECTED: Received our own local stream as remote!');
+            console.error('Local stream ID:', this.localStream.id);
+            console.error('Received stream ID:', stream.id);
+            return false;
+        }
+
+        // Check 2: Track ID collision (more granular loopback detection)
+        if (this.localStream) {
+            const localTracks = this.localStream.getTracks();
+            const isOwnTrack = localTracks.some(localTrack => localTrack.id === track.id);
+            if (isOwnTrack) {
+                console.error('❌ TRACK LOOPBACK: This track is our own local track!');
+                console.error('Local track ID:', track.id);
+                return false;
+            }
+        }
+
+        // Check 3: Verify track comes from remote peer transceiver
+        if (this.connection) {
+            const transceivers = this.connection.getTransceivers();
+            const sourceTransceiver = transceivers.find(t => t.receiver.track === track);
+            if (!sourceTransceiver) {
+                console.warn('⚠️ Track not found in any transceiver - may be invalid');
+                return false;
+            }
+            
+            // Ensure this is a receiving transceiver (not sending our own track back)
+            if (sourceTransceiver.direction === 'sendonly') {
+                console.error('❌ Invalid direction: Receiving track from sendonly transceiver');
+                return false;
+            }
+        }
+
+        // Check 4: Verify stream hasn't been marked as local origin
+        if (stream._peerPigeonOrigin === 'local') {
+            console.error('❌ Stream marked as local origin - preventing synchronization loop');
+            return false;
+        }
+
+        console.log('✅ Remote stream validation passed for peer', this.peerId.substring(0, 8));
+        return true;
+    }
+
+    /**
+     * Mark a stream as genuinely remote to prevent future confusion
+     */
+    markStreamAsRemote(stream) {
+        // Add internal marker to prevent future misidentification
+        Object.defineProperty(stream, '_peerPigeonOrigin', {
+            value: 'remote',
+            writable: false,
+            enumerable: false,
+            configurable: false
+        });
+
+        Object.defineProperty(stream, '_peerPigeonSourcePeerId', {
+            value: this.peerId,
+            writable: false,
+            enumerable: false,
+            configurable: false
+        });
+
+        console.log(`🔒 Stream ${stream.id} marked as remote from peer ${this.peerId.substring(0, 8)}`);
+    }
+
+    /**
+     * Mark local stream to prevent it from being treated as remote
+     */
+    markStreamAsLocal(stream) {
+        if (!stream) return;
+        
+        Object.defineProperty(stream, '_peerPigeonOrigin', {
+            value: 'local',
+            writable: false,
+            enumerable: false,
+            configurable: false
+        });
+
+        console.log(`🔒 Stream ${stream.id} marked as local origin`);
+    }
+
+    async createOffer() {
+        const offer = await this.connection.createOffer();
+        await this.connection.setLocalDescription(offer);
+        return offer;
+    }
+
+    async handleOffer(offer) {
+        // Check if we're in the right state to handle an offer
+        if (this.connection.signalingState !== 'stable') {
+            console.log(`Cannot handle offer from ${this.peerId} - connection state is ${this.connection.signalingState} (expected: stable)`);
+            throw new Error(`Cannot handle offer in state: ${this.connection.signalingState}`);
+        }
+        
+        await this.connection.setRemoteDescription(offer);
+        this.remoteDescriptionSet = true;
+        await this.processPendingIceCandidates();
+        
+        const answer = await this.connection.createAnswer();
+        await this.connection.setLocalDescription(answer);
+        return answer;
+    }
+
+    async handleAnswer(answer) {
+        // Check if we're in the right state to handle an answer
+        if (this.connection.signalingState !== 'have-local-offer') {
+            console.log(`Cannot handle answer from ${this.peerId} - connection state is ${this.connection.signalingState} (expected: have-local-offer)`);
+            
+            // If we're already stable, the connection might already be established
+            if (this.connection.signalingState === 'stable') {
+                console.log('Connection already stable, answer not needed');
+                return;
+            }
+            
+            throw new Error(`Cannot handle answer in state: ${this.connection.signalingState}`);
+        }
+        
+        await this.connection.setRemoteDescription(answer);
+        this.remoteDescriptionSet = true;
+        await this.processPendingIceCandidates();
+    }
+
+    async handleIceCandidate(candidate) {
+        console.log(`🧊 Received ICE candidate for ${this.peerId.substring(0, 8)}...`, {
+            type: candidate.type,
+            protocol: candidate.protocol
+        });
+        
+        if (!this.remoteDescriptionSet) {
+            console.log(`🧊 Buffering ICE candidate for ${this.peerId.substring(0, 8)}... (remote description not set yet)`);
+            this.pendingIceCandidates.push(candidate);
+            return;
+        }
+
+        try {
+            await this.connection.addIceCandidate(candidate);
+            console.log(`🧊 Successfully added ICE candidate for ${this.peerId.substring(0, 8)}...`);
+        } catch (error) {
+            console.error(`🧊 Failed to add ICE candidate for ${this.peerId.substring(0, 8)}...:`, error);
+        }
+    }
+
+    async processPendingIceCandidates() {
+        if (this.pendingIceCandidates.length > 0) {
+            console.log(`🧊 Processing ${this.pendingIceCandidates.length} buffered ICE candidates for ${this.peerId.substring(0, 8)}...`);
+            
+            for (const candidate of this.pendingIceCandidates) {
+                try {
+                    await this.connection.addIceCandidate(candidate);
+                    console.log(`🧊 Successfully added buffered ICE candidate (${candidate.type}) for ${this.peerId.substring(0, 8)}...`);
+                } catch (error) {
+                    console.error(`🧊 Failed to add buffered ICE candidate for ${this.peerId.substring(0, 8)}...:`, error);
+                }
+            }
+            
+            this.pendingIceCandidates = [];
+            console.log(`🧊 Finished processing buffered ICE candidates for ${this.peerId.substring(0, 8)}...`);
+        }
+    }
+
+    sendMessage(message) {
+        if (this.dataChannel && this.dataChannel.readyState === 'open') {
+            try {
+                this.dataChannel.send(JSON.stringify(message));
+                return true;
+            } catch (error) {
+                console.error(`Failed to send message to ${this.peerId}:`, error);
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Add or replace local media stream
      */
     async setLocalStream(stream) {
@@ -435,6 +618,9 @@ export class PeerConnection extends EventEmitter {
         if (stream) {
             const audioTracks = stream.getAudioTracks();
             const videoTracks = stream.getVideoTracks();
+            
+            // Mark stream as local origin to prevent loopback
+            this.markStreamAsLocal(stream);
             
             // Handle audio track using stored reference
             if (this.audioTransceiver) {

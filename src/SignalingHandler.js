@@ -191,7 +191,11 @@ export class SignalingHandler extends EventEmitter {
             // Get current media stream if available
             const localStream = this.mesh.mediaManager.localStream;
             const hasMedia = localStream !== null;
-            const options = { localStream };
+            const options = { 
+                localStream,
+                enableAudio: hasMedia && localStream.getAudioTracks().length > 0,
+                enableVideo: hasMedia && localStream.getVideoTracks().length > 0
+            };
             
             console.log(`Creating answer connection for ${fromPeerId.substring(0, 8)}... (with media: ${hasMedia})`);
             
