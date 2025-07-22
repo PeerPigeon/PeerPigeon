@@ -43,6 +43,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.peerPigeonApp = peerPigeonApp;
     window.peerPigeonMesh = peerPigeonApp.mesh;
     window.peerPigeonUI = peerPigeonApp.ui;
+    window.ui = peerPigeonApp.ui; // Also expose as 'ui' for compatibility with discovered peers buttons
     window.peerPigeonSignaling = peerPigeonApp.mesh.signalingClient;
     window.getPeerPigeonState = () => peerPigeonApp.mesh.getStatus();
     
