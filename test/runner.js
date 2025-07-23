@@ -25,7 +25,7 @@ class TestRunner {
   async runCommand(command, args = [], options = {}) {
     return new Promise((resolve, reject) => {
       console.log(`\n🔧 Running: ${command} ${args.join(' ')}`);
-      
+
       const proc = spawn(command, args, {
         cwd: projectRoot,
         stdio: 'inherit',
@@ -51,7 +51,7 @@ class TestRunner {
 
   async runCustomTests() {
     console.log('\n📋 Running Custom Test Suites...');
-    
+
     const customTests = [
       'test/unit/crypto.test.js',
       'test/unit/mesh.test.js',
@@ -94,7 +94,7 @@ class TestRunner {
     console.log('\n' + '='.repeat(60));
     console.log('📋 TEST SUMMARY');
     console.log('='.repeat(60));
-    
+
     this.results.suites.forEach(suite => {
       const status = suite.passed ? '✅' : '❌';
       console.log(`${status} ${suite.name}`);
@@ -103,7 +103,7 @@ class TestRunner {
     console.log(`\nTotal Suites: ${this.results.suites.length}`);
     console.log(`Passed: ${this.results.passed}`);
     console.log(`Failed: ${this.results.failed}`);
-    
+
     if (this.results.failed === 0) {
       console.log('\n🎉 All tests passed!');
     } else {
@@ -113,27 +113,26 @@ class TestRunner {
 
   async run() {
     console.log('🚀 Starting PeerPigeon Test Suite');
-    console.log('=' .repeat(60));
+    console.log('='.repeat(60));
 
     try {
       // Run linting first
       const lintPassed = await this.runLinting();
-      
+
       // Run custom tests
       const customPassed = await this.runCustomTests();
-      
+
       // Run Jest tests (if any Jest-compatible tests exist)
       // const jestPassed = await this.runJestTests();
-      
+
       // Run coverage analysis
       // const coveragePassed = await this.runCoverage();
 
       this.printSummary();
-      
+
       // Exit with appropriate code
       const allPassed = lintPassed && customPassed;
       process.exit(allPassed ? 0 : 1);
-      
     } catch (error) {
       console.error('💥 Test runner encountered an error:', error);
       process.exit(1);

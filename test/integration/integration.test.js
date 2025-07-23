@@ -300,13 +300,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   });
 }
 
-// Jest test wrapper for the integration tests
-describe('Integration Tests', () => {
-  test('Integration test runner placeholder', () => {
-    // This test just ensures Jest doesn't fail when trying to run this file
-    // The actual integration tests run via the custom runner above
-    expect(true).toBe(true);
-  });
-});
-
 export { runner as integrationTests };

@@ -3,9 +3,11 @@
  * Tests only the media functionality without crypto integration
  */
 
-import { jest } from '@jest/globals';
+import * as jestGlobals from '@jest/globals';
 import { MediaManager } from '../../src/MediaManager.js';
 import { PeerPigeonMesh } from '../../index.js';
+
+const { jest } = jestGlobals;
 
 // Mock browser environment for media testing
 global.window = {
@@ -96,7 +98,7 @@ describe('Media Functionality Tests', () => {
 
     // Reset all mocks
     jest.clearAllMocks();
-    
+
     // Set up default mock implementations
     mockGetUserMedia.mockImplementation(async (constraints) => {
       const tracks = [];
@@ -117,14 +119,14 @@ describe('Media Functionality Tests', () => {
         groupId: 'group1'
       },
       {
-        deviceId: 'mic1', 
+        deviceId: 'mic1',
         kind: 'audioinput',
         label: 'Mock Microphone 1',
         groupId: 'group1'
       },
       {
         deviceId: 'speaker1',
-        kind: 'audiooutput', 
+        kind: 'audiooutput',
         label: 'Mock Speaker 1',
         groupId: 'group1'
       }
@@ -153,7 +155,7 @@ describe('Media Functionality Tests', () => {
         mesh = null;
       }
     }
-    
+
     jest.clearAllMocks();
     jest.restoreAllMocks();
   });
@@ -189,14 +191,11 @@ describe('Media Functionality Tests', () => {
     test('MediaManager device enumeration', async () => {
       const mediaManager = new MediaManager();
 
-      // Mock the environmentDetector for MediaManager
-      const originalEnvDetector = mediaManager.constructor.prototype.enumerateDevices;
-      
       // Create a spy that bypasses environment detection
       const enumerateDevicesSpy = jest.spyOn(mediaManager, 'enumerateDevices');
-      enumerateDevicesSpy.mockImplementation(async function() {
+      enumerateDevicesSpy.mockImplementation(async function () {
         const devices = await global.navigator.mediaDevices.enumerateDevices();
-        
+
         this.devices.cameras = devices.filter(device => device.kind === 'videoinput');
         this.devices.microphones = devices.filter(device => device.kind === 'audioinput');
         this.devices.speakers = devices.filter(device => device.kind === 'audiooutput');
@@ -206,7 +205,7 @@ describe('Media Functionality Tests', () => {
       });
 
       const devices = await mediaManager.enumerateDevices();
-      
+
       expect(devices).toBeDefined();
       expect(Array.isArray(devices.cameras)).toBe(true);
       expect(Array.isArray(devices.microphones)).toBe(true);
@@ -223,7 +222,7 @@ describe('Media Functionality Tests', () => {
     test('Media through PeerPigeonMesh', async () => {
       mesh = new PeerPigeonMesh({
         ignoreEnvironmentErrors: true,
-        enableCrypto: false  // Disable crypto to avoid import issues
+        enableCrypto: false // Disable crypto to avoid import issues
       });
       await mesh.init();
 
@@ -269,7 +268,7 @@ describe('Media Functionality Tests', () => {
 
       // Start media
       await mesh.startMedia({ video: true, audio: true });
-      
+
       const activeState = mesh.getMediaState();
       expect(activeState.hasLocalStream).toBe(true);
       expect(activeState.videoEnabled).toBe(true);
@@ -312,13 +311,13 @@ describe('Media Functionality Tests', () => {
 
       const localStreamStartedSpy = jest.fn();
       const localStreamStoppedSpy = jest.fn();
-      
+
       mesh.addEventListener('localStreamStarted', localStreamStartedSpy);
       mesh.addEventListener('localStreamStopped', localStreamStoppedSpy);
 
       // Start media
       await mesh.startMedia({ video: true, audio: true });
-      
+
       // Stop media
       await mesh.stopMedia();
 
@@ -338,7 +337,7 @@ describe('Media Functionality Tests', () => {
       for (let i = 0; i < 3; i++) {
         const stream = await mesh.startMedia({ video: true, audio: false });
         expect(mesh.getLocalStream()).toBe(stream);
-        
+
         await mesh.stopMedia();
         expect(mesh.getLocalStream()).toBeNull();
       }

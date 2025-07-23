@@ -3,8 +3,9 @@
  * Tests encryption, decryption, key generation, and signing functionality
  */
 
-import { jest } from '@jest/globals';
+import * as jestGlobals from '@jest/globals';
 import { CryptoManager } from '../../src/CryptoManager.js';
+const { jest } = jestGlobals;
 
 describe('CryptoManager Unit Tests', () => {
   let crypto;
@@ -73,9 +74,10 @@ describe('CryptoManager Unit Tests', () => {
     expect(success).toBe(true);
     expect(crypto1.peerKeys.has('peer2')).toBe(true);
 
-    const storedKey = crypto1.peerKeys.get('peer2');    expect(storedKey.pub).toBe(crypto2.keypair.pub);
+    const storedKey = crypto1.peerKeys.get('peer2');
+    expect(storedKey.pub).toBe(crypto2.keypair.pub);
     expect(storedKey.epub).toBe(crypto2.keypair.epub);
-    
+
     // Cleanup
     crypto1.reset?.();
     crypto2.reset?.();
@@ -106,8 +108,9 @@ describe('CryptoManager Unit Tests', () => {
     expect(encrypted.data).toBeTruthy();
 
     // Decrypt with crypto2
-    const decrypted = await crypto2.decryptFromPeer(encrypted);    expect(decrypted).toBe(testMessage);
-    
+    const decrypted = await crypto2.decryptFromPeer(encrypted);
+    expect(decrypted).toBe(testMessage);
+
     // Cleanup
     crypto1.reset?.();
     crypto2.reset?.();

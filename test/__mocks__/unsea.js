@@ -1,7 +1,8 @@
 /**
  * Mock unsea crypto library for testing
  */
-import { jest } from '@jest/globals';
+import * as jestGlobals from '@jest/globals';
+const { jest } = jestGlobals;
 
 // Mock sea functions
 const mockSea = {

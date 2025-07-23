@@ -22,6 +22,9 @@ export class WebDHT extends EventEmitter {
     // Subscriptions: key -> Set of peer IDs that want notifications
     this.subscriptions = new Map();
 
+    // Pending subscriptions for keys that don't exist yet: keyId -> Set of peer IDs
+    this.pendingSubscriptions = new Map();
+
     // Active subscriptions from this peer to others
     this.mySubscriptions = new Set();
 
@@ -139,9 +142,41 @@ export class WebDHT extends EventEmitter {
       publisher: this.peerId
     };
 
+    // Check if this is a new key (for pending subscription activation)
+    const isNewKey = !this.localStorage.has(keyId);
+
     // CRITICAL FIX: Always store locally first (the originator always keeps a copy)
     this.storeLocally(keyId, storeData);
     console.log(`DHT PUT: Stored locally: ${key}`);
+
+    // If this is a new key, activate any pending subscriptions
+    if (isNewKey) {
+      const activatedSubscribers = this.activatePendingSubscriptions(keyId);
+
+      // Notify locally activated subscribers about the new key
+      if (activatedSubscribers.length > 0) {
+        console.log(`DHT PUT: Notifying ${activatedSubscribers.length} locally pending subscribers about new key ${key}`);
+
+        const notificationPromises = activatedSubscribers.map(async (subscriberId) => {
+          if (subscriberId !== this.peerId) {
+            try {
+              return await this.sendDHTMessage(subscriberId, 'value_changed', {
+                key,
+                keyId,
+                newValue: value,
+                timestamp: storeData.timestamp,
+                isNewKey: true
+              });
+            } catch (error) {
+              console.warn(`Failed to notify subscriber ${subscriberId.substring(0, 8)} about new key:`, error.message);
+              return null;
+            }
+          }
+        }).filter(Boolean);
+
+        await Promise.allSettled(notificationPromises);
+      }
+    }
 
     // AUTO-SUBSCRIBE: When putting a value, automatically subscribe to future changes
     this.mySubscriptions.add(keyId);
@@ -159,19 +194,21 @@ export class WebDHT extends EventEmitter {
      */
   async get(key, options = {}) {
     const keyId = await this.generateKeyId(key);
-    // ALWAYS subscribe when doing a get() - this is the desired behavior
-    const subscribe = true;
+    // Subscribe unless explicitly disabled or skipSubscribe is true
+    const subscribe = options.skipSubscribe ? false : (options.subscribe !== false);
     const forceRefresh = options.forceRefresh || false;
 
-    console.log(`DHT GET: ${key} -> ${keyId.substring(0, 8)}... (auto-subscribing, forceRefresh: ${forceRefresh})`);
+    console.log(`DHT GET: ${key} -> ${keyId.substring(0, 8)}... (auto-subscribing: ${subscribe}, forceRefresh: ${forceRefresh})`);
 
     // Check local storage FIRST (unless force refresh is requested)
     if (!forceRefresh && this.localStorage.has(keyId)) {
       const data = this.localStorage.get(keyId);
       if (!this.isExpired(data)) {
         console.log(`DHT GET: Found locally: ${key} (using cached data)`);
-        // Always add subscription even for local data
-        this.mySubscriptions.add(keyId);
+        // Add subscription even for local data (unless skipSubscribe is true)
+        if (subscribe) {
+          this.mySubscriptions.add(keyId);
+        }
         return data.value;
       } else {
         // Remove expired data
@@ -192,7 +229,7 @@ export class WebDHT extends EventEmitter {
 
   /**
      * Subscribe to changes for a key
-     * NOTE: get() operations automatically subscribe, so this is mainly for explicit subscription without retrieval
+     * NOTE: This now supports subscribing to keys that don't exist yet
      */
   async subscribe(key) {
     const keyId = await this.generateKeyId(key);
@@ -202,8 +239,39 @@ export class WebDHT extends EventEmitter {
     // Add to our subscriptions immediately
     this.mySubscriptions.add(keyId);
 
-    // Try to get the current value (which will also ensure we're subscribed on storage peers)
-    const currentValue = await this.get(key);
+    // Find the peers responsible for storing this key
+    const closestPeers = await this.findClosestPeers(keyId, this.config.replicationFactor);
+
+    // Send subscription requests to all potential storage peers
+    const subscribePromises = closestPeers.map(async (peerId) => {
+      if (peerId !== this.peerId) {
+        try {
+          return await this.sendDHTMessage(peerId, 'subscribe', {
+            keyId,
+            key,
+            subscriber: this.peerId
+          });
+        } catch (error) {
+          console.warn(`DHT SUBSCRIBE: Failed to subscribe to peer ${peerId.substring(0, 8)}:`, error.message);
+          return null;
+        }
+      }
+    }).filter(Boolean);
+
+    await Promise.allSettled(subscribePromises);
+
+    // Also add ourselves to pending subscriptions if we're among the closest
+    if (this.isAmongClosest(keyId, closestPeers)) {
+      this.addPendingSubscription(keyId, this.peerId);
+    }
+
+    // Try to get the current value (if it exists)
+    let currentValue = null;
+    try {
+      currentValue = await this.get(key, { skipSubscribe: true }); // Skip auto-subscribe since we're already subscribed
+    } catch (error) {
+      console.log(`DHT SUBSCRIBE: Key ${key} doesn't exist yet, but subscription is active for when it's created`);
+    }
 
     console.log(`DHT SUBSCRIBE: Subscribed to ${key}, current value:`, currentValue);
     return currentValue;
@@ -240,6 +308,14 @@ export class WebDHT extends EventEmitter {
       this.subscriptions.get(keyId).delete(this.peerId);
       if (this.subscriptions.get(keyId).size === 0) {
         this.subscriptions.delete(keyId);
+      }
+    }
+
+    // Remove local pending subscription if we're storing this key
+    if (this.pendingSubscriptions.has(keyId)) {
+      this.pendingSubscriptions.get(keyId).delete(this.peerId);
+      if (this.pendingSubscriptions.get(keyId).size === 0) {
+        this.pendingSubscriptions.delete(keyId);
       }
     }
 
@@ -390,7 +466,39 @@ export class WebDHT extends EventEmitter {
     const closestPeers = await this.findClosestPeers(keyId, this.config.replicationFactor);
 
     if (this.isAmongClosest(keyId, closestPeers)) {
+      // Check if this is a new key (for pending subscription activation)
+      const isNewKey = !this.localStorage.has(keyId);
+
       this.storeLocally(keyId, { key, value, timestamp, ttl, publisher });
+
+      // If this is a new key, activate any pending subscriptions
+      if (isNewKey) {
+        const activatedSubscribers = this.activatePendingSubscriptions(keyId);
+
+        // Notify newly activated subscribers about the new key
+        if (activatedSubscribers.length > 0) {
+          console.log(`DHT STORE: Notifying ${activatedSubscribers.length} subscribers about new key ${key}`);
+
+          const notificationPromises = activatedSubscribers.map(async (subscriberId) => {
+            if (subscriberId !== this.peerId && subscriberId !== fromPeerId) {
+              try {
+                return await this.sendDHTMessage(subscriberId, 'value_changed', {
+                  key,
+                  keyId,
+                  newValue: value,
+                  timestamp,
+                  isNewKey: true
+                });
+              } catch (error) {
+                console.warn(`Failed to notify subscriber ${subscriberId.substring(0, 8)} about new key:`, error.message);
+                return null;
+              }
+            }
+          }).filter(Boolean);
+
+          await Promise.allSettled(notificationPromises);
+        }
+      }
 
       console.log(`🔥 DHT STORE: Accepting and storing ${key}, sending success response`);
 
@@ -499,9 +607,16 @@ export class WebDHT extends EventEmitter {
   async handleSubscribeRequest(fromPeerId, data) {
     const { keyId, key, subscriber } = data;
 
+    console.log(`DHT SUBSCRIBE REQUEST: ${key} from ${fromPeerId.substring(0, 8)} for subscriber ${subscriber.substring(0, 8)}`);
+
     if (this.localStorage.has(keyId)) {
+      // Key exists - add to active subscriptions
       this.addSubscription(keyId, subscriber);
-      console.log(`DHT SUBSCRIBE: added ${subscriber.substring(0, 8)}... to ${key} notifications`);
+      console.log(`DHT SUBSCRIBE: added ${subscriber.substring(0, 8)}... to ${key} notifications (key exists)`);
+    } else {
+      // Key doesn't exist yet - add to pending subscriptions
+      this.addPendingSubscription(keyId, subscriber);
+      console.log(`DHT SUBSCRIBE: added ${subscriber.substring(0, 8)}... to ${key} pending notifications (key doesn't exist yet)`);
     }
   }
 
@@ -511,12 +626,22 @@ export class WebDHT extends EventEmitter {
   async handleUnsubscribeRequest(fromPeerId, data) {
     const { keyId, key, subscriber } = data;
 
+    // Remove from active subscriptions
     if (this.subscriptions.has(keyId)) {
       this.subscriptions.get(keyId).delete(subscriber);
       if (this.subscriptions.get(keyId).size === 0) {
         this.subscriptions.delete(keyId);
       }
-      console.log(`DHT UNSUBSCRIBE: removed ${subscriber.substring(0, 8)}... from ${key} notifications`);
+      console.log(`DHT UNSUBSCRIBE: removed ${subscriber.substring(0, 8)}... from ${key} active notifications`);
+    }
+
+    // Remove from pending subscriptions
+    if (this.pendingSubscriptions.has(keyId)) {
+      this.pendingSubscriptions.get(keyId).delete(subscriber);
+      if (this.pendingSubscriptions.get(keyId).size === 0) {
+        this.pendingSubscriptions.delete(keyId);
+      }
+      console.log(`DHT UNSUBSCRIBE: removed ${subscriber.substring(0, 8)}... from ${key} pending notifications`);
     }
   }
 
@@ -524,9 +649,9 @@ export class WebDHT extends EventEmitter {
      * Handle value changed notification
      */
   async handleValueChangedNotification(fromPeerId, data) {
-    const { key, keyId, newValue, timestamp } = data;
+    const { key, keyId, newValue, timestamp, isNewKey } = data;
 
-    console.log(`🔥 DHT VALUE_CHANGED notification: ${key} = ${newValue} from ${fromPeerId.substring(0, 8)}`);
+    console.log(`🔥 DHT VALUE_CHANGED notification: ${key} = ${newValue} from ${fromPeerId.substring(0, 8)}${isNewKey ? ' (NEW KEY)' : ''}`);
 
     // CRITICAL FIX: Always update local cache if we have it, regardless of subscriptions
     // This prevents stale cached values from being returned by get() operations
@@ -540,6 +665,17 @@ export class WebDHT extends EventEmitter {
       } else {
         console.log(`🔥 DHT VALUE_CHANGED: Ignoring older notification for ${key} (current: ${storedData.timestamp}, notification: ${timestamp})`);
       }
+    } else if (isNewKey) {
+      // For new keys, store the data locally even if we don't normally store this key
+      // This helps with caching and consistency
+      console.log(`🔥 DHT VALUE_CHANGED: Caching new key ${key} locally`);
+      this.storeLocally(keyId, {
+        key,
+        value: newValue,
+        timestamp,
+        ttl: null, // Use default TTL
+        publisher: fromPeerId
+      }, false); // Not a primary replica
     }
 
     // Check if we have subscribers for this key
@@ -551,8 +687,8 @@ export class WebDHT extends EventEmitter {
 
       // Emit change event if this peer is subscribed
       if (hasSubscribers) {
-        this.emit('valueChanged', { key, keyId, newValue, timestamp });
-        console.log(`🔥 DHT VALUE_CHANGED: Emitted local event for ${key}`);
+        this.emit('valueChanged', { key, keyId, newValue, timestamp, isNewKey });
+        console.log(`🔥 DHT VALUE_CHANGED: Emitted local event for ${key}${isNewKey ? ' (NEW KEY)' : ''}`);
       }
 
       // Forward to local subscribers (other peers that subscribed through this peer)
@@ -567,7 +703,8 @@ export class WebDHT extends EventEmitter {
                 key,
                 keyId,
                 newValue,
-                timestamp
+                timestamp,
+                isNewKey
               });
             } catch (error) {
               console.warn(`Failed to forward notification to ${subscriberId.substring(0, 8)}:`, error.message);
@@ -809,6 +946,42 @@ export class WebDHT extends EventEmitter {
   }
 
   /**
+     * Add a pending subscription for a key that doesn't exist yet
+     */
+  addPendingSubscription(keyId, subscriberId) {
+    if (!this.pendingSubscriptions.has(keyId)) {
+      this.pendingSubscriptions.set(keyId, new Set());
+    }
+    this.pendingSubscriptions.get(keyId).add(subscriberId);
+  }
+
+  /**
+     * Activate pending subscriptions when a key is first created
+     */
+  activatePendingSubscriptions(keyId) {
+    if (this.pendingSubscriptions.has(keyId)) {
+      const pendingSubscribers = this.pendingSubscriptions.get(keyId);
+
+      // Move all pending subscribers to active subscriptions
+      if (!this.subscriptions.has(keyId)) {
+        this.subscriptions.set(keyId, new Set());
+      }
+
+      pendingSubscribers.forEach(subscriberId => {
+        this.subscriptions.get(keyId).add(subscriberId);
+      });
+
+      console.log(`DHT: Activated ${pendingSubscribers.size} pending subscriptions for keyId ${keyId.substring(0, 8)}`);
+
+      // Clear pending subscriptions for this key
+      this.pendingSubscriptions.delete(keyId);
+
+      return Array.from(pendingSubscribers);
+    }
+    return [];
+  }
+
+  /**
      * Check if this peer is among the closest to a key
      */
   isAmongClosest(keyId, closestPeers) {
@@ -903,6 +1076,7 @@ export class WebDHT extends EventEmitter {
     return {
       storedKeys: this.localStorage.size,
       activeSubscriptions: this.subscriptions.size,
+      pendingSubscriptions: this.pendingSubscriptions.size,
       mySubscriptions: this.mySubscriptions.size,
       connectedPeers: this.mesh.connectionManager.getConnectedPeerCount()
     };
@@ -919,6 +1093,7 @@ export class WebDHT extends EventEmitter {
 
     this.localStorage.clear();
     this.subscriptions.clear();
+    this.pendingSubscriptions.clear();
     this.mySubscriptions.clear();
 
     if (this.responseHandlers) {
