@@ -4,7 +4,8 @@
  */
 
 // Import Jest globals for ES modules
-import { jest } from '@jest/globals';
+import * as jestGlobals from '@jest/globals';
+const { jest } = jestGlobals;
 
 // Increase timeout for integration tests involving WebRTC
 jest.setTimeout(30000);
@@ -100,12 +101,12 @@ global.cleanupTest = () => {
   // Clear all timers
   clearInterval();
   clearTimeout();
-  
+
   // Force garbage collection if available
   if (global.gc) {
     global.gc();
   }
-  
+
   // Clear any remaining handles
   openHandles.forEach(handle => {
     try {
@@ -150,14 +151,14 @@ global.WebSocket = class MockWebSocket {
     this.onmessage = null;
     this.onclose = null;
     this.onerror = null;
-    
+
     // Simulate connection after next tick
     setTimeout(() => {
       if (this.onopen) this.onopen();
     }, 0);
   }
 
-  send(data) {
+  send(_data) {
     // Mock send functionality
   }
 

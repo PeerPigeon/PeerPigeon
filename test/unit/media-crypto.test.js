@@ -3,9 +3,11 @@
  * Tests the crypto-media integration with secure messaging features
  */
 
-import { jest } from '@jest/globals';
+import * as jestGlobals from '@jest/globals';
 import { PeerPigeonMesh } from '../../index.js';
 import { MediaManager } from '../../src/MediaManager.js';
+
+const { jest } = jestGlobals;
 
 // Mock crypto library before any imports
 global.crypto = {

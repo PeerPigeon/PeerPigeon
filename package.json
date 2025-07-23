@@ -1,6 +1,6 @@
 {
   "name": "peerpigeon",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
   "main": "index.js",
   "type": "module",
@@ -20,7 +20,7 @@
     "test:media-only": "NODE_OPTIONS='--experimental-vm-modules --no-warnings' jest test/unit/media-only.test.js",
     "test:coverage": "NODE_OPTIONS='--experimental-vm-modules --no-warnings' jest --coverage",
     "test:watch": "jest --watch",
-    "test:custom": "node test/unit/crypto.test.js && node test/unit/mesh.test.js && node test/integration/integration.test.js",
+    "test:custom": "NODE_OPTIONS='--experimental-vm-modules --no-warnings' jest test/unit/crypto.test.js test/unit/mesh.test.js && node test/integration/integration.test.js",
     "test:all": "node test/runner.js",
     "lint": "eslint src/ examples/ websocket-server/ --ext .js",
     "lint:fix": "eslint src/ examples/ websocket-server/ --ext .js --fix",
@@ -92,6 +92,9 @@
     "transform": {},
     "testMatch": [
       "**/test/**/*.test.js"
+    ],
+    "testPathIgnorePatterns": [
+      "/test/integration/integration.test.js"
     ],
     "collectCoverageFrom": [
       "src/**/*.js",

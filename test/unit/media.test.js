@@ -3,9 +3,11 @@
  * Tests MediaManager, media streaming, device enumeration, and media controls
  */
 
-import { jest } from '@jest/globals';
+import * as jestGlobals from '@jest/globals';
 import { MediaManager } from '../../src/MediaManager.js';
 import { PeerPigeonMesh } from '../../index.js';
+
+const { jest } = jestGlobals;
 
 // Mock crypto library before any imports
 global.crypto = {
