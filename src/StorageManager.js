@@ -36,11 +36,25 @@ export class StorageManager extends EventEmitter {
   }
 
   loadSignalingUrlFromQuery() {
-    // Only works in browser environments
-    if (!environmentDetector.isBrowser) return this.loadSignalingUrlFromStorage();
+    // Only works in browser and NativeScript environments with location/URL support
+    if (!environmentDetector.isBrowser && !environmentDetector.isNativeScript) return this.loadSignalingUrlFromStorage();
 
-    const urlParams = new URLSearchParams(window.location.search);
-    const signalingUrl = urlParams.get('api') || urlParams.get('url') || urlParams.get('signaling');
+    // Check if we have URL search capabilities
+    if (typeof URLSearchParams === 'undefined' ||
+        (environmentDetector.isBrowser && typeof window === 'undefined') ||
+        (environmentDetector.isBrowser && typeof window.location === 'undefined')) {
+      return this.loadSignalingUrlFromStorage();
+    }
+
+    let searchParams;
+    if (environmentDetector.isBrowser) {
+      searchParams = new URLSearchParams(window.location.search);
+    } else if (environmentDetector.isNativeScript) {
+      // NativeScript might not have window.location, fallback to storage
+      return this.loadSignalingUrlFromStorage();
+    }
+
+    const signalingUrl = searchParams?.get('api') || searchParams?.get('url') || searchParams?.get('signaling');
 
     if (signalingUrl) {
       // Only emit event if URL is different from current one
@@ -63,7 +77,7 @@ export class StorageManager extends EventEmitter {
 
     // Environment-aware random value generation
     if (environmentDetector.hasRandomValues) {
-      if (environmentDetector.isBrowser || environmentDetector.isWorker) {
+      if (environmentDetector.isBrowser || environmentDetector.isWorker || environmentDetector.isNativeScript) {
         crypto.getRandomValues(array);
       } else if (environmentDetector.isNodeJS) {
         // In Node.js, use crypto module (handle both CommonJS and ES modules)

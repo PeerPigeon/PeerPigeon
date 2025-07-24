@@ -45,7 +45,8 @@
     "gossip",
     "mesh-network",
     "xor-routing",
-    "webrtc-mesh"
+    "webrtc-mesh",
+    "nativescript"
   ],
   "author": "Daniel Raeder",
   "license": "MIT",

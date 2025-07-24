@@ -892,15 +892,18 @@ open "http://localhost:8080/examples/browser/?api=wss://your-signaling-server.co
 - Force connection utilities for testing
 - Real-time peer discovery and connection monitoring
 
-## 🌐 Browser Compatibility & Requirements
+## 🌐 Platform Compatibility & Requirements
 
-### Required Browser Features
-- **WebRTC**: RTCPeerConnection and RTCDataChannel support
-- **ES6 Modules**: Dynamic imports and module syntax  
-- **Crypto API**: For cryptographically secure peer ID generation
-- **WebSocket API**: For real-time signaling communication
+### Supported Platforms
 
-### Supported Browsers & Versions
+| Platform | Environment | WebRTC Support | WebSocket Support | Status |
+|---------|-------------|----------------|-------------------|---------|
+| **Web Browsers** | Modern browsers | ✅ Native | ✅ Native | **Full Support** |
+| **Node.js** | Server-side | ⚠️ Via plugin | ✅ Via 'ws' | **Supported** |
+| **NativeScript** | Mobile apps | ⚠️ Via plugin | ✅ Native/Plugin | **Supported** |
+| **Web Workers** | Browser workers | ✅ Limited | ✅ Yes | **Basic Support** |
+
+### Browser Compatibility
 
 | Browser | Minimum Version | WebRTC Support | WebSocket Support | Status |
 |---------|----------------|----------------|-------------------|---------|
@@ -910,6 +913,38 @@ open "http://localhost:8080/examples/browser/?api=wss://your-signaling-server.co
 | **Edge** | 80+ | ✅ Full | ✅ Yes | **Supported** |
 | **Mobile Chrome** | 80+ | ✅ Full | ✅ Yes | **Supported** |
 | **Mobile Safari** | 14+ | ✅ Full | ✅ Yes | **Supported** |
+
+### Required Features
+- **WebRTC**: RTCPeerConnection and RTCDataChannel support
+- **ES6 Modules**: Dynamic imports and module syntax  
+- **Crypto API**: For cryptographically secure peer ID generation
+- **WebSocket API**: For real-time signaling communication
+
+### NativeScript Support
+
+PeerPigeon includes comprehensive NativeScript support:
+
+```javascript
+// NativeScript usage (same API as browser)
+import { PeerPigeonMesh } from 'peerpigeon';
+
+const mesh = new PeerPigeonMesh();
+await mesh.init(); // Automatically detects NativeScript environment
+
+// Environment detection
+console.log('Environment:', mesh.environmentReport.runtime);
+// { isNativeScript: true, platform: 'android' }
+```
+
+**NativeScript Features:**
+- ✅ Environment detection with platform info (Android/iOS/visionOS)
+- ✅ WebSocket signaling (native or via plugin)
+- ✅ Storage management using NativeScript APIs
+- ✅ Basic mesh networking capabilities
+- ⚠️ WebRTC requires additional native plugins
+- ⚠️ Media features require camera/microphone permissions
+
+See the [NativeScript example](examples/nativescript/) for complete setup instructions.
 
 ### Feature Detection
 
@@ -1321,7 +1356,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **Quick Links:**
 - [Live Demo](http://localhost:8080/examples/browser/) (after starting local server)
+- [Browser Examples](examples/browser/) - Complete web-based examples
+- [Node.js Examples](examples/node/) - Server-side examples  
+- [NativeScript Examples](examples/nativescript/) - Mobile app examples
 - [API Documentation](docs/API.md)
-- [Deployment Guide](docs/DEPLOYMENT.md)  
+- [Deployment Guide](docs/DEPLOYMENT.md)
 - [GitHub Issues](https://github.com/danrayadev/pigon/issues)
 - [Contributing Guidelines](CONTRIBUTING.md)

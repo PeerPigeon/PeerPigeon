@@ -1,0 +1,27 @@
+{
+  "name": "peerpigeon-nativescript-example",
+  "version": "1.0.0",
+  "description": "NativeScript example for PeerPigeon mesh networking",
+  "main": "app.js",
+  "dependencies": {
+    "@nativescript/core": "^8.0.0",
+    "peerpigeon": "^0.0.7"
+  },
+  "devDependencies": {
+    "@nativescript/cli": "^8.0.0"
+  },
+  "scripts": {
+    "ios": "ns run ios",
+    "android": "ns run android",
+    "clean": "ns clean"
+  },
+  "keywords": [
+    "nativescript",
+    "peerpigeon",
+    "webrtc",
+    "p2p",
+    "mesh-networking"
+  ],
+  "author": "PeerPigeon",
+  "license": "MIT"
+}

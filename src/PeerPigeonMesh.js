@@ -135,10 +135,11 @@ export class PeerPigeonMesh extends EventEmitter {
 
     // Log environment info
     console.log('🔍 PeerPigeon Environment Detection:', {
-      runtime: `${report.runtime.isBrowser ? 'Browser' : ''}${report.runtime.isNodeJS ? 'Node.js' : ''}${report.runtime.isWorker ? 'Worker' : ''}`,
+      runtime: `${report.runtime.isBrowser ? 'Browser' : ''}${report.runtime.isNodeJS ? 'Node.js' : ''}${report.runtime.isWorker ? 'Worker' : ''}${report.runtime.isNativeScript ? 'NativeScript' : ''}`,
       webrtc: report.capabilities.webrtc,
       websocket: report.capabilities.webSocket,
-      browser: report.browser?.name || 'N/A'
+      browser: report.browser?.name || 'N/A',
+      nativescript: report.nativescript?.platform || 'N/A'
     });
 
     // Check WebRTC support (required for peer connections)
@@ -147,6 +148,8 @@ export class PeerPigeonMesh extends EventEmitter {
         errors.push('WebRTC is not supported in this browser. PeerPigeon requires WebRTC for peer-to-peer connections.');
       } else if (report.runtime.isNodeJS) {
         warnings.push('WebRTC support not detected in Node.js environment. Consider using a WebRTC library like node-webrtc.');
+      } else if (report.runtime.isNativeScript) {
+        warnings.push('WebRTC support not detected in NativeScript environment. Consider using a native WebRTC plugin.');
       }
     }
 
@@ -156,11 +159,13 @@ export class PeerPigeonMesh extends EventEmitter {
         errors.push('WebSocket is not supported in this browser. PeerPigeon requires WebSocket for signaling.');
       } else if (report.runtime.isNodeJS) {
         warnings.push('WebSocket support not detected. Install the "ws" package for WebSocket support in Node.js.');
+      } else if (report.runtime.isNativeScript) {
+        warnings.push('WebSocket support not detected. Consider using a native WebSocket plugin or polyfill.');
       }
     }
 
     // Check storage capabilities for persistent peer ID
-    if (report.runtime.isBrowser && !report.capabilities.localStorage && !report.capabilities.sessionStorage) {
+    if ((report.runtime.isBrowser || report.runtime.isNativeScript) && !report.capabilities.localStorage && !report.capabilities.sessionStorage) {
       warnings.push('No storage mechanism available. Peer ID will not persist between sessions.');
     }
 
@@ -185,6 +190,21 @@ export class PeerPigeonMesh extends EventEmitter {
       // Check for secure context in production
       if (typeof location !== 'undefined' && location.protocol === 'http:' && location.hostname !== 'localhost') {
         warnings.push('Running on HTTP in production. Some WebRTC features may be limited. Consider using HTTPS.');
+      }
+    }
+
+    if (report.runtime.isNativeScript) {
+      // NativeScript-specific checks
+      const nativeScript = report.nativescript;
+      if (nativeScript && nativeScript.platform) {
+        console.log(`🔮 Running on NativeScript ${nativeScript.platform} platform`);
+
+        // Platform-specific considerations
+        if (nativeScript.platform === 'android') {
+          warnings.push('Android WebRTC may require network permissions and appropriate security configurations.');
+        } else if (nativeScript.platform === 'ios' || nativeScript.platform === 'visionos') {
+          warnings.push('iOS/visionOS WebRTC may require camera/microphone permissions for media features.');
+        }
       }
     }
 

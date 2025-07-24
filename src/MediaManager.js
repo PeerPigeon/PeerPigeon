@@ -53,8 +53,10 @@ export class MediaManager extends EventEmitter {
      * Get available media devices
      */
   async enumerateDevices() {
-    // Only available in browser environments with media device support
-    if (!environmentDetector.isBrowser || typeof navigator.mediaDevices === 'undefined') {
+    // Only available in browser and NativeScript environments with media device support
+    if ((!environmentDetector.isBrowser && !environmentDetector.isNativeScript) ||
+        typeof navigator === 'undefined' ||
+        typeof navigator.mediaDevices === 'undefined') {
       console.warn('Media device enumeration not available in this environment');
       return;
     }

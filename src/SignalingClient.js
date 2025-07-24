@@ -60,8 +60,8 @@ export class SignalingClient extends EventEmitter {
         console.warn('ws package not found in Node.js environment. Install with: npm install ws');
         throw new Error('WebSocket not available in Node.js. Install the "ws" package.');
       }
-    } else if (environmentDetector.isBrowser || environmentDetector.isWorker) {
-      // In browser or worker environments, use the native WebSocket
+    } else if (environmentDetector.isBrowser || environmentDetector.isWorker || environmentDetector.isNativeScript) {
+      // In browser, worker, or NativeScript environments, use the native WebSocket
       return new WebSocket(url);
     } else {
       throw new Error('WebSocket not supported in this environment');
@@ -383,8 +383,8 @@ export class SignalingClient extends EventEmitter {
       }
     };
 
-    if (environmentDetector.isBrowser) {
-      this.keepAliveInterval = window.setInterval(keepAliveCallback, this.keepAliveIntervalMs);
+    if (environmentDetector.isBrowser || environmentDetector.isNativeScript) {
+      this.keepAliveInterval = (typeof window !== 'undefined' ? window.setInterval : setInterval)(keepAliveCallback, this.keepAliveIntervalMs);
     } else {
       this.keepAliveInterval = setInterval(keepAliveCallback, this.keepAliveIntervalMs);
     }
@@ -467,8 +467,8 @@ export class SignalingClient extends EventEmitter {
       }
     };
 
-    if (environmentDetector.isBrowser) {
-      this.healthCheckInterval = window.setInterval(healthCheckCallback, 30000);
+    if (environmentDetector.isBrowser || environmentDetector.isNativeScript) {
+      this.healthCheckInterval = (typeof window !== 'undefined' ? window.setInterval : setInterval)(healthCheckCallback, 30000);
     } else {
       this.healthCheckInterval = setInterval(healthCheckCallback, 30000);
     }
