@@ -18,6 +18,7 @@ export class EnvironmentDetector {
     this._cache.set('isSharedWorker', this._detectSharedWorker());
     this._cache.set('isDeno', this._detectDeno());
     this._cache.set('isBun', this._detectBun());
+    this._cache.set('isNativeScript', this._detectNativeScript());
   }
 
   // Primary environment detection
@@ -39,6 +40,15 @@ export class EnvironmentDetector {
 
   _detectBun() {
     return typeof Bun !== 'undefined';
+  }
+
+  _detectNativeScript() {
+    return typeof global !== 'undefined' &&
+           ((typeof global.NativeScriptGlobals !== 'undefined') ||
+            (typeof global.__ANDROID__ !== 'undefined') ||
+            (typeof global.__IOS__ !== 'undefined') ||
+            (typeof global.__VISIONOS__ !== 'undefined') ||
+            (typeof global.loadModule === 'function' && typeof global.registerModule === 'function'));
   }
 
   _detectWorker() {
@@ -99,12 +109,16 @@ export class EnvironmentDetector {
     return this._cache.get('isBun');
   }
 
+  get isNativeScript() {
+    return this._cache.get('isNativeScript');
+  }
+
   get isServer() {
     return this.isNodeJS || this.isDeno || this.isBun;
   }
 
   get isClient() {
-    return this.isBrowser || this.isWorker;
+    return this.isBrowser || this.isWorker || this.isNativeScript;
   }
 
   // WebRTC capability detection
@@ -120,20 +134,27 @@ export class EnvironmentDetector {
                    typeof global.RTCPeerConnection !== 'undefined') ||
                    typeof RTCPeerConnection !== 'undefined';
     }
+    if (this.isNativeScript) {
+      // NativeScript can access native WebRTC implementations through native modules
+      // Check for globally injected WebRTC first
+      return (typeof global !== 'undefined' &&
+                   typeof global.RTCPeerConnection !== 'undefined') ||
+                   typeof RTCPeerConnection !== 'undefined';
+    }
     return false;
   }
 
   get hasDataChannel() {
-    return this.hasWebRTC && this.isBrowser;
+    return this.hasWebRTC && (this.isBrowser || this.isNativeScript);
   }
 
   get hasGetUserMedia() {
-    if (!this.isBrowser) return false;
-    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia) ||
-               !!(navigator.getUserMedia ||
+    if (!this.isBrowser && !this.isNativeScript) return false;
+    return !!(navigator && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) ||
+               !!(navigator && (navigator.getUserMedia ||
                   navigator.webkitGetUserMedia ||
                   navigator.mozGetUserMedia ||
-                  navigator.msGetUserMedia);
+                  navigator.msGetUserMedia));
   }
 
   // WebSocket capability detection
@@ -164,12 +185,17 @@ export class EnvironmentDetector {
         return false;
       }
     }
+    if (this.isNativeScript) {
+      // NativeScript has WebSocket support through global injection or native modules
+      return typeof WebSocket !== 'undefined' ||
+             (typeof global !== 'undefined' && typeof global.WebSocket !== 'undefined');
+    }
     return false;
   }
 
   // Storage capability detection
   get hasLocalStorage() {
-    if (!this.isBrowser) return false;
+    if (!this.isBrowser && !this.isNativeScript) return false;
     try {
       const test = '__storage_test__';
       localStorage.setItem(test, test);
@@ -181,7 +207,7 @@ export class EnvironmentDetector {
   }
 
   get hasSessionStorage() {
-    if (!this.isBrowser) return false;
+    if (!this.isBrowser && !this.isNativeScript) return false;
     try {
       const test = '__storage_test__';
       sessionStorage.setItem(test, test);
@@ -193,12 +219,12 @@ export class EnvironmentDetector {
   }
 
   get hasIndexedDB() {
-    if (!this.isBrowser) return false;
+    if (!this.isBrowser) return false; // NativeScript doesn't typically have IndexedDB
     return typeof indexedDB !== 'undefined';
   }
 
   get hasCookies() {
-    if (!this.isBrowser) return false;
+    if (!this.isBrowser) return false; // NativeScript doesn't have cookies
     return typeof document !== 'undefined' &&
                typeof document.cookie === 'string';
   }
@@ -243,6 +269,11 @@ export class EnvironmentDetector {
         return false;
       }
     }
+    if (this.isNativeScript) {
+      // NativeScript may have crypto through global polyfills or native modules
+      return (typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined') ||
+             (typeof global !== 'undefined' && typeof global.crypto !== 'undefined');
+    }
     return false;
   }
 
@@ -263,6 +294,13 @@ export class EnvironmentDetector {
       } catch (e) {
         return false;
       }
+    }
+    if (this.isNativeScript) {
+      // NativeScript may have crypto random values through global polyfills
+      return (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') ||
+             (typeof global !== 'undefined' &&
+              typeof global.crypto !== 'undefined' &&
+              typeof global.crypto.getRandomValues === 'function');
     }
     return false;
   }
@@ -318,6 +356,34 @@ export class EnvironmentDetector {
     };
   }
 
+  // NativeScript-specific detection
+  getNativeScriptInfo() {
+    if (!this.isNativeScript) return null;
+
+    const info = {
+      runtime: 'nativescript'
+    };
+
+    // Detect platform if globals are available
+    if (typeof global !== 'undefined') {
+      if (global.__ANDROID__) {
+        info.platform = 'android';
+      } else if (global.__IOS__) {
+        info.platform = 'ios';
+      } else if (global.__VISIONOS__) {
+        info.platform = 'visionos';
+      }
+
+      // Add additional NativeScript globals if available
+      if (global.NativeScriptGlobals) {
+        info.launched = global.NativeScriptGlobals.launched;
+        info.appInstanceReady = global.NativeScriptGlobals.appInstanceReady;
+      }
+    }
+
+    return info;
+  }
+
   // Device and platform detection
   getPlatformInfo() {
     if (this.isBrowser) {
@@ -334,6 +400,10 @@ export class EnvironmentDetector {
 
     if (this.isNodeJS) {
       return this.getNodeInfo();
+    }
+
+    if (this.isNativeScript) {
+      return this.getNativeScriptInfo();
     }
 
     return null;
@@ -390,6 +460,7 @@ export class EnvironmentDetector {
         isSharedWorker: this.isSharedWorker,
         isDeno: this.isDeno,
         isBun: this.isBun,
+        isNativeScript: this.isNativeScript,
         isServer: this.isServer,
         isClient: this.isClient
       },
@@ -410,6 +481,7 @@ export class EnvironmentDetector {
       platform: this.getPlatformInfo(),
       browser: this.getBrowserInfo(),
       node: this.getNodeInfo(),
+      nativescript: this.getNativeScriptInfo(),
       network: {
         online: this.isOnline,
         type: this.networkType
@@ -436,6 +508,7 @@ export const environmentDetector = new EnvironmentDetector();
 export const isBrowser = () => environmentDetector.isBrowser;
 export const isNodeJS = () => environmentDetector.isNodeJS;
 export const isWorker = () => environmentDetector.isWorker;
+export const isNativeScript = () => environmentDetector.isNativeScript;
 export const hasWebRTC = () => environmentDetector.hasWebRTC;
 export const hasWebSocket = () => environmentDetector.hasWebSocket;
 export const getEnvironmentReport = () => environmentDetector.getEnvironmentReport();
