@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: CryptoManager.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: CryptoManager.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>import { EventEmitter } from './EventEmitter.js';
+
+// Dynamic import for unsea to handle both Node.js and browser environments
+let unsea = null;
+
+async function initializeUnsea() {
+  if (unsea) return unsea;
+
+  try {
+    // Detect environment - prioritize Node.js detection for tests
+    const isNode = typeof process !== 'undefined' &amp;&amp; process.versions &amp;&amp; process.versions.node;
+    const isBrowser = !isNode &amp;&amp; typeof window !== 'undefined' &amp;&amp; typeof document !== 'undefined';
+
+    if (isNode) {
+      // For Node.js environments (including tests), use npm package
+      unsea = await import('unsea');
+      console.log('✅ Loaded unsea from npm package (Node.js)');
+    } else if (isBrowser) {
+      // For browser environments, try CDN sources
+      try {
+        unsea = await import('https://cdn.jsdelivr.net/npm/unsea@latest/+esm');
+        console.log('✅ Loaded unsea from jsDelivr CDN');
+      } catch (jsDelivrError) {
+        console.warn('Failed to load from jsDelivr, trying unpkg:', jsDelivrError);
+        try {
+          unsea = await import('https://unpkg.com/unsea@latest/dist/unsea.esm.js');
+          console.log('✅ Loaded unsea from unpkg CDN');
+        } catch (unpkgError) {
+          console.warn('Failed to load from unpkg, trying Skypack:', unpkgError);
+          unsea = await import('https://cdn.skypack.dev/unsea');
+          console.log('✅ Loaded unsea from Skypack CDN');
+        }
+      }
+    } else {
+      throw new Error('Unknown environment - cannot load unsea');
+    }
+
+    if (!unsea) {
+      throw new Error('Unsea not found after loading');
+    }
+
+    return unsea;
+  } catch (error) {
+    console.error('Failed to load unsea:', error);
+    throw error;
+  }
+}
+
+export class CryptoManager extends EventEmitter {
+  constructor() {
+    super();
+    this.unsea = null;
+    this.keypair = null;
+    this.peerKeys = new Map(); // Store peer public keys
+    this.encryptionEnabled = false;
+    this.initialized = false;
+    this.groupKeys = new Map(); // Store group encryption keys
+    this.messageNonces = new Set(); // Prevent replay attacks
+    this.maxNonceAge = 300000; // 5 minutes
+
+    // Performance metrics
+    this.stats = {
+      messagesEncrypted: 0,
+      messagesDecrypted: 0,
+      encryptionTime: 0,
+      decryptionTime: 0,
+      keyExchanges: 0
+    };
+  }
+
+  /**
+     * Initialize the crypto manager
+     * @param {Object} options - Configuration options
+     * @param {string} options.alias - Optional user alias for persistent identity
+     * @param {string} options.password - Optional password for user account
+     * @param {boolean} options.generateKeypair - Whether to generate a new keypair if no credentials
+     * @returns {Promise&lt;Object>} The generated or loaded keypair
+     */
+  async init(options = {}) {
+    try {
+      this.unsea = await initializeUnsea();
+
+      if (options.alias &amp;&amp; options.password) {
+        // Try to create or authenticate with persistent identity
+        await this.createOrAuthenticateUser(options.alias, options.password);
+      } else if (options.generateKeypair !== false) {
+        // Generate ephemeral keypair
+        this.keypair = await this.unsea.generateRandomPair();
+      }
+
+      if (this.keypair) {
+        this.encryptionEnabled = true;
+        this.initialized = true;
+        this.emit('cryptoReady', { publicKey: this.getPublicKey() });
+
+        // Start nonce cleanup
+        this.startNonceCleanup();
+      }
+
+      return this.keypair;
+    } catch (error) {
+      console.error('CryptoManager initialization failed:', error);
+      this.emit('cryptoError', { error: error.message });
+      throw error;
+    }
+  }
+
+  /**
+     * Create or authenticate a persistent user account
+     */
+  async createOrAuthenticateUser(alias, password) {
+    try {
+      // For unsea, we'll generate a deterministic keypair from credentials
+      // Note: unsea doesn't have built-in user accounts like GUN
+      // We can simulate this by generating deterministic keys from password+alias
+
+      // Use unsea's key persistence if available (browser only)
+      if (typeof window !== 'undefined') {
+        try {
+          // Try to load existing keys
+          const existingKeys = await this.unsea.loadKeys(alias, password);
+          if (existingKeys) {
+            this.keypair = existingKeys;
+          } else {
+            // Generate new keys and save them
+            this.keypair = await this.unsea.generateRandomPair();
+            await this.unsea.saveKeys(alias, this.keypair, password);
+          }
+        } catch (error) {
+          // Fallback to generating ephemeral keys
+          console.warn('Failed to use persistent storage, generating ephemeral keys:', error);
+          this.keypair = await this.unsea.generateRandomPair();
+        }
+      } else {
+        // For Node.js, just generate ephemeral keys
+        this.keypair = await this.unsea.generateRandomPair();
+      }
+
+      this.emit('userAuthenticated', { alias, publicKey: this.getPublicKey() });
+    } catch (error) {
+      console.error('User authentication failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+     * Get the public key for sharing
+     * @returns {string} The public key
+     */
+  getPublicKey() {
+    // In unsea, the public key is likely in the 'pub' property
+    return this.keypair?.pub || this.keypair?.publicKey;
+  }
+
+  /**
+     * Get crypto status information
+     * @returns {Object} Status information
+     */
+  getStatus() {
+    // Convert group keys Map to object for UI consumption
+    const groups = {};
+    this.groupKeys.forEach((groupKey, groupId) => {
+      groups[groupId] = {
+        publicKey: groupKey.pub,
+        created: groupKey.created || Date.now() // Use stored creation time or fallback to current time
+      };
+    });
+
+    return {
+      initialized: this.initialized,
+      enabled: this.encryptionEnabled,
+      hasKeypair: !!this.keypair,
+      publicKey: this.getPublicKey(),
+      peerCount: this.peerKeys.size,
+      groupCount: this.groupKeys.size,
+      groups,
+      stats: { ...this.stats }
+    };
+  }
+
+  /**
+     * Store a peer's public keys (both pub and epub)
+     * @param {string} peerId - The peer ID
+     * @param {string|Object} publicKey - The peer's public key(s) - can be string (pub) or object with {pub, epub}
+     */
+  addPeerKey(peerId, publicKey) {
+    if (!publicKey) return false;
+
+    // Handle both string (just pub) and object (pub + epub) formats
+    let keyData;
+    if (typeof publicKey === 'string') {
+      keyData = { pub: publicKey, epub: null };
+    } else if (typeof publicKey === 'object' &amp;&amp; (publicKey.pub || publicKey.epub)) {
+      keyData = publicKey;
+    } else {
+      return false;
+    }
+
+    this.peerKeys.set(peerId, keyData);
+    this.stats.keyExchanges++;
+    this.emit('peerKeyAdded', { peerId, publicKey: keyData });
+    return true;
+  }
+
+  /**
+     * Remove a peer's public key
+     * @param {string} peerId - The peer ID
+     */
+  removePeerKey(peerId) {
+    const removed = this.peerKeys.delete(peerId);
+    if (removed) {
+      this.emit('peerKeyRemoved', { peerId });
+    }
+    return removed;
+  }
+
+  /**
+     * Encrypt a message for a specific peer
+     * @param {any} message - The message to encrypt
+     * @param {string} peerId - The target peer ID
+     * @returns {Promise&lt;Object>} Encrypted message object
+     */
+  async encryptForPeer(message, peerId) {
+    if (!this.encryptionEnabled) {
+      return { encrypted: false, data: message };
+    }
+
+    const peerKeyData = this.peerKeys.get(peerId);
+    if (!peerKeyData) {
+      throw new Error(`No public key found for peer ${peerId}`);
+    }
+
+    // Check if we have the encryption public key (epub)
+    if (!peerKeyData.epub) {
+      throw new Error(`No encryption public key (epub) found for peer ${peerId}. Only regular public key (pub) available.`);
+    }
+
+    const startTime = Date.now();
+    try {
+      const nonce = await this.generateNonce();
+      const serialized = JSON.stringify(message);
+
+      // Create a keypair object for unsea with both pub and epub
+      const peerKeypair = {
+        pub: peerKeyData.pub,
+        epub: peerKeyData.epub
+      };
+      const encrypted = await this.unsea.encryptMessageWithMeta(serialized, peerKeypair);
+
+      const result = {
+        encrypted: true,
+        data: encrypted,
+        from: this.getPublicKey(),
+        nonce,
+        timestamp: Date.now()
+      };
+
+      this.stats.messagesEncrypted++;
+      this.stats.encryptionTime += Date.now() - startTime;
+
+      return result;
+    } catch (error) {
+      console.error('Peer encryption failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+     * Decrypt a message from a peer
+     * @param {Object} encryptedData - The encrypted message object
+     * @returns {Promise&lt;any>} The decrypted message
+     */
+  async decryptFromPeer(encryptedData) {
+    if (!this.encryptionEnabled || !encryptedData.encrypted) {
+      return encryptedData.data || encryptedData;
+    }
+
+    // Check for replay attacks
+    if (encryptedData.nonce &amp;&amp; this.messageNonces.has(encryptedData.nonce)) {
+      throw new Error('Replay attack detected: duplicate nonce');
+    }
+
+    const startTime = Date.now();
+    try {
+      // Use unsea's decryptMessageWithMeta - pass our ephemeral private key (epriv)
+      const decrypted = await this.unsea.decryptMessageWithMeta(encryptedData.data, this.keypair.epriv);
+      const parsed = JSON.parse(decrypted);
+
+      // Store nonce to prevent replay
+      if (encryptedData.nonce) {
+        this.messageNonces.add(encryptedData.nonce);
+      }
+
+      this.stats.messagesDecrypted++;
+      this.stats.decryptionTime += Date.now() - startTime;
+
+      return parsed;
+    } catch (error) {
+      console.error('Peer decryption failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+     * Sign data with our private key
+     * @param {any} data - The data to sign
+     * @returns {Promise&lt;string>} The signature
+     */
+  async sign(data) {
+    if (!this.encryptionEnabled) return null;
+
+    try {
+      const serialized = typeof data === 'string' ? data : JSON.stringify(data);
+      return await this.unsea.signMessage(serialized, this.keypair.priv);
+    } catch (error) {
+      console.error('Signing failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+     * Verify a signature
+     * @param {string} signature - The signature to verify
+     * @param {any} data - The original data
+     * @param {string} publicKey - The signer's public key
+     * @returns {Promise&lt;boolean>} Whether the signature is valid
+     */
+  async verify(signature, data, publicKey) {
+    if (!this.encryptionEnabled) return true;
+
+    try {
+      const serialized = typeof data === 'string' ? data : JSON.stringify(data);
+      return await this.unsea.verifyMessage(serialized, signature, publicKey);
+    } catch (error) {
+      console.error('Signature verification failed:', error);
+      return false;
+    }
+  }
+
+  /**
+     * Generate a shared group key
+     * @param {string} groupId - The group identifier
+     * @returns {Promise&lt;Object>} The group key pair
+     */
+  async generateGroupKey(groupId) {
+    try {
+      const groupKey = await this.unsea.generateRandomPair();
+      // Add metadata to the group key
+      const groupKeyWithMeta = {
+        ...groupKey,
+        created: Date.now(),
+        groupId
+      };
+      this.groupKeys.set(groupId, groupKeyWithMeta);
+      this.emit('groupKeyGenerated', { groupId, publicKey: groupKey.pub });
+      return groupKeyWithMeta;
+    } catch (error) {
+      console.error('Group key generation failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+     * Add an existing group key
+     * @param {string} groupId - The group identifier
+     * @param {Object} groupKey - The group key pair
+     */
+  addGroupKey(groupId, groupKey) {
+    this.groupKeys.set(groupId, groupKey);
+    this.emit('groupKeyAdded', { groupId, publicKey: groupKey.pub });
+  }
+
+  /**
+     * Encrypt a message for a group
+     * @param {any} message - The message to encrypt
+     * @param {string} groupId - The group identifier
+     * @returns {Promise&lt;Object>} Encrypted message object
+     */
+  async encryptForGroup(message, groupId) {
+    if (!this.encryptionEnabled) {
+      return { encrypted: false, data: message };
+    }
+
+    const groupKey = this.groupKeys.get(groupId);
+    if (!groupKey) {
+      throw new Error(`No group key found for group ${groupId}`);
+    }
+
+    const startTime = Date.now();
+    try {
+      const nonce = await this.generateNonce();
+      const serialized = JSON.stringify(message);
+      const encrypted = await this.unsea.encryptMessageWithMeta(serialized, groupKey);
+
+      const result = {
+        encrypted: true,
+        group: true,
+        groupId,
+        data: encrypted,
+        from: this.getPublicKey(),
+        nonce,
+        timestamp: Date.now()
+      };
+
+      this.stats.messagesEncrypted++;
+      this.stats.encryptionTime += Date.now() - startTime;
+
+      return result;
+    } catch (error) {
+      console.error('Group encryption failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+     * Decrypt a group message
+     * @param {Object} encryptedData - The encrypted message object
+     * @returns {Promise&lt;any>} The decrypted message
+     */
+  async decryptFromGroup(encryptedData) {
+    if (!this.encryptionEnabled || !encryptedData.encrypted || !encryptedData.group) {
+      return encryptedData.data || encryptedData;
+    }
+
+    const groupKey = this.groupKeys.get(encryptedData.groupId);
+    if (!groupKey) {
+      throw new Error(`No group key found for group ${encryptedData.groupId}`);
+    }
+
+    // Check for replay attacks
+    if (encryptedData.nonce &amp;&amp; this.messageNonces.has(encryptedData.nonce)) {
+      throw new Error('Replay attack detected: duplicate nonce');
+    }
+
+    const startTime = Date.now();
+    try {
+      const decrypted = await this.unsea.decryptMessageWithMeta(encryptedData.data, groupKey.epriv);
+      const parsed = JSON.parse(decrypted);
+
+      // Store nonce to prevent replay
+      if (encryptedData.nonce) {
+        this.messageNonces.add(encryptedData.nonce);
+      }
+
+      this.stats.messagesDecrypted++;
+      this.stats.decryptionTime += Date.now() - startTime;
+
+      return parsed;
+    } catch (error) {
+      console.error('Group decryption failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+     * Generate a cryptographically secure nonce
+     * @returns {Promise&lt;string>} A unique nonce
+     */
+  async generateNonce() {
+    // Generate a simple nonce using timestamp and random
+    const timestamp = Date.now().toString();
+    const random = Math.random().toString(36).substring(2);
+    const combined = `${timestamp}-${random}-${Math.floor(Math.random() * 1000000)}`;
+
+    // Use crypto.subtle to hash the combined string if available
+    if (typeof crypto !== 'undefined' &amp;&amp; crypto.subtle) {
+      try {
+        const encoder = new TextEncoder();
+        const data = encoder.encode(combined);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
+      } catch (error) {
+        console.warn('Could not use crypto.subtle for nonce generation:', error);
+      }
+    }
+
+    // Fallback to simple combined string
+    return combined;
+  }
+
+  /**
+     * Start periodic cleanup of old nonces
+     */
+  startNonceCleanup() {
+    setInterval(() => {
+      // Remove old nonces (this is a simplified approach)
+      // In a real implementation, you'd store nonces with timestamps
+      if (this.messageNonces.size > 1000) {
+        this.messageNonces.clear();
+      }
+    }, 60000); // Clean up every minute
+  }
+
+  /**
+     * Export public key for sharing
+     * @returns {Object} Export data
+     */
+  exportPublicKey() {
+    if (!this.keypair) return null;
+
+    return {
+      pub: this.keypair.pub,
+      epub: this.keypair.epub,
+      algorithm: 'ECDSA',
+      created: Date.now()
+    };
+  }
+
+  /**
+     * Clear all stored keys and reset state
+     */
+  reset() {
+    this.keypair = null;
+    this.peerKeys.clear();
+    this.groupKeys.clear();
+    this.messageNonces.clear();
+    this.encryptionEnabled = false;
+    this.initialized = false;
+
+    // Reset stats
+    this.stats = {
+      messagesEncrypted: 0,
+      messagesDecrypted: 0,
+      encryptionTime: 0,
+      decryptionTime: 0,
+      keyExchanges: 0
+    };
+
+    this.emit('cryptoReset');
+  }
+
+  /**
+     * Test crypto functionality
+     * @returns {Promise&lt;Object>} Test results
+     */
+  async runSelfTest() {
+    const results = {
+      keypairGeneration: false,
+      encryption: false,
+      decryption: false,
+      signing: false,
+      verification: false,
+      groupEncryption: false,
+      errors: []
+    };
+
+    // Check if crypto is properly initialized
+    if (!this.unsea) {
+      results.errors.push('Unsea library not loaded');
+      return results;
+    }
+
+    if (!this.initialized) {
+      results.errors.push('CryptoManager not initialized');
+      return results;
+    }
+
+    console.log('🔍 Debug: unsea object:', this.unsea);
+    console.log('🔍 Debug: available methods:', Object.keys(this.unsea));
+
+    try {
+      // Test keypair generation
+      console.log('🧪 Testing keypair generation...');
+      const testKeypair = await this.unsea.generateRandomPair();
+      console.log('🔍 Generated keypair:', testKeypair);
+      results.keypairGeneration = !!(testKeypair &amp;&amp; (testKeypair.pub || testKeypair.publicKey));
+
+      // Test encryption/decryption - create two keypairs to simulate peer-to-peer encryption
+      console.log('🧪 Testing encryption...');
+      const testMessage = 'Hello, crypto world!';
+
+      // Create a second keypair to simulate a peer
+      const peerKeypair = await this.unsea.generateRandomPair();
+
+      // Encrypt from our keypair TO the peer keypair
+      const encrypted = await this.unsea.encryptMessageWithMeta(testMessage, peerKeypair);
+      console.log('🔍 Encrypted result:', encrypted);
+      results.encryption = !!encrypted;
+
+      console.log('🧪 Testing decryption...');
+      // Use the ephemeral private key (epriv) for decryption as shown in the example
+      const decrypted = await this.unsea.decryptMessageWithMeta(encrypted, peerKeypair.epriv);
+      console.log('🔍 Decrypted result:', decrypted);
+      results.decryption = decrypted === testMessage;
+
+      // Test signing/verification
+      console.log('🧪 Testing signing...');
+      const signature = await this.unsea.signMessage(testMessage, this.keypair.priv);
+      console.log('🔍 Signature:', signature);
+      results.signing = !!signature;
+
+      console.log('🧪 Testing verification...');
+      const verified = await this.unsea.verifyMessage(testMessage, signature, this.keypair.pub);
+      console.log('🔍 Verification result:', verified);
+      results.verification = verified === true;
+
+      // Test group encryption (same as regular encryption with different key)
+      console.log('🧪 Testing group encryption...');
+      const groupKey = await this.unsea.generateRandomPair();
+      const groupEncrypted = await this.unsea.encryptMessageWithMeta(testMessage, groupKey);
+      const groupDecrypted = await this.unsea.decryptMessageWithMeta(groupEncrypted, groupKey.epriv);
+      results.groupEncryption = groupDecrypted === testMessage;
+    } catch (error) {
+      console.error('🔍 Self-test error:', error);
+      results.errors.push(error.message);
+    }
+
+    console.log('🔍 Final test results:', results);
+    return results;
+  }
+}
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="CleanupManager.html">CleanupManager</a></li><li><a href="ConnectionManager.html">ConnectionManager</a></li><li><a href="EnvironmentDetector.html">EnvironmentDetector</a></li><li><a href="EvictionManager.html">EvictionManager</a></li><li><a href="GossipManager.html">GossipManager</a></li><li><a href="MeshOptimizer.html">MeshOptimizer</a></li><li><a href="PeerPigeonMesh.html">PeerPigeonMesh</a></li><li><a href="PeerPigeonMesh_PeerPigeonMesh.html">PeerPigeonMesh</a></li><li><a href="SignalingHandler.html">SignalingHandler</a></li><li><a href="StorageManager.html">StorageManager</a></li><li><a href="WebDHT.html">WebDHT</a></li></ul><h3>Global</h3><ul><li><a href="global.html#safeClearInterval">safeClearInterval</a></li><li><a href="global.html#safeClearTimeout">safeClearTimeout</a></li><li><a href="global.html#safeSetInterval">safeSetInterval</a></li><li><a href="global.html#safeSetTimeout">safeSetTimeout</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 4.0.4</a> on Thu Jul 24 2025 17:59:30 GMT-0500 (Central Daylight Time)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>
