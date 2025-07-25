@@ -1,6 +1,6 @@
 {
   "name": "peerpigeon",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
   "main": "index.js",
   "type": "module",
@@ -15,7 +15,9 @@
     "server": "node websocket-server/server.js",
     "lint": "eslint src/ examples/ websocket-server/ --ext .js",
     "lint:fix": "eslint src/ examples/ websocket-server/ --ext .js --fix",
-    "ci": "npm run lint",
+    "test": "node tests/DistributedStorageManager.test.js",
+    "test:storage": "node examples/distributed-storage-test.js",
+    "ci": "npm run lint && npm run test",
     "prepublishOnly": "npm run ci"
   },
   "files": [

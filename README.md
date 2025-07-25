@@ -16,7 +16,8 @@
 - **🧠 Smart Eviction Strategy**: Automatically replaces distant peers with closer ones to optimize mesh topology
 - **🔍 Auto-Discovery**: Seamlessly connects to peers as they join the network
 - **⚡ WebSocket Signaling**: Real-time bidirectional communication for optimal performance
-- **�️ Distributed Hash Table (WebDHT)**: Store and retrieve data across the mesh with automatic replication
+- **🗄️ Distributed Hash Table (WebDHT)**: Store and retrieve data across the mesh with automatic replication
+- **📦 Distributed Storage Layer**: Encrypted, access-controlled storage with CRDT support for collaborative editing
 - **🎥 Media Streaming**: Built-in support for audio/video streaming between peers
 - **💬 Messaging System**: Direct messages and broadcast gossip protocol messaging
 - **🔧 Modular Architecture**: Clean separation of concerns with event-driven components
@@ -168,6 +169,63 @@ mesh.addEventListener('dhtValueChanged', (data) => {
 
 // Update a value and notify subscribers
 await mesh.dhtUpdate('shared-counter', 42);
+```
+
+### Distributed Storage Layer Examples
+
+```javascript
+// Enable crypto for encryption support
+const mesh = new PeerPigeonMesh({
+    enableCrypto: true,
+    enableWebDHT: true
+});
+
+await mesh.cryptoManager.init();
+await mesh.connect('ws://localhost:3000');
+
+// Store private encrypted data
+await mesh.distributedStorage.store('user:profile', {
+    name: 'Alice',
+    email: 'alice@example.com'
+}, {
+    isPublic: false,      // Private (encrypted)
+    isImmutable: false    // Mutable for owner
+});
+
+// Store public data
+await mesh.distributedStorage.store('app:config', {
+    version: '1.0.0',
+    features: ['chat', 'files']
+}, {
+    isPublic: true,       // Public (not encrypted)
+    isImmutable: true     // Immutable for other peers
+});
+
+// Store collaborative document with CRDT
+await mesh.distributedStorage.store('doc:shared', {
+    title: 'Shared Document',
+    content: 'Initial content'
+}, {
+    isPublic: true,
+    enableCRDT: true      // Enable collaborative editing
+});
+
+// Grant access to private data
+await mesh.distributedStorage.grantAccess('user:profile', otherPeer.peerId);
+
+// Retrieve data
+const profile = await mesh.distributedStorage.retrieve('user:profile');
+
+// Update data (owner only, or CRDT-enabled)
+await mesh.distributedStorage.update('user:profile', {
+    name: 'Alice Smith',
+    email: 'alice.smith@example.com'
+});
+
+// Listen for storage events
+mesh.addEventListener('storageDataUpdated', (event) => {
+    console.log(`Data updated: ${event.key} (version ${event.version})`);
+});
 ```
 
 ### Media Streaming Examples

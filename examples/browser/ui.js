@@ -217,6 +217,9 @@ export class PeerPigeonUI {
     // DHT controls
     this.setupDHTControls();
 
+    // Storage controls
+    this.setupStorageControls();
+
     // Crypto controls
     this.setupCryptoControls();
 
@@ -232,6 +235,7 @@ export class PeerPigeonUI {
     const dhtKey = document.getElementById('dht-key');
     const dhtValue = document.getElementById('dht-value');
     const dhtGetKey = document.getElementById('dht-get-key'); // Separate key field for retrieval
+    const dhtSubscribeKey = document.getElementById('dht-subscribe-key'); // Separate key field for subscription
     const dhtPutBtn = document.getElementById('dht-put-btn');
     const dhtUpdateBtn = document.getElementById('dht-update-btn');
     const dhtGetBtn = document.getElementById('dht-get-btn');
@@ -246,6 +250,7 @@ export class PeerPigeonUI {
       dhtKey: !!dhtKey,
       dhtValue: !!dhtValue,
       dhtGetKey: !!dhtGetKey,
+      dhtSubscribeKey: !!dhtSubscribeKey,
       dhtPutBtn: !!dhtPutBtn,
       dhtUpdateBtn: !!dhtUpdateBtn,
       dhtGetBtn: !!dhtGetBtn,
@@ -457,13 +462,11 @@ export class PeerPigeonUI {
     // Subscribe to DHT key
     if (dhtSubscribeBtn) {
       dhtSubscribeBtn.addEventListener('click', async () => {
-        // Check both key fields - use whichever has a value
-        const putKey = dhtKey?.value?.trim();
-        const getKey = dhtGetKey?.value?.trim();
-        const key = putKey || getKey;
+        // Use the dedicated subscription key field
+        const key = dhtSubscribeKey?.value?.trim();
 
         if (!key) {
-          this.addDHTLogEntry('❌ Error: Key is required (enter key in either Put/Update or Get field)');
+          this.addDHTLogEntry('❌ Error: Key is required for subscription');
           return;
         }
 
@@ -480,11 +483,13 @@ export class PeerPigeonUI {
           this.addDHTLogEntry(`✅ Subscribed to: ${key}`);
           if (value !== null) {
             this.addDHTLogEntry(`   Current value from original storing peers: ${JSON.stringify(value)}`);
-            if (dhtValue) {
-              dhtValue.value = typeof value === 'string' ? value : JSON.stringify(value);
-            }
           } else {
             this.addDHTLogEntry('   No current value found on original storing peers');
+          }
+
+          // Clear the subscription key field after successful subscription
+          if (dhtSubscribeKey) {
+            dhtSubscribeKey.value = '';
           }
         } catch (error) {
           this.addDHTLogEntry(`❌ Error subscribing to ${key}: ${error.message}`);
@@ -495,13 +500,11 @@ export class PeerPigeonUI {
     // Unsubscribe from DHT key
     if (dhtUnsubscribeBtn) {
       dhtUnsubscribeBtn.addEventListener('click', async () => {
-        // Check both key fields - use whichever has a value
-        const putKey = dhtKey?.value?.trim();
-        const getKey = dhtGetKey?.value?.trim();
-        const key = putKey || getKey;
+        // Use the dedicated subscription key field
+        const key = dhtSubscribeKey?.value?.trim();
 
         if (!key) {
-          this.addDHTLogEntry('❌ Error: Key is required (enter key in either Put/Update or Get field)');
+          this.addDHTLogEntry('❌ Error: Key is required for unsubscription');
           return;
         }
 
@@ -513,11 +516,523 @@ export class PeerPigeonUI {
         try {
           await this.mesh.dhtUnsubscribe(key);
           this.addDHTLogEntry(`🔕 Unsubscribed from: ${key}`);
+
+          // Clear the subscription key field after successful unsubscription
+          if (dhtSubscribeKey) {
+            dhtSubscribeKey.value = '';
+          }
         } catch (error) {
           this.addDHTLogEntry(`❌ Error unsubscribing from ${key}: ${error.message}`);
         }
       });
     }
+  }
+
+  setupStorageControls() {
+    // Ensure storage section starts collapsed with robust hiding
+    const storageSection = document.querySelector('.storage');
+    const storageToggle = document.getElementById('storage-toggle');
+    const storageContent = document.getElementById('storage-content');
+
+    if (storageSection && storageToggle && storageContent) {
+      // Force initial collapsed state with multiple approaches
+      storageSection.setAttribute('aria-expanded', 'false');
+      storageToggle.setAttribute('aria-expanded', 'false');
+
+      // Use multiple ways to hide the content
+      storageContent.style.display = 'none';
+      storageContent.style.visibility = 'hidden';
+      storageContent.style.maxHeight = '0';
+      storageContent.style.overflow = 'hidden';
+      storageContent.classList.add('collapsed');
+
+      // Ensure the toggle button shows collapsed state
+      if (storageToggle.textContent && !storageToggle.textContent.includes('▶')) {
+        storageToggle.textContent = storageToggle.textContent.replace('▼', '▶');
+      }
+    }
+
+    // Enable/Disable Storage
+    const storageEnableBtn = document.getElementById('storage-enable-btn');
+    const storageDisableBtn = document.getElementById('storage-disable-btn');
+    const storageClearBtn = document.getElementById('storage-clear-btn');
+
+    if (storageEnableBtn) {
+      storageEnableBtn.addEventListener('click', async () => {
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          await this.mesh.distributedStorage.enable();
+          this.addStorageLogEntry('✅ Distributed storage enabled');
+          this.updateStorageStatus();
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error enabling storage: ${error.message}`);
+        }
+      });
+    }
+
+    if (storageDisableBtn) {
+      storageDisableBtn.addEventListener('click', async () => {
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          await this.mesh.distributedStorage.disable();
+          this.addStorageLogEntry('⚠️ Distributed storage disabled');
+          this.updateStorageStatus();
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error disabling storage: ${error.message}`);
+        }
+      });
+    }
+
+    if (storageClearBtn) {
+      storageClearBtn.addEventListener('click', async () => {
+        if (!confirm('Are you sure you want to clear all stored data? This cannot be undone.')) {
+          return;
+        }
+
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          await this.mesh.distributedStorage.clear();
+          this.addStorageLogEntry('🗑️ All stored data cleared');
+          this.updateStorageStatus();
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error clearing storage: ${error.message}`);
+        }
+      });
+    }
+
+    // Store Data
+    const storageStoreBtn = document.getElementById('storage-store-btn');
+    const storageUpdateBtn = document.getElementById('storage-update-btn');
+
+    if (storageStoreBtn) {
+      storageStoreBtn.addEventListener('click', async () => {
+        await this.handleStorageStore(false);
+      });
+    }
+
+    if (storageUpdateBtn) {
+      storageUpdateBtn.addEventListener('click', async () => {
+        await this.handleStorageStore(true);
+      });
+    }
+
+    // Retrieve Data
+    const storageGetBtn = document.getElementById('storage-get-btn');
+    const storageDeleteBtn = document.getElementById('storage-delete-btn');
+
+    if (storageGetBtn) {
+      storageGetBtn.addEventListener('click', async () => {
+        const key = document.getElementById('storage-get-key')?.value?.trim();
+
+        if (!key) {
+          this.addStorageLogEntry('❌ Error: Key is required');
+          return;
+        }
+
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          const result = await this.mesh.distributedStorage.retrieve(key);
+          if (result !== null) {
+            this.addStorageLogEntry(`📋 Retrieved: ${key} = ${JSON.stringify(result)}`);
+
+            // Get key info for metadata display
+            try {
+              const keyInfo = await this.mesh.distributedStorage.getKeyInfo(key);
+              if (keyInfo) {
+                this.addStorageLogEntry(`   Metadata: public=${keyInfo.isPublic}, immutable=${keyInfo.isImmutable}, owner=${keyInfo.owner?.substring(0, 8)}...`);
+                this.addStorageLogEntry(`   Created: ${new Date(keyInfo.createdAt).toLocaleString()}`);
+              }
+            } catch (metaError) {
+              // Metadata display is optional, don't fail the retrieval
+              console.warn('Could not get metadata for display:', metaError);
+            }
+          } else {
+            this.addStorageLogEntry(`❌ Key not found or access denied: ${key}`);
+          }
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error retrieving ${key}: ${error.message}`);
+        }
+      });
+    }
+
+    if (storageDeleteBtn) {
+      storageDeleteBtn.addEventListener('click', async () => {
+        const key = document.getElementById('storage-get-key')?.value?.trim();
+
+        if (!key) {
+          this.addStorageLogEntry('❌ Error: Key is required');
+          return;
+        }
+
+        if (!confirm(`Are you sure you want to delete "${key}"? This cannot be undone.`)) {
+          return;
+        }
+
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          const success = await this.mesh.distributedStorage.delete(key);
+          if (success) {
+            this.addStorageLogEntry(`🗑️ Deleted: ${key}`);
+            this.updateStorageStatus();
+          } else {
+            this.addStorageLogEntry(`❌ Failed to delete: ${key}`);
+          }
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error deleting ${key}: ${error.message}`);
+        }
+      });
+    }
+
+    // Access Control
+    const storageGrantAccessBtn = document.getElementById('storage-grant-access-btn');
+    const storageRevokeAccessBtn = document.getElementById('storage-revoke-access-btn');
+
+    if (storageGrantAccessBtn) {
+      storageGrantAccessBtn.addEventListener('click', async () => {
+        const key = document.getElementById('storage-access-key')?.value?.trim();
+        const peerId = document.getElementById('storage-access-peer')?.value?.trim();
+        const level = document.getElementById('storage-access-level')?.value;
+
+        if (!key || !peerId) {
+          this.addStorageLogEntry('❌ Error: Key and peer ID are required');
+          return;
+        }
+
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          const success = await this.mesh.distributedStorage.grantAccess(key, peerId, level);
+          if (success) {
+            this.addStorageLogEntry(`✅ Granted ${level} access to ${peerId.substring(0, 8)}... for key: ${key}`);
+          } else {
+            this.addStorageLogEntry('❌ Failed to grant access');
+          }
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error granting access: ${error.message}`);
+        }
+      });
+    }
+
+    if (storageRevokeAccessBtn) {
+      storageRevokeAccessBtn.addEventListener('click', async () => {
+        const key = document.getElementById('storage-revoke-key')?.value?.trim();
+        const peerId = document.getElementById('storage-revoke-peer')?.value?.trim();
+
+        if (!key || !peerId) {
+          this.addStorageLogEntry('❌ Error: Key and peer ID are required');
+          return;
+        }
+
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          const success = await this.mesh.distributedStorage.revokeAccess(key, peerId);
+          if (success) {
+            this.addStorageLogEntry(`✅ Revoked access from ${peerId.substring(0, 8)}... for key: ${key}`);
+          } else {
+            this.addStorageLogEntry('❌ Failed to revoke access');
+          }
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error revoking access: ${error.message}`);
+        }
+      });
+    }
+
+    // Bulk Operations
+    const storageListBtn = document.getElementById('storage-list-btn');
+    const storageBulkDeleteBtn = document.getElementById('storage-bulk-delete-btn');
+
+    if (storageListBtn) {
+      storageListBtn.addEventListener('click', async () => {
+        const prefix = document.getElementById('storage-prefix')?.value?.trim() || '';
+
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          const keys = await this.mesh.distributedStorage.listKeys(prefix);
+          if (keys.length > 0) {
+            this.addStorageLogEntry(`📋 Found ${keys.length} keys with prefix "${prefix}":`);
+            keys.forEach(key => {
+              this.addStorageLogEntry(`   • ${key}`);
+            });
+          } else {
+            this.addStorageLogEntry(`❌ No keys found with prefix "${prefix}"`);
+          }
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error listing keys: ${error.message}`);
+        }
+      });
+    }
+
+    if (storageBulkDeleteBtn) {
+      storageBulkDeleteBtn.addEventListener('click', async () => {
+        const prefix = document.getElementById('storage-prefix')?.value?.trim();
+
+        if (!prefix) {
+          this.addStorageLogEntry('❌ Error: Prefix is required for bulk delete');
+          return;
+        }
+
+        if (!confirm(`Are you sure you want to delete all keys with prefix "${prefix}"? This cannot be undone.`)) {
+          return;
+        }
+
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          const count = await this.mesh.distributedStorage.bulkDelete(prefix);
+          this.addStorageLogEntry(`🗑️ Bulk deleted ${count} keys with prefix "${prefix}"`);
+          this.updateStorageStatus();
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error bulk deleting: ${error.message}`);
+        }
+      });
+    }
+
+    // Search
+    const storageSearchBtn = document.getElementById('storage-search-btn');
+
+    if (storageSearchBtn) {
+      storageSearchBtn.addEventListener('click', async () => {
+        const query = document.getElementById('storage-search-query')?.value?.trim();
+        const type = document.getElementById('storage-search-type')?.value || 'key';
+
+        if (!query) {
+          this.addStorageLogEntry('❌ Error: Search query is required');
+          return;
+        }
+
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          const results = await this.mesh.distributedStorage.search(query, type);
+          if (results.length > 0) {
+            this.addStorageLogEntry(`🔍 Found ${results.length} results for "${query}" in ${type}:`);
+            results.forEach(result => {
+              this.addStorageLogEntry(`   • ${result.key}: ${JSON.stringify(result.value).substring(0, 100)}...`);
+            });
+          } else {
+            this.addStorageLogEntry(`❌ No results found for "${query}" in ${type}`);
+          }
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error searching: ${error.message}`);
+        }
+      });
+    }
+
+    // Backup/Restore
+    const storageBackupBtn = document.getElementById('storage-backup-btn');
+    const storageRestoreBtn = document.getElementById('storage-restore-btn');
+    const storageRestoreFile = document.getElementById('storage-restore-file');
+
+    if (storageBackupBtn) {
+      storageBackupBtn.addEventListener('click', async () => {
+        try {
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          const backup = await this.mesh.distributedStorage.backup();
+          const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `peerpigeon-storage-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+          a.click();
+
+          URL.revokeObjectURL(url);
+          this.addStorageLogEntry(`💾 Backup created with ${backup.items.length} items`);
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error creating backup: ${error.message}`);
+        }
+      });
+    }
+
+    if (storageRestoreBtn) {
+      storageRestoreBtn.addEventListener('click', () => {
+        storageRestoreFile?.click();
+      });
+    }
+
+    if (storageRestoreFile) {
+      storageRestoreFile.addEventListener('change', async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        try {
+          const text = await file.text();
+          const backup = JSON.parse(text);
+
+          if (!this.mesh.distributedStorage) {
+            this.addStorageLogEntry('❌ Error: Distributed storage not available');
+            return;
+          }
+
+          const result = await this.mesh.distributedStorage.restore(backup);
+          this.addStorageLogEntry(`📥 Restored ${result.restored} items (${result.failed} failed)`);
+          this.updateStorageStatus();
+        } catch (error) {
+          this.addStorageLogEntry(`❌ Error restoring backup: ${error.message}`);
+        }
+
+        // Clear the file input
+        e.target.value = '';
+      });
+    }
+  }
+
+  async handleStorageStore(isUpdate = false) {
+    const key = document.getElementById('storage-key')?.value?.trim();
+    const value = document.getElementById('storage-value')?.value?.trim();
+    const encrypt = document.getElementById('storage-encrypt')?.checked ?? true;
+    const isPublic = document.getElementById('storage-public')?.checked ?? false;
+    const immutable = document.getElementById('storage-immutable')?.checked ?? false;
+    const enableCrdt = document.getElementById('storage-crdt')?.checked ?? false;
+    const ttl = parseInt(document.getElementById('storage-ttl')?.value) || 0;
+
+    if (!key || !value) {
+      this.addStorageLogEntry('❌ Error: Both key and value are required');
+      return;
+    }
+
+    try {
+      if (!this.mesh.distributedStorage) {
+        this.addStorageLogEntry('❌ Error: Distributed storage not available');
+        return;
+      }
+
+      let parsedValue;
+      try {
+        parsedValue = JSON.parse(value);
+      } catch {
+        parsedValue = value; // Use as string if not valid JSON
+      }
+
+      const options = {
+        encrypt,
+        isPublic,
+        isImmutable: immutable,
+        enableCRDT: enableCrdt,
+        ttl: ttl > 0 ? ttl * 1000 : undefined // Convert to milliseconds
+      };
+
+      let success;
+      if (isUpdate) {
+        success = await this.mesh.distributedStorage.update(key, parsedValue, options);
+        if (success) {
+          this.addStorageLogEntry(`🔄 Updated: ${key} = ${JSON.stringify(parsedValue)}`);
+        } else {
+          this.addStorageLogEntry(`❌ Failed to update: ${key}`);
+        }
+      } else {
+        success = await this.mesh.distributedStorage.store(key, parsedValue, options);
+        if (success) {
+          this.addStorageLogEntry(`💾 Stored: ${key} = ${JSON.stringify(parsedValue)}`);
+        } else {
+          this.addStorageLogEntry(`❌ Failed to store: ${key}`);
+        }
+      }
+
+      if (success) {
+        const optionsStr = [];
+        if (encrypt) optionsStr.push('encrypted');
+        if (isPublic) optionsStr.push('public');
+        if (immutable) optionsStr.push('immutable');
+        if (enableCrdt) optionsStr.push('CRDT');
+        if (ttl > 0) optionsStr.push(`TTL: ${ttl}s`);
+
+        if (optionsStr.length > 0) {
+          this.addStorageLogEntry(`   Options: ${optionsStr.join(', ')}`);
+        }
+
+        this.updateStorageStatus();
+      }
+    } catch (error) {
+      this.addStorageLogEntry(`❌ Error ${isUpdate ? 'updating' : 'storing'} ${key}: ${error.message}`);
+    }
+  }
+
+  addStorageLogEntry(message) {
+    const logElement = document.getElementById('storage-log');
+    if (!logElement) return;
+
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+
+    logElement.appendChild(entry);
+    logElement.scrollTop = logElement.scrollHeight;
+
+    // Keep only last 100 entries
+    while (logElement.children.length > 100) {
+      logElement.removeChild(logElement.firstChild);
+    }
+  }
+
+  updateStorageStatus() {
+    if (!this.mesh.distributedStorage) {
+      document.getElementById('storage-status').textContent = 'Not Available';
+      document.getElementById('storage-item-count').textContent = '0';
+      document.getElementById('storage-total-size').textContent = '0 bytes';
+      return;
+    }
+
+    const isEnabled = this.mesh.distributedStorage.isEnabled();
+    document.getElementById('storage-status').textContent = isEnabled ? 'Enabled' : 'Disabled';
+
+    // Get storage stats if available
+    this.mesh.distributedStorage.getStats().then(stats => {
+      document.getElementById('storage-item-count').textContent = stats.itemCount.toString();
+      document.getElementById('storage-total-size').textContent = this.formatBytes(stats.totalSize);
+    }).catch(() => {
+      document.getElementById('storage-item-count').textContent = '0';
+      document.getElementById('storage-total-size').textContent = '0 bytes';
+    });
+  }
+
+  formatBytes(bytes) {
+    if (bytes === 0) return '0 bytes';
+    const k = 1024;
+    const sizes = ['bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   }
 
   setupCryptoControls() {
@@ -913,6 +1428,7 @@ export class PeerPigeonUI {
       'manual-connection',
       'settings',
       'dht',
+      'storage',
       'crypto',
       'media'
     ];
@@ -920,8 +1436,25 @@ export class PeerPigeonUI {
     sections.forEach(sectionId => {
       const toggle = document.getElementById(`${sectionId}-toggle`);
       const content = document.getElementById(`${sectionId}-content`);
+      const section = document.querySelector(`.${sectionId}`);
 
-      if (toggle && content) {
+      if (toggle && content && section) {
+        // Force all sections to start collapsed with multiple approaches
+        section.setAttribute('aria-expanded', 'false');
+        toggle.setAttribute('aria-expanded', 'false');
+
+        // Use multiple ways to hide the content
+        content.style.display = 'none';
+        content.style.visibility = 'hidden';
+        content.style.maxHeight = '0';
+        content.style.overflow = 'hidden';
+        content.classList.add('collapsed');
+
+        // Ensure the toggle button shows collapsed state
+        if (toggle.textContent && !toggle.textContent.includes('▶')) {
+          toggle.textContent = toggle.textContent.replace('▼', '▶');
+        }
+
         toggle.addEventListener('click', () => {
           this.toggleSection(sectionId);
         });
@@ -960,10 +1493,20 @@ export class PeerPigeonUI {
     }
 
     if (isExpanded) {
+      // Collapse - hide with multiple approaches
       content.style.display = 'none';
+      content.style.visibility = 'hidden';
+      content.style.maxHeight = '0';
+      content.style.overflow = 'hidden';
+      content.classList.add('collapsed');
       toggle.textContent = toggle.textContent.replace('▼', '▶');
     } else {
+      // Expand - show and reset styles
       content.style.display = 'block';
+      content.style.visibility = 'visible';
+      content.style.maxHeight = 'none';
+      content.style.overflow = 'visible';
+      content.classList.remove('collapsed');
       toggle.textContent = toggle.textContent.replace('▶', '▼');
     }
   }
@@ -2039,6 +2582,9 @@ export class PeerPigeonUI {
 
     // Update DHT status
     this.updateDHTStatus();
+
+    // Update storage status
+    this.updateStorageStatus();
   }
 
   updateStatus() {
