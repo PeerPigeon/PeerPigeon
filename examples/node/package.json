@@ -1,0 +1,17 @@
+{
+  "name": "peerpigeon-node-examples",
+  "version": "1.0.0",
+  "description": "Node.js examples for PeerPigeon distributed mesh networking",
+  "type": "module",
+  "scripts": {
+    "storage-test": "node storage-test.js",
+    "basic-example": "node basic-storage-example.js",
+    "test": "node storage-test.js"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "author": "PeerPigeon Contributors",
+  "license": "MIT"
+}

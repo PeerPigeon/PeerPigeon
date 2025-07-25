@@ -82,21 +82,68 @@ main {
     box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
 
-.connected-peers {
+/* Base styles for all collapsible sections */
+.discovered-peers,
+.connected-peers,
+.manual-connection,
+.settings,
+.media,
+.dht,
+.crypto,
+.storage {
     background: white;
     padding: 20px;
     border-radius: 8px;
     box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    display: flex;
-    flex-direction: column;
-    min-height: 300px;
+    margin-bottom: 20px;
 }
 
+/* Individual section color schemes */
+.discovered-peers {
+    border-left: 4px solid #3498db;
+}
+
+.discovered-peers .section-header h2 {
+    color: #3498db;
+    border-bottom: 2px solid #3498db;
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.discovered-peers .toggle-btn {
+    color: #3498db;
+}
+
+.discovered-peers .toggle-btn:hover {
+    color: #2980b9;
+}
+
+.connected-peers {
+    border-left: 4px solid #2ecc71;
+}
+
+.connected-peers .section-header h2 {
+    color: #2ecc71;
+    border-bottom: 2px solid #2ecc71;
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.connected-peers .toggle-btn {
+    color: #2ecc71;
+}
+
+.connected-peers .toggle-btn:hover {
+    color: #27ae60;
+}
+
+/* General h2 styling - overridden by specific section styles */
 h2 {
     margin-bottom: 15px;
-    color: #2c3e50;
-    border-bottom: 2px solid #ecf0f1;
-    padding-bottom: 5px;
 }
 
 .info-group,
@@ -112,7 +159,9 @@ label {
 }
 
 input[type="text"],
-input[type="url"] {
+input[type="url"],
+input[type="number"],
+textarea {
     width: 100%;
     padding: 10px;
     border: 2px solid #ecf0f1;
@@ -120,10 +169,13 @@ input[type="url"] {
     font-size: 14px;
     color: #333;
     transition: border-color 0.3s;
+    font-family: inherit;
 }
 
 input[type="text"]:focus,
-input[type="url"]:focus {
+input[type="url"]:focus,
+input[type="number"]:focus,
+textarea:focus {
     outline: none;
     border-color: #3498db;
 }
@@ -434,15 +486,45 @@ input[type="url"]:focus {
 }
 
 .manual-connection {
-    background: white;
-    padding: 20px;
-    border-radius: 8px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     border-left: 4px solid #e74c3c;
 }
 
-.manual-connection h2 {
+.manual-connection .section-header h2 {
     color: #e74c3c;
+    border-bottom: 2px solid #e74c3c;
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.manual-connection .toggle-btn {
+    color: #e74c3c;
+}
+
+.manual-connection .toggle-btn:hover {
+    color: #c0392b;
+}
+
+.settings {
+    border-left: 4px solid #95a5a6;
+}
+
+.settings .section-header h2 {
+    color: #95a5a6;
+    border-bottom: 2px solid #95a5a6;
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.settings .toggle-btn {
+    color: #95a5a6;
+}
+
+.settings .toggle-btn:hover {
+    color: #7f8c8d;
 }
 
 /* Make collapsed sections compact line items */
@@ -451,6 +533,8 @@ input[type="url"]:focus {
 .manual-connection[aria-expanded="false"],
 .connected-peers[aria-expanded="false"],
 .dht[aria-expanded="false"],
+.crypto[aria-expanded="false"],
+.storage[aria-expanded="false"],
 .media[aria-expanded="false"] {
     background: none !important;
     border: none !important;
@@ -467,38 +551,29 @@ input[type="url"]:focus {
 .connected-peers[aria-expanded="false"] .section-header,
 .dht[aria-expanded="false"] .section-header,
 .crypto[aria-expanded="false"] .section-header,
+.storage[aria-expanded="false"] .section-header,
 .media[aria-expanded="false"] .section-header {
     margin: 0;
     padding: 0;
 }
 
-.discovered-peers[aria-expanded="false"] h2, 
-.settings[aria-expanded="false"] h2,
-.manual-connection[aria-expanded="false"] h2,
-.connected-peers[aria-expanded="false"] h2,
-.dht[aria-expanded="false"] h2,
-.crypto[aria-expanded="false"] h2,
-.media[aria-expanded="false"] h2 {
-    border-bottom: none !important;
-    margin: 0 !important;
-    padding: 2px 0 !important;
+/* Collapsed sections preserve their colors but are more compact */
+.discovered-peers[aria-expanded="false"] .toggle-btn, 
+.settings[aria-expanded="false"] .toggle-btn,
+.manual-connection[aria-expanded="false"] .toggle-btn,
+.connected-peers[aria-expanded="false"] .toggle-btn,
+.media[aria-expanded="false"] .toggle-btn,
+.dht[aria-expanded="false"] .toggle-btn,
+.crypto[aria-expanded="false"] .toggle-btn,
+.storage[aria-expanded="false"] .toggle-btn {
     font-size: 0.9em !important;
-    color: #666 !important;
+    padding: 2px 8px !important;
 }
 
 /* Toggle functionality styles */
 .section-header {
     position: relative;
     margin: 10px 0 5px 0;
-}
-
-.section-header h2 {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 0;
-    font-size: 1.1em;
-    font-weight: 600;
 }
 
 .toggle-btn {
@@ -799,16 +874,24 @@ input[type="url"]:focus {
 
 /* Media Controls Styles */
 .media {
-    background: white;
-    padding: 20px;
-    border-radius: 8px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    margin-bottom: 20px;
     border-left: 4px solid #f39c12;
 }
 
-.media h2 {
+.media .section-header h2 {
     color: #f39c12;
+    border-bottom: 2px solid #f39c12;
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.media .toggle-btn {
+    color: #f39c12;
+}
+
+.media .toggle-btn:hover {
+    color: #e67e22;
 }
 
 .media-controls {
@@ -1003,16 +1086,24 @@ input[type="url"]:focus {
 
 /* DHT Styles */
 .dht {
-    background: white;
-    padding: 20px;
-    border-radius: 8px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    margin-bottom: 20px;
     border-left: 4px solid #9b59b6;
 }
 
-.dht h2 {
+.dht .section-header h2 {
     color: #9b59b6;
+    border-bottom: 2px solid #9b59b6;
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.dht .toggle-btn {
+    color: #9b59b6;
+}
+
+.dht .toggle-btn:hover {
+    color: #8e44ad;
 }
 
 .dht-actions {
@@ -1291,7 +1382,24 @@ input[type="url"]:focus {
 
 /* Crypto Section Styles */
 .crypto {
-    margin-bottom: 30px;
+    border-left: 4px solid #e67e22;
+}
+
+.crypto .section-header h2 {
+    color: #e67e22;
+    border-bottom: 2px solid #e67e22;
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.crypto .toggle-btn {
+    color: #e67e22;
+}
+
+.crypto .toggle-btn:hover {
+    color: #d35400;
 }
 
 .crypto-status .info-group {
@@ -1501,4 +1609,128 @@ input[type="url"]:focus {
     #crypto-public-key {
         max-width: 200px;
     }
+}
+
+/* Distributed Storage Styles */
+.storage {
+    border-left: 4px solid #17a2b8;
+}
+
+.storage .section-header h2 {
+    color: #17a2b8;
+    border-bottom: 2px solid #17a2b8;
+    padding-bottom: 8px;
+    margin-bottom: 20px;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.storage .toggle-btn {
+    color: #17a2b8;
+}
+
+.storage .toggle-btn:hover {
+    color: #138496;
+}
+
+.storage-status {
+    background: #f8f9fa;
+    padding: 15px;
+    border-radius: 6px;
+    margin-bottom: 20px;
+}
+
+.storage-controls {
+    margin-bottom: 20px;
+}
+
+.storage-operations {
+    margin-bottom: 20px;
+}
+
+.storage-options {
+    background: #f8f9fa;
+    padding: 15px;
+    border-radius: 6px;
+    margin: 15px 0;
+}
+
+.storage-options h4 {
+    margin-bottom: 15px;
+    color: #495057;
+}
+
+.storage-retrieve {
+    margin-bottom: 20px;
+}
+
+.storage-access {
+    margin-bottom: 20px;
+    background: #fff3cd;
+    padding: 15px;
+    border-radius: 6px;
+    border-left: 4px solid #ffc107;
+}
+
+.storage-access h3 {
+    color: #856404;
+    margin-bottom: 15px;
+}
+
+.storage-bulk {
+    margin-bottom: 20px;
+    background: #f8d7da;
+    padding: 15px;
+    border-radius: 6px;
+    border-left: 4px solid #dc3545;
+}
+
+.storage-bulk h3 {
+    color: #721c24;
+    margin-bottom: 15px;
+}
+
+.storage-search {
+    margin-bottom: 20px;
+}
+
+.storage-backup {
+    margin-bottom: 20px;
+    background: #d1ecf1;
+    padding: 15px;
+    border-radius: 6px;
+    border-left: 4px solid #0dcaf0;
+}
+
+.storage-backup h3 {
+    color: #055160;
+    margin-bottom: 15px;
+}
+
+.storage-results {
+    margin-top: 20px;
+}
+
+.storage-log {
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 6px;
+    padding: 15px;
+    height: 200px;
+    overflow-y: auto;
+    font-family: 'Monaco', 'Menlo', 'Consolas', monospace;
+    font-size: 0.9em;
+    line-height: 1.4;
+}
+
+.storage-log .log-entry {
+    margin-bottom: 5px;
+    padding: 2px 0;
+    word-wrap: break-word;
+}
+
+.storage-log:empty::before {
+    content: "No storage operations yet...";
+    color: #6c757d;
+    font-style: italic;
 }

@@ -11,6 +11,7 @@ import { GossipManager } from './GossipManager.js';
 import { MediaManager } from './MediaManager.js';
 import { WebDHT } from './WebDHT.js';
 import { CryptoManager } from './CryptoManager.js';
+import { DistributedStorageManager } from './DistributedStorageManager.js';
 import { environmentDetector } from './EnvironmentDetector.js';
 
 export class PeerPigeonMesh extends EventEmitter {
@@ -51,6 +52,7 @@ export class PeerPigeonMesh extends EventEmitter {
     this.signalingHandler = new SignalingHandler(this, this.connectionManager);
     this.gossipManager = new GossipManager(this, this.connectionManager);
     this.webDHT = null; // Will be initialized after peerId is set
+    this.distributedStorage = null; // Will be initialized after WebDHT is set
 
     // Initialize crypto manager if enabled
     this.cryptoManager = null;
@@ -250,6 +252,13 @@ export class PeerPigeonMesh extends EventEmitter {
 
         // Setup WebDHT event handlers now that it's initialized
         this.setupWebDHTEventHandlers();
+
+        // Initialize DistributedStorageManager if WebDHT is enabled
+        this.distributedStorage = new DistributedStorageManager(this);
+        console.log('DistributedStorageManager initialized');
+
+        // Setup DistributedStorageManager event handlers
+        this.setupDistributedStorageEventHandlers();
       } else {
         console.log('WebDHT disabled by configuration');
       }
@@ -827,6 +836,38 @@ export class PeerPigeonMesh extends EventEmitter {
     if (this.webDHT) {
       this.webDHT.addEventListener('valueChanged', (data) => {
         this.emit('dhtValueChanged', data);
+      });
+    }
+  }
+
+  /**
+   * Setup event handlers for DistributedStorageManager
+   */
+  setupDistributedStorageEventHandlers() {
+    // Only set up if distributedStorage exists
+    if (this.distributedStorage) {
+      this.distributedStorage.addEventListener('dataStored', (data) => {
+        this.emit('storageDataStored', data);
+      });
+
+      this.distributedStorage.addEventListener('dataRetrieved', (data) => {
+        this.emit('storageDataRetrieved', data);
+      });
+
+      this.distributedStorage.addEventListener('dataUpdated', (data) => {
+        this.emit('storageDataUpdated', data);
+      });
+
+      this.distributedStorage.addEventListener('dataDeleted', (data) => {
+        this.emit('storageDataDeleted', data);
+      });
+
+      this.distributedStorage.addEventListener('accessGranted', (data) => {
+        this.emit('storageAccessGranted', data);
+      });
+
+      this.distributedStorage.addEventListener('accessRevoked', (data) => {
+        this.emit('storageAccessRevoked', data);
       });
     }
   }

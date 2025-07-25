@@ -484,6 +484,169 @@
                 </div>
             </div>
 
+            <div class="storage" aria-expanded="false">
+                <div class="section-header">
+                    <h2>
+                        <button id="storage-toggle" class="toggle-btn" aria-expanded="false">
+                            ▶ Distributed Storage - Encrypted P2P Storage Layer
+                        </button>
+                    </h2>
+                </div>
+                <div id="storage-content" class="collapsible-content" style="display: none;">
+                    <!-- Storage Status -->
+                    <div class="storage-status">
+                        <h3>Storage Status</h3>
+                        <div class="info-group">
+                            <label>Storage Layer:</label>
+                            <span id="storage-status">Disabled</span>
+                        </div>
+                        <div class="info-group">
+                            <label>Stored Items:</label>
+                            <span id="storage-item-count">0</span>
+                        </div>
+                        <div class="info-group">
+                            <label>Total Size:</label>
+                            <span id="storage-total-size">0 bytes</span>
+                        </div>
+                    </div>
+
+                    <!-- Storage Controls -->
+                    <div class="storage-controls">
+                        <h3>Storage Controls</h3>
+                        <div class="button-group">
+                            <button id="storage-enable-btn" class="btn primary">Enable Storage</button>
+                            <button id="storage-disable-btn" class="btn warning">Disable Storage</button>
+                            <button id="storage-clear-btn" class="btn quaternary">Clear All</button>
+                        </div>
+                    </div>
+
+                    <!-- Store Data -->
+                    <div class="storage-operations">
+                        <h3>Store Data</h3>
+                        <div class="input-group">
+                            <label for="storage-key">Key:</label>
+                            <input type="text" id="storage-key" placeholder="Storage key">
+                        </div>
+                        <div class="input-group">
+                            <label for="storage-value">Value:</label>
+                            <textarea id="storage-value" placeholder="Data to store (JSON or text)" rows="3"></textarea>
+                        </div>
+                        
+                        <!-- Storage Options -->
+                        <div class="storage-options">
+                            <h4>Storage Options</h4>
+                            <div class="input-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="storage-encrypt" checked>
+                                    <span class="checkmark"></span>
+                                    Encrypt data
+                                </label>
+                            </div>
+                            <div class="input-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="storage-public">
+                                    <span class="checkmark"></span>
+                                    Public access (readable by anyone)
+                                </label>
+                            </div>
+                            <div class="input-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="storage-immutable">
+                                    <span class="checkmark"></span>
+                                    Immutable (cannot be updated)
+                                </label>
+                            </div>
+                            <div class="input-group">
+                                <label class="checkbox-label">
+                                    <input type="checkbox" id="storage-crdt">
+                                    <span class="checkmark"></span>
+                                    Enable CRDT (conflict-free updates)
+                                </label>
+                            </div>
+                            <div class="input-group">
+                                <label for="storage-ttl">TTL (seconds, 0 = no expiration):</label>
+                                <input type="number" id="storage-ttl" value="0" min="0">
+                            </div>
+                        </div>
+                        
+                        <div class="button-group">
+                            <button id="storage-store-btn" class="btn primary">Store Data</button>
+                            <button id="storage-update-btn" class="btn secondary">Update Data</button>
+                        </div>
+                    </div>
+
+                    <!-- Retrieve Data -->
+                    <div class="storage-retrieve">
+                        <h3>Retrieve Data</h3>
+                        <div class="input-group horizontal">
+                            <input type="text" id="storage-get-key" placeholder="Key to retrieve">
+                            <button id="storage-get-btn" class="btn secondary">Get Data</button>
+                            <button id="storage-delete-btn" class="btn warning">Delete</button>
+                        </div>
+                    </div>
+
+                    <!-- Access Control -->
+                    <div class="storage-access">
+                        <h3>Access Control</h3>
+                        <div class="input-group horizontal">
+                            <input type="text" id="storage-access-key" placeholder="Key for access control">
+                            <input type="text" id="storage-access-peer" placeholder="Peer ID to grant access">
+                            <select id="storage-access-level">
+                                <option value="read">Read</option>
+                                <option value="write">Write</option>
+                                <option value="admin">Admin</option>
+                            </select>
+                            <button id="storage-grant-access-btn" class="btn tertiary">Grant Access</button>
+                        </div>
+                        <div class="input-group horizontal">
+                            <input type="text" id="storage-revoke-key" placeholder="Key for access revocation">
+                            <input type="text" id="storage-revoke-peer" placeholder="Peer ID to revoke access">
+                            <button id="storage-revoke-access-btn" class="btn quaternary">Revoke Access</button>
+                        </div>
+                    </div>
+
+                    <!-- Bulk Operations -->
+                    <div class="storage-bulk">
+                        <h3>Bulk Operations</h3>
+                        <div class="input-group horizontal">
+                            <input type="text" id="storage-prefix" placeholder="Key prefix for bulk operations">
+                            <button id="storage-list-btn" class="btn tertiary">List Keys</button>
+                            <button id="storage-bulk-delete-btn" class="btn warning">Bulk Delete</button>
+                        </div>
+                    </div>
+
+                    <!-- Search -->
+                    <div class="storage-search">
+                        <h3>Search</h3>
+                        <div class="input-group horizontal">
+                            <input type="text" id="storage-search-query" placeholder="Search query">
+                            <select id="storage-search-type">
+                                <option value="key">Search Keys</option>
+                                <option value="value">Search Values</option>
+                                <option value="metadata">Search Metadata</option>
+                            </select>
+                            <button id="storage-search-btn" class="btn tertiary">Search</button>
+                        </div>
+                    </div>
+
+                    <!-- Backup/Restore -->
+                    <div class="storage-backup">
+                        <h3>Backup & Restore</h3>
+                        <div class="button-group">
+                            <button id="storage-backup-btn" class="btn tertiary">Create Backup</button>
+                            <button id="storage-restore-btn" class="btn tertiary">Restore from Backup</button>
+                        </div>
+                        <input type="file" id="storage-restore-file" accept=".json" style="display: none;">
+                    </div>
+
+                    <!-- Storage Log -->
+                    <div class="storage-results">
+                        <h3>Storage Operations Log</h3>
+                        <div id="storage-log" class="storage-log"></div>
+                    </div>
+                </div>
+            </div>
+
             <div class="messages">
                 <h2>Messages</h2>
                 <div class="input-group horizontal">

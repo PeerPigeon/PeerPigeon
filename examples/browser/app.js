@@ -3,10 +3,11 @@ import { PeerPigeonUI } from './ui.js';
 
 class PeerPigeonApp {
   constructor() {
-    // Initialize mesh with crypto and WebDHT enabled
+    // Initialize mesh with crypto, WebDHT, and distributed storage enabled
     this.mesh = new PeerPigeonMesh({
       enableWebDHT: true,
-      enableCrypto: true
+      enableCrypto: true,
+      enableDistributedStorage: true
     });
 
     this.ui = new PeerPigeonUI(this.mesh);
