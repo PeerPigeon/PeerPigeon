@@ -644,6 +644,94 @@
                         <h3>Storage Operations Log</h3>
                         <div id="storage-log" class="storage-log"></div>
                     </div>
+
+                    <!-- Lexical Storage Interface -->
+                    <div class="lexical-storage">
+                        <h3>🔗 Lexical Storage Interface (GUN-like API)</h3>
+                        <p class="feature-description">Chain operations like: <code>storage.get('users').get('alice').put({name: 'Alice'})</code></p>
+                        
+                        <!-- Lexical Operations -->
+                        <div class="lexical-operations">
+                            <h4>Chain Operations</h4>
+                            <div class="input-group">
+                                <label for="lexical-path">Path (dot notation):</label>
+                                <input type="text" id="lexical-path" placeholder="users.alice" value="demo.user1">
+                            </div>
+                            <div class="input-group">
+                                <label for="lexical-data">Data (JSON):</label>
+                                <textarea id="lexical-data" rows="3" placeholder='{"name": "Alice", "age": 30}'></textarea>
+                            </div>
+                            <div class="input-group">
+                                <label for="lexical-property">Property to get:</label>
+                                <input type="text" id="lexical-property" placeholder="name" value="name">
+                            </div>
+                            
+                            <div class="button-group">
+                                <button id="lexical-put-btn" class="btn primary">Put Data</button>
+                                <button id="lexical-get-btn" class="btn secondary">Get Property</button>
+                                <button id="lexical-val-btn" class="btn secondary">Get Full Object</button>
+                                <button id="lexical-update-btn" class="btn tertiary">Update</button>
+                                <button id="lexical-delete-btn" class="btn warning">Delete</button>
+                            </div>
+                        </div>
+
+                        <!-- Set Operations -->
+                        <div class="lexical-sets">
+                            <h4>Set Operations</h4>
+                            <div class="input-group">
+                                <label for="lexical-set-path">Set Path:</label>
+                                <input type="text" id="lexical-set-path" placeholder="users.alice.friends" value="demo.friends">
+                            </div>
+                            <div class="input-group">
+                                <label for="lexical-set-data">Set Data (JSON object):</label>
+                                <textarea id="lexical-set-data" rows="2" placeholder='{"bob": {"name": "Bob"}, "charlie": {"name": "Charlie"}}'></textarea>
+                            </div>
+                            
+                            <div class="button-group">
+                                <button id="lexical-set-btn" class="btn primary">Set Data</button>
+                                <button id="lexical-map-btn" class="btn secondary">Map & Log</button>
+                            </div>
+                        </div>
+
+                        <!-- Property Access Demo -->
+                        <div class="lexical-proxy">
+                            <h4>Property Access (Proxy)</h4>
+                            <div class="input-group">
+                                <label for="lexical-proxy-path">Property Path:</label>
+                                <input type="text" id="lexical-proxy-path" placeholder="users.alice.settings.theme" value="demo.settings.theme">
+                            </div>
+                            <div class="input-group">
+                                <label for="lexical-proxy-value">Value:</label>
+                                <input type="text" id="lexical-proxy-value" placeholder="dark" value="dark">
+                            </div>
+                            
+                            <div class="button-group">
+                                <button id="lexical-proxy-set-btn" class="btn primary">Set via Proxy</button>
+                                <button id="lexical-proxy-get-btn" class="btn secondary">Get via Proxy</button>
+                            </div>
+                        </div>
+
+                        <!-- Utility Operations -->
+                        <div class="lexical-utils">
+                            <h4>Utility Methods</h4>
+                            <div class="input-group">
+                                <label for="lexical-util-path">Path:</label>
+                                <input type="text" id="lexical-util-path" placeholder="demo.user1" value="demo.user1">
+                            </div>
+                            
+                            <div class="button-group">
+                                <button id="lexical-exists-btn" class="btn tertiary">Check Exists</button>
+                                <button id="lexical-keys-btn" class="btn tertiary">Get Keys</button>
+                                <button id="lexical-path-btn" class="btn tertiary">Get Path</button>
+                            </div>
+                        </div>
+
+                        <!-- Lexical Results -->
+                        <div class="lexical-results">
+                            <h4>Lexical Operations Results</h4>
+                            <div id="lexical-log" class="storage-log"></div>
+                        </div>
+                    </div>
                 </div>
             </div>
 

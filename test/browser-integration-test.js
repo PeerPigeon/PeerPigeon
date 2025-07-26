@@ -1060,6 +1060,162 @@ class BrowserIntegrationTest {
       return { testPassed: false, error: error.message };
     }
   }
+
+  /**
+   * Test lexical storage interface
+   */
+  async testLexicalStorageInterface() {
+    console.log('🔗 Testing lexical storage interface...');
+    try {
+      const testPage = this.pages[0];
+
+      // Test basic lexical operations
+      const basicResult = await testPage.evaluate(async () => {
+        try {
+          const meshInstance = window.peerPigeonMesh || window.mesh;
+          if (!meshInstance || !meshInstance.distributedStorage) {
+            return { success: false, error: 'No distributed storage available' };
+          }
+
+          const lex = meshInstance.distributedStorage.lexical();
+
+          // Test basic put/get
+          const user = lex.get('test-users').get('alice');
+          await user.put({ name: 'Alice', age: 30, city: 'New York' });
+
+          const name = await user.get('name').val();
+          const age = await user.get('age').val();
+
+          if (name !== 'Alice' || age !== 30) {
+            return { success: false, error: `Expected Alice/30, got ${name}/${age}` };
+          }
+
+          // Test object reconstruction
+          const fullUser = await user.val();
+          if (!fullUser || fullUser.name !== 'Alice' || fullUser.age !== 30) {
+            return { success: false, error: 'Object reconstruction failed' };
+          }
+
+          return { success: true, user: fullUser };
+        } catch (error) {
+          return { success: false, error: error.message };
+        }
+      });
+
+      if (!basicResult.success) {
+        throw new Error(`Basic lexical operations failed: ${basicResult.error}`);
+      }
+
+      console.log('✅ Basic lexical operations passed');
+
+      // Test property access via proxy
+      const proxyResult = await testPage.evaluate(async () => {
+        try {
+          const meshInstance = window.peerPigeonMesh || window.mesh;
+          const lex = meshInstance.distributedStorage.lexical();
+
+          // Test proxy-based property access
+          const settings = lex.users.bob.settings;
+          await settings.put({ theme: 'dark', language: 'en' });
+
+          const theme = await settings.theme.val();
+          const language = await settings.language.val();
+
+          if (theme !== 'dark' || language !== 'en') {
+            return { success: false, error: `Expected dark/en, got ${theme}/${language}` };
+          }
+
+          return { success: true };
+        } catch (error) {
+          return { success: false, error: error.message };
+        }
+      });
+
+      if (!proxyResult.success) {
+        throw new Error(`Property access failed: ${proxyResult.error}`);
+      }
+
+      console.log('✅ Property access via proxy passed');
+
+      // Test set operations
+      const setResult = await testPage.evaluate(async () => {
+        try {
+          const meshInstance = window.peerPigeonMesh || window.mesh;
+          const lex = meshInstance.distributedStorage.lexical();
+
+          const friends = lex.get('users').get('charlie').get('friends');
+          await friends.set({
+            alice: { name: 'Alice', status: 'online' },
+            bob: { name: 'Bob', status: 'offline' }
+          });
+
+          // Verify set data was stored
+          const setData = await meshInstance.distributedStorage.retrieve('users:charlie:friends:_set');
+          if (!setData || !setData.alice || !setData.bob) {
+            return { success: false, error: 'Set data not stored correctly' };
+          }
+
+          return { success: true, setData };
+        } catch (error) {
+          return { success: false, error: error.message };
+        }
+      });
+
+      if (!setResult.success) {
+        throw new Error(`Set operations failed: ${setResult.error}`);
+      }
+
+      console.log('✅ Set operations passed');
+
+      // Test utility methods
+      const utilityResult = await testPage.evaluate(async () => {
+        try {
+          const meshInstance = window.peerPigeonMesh || window.mesh;
+          const lex = meshInstance.distributedStorage.lexical();
+
+          const testObj = lex.get('test').get('object');
+          await testObj.put({ prop1: 'value1', prop2: 'value2' });
+
+          // Test exists
+          const exists = await testObj.exists();
+          if (!exists) {
+            return { success: false, error: 'exists() should return true' };
+          }
+
+          // Test keys
+          const keys = await testObj.keys();
+          if (!keys.includes('prop1') || !keys.includes('prop2')) {
+            return { success: false, error: 'keys() did not return expected keys' };
+          }
+
+          // Test getPath
+          const path = testObj.getPath();
+          if (path !== 'test:object') {
+            return { success: false, error: `Expected path 'test:object', got '${path}'` };
+          }
+
+          return { success: true, keys, path };
+        } catch (error) {
+          return { success: false, error: error.message };
+        }
+      });
+
+      if (!utilityResult.success) {
+        throw new Error(`Utility methods failed: ${utilityResult.error}`);
+      }
+
+      console.log('✅ Utility methods passed');
+
+      console.log('\n✅ LEXICAL STORAGE INTERFACE TEST PASSED');
+      this.recordTestResult('Lexical Storage Interface', true);
+      return { success: true };
+    } catch (error) {
+      console.error('❌ Lexical storage interface test failed:', error.message);
+      this.recordTestResult('Lexical Storage Interface', false, error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
   /**
    * Test manual peer connection
    */
@@ -1240,6 +1396,7 @@ class BrowserIntegrationTest {
       await this.test2WayMediaStreaming(); // Test bidirectional streaming capabilities
       await this.testCrypto();
       await this.testDistributedStorage();
+      await this.testLexicalStorageInterface();
       await this.testManualConnection();
       await this.testSettings();
       await this.testHealthCheck();
