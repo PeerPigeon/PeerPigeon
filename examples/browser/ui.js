@@ -916,6 +916,370 @@ export class PeerPigeonUI {
         e.target.value = '';
       });
     }
+
+    // Setup Lexical Storage Interface
+    this.setupLexicalStorageControls();
+  }
+
+  setupLexicalStorageControls() {
+    // Chain Operations
+    const lexicalPutBtn = document.getElementById('lexical-put-btn');
+    const lexicalGetBtn = document.getElementById('lexical-get-btn');
+    const lexicalValBtn = document.getElementById('lexical-val-btn');
+    const lexicalUpdateBtn = document.getElementById('lexical-update-btn');
+    const lexicalDeleteBtn = document.getElementById('lexical-delete-btn');
+
+    // Set Operations
+    const lexicalSetBtn = document.getElementById('lexical-set-btn');
+    const lexicalMapBtn = document.getElementById('lexical-map-btn');
+
+    // Property Access
+    const lexicalProxySetBtn = document.getElementById('lexical-proxy-set-btn');
+    const lexicalProxyGetBtn = document.getElementById('lexical-proxy-get-btn');
+
+    // Utility Operations
+    const lexicalExistsBtn = document.getElementById('lexical-exists-btn');
+    const lexicalKeysBtn = document.getElementById('lexical-keys-btn');
+    const lexicalPathBtn = document.getElementById('lexical-path-btn');
+
+    // Chain Operations Event Handlers
+    if (lexicalPutBtn) {
+      lexicalPutBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-path')?.value?.trim();
+        const data = document.getElementById('lexical-data')?.value?.trim();
+
+        if (!path || !data) {
+          this.addLexicalLogEntry('❌ Error: Both path and data are required');
+          return;
+        }
+
+        try {
+          const parsedData = JSON.parse(data);
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          await current.put(parsedData);
+          this.addLexicalLogEntry(`✅ Put data at path: ${path}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    if (lexicalGetBtn) {
+      lexicalGetBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-path')?.value?.trim();
+        const property = document.getElementById('lexical-property')?.value?.trim();
+
+        if (!path || !property) {
+          this.addLexicalLogEntry('❌ Error: Both path and property are required');
+          return;
+        }
+
+        try {
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          const value = await current.get(property).val();
+          this.addLexicalLogEntry(`📄 ${path}.${property}: ${JSON.stringify(value)}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    if (lexicalValBtn) {
+      lexicalValBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-path')?.value?.trim();
+
+        if (!path) {
+          this.addLexicalLogEntry('❌ Error: Path is required');
+          return;
+        }
+
+        try {
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          const value = await current.val();
+          this.addLexicalLogEntry(`📄 Full object at ${path}: ${JSON.stringify(value, null, 2)}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    if (lexicalUpdateBtn) {
+      lexicalUpdateBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-path')?.value?.trim();
+        const data = document.getElementById('lexical-data')?.value?.trim();
+
+        if (!path || !data) {
+          this.addLexicalLogEntry('❌ Error: Both path and data are required');
+          return;
+        }
+
+        try {
+          const parsedData = JSON.parse(data);
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          await current.update(parsedData);
+          this.addLexicalLogEntry(`✅ Updated data at path: ${path}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    if (lexicalDeleteBtn) {
+      lexicalDeleteBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-path')?.value?.trim();
+
+        if (!path) {
+          this.addLexicalLogEntry('❌ Error: Path is required');
+          return;
+        }
+
+        try {
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          await current.delete();
+          this.addLexicalLogEntry(`✅ Deleted data at path: ${path}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    // Set Operations Event Handlers
+    if (lexicalSetBtn) {
+      lexicalSetBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-set-path')?.value?.trim();
+        const data = document.getElementById('lexical-set-data')?.value?.trim();
+
+        if (!path || !data) {
+          this.addLexicalLogEntry('❌ Error: Both path and data are required');
+          return;
+        }
+
+        try {
+          const parsedData = JSON.parse(data);
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          await current.set(parsedData);
+          this.addLexicalLogEntry(`✅ Set data at path: ${path}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    if (lexicalMapBtn) {
+      lexicalMapBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-set-path')?.value?.trim();
+
+        if (!path) {
+          this.addLexicalLogEntry('❌ Error: Path is required');
+          return;
+        }
+
+        try {
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          const mapResults = [];
+          const unsubscribe = current.map().on((value, key) => {
+            mapResults.push({ key, value });
+            this.addLexicalLogEntry(`🗺️ Map result - ${key}: ${JSON.stringify(value)}`);
+          });
+
+          // Stop mapping after a short delay
+          setTimeout(() => {
+            if (unsubscribe) unsubscribe();
+            this.addLexicalLogEntry(`✅ Map operation completed with ${mapResults.length} results`);
+          }, 1000);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    // Property Access Event Handlers
+    if (lexicalProxySetBtn) {
+      lexicalProxySetBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-proxy-path')?.value?.trim();
+        const value = document.getElementById('lexical-proxy-value')?.value?.trim();
+
+        if (!path || !value) {
+          this.addLexicalLogEntry('❌ Error: Both path and value are required');
+          return;
+        }
+
+        try {
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          // Use proxy property access
+          let current = lex;
+          for (const part of pathParts.slice(0, -1)) {
+            current = current[part];
+          }
+
+          const lastPart = pathParts[pathParts.length - 1];
+          await current[lastPart].put(value);
+
+          this.addLexicalLogEntry(`✅ Set via proxy: ${path} = ${value}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    if (lexicalProxyGetBtn) {
+      lexicalProxyGetBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-proxy-path')?.value?.trim();
+
+        if (!path) {
+          this.addLexicalLogEntry('❌ Error: Path is required');
+          return;
+        }
+
+        try {
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          // Use proxy property access
+          let current = lex;
+          for (const part of pathParts.slice(0, -1)) {
+            current = current[part];
+          }
+
+          const lastPart = pathParts[pathParts.length - 1];
+          const value = await current[lastPart].val();
+
+          this.addLexicalLogEntry(`📄 Proxy get ${path}: ${JSON.stringify(value)}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    // Utility Operations Event Handlers
+    if (lexicalExistsBtn) {
+      lexicalExistsBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-util-path')?.value?.trim();
+
+        if (!path) {
+          this.addLexicalLogEntry('❌ Error: Path is required');
+          return;
+        }
+
+        try {
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          const exists = await current.exists();
+          this.addLexicalLogEntry(`🔍 ${path} exists: ${exists}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    if (lexicalKeysBtn) {
+      lexicalKeysBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-util-path')?.value?.trim();
+
+        if (!path) {
+          this.addLexicalLogEntry('❌ Error: Path is required');
+          return;
+        }
+
+        try {
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          const keys = await current.keys();
+          this.addLexicalLogEntry(`🔑 Keys at ${path}: [${keys.join(', ')}]`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
+
+    if (lexicalPathBtn) {
+      lexicalPathBtn.addEventListener('click', async () => {
+        const path = document.getElementById('lexical-util-path')?.value?.trim();
+
+        if (!path) {
+          this.addLexicalLogEntry('❌ Error: Path is required');
+          return;
+        }
+
+        try {
+          const lex = this.mesh.distributedStorage.lexical();
+          const pathParts = path.split('.');
+
+          let current = lex;
+          for (const part of pathParts) {
+            current = current.get(part);
+          }
+
+          const fullPath = current.getPath();
+          this.addLexicalLogEntry(`🛤️ Full storage path: ${fullPath}`);
+        } catch (error) {
+          this.addLexicalLogEntry(`❌ Error: ${error.message}`);
+        }
+      });
+    }
   }
 
   async handleStorageStore(isUpdate = false) {
@@ -991,6 +1355,23 @@ export class PeerPigeonUI {
 
   addStorageLogEntry(message) {
     const logElement = document.getElementById('storage-log');
+    if (!logElement) return;
+
+    const entry = document.createElement('div');
+    entry.className = 'log-entry';
+    entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+
+    logElement.appendChild(entry);
+    logElement.scrollTop = logElement.scrollHeight;
+
+    // Keep only last 100 entries
+    while (logElement.children.length > 100) {
+      logElement.removeChild(logElement.firstChild);
+    }
+  }
+
+  addLexicalLogEntry(message) {
+    const logElement = document.getElementById('lexical-log');
     if (!logElement) return;
 
     const entry = document.createElement('div');

@@ -1,5 +1,6 @@
 import { EventEmitter } from './EventEmitter.js';
 import DebugLogger from './DebugLogger.js';
+import { createLexicalInterface } from './LexicalStorageInterface.js';
 
 // Dynamic import for unsea to handle both Node.js and browser environments
 let unsea = null;
@@ -403,6 +404,10 @@ export class DistributedStorageManager extends EventEmitter {
    * @returns {Promise<boolean>} Success status
    */
   async store(key, value, options = {}) {
+    if (!this.enabled) {
+      return false;
+    }
+
     if (!this.webDHT) {
       throw new Error('WebDHT not available - ensure it is enabled in mesh configuration');
     }
@@ -1697,5 +1702,21 @@ export class DistributedStorageManager extends EventEmitter {
     }
 
     return results;
+  }
+
+  /**
+   * Get a lexical interface for GUN-like chaining
+   * @returns {Proxy} Lexical interface
+   */
+  lexical() {
+    return createLexicalInterface(this);
+  }
+
+  /**
+   * Alias for lexical() - more GUN-like naming
+   * @returns {Proxy} Lexical interface
+   */
+  gun() {
+    return this.lexical();
   }
 }

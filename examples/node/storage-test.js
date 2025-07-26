@@ -387,20 +387,154 @@ class StorageTest {
   }
 
   async testStorageToggle() {
-    await this.runTest('Storage Enable/Disable', async () => {
-      // Test disable
-      await this.storage.disable();
+    await this.runTest('Storage Toggle', async () => {
+      const key = 'test-toggle';
+      const value = { test: true };
+
+      // Store when enabled
+      await this.storage.store(key, value);
+      let retrieved = await this.storage.retrieve(key);
+      if (JSON.stringify(retrieved) !== JSON.stringify(value)) {
+        throw new Error('Failed to store when enabled');
+      }
+
+      // Disable storage
+      this.storage.disable();
       if (this.storage.isEnabled()) {
         throw new Error('Storage should be disabled');
       }
 
-      // Test enable
-      await this.storage.enable();
+      // Operations should fail or return null when disabled
+      const disabledResult = await this.storage.store('disabled-key', { test: true });
+      if (disabledResult !== false) {
+        throw new Error('Store should fail when disabled');
+      }
+
+      // Re-enable storage
+      this.storage.enable();
       if (!this.storage.isEnabled()) {
         throw new Error('Storage should be enabled');
       }
 
-      console.log('   Storage successfully toggled enabled/disabled');
+      // Should work again
+      retrieved = await this.storage.retrieve(key);
+      if (JSON.stringify(retrieved) !== JSON.stringify(value)) {
+        throw new Error('Failed to retrieve after re-enabling');
+      }
+
+      console.log('   Storage toggle functionality verified');
+    });
+  }
+
+  async testLexicalInterface() {
+    await this.runTest('Lexical Interface - Basic Operations', async () => {
+      const lex = this.storage.lexical();
+
+      // Test basic put/get
+      const user = lex.get('users').get('alice');
+      await user.put({ name: 'Alice', age: 30, city: 'New York' });
+
+      const name = await user.get('name').val();
+      if (name !== 'Alice') {
+        throw new Error(`Expected 'Alice', got '${name}'`);
+      }
+
+      const age = await user.get('age').val();
+      if (age !== 30) {
+        throw new Error(`Expected 30, got ${age}`);
+      }
+
+      // Test object reconstruction
+      const fullUser = await user.val();
+      if (!fullUser || fullUser.name !== 'Alice' || fullUser.age !== 30 || fullUser.city !== 'New York') {
+        throw new Error('Object reconstruction failed');
+      }
+
+      console.log('   Basic lexical operations verified');
+    });
+
+    await this.runTest('Lexical Interface - Set Operations', async () => {
+      const lex = this.storage.lexical();
+      const friends = lex.get('users').get('bob').get('friends');
+
+      // Test set operations
+      await friends.set({
+        alice: { name: 'Alice', status: 'online' },
+        charlie: { name: 'Charlie', status: 'offline' }
+      });
+
+      // Verify set data was stored
+      const setData = await this.storage.retrieve('users:bob:friends:_set');
+      if (!setData || !setData.alice || !setData.charlie) {
+        throw new Error('Set data not stored correctly');
+      }
+
+      console.log('   Set operations verified');
+    });
+
+    await this.runTest('Lexical Interface - Property Access', async () => {
+      const lex = this.storage.lexical();
+
+      // Test proxy-based property access
+      const settings = lex.users.alice.settings;
+      await settings.put({ theme: 'dark', language: 'en' });
+
+      const theme = await settings.theme.val();
+      if (theme !== 'dark') {
+        throw new Error(`Expected 'dark', got '${theme}'`);
+      }
+
+      console.log('   Property access verified');
+    });
+
+    await this.runTest('Lexical Interface - Update and Delete', async () => {
+      const lex = this.storage.lexical();
+      const profile = lex.get('profiles').get('user1');
+
+      // Test update
+      await profile.put({ name: 'John', age: 25 });
+      await profile.update({ age: 26, city: 'Boston' });
+
+      const updatedProfile = await profile.val();
+      if (updatedProfile.age !== 26 || updatedProfile.city !== 'Boston' || updatedProfile.name !== 'John') {
+        throw new Error('Update operation failed');
+      }
+
+      // Test delete
+      await profile.delete();
+      const deletedProfile = await profile.val();
+      if (deletedProfile !== null) {
+        throw new Error('Delete operation failed');
+      }
+
+      console.log('   Update and delete operations verified');
+    });
+
+    await this.runTest('Lexical Interface - Utility Methods', async () => {
+      const lex = this.storage.lexical();
+      const testObj = lex.get('test').get('object');
+
+      await testObj.put({ prop1: 'value1', prop2: 'value2', prop3: 'value3' });
+
+      // Test exists
+      const exists = await testObj.exists();
+      if (!exists) {
+        throw new Error('exists() should return true');
+      }
+
+      // Test keys
+      const keys = await testObj.keys();
+      if (!keys.includes('prop1') || !keys.includes('prop2') || !keys.includes('prop3')) {
+        throw new Error('keys() did not return expected keys');
+      }
+
+      // Test getPath
+      const path = testObj.getPath();
+      if (path !== 'test:object') {
+        throw new Error(`Expected path 'test:object', got '${path}'`);
+      }
+
+      console.log('   Utility methods verified');
     });
   }
 
@@ -427,6 +561,7 @@ class StorageTest {
     await this.testBackupAndRestore();
     await this.testStatistics();
     await this.testStorageToggle();
+    await this.testLexicalInterface();
     await this.testCleanup();
 
     this.printSummary();
