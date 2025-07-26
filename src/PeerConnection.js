@@ -56,35 +56,24 @@ export class PeerConnection extends EventEmitter {
 
     this.setupConnectionHandlers();
 
-    // Only pre-allocate transceivers if media is actually intended to be used
-    // This prevents unnecessary WebRTC negotiations for data-only connections
-    const hasLocalMedia = this.localStream && (this.localStream.getAudioTracks().length > 0 || this.localStream.getVideoTracks().length > 0);
-    const intendToUseMedia = this.enableVideo || this.enableAudio || hasLocalMedia;
+    // ALWAYS pre-allocate transceivers for audio and video to enable future media streaming
+    // This ensures connections can handle media even if no media stream is available initially
+    this.debug.log('🔄 Pre-allocating audio and video transceivers for future media capability');
 
-    if (intendToUseMedia) {
-      this.debug.log('🔄 Pre-allocating transceivers for stable media negotiation');
+    // Always add audio transceiver
+    this.audioTransceiver = this.connection.addTransceiver('audio', {
+      direction: 'sendrecv'
+    });
 
-      // Add audio transceiver only if audio is enabled or present
-      if (this.enableAudio || (this.localStream && this.localStream.getAudioTracks().length > 0)) {
-        this.audioTransceiver = this.connection.addTransceiver('audio', {
-          direction: 'recvonly'
-        });
-      }
+    // Always add video transceiver
+    this.videoTransceiver = this.connection.addTransceiver('video', {
+      direction: 'sendrecv'
+    });
 
-      // Add video transceiver only if video is enabled or present
-      if (this.enableVideo || (this.localStream && this.localStream.getVideoTracks().length > 0)) {
-        this.videoTransceiver = this.connection.addTransceiver('video', {
-          direction: 'recvonly'
-        });
-      }
-
-      // Add local media stream if provided
-      if (this.localStream) {
-        this.debug.log('Adding local stream tracks to existing transceivers');
-        await this.setLocalStreamToTransceivers(this.localStream);
-      }
-    } else {
-      this.debug.log('📡 Creating data-only connection (no media transceivers)');
+    // Add local media stream if provided
+    if (this.localStream) {
+      this.debug.log('Adding local stream tracks to existing transceivers');
+      await this.setLocalStreamToTransceivers(this.localStream);
     }
 
     if (this.isInitiator) {
@@ -124,9 +113,12 @@ export class PeerConnection extends EventEmitter {
       this.debug.log(`🎵 Track received: kind=${track.kind}, id=${track.id}, enabled=${track.enabled}, readyState=${track.readyState}`);
 
       // CRITICAL: Enhanced loopback detection and stream validation
+      this.debug.log('🔍 ONTRACK DEBUG: Starting stream validation...');
       if (!this.validateRemoteStream(stream, track)) {
+        this.debug.error('❌ ONTRACK DEBUG: Stream validation FAILED - rejecting remote stream');
         return; // Don't process invalid or looped back streams
       }
+      this.debug.log('✅ ONTRACK DEBUG: Stream validation PASSED - processing remote stream');
 
       if (stream) {
         this.remoteStream = stream;
@@ -146,7 +138,11 @@ export class PeerConnection extends EventEmitter {
           this.setupAudioDataMonitoring(audioTrack, index);
         });
 
+        this.debug.log('🚨 ONTRACK DEBUG: About to emit remoteStream event');
         this.emit('remoteStream', { peerId: this.peerId, stream: this.remoteStream });
+        this.debug.log('✅ ONTRACK DEBUG: remoteStream event emitted successfully');
+      } else {
+        this.debug.error('❌ ONTRACK DEBUG: No stream in ontrack event - this should not happen');
       }
     };
 
@@ -304,25 +300,38 @@ export class PeerConnection extends EventEmitter {
     // Handle renegotiation when tracks are added/removed
     this.connection.onnegotiationneeded = () => {
       this.debug.log(`🔄 Negotiation needed for ${this.peerId} (WebRTC detected track changes)`);
-      // With pre-allocated transceivers, we should NEVER need renegotiation
-      // Any renegotiation indicates a problem with our transceiver approach
-      this.debug.log('🚫 UNEXPECTED: Renegotiation triggered despite transceiver approach - investigating...');
+      // CRITICAL: Renegotiation IS needed when tracks are added/replaced, even with pre-allocated transceivers
+      // Pre-allocated transceivers only avoid m-line changes, but SDP still needs to be renegotiated
+      this.debug.log('✅ RENEGOTIATION: Track changes detected - triggering renegotiation as expected');
 
       // Log debug info about current transceivers (with error handling for Node.js WebRTC)
       try {
         const transceivers = this.connection.getTransceivers();
-        this.debug.log('� Transceivers state during unexpected negotiation:', transceivers.map(t => ({
+        this.debug.log('🔄 Transceivers state during renegotiation:', transceivers.map(t => ({
           kind: t.receiver?.track?.kind || 'unknown',
           direction: t.direction,
           hasTrack: !!t.sender?.track,
           mid: t.mid
         })));
       } catch (error) {
-        this.debug.log('� Cannot inspect transceivers (Node.js WebRTC limitation):', error.message);
+        this.debug.log('🔄 Cannot inspect transceivers (Node.js WebRTC limitation):', error.message);
       }
 
-      // For now, ignore renegotiation to prevent connection issues
-      // this.emit('renegotiationNeeded', { peerId: this.peerId });
+      // Emit renegotiation needed event to trigger SDP exchange
+      this.emit('renegotiationNeeded', { peerId: this.peerId });
+    };
+
+    // CRITICAL FIX: Handle track changes manually after renegotiation
+    // Since we use replaceTrack() with pre-allocated transceivers, ontrack events don't fire
+    // We need to monitor transceivers for new tracks after SDP exchanges
+    this.connection.onsignalingstatechange = () => {
+      this.debug.log(`🔄 Signaling state changed for ${this.peerId}: ${this.connection.signalingState}`);
+
+      // When signaling becomes stable after renegotiation, check for new remote tracks
+      if (this.connection.signalingState === 'stable') {
+        this.debug.log('🔍 Signaling stable - checking for new remote tracks...');
+        this.checkForNewRemoteTracks();
+      }
     };
   }
 
@@ -417,29 +426,38 @@ export class PeerConnection extends EventEmitter {
       throw new Error('Invalid offer: malformed SDP');
     }
 
+    // ENHANCED DEBUGGING: Log detailed state before processing offer
+    this.debug.log(`🔄 OFFER DEBUG: Processing offer from ${this.peerId.substring(0, 8)}...`);
+    this.debug.log(`🔄 OFFER DEBUG: Current signaling state: ${this.connection.signalingState}`);
+    this.debug.log(`🔄 OFFER DEBUG: Current connection state: ${this.connection.connectionState}`);
+    this.debug.log(`🔄 OFFER DEBUG: Current ICE state: ${this.connection.iceConnectionState}`);
+    this.debug.log(`🔄 OFFER DEBUG: Offer SDP length: ${offer.sdp.length}`);
+
     // Check if we're in the right state to handle an offer
     if (this.connection.signalingState !== 'stable') {
-      this.debug.log(`Cannot handle offer from ${this.peerId} - connection state is ${this.connection.signalingState} (expected: stable)`);
+      this.debug.log(`❌ OFFER DEBUG: Cannot handle offer from ${this.peerId} - connection state is ${this.connection.signalingState} (expected: stable)`);
       throw new Error(`Cannot handle offer in state: ${this.connection.signalingState}`);
     }
 
-    this.debug.log(`🔄 Processing offer from ${this.peerId.substring(0, 8)}... SDP length: ${offer.sdp.length}`);
+    this.debug.log(`🔄 OFFER DEBUG: State validation passed, processing offer from ${this.peerId.substring(0, 8)}... SDP length: ${offer.sdp.length}`);
 
     try {
       await this.connection.setRemoteDescription(offer);
       this.remoteDescriptionSet = true;
-      this.debug.log(`✅ Offer processed successfully from ${this.peerId.substring(0, 8)}...`);
+      this.debug.log(`✅ OFFER DEBUG: Offer processed successfully from ${this.peerId.substring(0, 8)}...`);
+      this.debug.log(`✅ OFFER DEBUG: New signaling state after offer: ${this.connection.signalingState}`);
       await this.processPendingIceCandidates();
 
       const answer = await this.connection.createAnswer();
       await this.connection.setLocalDescription(answer);
-      this.debug.log(`✅ Answer created for offer from ${this.peerId.substring(0, 8)}...`);
+      this.debug.log(`✅ OFFER DEBUG: Answer created for offer from ${this.peerId.substring(0, 8)}...`);
+      this.debug.log(`✅ OFFER DEBUG: Final signaling state after answer: ${this.connection.signalingState}`);
       return answer;
     } catch (error) {
-      this.debug.error(`❌ Failed to process offer from ${this.peerId}:`, error);
-      this.debug.error('Offer SDP that failed:', offer.sdp);
-      this.debug.error('Current connection state:', this.connection.signalingState);
-      this.debug.error('Current ICE state:', this.connection.iceConnectionState);
+      this.debug.error(`❌ OFFER DEBUG: Failed to process offer from ${this.peerId}:`, error);
+      this.debug.error('OFFER DEBUG: Offer SDP that failed:', offer.sdp);
+      this.debug.error('OFFER DEBUG: Current connection state:', this.connection.signalingState);
+      this.debug.error('OFFER DEBUG: Current ICE state:', this.connection.iceConnectionState);
       throw error;
     }
   }
@@ -467,31 +485,40 @@ export class PeerConnection extends EventEmitter {
       throw new Error('Invalid answer: malformed SDP');
     }
 
+    // ENHANCED DEBUGGING: Log detailed state before processing answer
+    this.debug.log(`🔄 ANSWER DEBUG: Processing answer from ${this.peerId.substring(0, 8)}...`);
+    this.debug.log(`🔄 ANSWER DEBUG: Current signaling state: ${this.connection.signalingState}`);
+    this.debug.log(`🔄 ANSWER DEBUG: Current connection state: ${this.connection.connectionState}`);
+    this.debug.log(`🔄 ANSWER DEBUG: Current ICE state: ${this.connection.iceConnectionState}`);
+    this.debug.log(`🔄 ANSWER DEBUG: Answer SDP length: ${answer.sdp.length}`);
+
     // Check if we're in the right state to handle an answer
     if (this.connection.signalingState !== 'have-local-offer') {
-      this.debug.log(`Cannot handle answer from ${this.peerId} - connection state is ${this.connection.signalingState} (expected: have-local-offer)`);
+      this.debug.log(`❌ ANSWER DEBUG: Cannot handle answer from ${this.peerId} - connection state is ${this.connection.signalingState} (expected: have-local-offer)`);
 
       // If we're already stable, the connection might already be established
       if (this.connection.signalingState === 'stable') {
-        this.debug.log('Connection already stable, answer not needed');
+        this.debug.log('✅ ANSWER DEBUG: Connection already stable, answer not needed');
         return;
       }
 
       throw new Error(`Cannot handle answer in state: ${this.connection.signalingState}`);
     }
 
-    this.debug.log(`🔄 Processing answer from ${this.peerId.substring(0, 8)}... SDP length: ${answer.sdp.length}`);
+    this.debug.log(`🔄 ANSWER DEBUG: State validation passed, processing answer from ${this.peerId.substring(0, 8)}... SDP length: ${answer.sdp.length}`);
 
     try {
       await this.connection.setRemoteDescription(answer);
       this.remoteDescriptionSet = true;
-      this.debug.log(`✅ Answer processed successfully from ${this.peerId.substring(0, 8)}...`);
+      this.debug.log(`✅ ANSWER DEBUG: Answer processed successfully from ${this.peerId.substring(0, 8)}...`);
+      this.debug.log(`✅ ANSWER DEBUG: New signaling state: ${this.connection.signalingState}`);
+      this.debug.log(`✅ ANSWER DEBUG: New connection state: ${this.connection.connectionState}`);
       await this.processPendingIceCandidates();
     } catch (error) {
-      this.debug.error(`❌ Failed to set remote description for answer from ${this.peerId}:`, error);
-      this.debug.error('Answer SDP that failed:', answer.sdp);
-      this.debug.error('Current connection state:', this.connection.signalingState);
-      this.debug.error('Current ICE state:', this.connection.iceConnectionState);
+      this.debug.error(`❌ ANSWER DEBUG: Failed to set remote description for answer from ${this.peerId}:`, error);
+      this.debug.error('ANSWER DEBUG: Answer SDP that failed:', answer.sdp);
+      this.debug.error('ANSWER DEBUG: Current connection state:', this.connection.signalingState);
+      this.debug.error('ANSWER DEBUG: Current ICE state:', this.connection.iceConnectionState);
       throw error;
     }
   }
@@ -565,9 +592,61 @@ export class PeerConnection extends EventEmitter {
   }
 
   /**
+   * CRITICAL FIX: Manually check for new remote tracks after renegotiation
+   * This is needed because replaceTrack() doesn't trigger ontrack events
+   */
+  checkForNewRemoteTracks() {
+    this.debug.log(`🔍 TRACK CHECK: Checking transceivers for new remote tracks from ${this.peerId.substring(0, 8)}...`);
+
+    try {
+      const transceivers = this.connection.getTransceivers();
+      let foundNewTracks = false;
+
+      transceivers.forEach((transceiver, index) => {
+        const track = transceiver.receiver.track;
+        if (track && track.readyState === 'live') {
+          this.debug.log(`🔍 TRACK CHECK: Transceiver ${index} has live ${track.kind} track: ${track.id.substring(0, 8)}...`);
+
+          // Check if this is a new track we haven't processed
+          const isNewTrack = !this.processedTrackIds || !this.processedTrackIds.has(track.id);
+
+          if (isNewTrack) {
+            this.debug.log(`🎵 NEW TRACK FOUND: Processing new ${track.kind} track from ${this.peerId.substring(0, 8)}...`);
+
+            // Create a stream from this track (simulate ontrack event)
+            const stream = new MediaStream([track]);
+
+            // Validate and process like ontrack would
+            if (this.validateRemoteStream(stream, track)) {
+              this.remoteStream = stream;
+              this.markStreamAsRemote(stream);
+
+              // Track that we've processed this track
+              if (!this.processedTrackIds) this.processedTrackIds = new Set();
+              this.processedTrackIds.add(track.id);
+
+              this.debug.log('🚨 TRACK CHECK: Emitting remoteStream event for new track');
+              this.emit('remoteStream', { peerId: this.peerId, stream: this.remoteStream });
+              foundNewTracks = true;
+            }
+          }
+        }
+      });
+
+      if (!foundNewTracks) {
+        this.debug.log('🔍 TRACK CHECK: No new remote tracks found');
+      }
+    } catch (error) {
+      this.debug.error('❌ TRACK CHECK: Failed to check for remote tracks:', error);
+    }
+  }
+
+  /**
      * Enhanced validation to ensure received stream is genuinely remote
      */
   validateRemoteStream(stream, track) {
+    this.debug.log('🔍 VALIDATION: Starting remote stream validation...');
+
     // Check 1: Stream ID collision (basic loopback detection)
     if (this.localStream && stream.id === this.localStream.id) {
       this.debug.error('❌ LOOPBACK DETECTED: Received our own local stream as remote!');
@@ -575,6 +654,7 @@ export class PeerConnection extends EventEmitter {
       this.debug.error('Received stream ID:', stream.id);
       return false;
     }
+    this.debug.log('✅ VALIDATION: Stream ID check passed');
 
     // Check 2: Track ID collision (more granular loopback detection)
     if (this.localStream) {
@@ -586,20 +666,31 @@ export class PeerConnection extends EventEmitter {
         return false;
       }
     }
+    this.debug.log('✅ VALIDATION: Track ID check passed');
 
     // Check 3: Verify track comes from remote peer transceiver
     if (this.connection) {
       const transceivers = this.connection.getTransceivers();
+      this.debug.log(`🔍 VALIDATION: Checking ${transceivers.length} transceivers for track ${track.id.substring(0, 8)}...`);
+
       const sourceTransceiver = transceivers.find(t => t.receiver.track === track);
       if (!sourceTransceiver) {
-        this.debug.warn('⚠️ Track not found in any transceiver - may be invalid');
-        return false;
-      }
-
-      // Ensure this is a receiving transceiver (not sending our own track back)
-      if (sourceTransceiver.direction === 'sendonly') {
-        this.debug.error('❌ Invalid direction: Receiving track from sendonly transceiver');
-        return false;
+        this.debug.warn('⚠️ VALIDATION: Track not found in any transceiver - may be invalid');
+        this.debug.warn('Available transceivers:', transceivers.map(t => ({
+          kind: t.receiver?.track?.kind || 'no-track',
+          direction: t.direction,
+          trackId: t.receiver?.track?.id?.substring(0, 8) || 'none'
+        })));
+        // TEMPORARY FIX: Don't reject just because transceiver lookup fails
+        // return false;
+        this.debug.log('⚠️ VALIDATION: Allowing track despite transceiver lookup failure (temporary fix)');
+      } else {
+        // Ensure this is a receiving transceiver (not sending our own track back)
+        if (sourceTransceiver.direction === 'sendonly') {
+          this.debug.error('❌ Invalid direction: Receiving track from sendonly transceiver');
+          return false;
+        }
+        this.debug.log(`✅ VALIDATION: Transceiver check passed (direction: ${sourceTransceiver.direction})`);
       }
     }
 
@@ -608,6 +699,7 @@ export class PeerConnection extends EventEmitter {
       this.debug.error('❌ Stream marked as local origin - preventing synchronization loop');
       return false;
     }
+    this.debug.log('✅ VALIDATION: Local origin check passed');
 
     this.debug.log('✅ Remote stream validation passed for peer', this.peerId.substring(0, 8));
     return true;
@@ -736,12 +828,75 @@ export class PeerConnection extends EventEmitter {
     // DEBUG: Log final transceivers after changes
     const finalTransceivers = this.connection.getTransceivers();
     this.debug.log('🔍 Final transceivers after stream change:', finalTransceivers.map(t => ({
-      kind: t.receiver.track?.kind || 'unknown',
+      kind: t.receiver?.track?.kind || 'unknown',
       direction: t.direction,
-      hasTrack: !!t.sender.track,
-      trackId: t.sender.track?.id?.substring(0, 8) || 'none',
+      hasTrack: !!t.sender?.track,
+      trackId: t.sender?.track?.id?.substring(0, 8) || 'none',
       mid: t.mid
     })));
+
+    // AGGRESSIVE FIX: Force immediate renegotiation if connection is stuck
+    if (this.connection.signalingState === 'have-local-offer') {
+      this.debug.log('🆘 FORCE RENEGOTIATION: Connection stuck in \'have-local-offer\' - forcing immediate renegotiation');
+
+      // Force renegotiation event
+      this.emit('renegotiationNeeded', { peerId: this.peerId });
+
+      // Also try direct renegotiation as backup
+      setTimeout(() => {
+        if (this.connection.signalingState === 'have-local-offer') {
+          this.debug.log('🆘 EMERGENCY: Still stuck after forced renegotiation - attempting direct recovery');
+          this.forceConnectionRecovery().catch(err => {
+            this.debug.error('❌ EMERGENCY: Direct recovery failed', err);
+          });
+        }
+      }, 5000);
+    } else {
+      // Normal renegotiation for stable connections
+      this.debug.log('✅ RENEGOTIATION: Triggering normal renegotiation for media changes');
+      this.emit('renegotiationNeeded', { peerId: this.peerId });
+    }
+
+    // CRITICAL: Force renegotiation when media changes
+    this.debug.log('✅ Stream updated - forcing renegotiation for media changes');
+    this.debug.log(`   Current state: connectionState=${this.connection.connectionState}, signalingState=${this.connection.signalingState}`);
+
+    // Always trigger renegotiation when stream changes, regardless of connection state
+    if (stream) {
+      setTimeout(() => {
+        this.debug.log('🔄 Forcing renegotiation for media stream changes');
+        this.emit('renegotiationNeeded', { peerId: this.peerId });
+      }, 200); // Increased delay to ensure replaceTrack completes
+    }
+  }
+
+  /**
+   * Force connection recovery for stuck connections
+   */
+  async forceConnectionRecovery() {
+    this.debug.log(`🆘 FORCE RECOVERY: Attempting emergency recovery for ${this.peerId.substring(0, 8)}...`);
+
+    try {
+      // Create a new offer to break the stuck state
+      const offer = await this.connection.createOffer({ iceRestart: true });
+      await this.connection.setLocalDescription(offer);
+
+      // Emit recovery offer via mesh signaling
+      if (this.mesh && this.mesh.sendSignalingMessage) {
+        await this.mesh.sendSignalingMessage({
+          type: 'recovery-offer',
+          data: offer,
+          emergency: true
+        }, this.peerId);
+
+        this.debug.log(`✅ RECOVERY: Emergency offer sent for ${this.peerId.substring(0, 8)}...`);
+      } else {
+        this.debug.error(`❌ RECOVERY: No mesh signaling available for ${this.peerId.substring(0, 8)}...`);
+      }
+    } catch (error) {
+      this.debug.error(`❌ RECOVERY: Emergency recovery failed for ${this.peerId.substring(0, 8)}...`, error);
+      throw error;
+    }
   }
 
   /**

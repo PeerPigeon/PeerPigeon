@@ -96,23 +96,44 @@ export class PeerPigeonMesh extends EventEmitter {
         this._handleMeshSignalingMessage(data.message, data.from);
         return; // Don't emit as regular message
       }
-      
+
       // Handle crypto key exchange messages
       if (data.message && (data.message.type === 'key_exchange' || data.message.type === 'key_exchange_response')) {
         this._handleKeyExchange(data.message, data.from);
         return; // Don't emit as regular message
       }
-      
+
       this.emit('messageReceived', data);
+    });
+
+    // CRITICAL: Handle remote stream announcements from gossip
+    // When we hear about a stream from an indirectly connected peer,
+    // establish a direct connection to receive the media
+    this.addEventListener('remoteStreamAnnouncement', (data) => {
+      this._handleRemoteStreamAnnouncement(data);
     });
 
     // Forward media events
     this.mediaManager.addEventListener('localStreamStarted', (data) => {
       this.emit('localStreamStarted', data);
+      // Gossip stream start announcement to all peers in the mesh
+      this.gossipManager.broadcastMessage({
+        event: 'streamStarted',
+        peerId: this.peerId,
+        hasVideo: data.hasVideo,
+        hasAudio: data.hasAudio,
+        timestamp: Date.now()
+      }, 'mediaEvent');
     });
 
     this.mediaManager.addEventListener('localStreamStopped', () => {
       this.emit('localStreamStopped');
+      // Gossip stream stop announcement to all peers in the mesh
+      this.gossipManager.broadcastMessage({
+        event: 'streamStopped',
+        peerId: this.peerId,
+        timestamp: Date.now()
+      }, 'mediaEvent');
     });
 
     this.mediaManager.addEventListener('error', (data) => {
@@ -669,8 +690,31 @@ export class PeerPigeonMesh extends EventEmitter {
 
       // Update all existing peer connections with the new stream
       const connections = this.connectionManager.getAllConnections();
+      this.debug.log(`📡 MEDIA START: Applying stream to ${connections.length} connections`);
+
       for (const connection of connections) {
+        this.debug.log(`📡 MEDIA START: Setting stream for peer ${connection.peerId.substring(0, 8)}...`);
         await connection.setLocalStream(stream);
+
+        // FORCE IMMEDIATE RENEGOTIATION: Don't wait for the automatic trigger
+        this.debug.log(`📡 MEDIA START: Forcing immediate renegotiation for peer ${connection.peerId.substring(0, 8)}...`);
+        setTimeout(async () => {
+          try {
+            if (connection.connection && connection.connection.signalingState === 'stable') {
+              // Create and send a renegotiation offer immediately
+              const offer = await connection.createOffer();
+              await this.sendSignalingMessage({
+                type: 'renegotiation-offer',
+                data: offer,
+                timestamp: Date.now(),
+                forced: true // Mark as forced renegotiation
+              }, connection.peerId);
+              this.debug.log(`✅ MEDIA START: Forced renegotiation offer sent to ${connection.peerId.substring(0, 8)}...`);
+            }
+          } catch (error) {
+            this.debug.error(`❌ MEDIA START: Failed to force renegotiation for ${connection.peerId.substring(0, 8)}...`, error);
+          }
+        }, 500); // Small delay to ensure setLocalStream completes
       }
 
       return stream;
@@ -1165,36 +1209,56 @@ export class PeerPigeonMesh extends EventEmitter {
   }
 
   /**
-   * Send a signaling message, preferring mesh over WebSocket when possible
+   * Send a signaling message, using mesh connections for renegotiation
    * @param {Object} message - The signaling message
    * @param {string} targetPeerId - Target peer ID (optional)
    * @returns {Promise<boolean>} Success status
    */
   async sendSignalingMessage(message, targetPeerId = null) {
-    // For initial connection and peer discovery, use WebSocket if available
-    const isInitialConnectionMessage = message.type === 'offer' || message.type === 'answer' ||
-                                     message.type === 'ice-candidate' || message.type === 'announce';
-    
-    // If we have mesh connectivity and this isn't an initial connection message, use mesh
-    if (this.connected && this.connectionManager.getConnectedPeerCount() > 0 && !isInitialConnectionMessage) {
-      this.debug.log(`📡 Using mesh signaling for ${message.type} (${this.connectionManager.getConnectedPeerCount()} peers connected)`);
-      return await this.sendMeshSignalingMessage(message, targetPeerId);
+    // CRITICAL FIX: Use mesh for renegotiation, WebSocket only for initial handshake
+    const isRenegotiation = message.type === 'renegotiation-offer' || message.type === 'renegotiation-answer';
+
+    if (isRenegotiation && targetPeerId) {
+      // Use existing mesh connection for renegotiation
+      this.debug.log(`🔄 MESH RENEGOTIATION: Sending ${message.type} via mesh to ${targetPeerId.substring(0, 8)}...`);
+
+      const peerConnection = this.connectionManager.getPeer(targetPeerId);
+      if (peerConnection && peerConnection.sendMessage) {
+        const success = peerConnection.sendMessage({
+          type: 'signaling',
+          data: message,
+          fromPeerId: this.peerId,
+          timestamp: Date.now()
+        });
+
+        if (success) {
+          this.debug.log(`✅ MESH RENEGOTIATION: ${message.type} sent via mesh to ${targetPeerId.substring(0, 8)}...`);
+          return true;
+        } else {
+          this.debug.error(`❌ MESH RENEGOTIATION: Failed to send ${message.type} via mesh to ${targetPeerId.substring(0, 8)}...`);
+        }
+      } else {
+        this.debug.error(`❌ MESH RENEGOTIATION: No mesh connection to ${targetPeerId.substring(0, 8)}... for ${message.type}`);
+      }
+
+      // Fall back to WebSocket if mesh fails
+      this.debug.log(`🔄 FALLBACK: Using WebSocket for ${message.type} to ${targetPeerId.substring(0, 8)}...`);
     }
-    
-    // Fall back to WebSocket signaling
+
+    // Use WebSocket for initial offers/answers and fallback
     if (this.signalingClient && this.signalingClient.isConnected()) {
-      this.debug.log(`📡 Using WebSocket signaling for ${message.type} (mesh: ${this.connected}, peers: ${this.connectionManager.getConnectedPeerCount()})`);
-      
+      this.debug.log(`📡 Using WebSocket signaling for ${message.type} to ${targetPeerId?.substring(0, 8) || 'broadcast'}`);
+
       // Include targetPeerId in the message if provided
       const messageWithTarget = { ...message };
       if (targetPeerId) {
         messageWithTarget.targetPeerId = targetPeerId;
       }
-      
+
       return await this.signalingClient.sendSignalingMessage(messageWithTarget);
     }
-    
-    this.debug.warn(`📡 Cannot send signaling message ${message.type} - no connectivity (mesh: ${this.connected}, WebSocket: ${this.signalingClient?.isConnected()})`);
+
+    this.debug.warn(`📡 Cannot send signaling message ${message.type} - WebSocket not connected and mesh failed`);
     return false;
   }
 
@@ -1427,5 +1491,26 @@ export class PeerPigeonMesh extends EventEmitter {
         }
       }
     }
+  }
+
+  /**
+   * Handle remote stream announcements from gossip protocol
+   * The actual stream forwarding is handled by ConnectionManager
+   * @param {Object} data - Stream announcement data
+   * @private
+   */
+  async _handleRemoteStreamAnnouncement(data) {
+    const { peerId, event } = data;
+
+    // Don't process our own announcements
+    if (peerId === this.peerId) {
+      return;
+    }
+
+    this.debug.log(`🎵 GOSSIP STREAM: Received stream announcement - ${event} from ${peerId.substring(0, 8)}...`);
+
+    // Stream forwarding is now handled automatically by ConnectionManager
+    // when remoteStream events are received, so we just emit for UI handling
+    this.emit('remoteStreamAnnouncement', data);
   }
 }

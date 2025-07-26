@@ -285,11 +285,24 @@ wss.on('connection', (ws, req) => {
         case 'offer':
         case 'answer':
         case 'ice-candidate': {
+          // CRITICAL DEBUG: Log answer routing details
+          if (type === 'answer') {
+            console.log('🔍 WEBSOCKET DEBUG: Received answer message:', {
+              type,
+              fromPeerId: peerId?.substring(0, 8) + '...',
+              targetPeerId: targetPeerId?.substring(0, 8) + '...',
+              hasTargetPeerId: !!targetPeerId,
+              hasData: !!messageData
+            });
+          }
+
           // Handle WebRTC signaling - this is the server's primary purpose
           if (targetPeerId) {
             const success = sendToSpecificPeer(targetPeerId, responseMessage);
             if (!success) {
               console.log(`⚠️  Failed to send ${type} to ${targetPeerId.substring(0, 8)}... (peer not found)`);
+            } else if (type === 'answer') {
+              console.log(`✅ WEBSOCKET DEBUG: Answer successfully routed to ${targetPeerId.substring(0, 8)}...`);
             }
           } else {
             console.log(`⚠️  ${type} message missing targetPeerId`);

@@ -154,7 +154,7 @@ class StorageSpacesTest {
   async testSpaceSeparation() {
     await this.runTest('Space Separation Protection', async () => {
       const baseKey = 'protected-key';
-      
+
       // Store in private space first
       await this.storage.store(baseKey, { space: 'private', data: 'secret' });
 
@@ -222,7 +222,7 @@ class StorageSpacesTest {
         // This should work now
         await this.storage.store('enforcement-test', { data: 'private' });
         await this.storage.store('enforcement-test', { data: 'public' }, { space: 'public' });
-        
+
         console.log('   ✓ Space enforcement can be disabled');
       } finally {
         // Re-enable for other tests
