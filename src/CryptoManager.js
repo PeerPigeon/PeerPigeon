@@ -1,4 +1,5 @@
 import { EventEmitter } from './EventEmitter.js';
+import DebugLogger from './DebugLogger.js';
 
 // Dynamic import for unsea to handle both Node.js and browser environments
 let unsea = null;
@@ -49,6 +50,7 @@ async function initializeUnsea() {
 export class CryptoManager extends EventEmitter {
   constructor() {
     super();
+    this.debug = DebugLogger.create('CryptoManager');
     this.unsea = null;
     this.keypair = null;
     this.peerKeys = new Map(); // Store peer public keys
@@ -99,7 +101,7 @@ export class CryptoManager extends EventEmitter {
 
       return this.keypair;
     } catch (error) {
-      console.error('CryptoManager initialization failed:', error);
+      this.debug.error('CryptoManager initialization failed:', error);
       this.emit('cryptoError', { error: error.message });
       throw error;
     }
@@ -128,7 +130,7 @@ export class CryptoManager extends EventEmitter {
           }
         } catch (error) {
           // Fallback to generating ephemeral keys
-          console.warn('Failed to use persistent storage, generating ephemeral keys:', error);
+          this.debug.warn('Failed to use persistent storage, generating ephemeral keys:', error);
           this.keypair = await this.unsea.generateRandomPair();
         }
       } else {
@@ -138,7 +140,7 @@ export class CryptoManager extends EventEmitter {
 
       this.emit('userAuthenticated', { alias, publicKey: this.getPublicKey() });
     } catch (error) {
-      console.error('User authentication failed:', error);
+      this.debug.error('User authentication failed:', error);
       throw error;
     }
   }
@@ -260,7 +262,7 @@ export class CryptoManager extends EventEmitter {
 
       return result;
     } catch (error) {
-      console.error('Peer encryption failed:', error);
+      this.debug.error('Peer encryption failed:', error);
       throw error;
     }
   }
@@ -296,7 +298,7 @@ export class CryptoManager extends EventEmitter {
 
       return parsed;
     } catch (error) {
-      console.error('Peer decryption failed:', error);
+      this.debug.error('Peer decryption failed:', error);
       throw error;
     }
   }
@@ -313,7 +315,7 @@ export class CryptoManager extends EventEmitter {
       const serialized = typeof data === 'string' ? data : JSON.stringify(data);
       return await this.unsea.signMessage(serialized, this.keypair.priv);
     } catch (error) {
-      console.error('Signing failed:', error);
+      this.debug.error('Signing failed:', error);
       throw error;
     }
   }
@@ -332,7 +334,7 @@ export class CryptoManager extends EventEmitter {
       const serialized = typeof data === 'string' ? data : JSON.stringify(data);
       return await this.unsea.verifyMessage(serialized, signature, publicKey);
     } catch (error) {
-      console.error('Signature verification failed:', error);
+      this.debug.error('Signature verification failed:', error);
       return false;
     }
   }
@@ -355,7 +357,7 @@ export class CryptoManager extends EventEmitter {
       this.emit('groupKeyGenerated', { groupId, publicKey: groupKey.pub });
       return groupKeyWithMeta;
     } catch (error) {
-      console.error('Group key generation failed:', error);
+      this.debug.error('Group key generation failed:', error);
       throw error;
     }
   }
@@ -407,7 +409,7 @@ export class CryptoManager extends EventEmitter {
 
       return result;
     } catch (error) {
-      console.error('Group encryption failed:', error);
+      this.debug.error('Group encryption failed:', error);
       throw error;
     }
   }
@@ -447,7 +449,7 @@ export class CryptoManager extends EventEmitter {
 
       return parsed;
     } catch (error) {
-      console.error('Group decryption failed:', error);
+      this.debug.error('Group decryption failed:', error);
       throw error;
     }
   }
@@ -471,7 +473,7 @@ export class CryptoManager extends EventEmitter {
         const hashArray = Array.from(new Uint8Array(hashBuffer));
         return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').substring(0, 16);
       } catch (error) {
-        console.warn('Could not use crypto.subtle for nonce generation:', error);
+        this.debug.warn('Could not use crypto.subtle for nonce generation:', error);
       }
     }
 
@@ -556,18 +558,18 @@ export class CryptoManager extends EventEmitter {
       return results;
     }
 
-    console.log('🔍 Debug: unsea object:', this.unsea);
-    console.log('🔍 Debug: available methods:', Object.keys(this.unsea));
+    this.debug.log('🔍 Debug: unsea object:', this.unsea);
+    this.debug.log('🔍 Debug: available methods:', Object.keys(this.unsea));
 
     try {
       // Test keypair generation
-      console.log('🧪 Testing keypair generation...');
+      this.debug.log('🧪 Testing keypair generation...');
       const testKeypair = await this.unsea.generateRandomPair();
-      console.log('🔍 Generated keypair:', testKeypair);
+      this.debug.log('🔍 Generated keypair:', testKeypair);
       results.keypairGeneration = !!(testKeypair && (testKeypair.pub || testKeypair.publicKey));
 
       // Test encryption/decryption - create two keypairs to simulate peer-to-peer encryption
-      console.log('🧪 Testing encryption...');
+      this.debug.log('🧪 Testing encryption...');
       const testMessage = 'Hello, crypto world!';
 
       // Create a second keypair to simulate a peer
@@ -575,38 +577,38 @@ export class CryptoManager extends EventEmitter {
 
       // Encrypt from our keypair TO the peer keypair
       const encrypted = await this.unsea.encryptMessageWithMeta(testMessage, peerKeypair);
-      console.log('🔍 Encrypted result:', encrypted);
+      this.debug.log('🔍 Encrypted result:', encrypted);
       results.encryption = !!encrypted;
 
-      console.log('🧪 Testing decryption...');
+      this.debug.log('🧪 Testing decryption...');
       // Use the ephemeral private key (epriv) for decryption as shown in the example
       const decrypted = await this.unsea.decryptMessageWithMeta(encrypted, peerKeypair.epriv);
-      console.log('🔍 Decrypted result:', decrypted);
+      this.debug.log('🔍 Decrypted result:', decrypted);
       results.decryption = decrypted === testMessage;
 
       // Test signing/verification
-      console.log('🧪 Testing signing...');
+      this.debug.log('🧪 Testing signing...');
       const signature = await this.unsea.signMessage(testMessage, this.keypair.priv);
-      console.log('🔍 Signature:', signature);
+      this.debug.log('🔍 Signature:', signature);
       results.signing = !!signature;
 
-      console.log('🧪 Testing verification...');
+      this.debug.log('🧪 Testing verification...');
       const verified = await this.unsea.verifyMessage(testMessage, signature, this.keypair.pub);
-      console.log('🔍 Verification result:', verified);
+      this.debug.log('🔍 Verification result:', verified);
       results.verification = verified === true;
 
       // Test group encryption (same as regular encryption with different key)
-      console.log('🧪 Testing group encryption...');
+      this.debug.log('🧪 Testing group encryption...');
       const groupKey = await this.unsea.generateRandomPair();
       const groupEncrypted = await this.unsea.encryptMessageWithMeta(testMessage, groupKey);
       const groupDecrypted = await this.unsea.decryptMessageWithMeta(groupEncrypted, groupKey.epriv);
       results.groupEncryption = groupDecrypted === testMessage;
     } catch (error) {
-      console.error('🔍 Self-test error:', error);
+      this.debug.error('🔍 Self-test error:', error);
       results.errors.push(error.message);
     }
 
-    console.log('🔍 Final test results:', results);
+    this.debug.log('🔍 Final test results:', results);
     return results;
   }
 }

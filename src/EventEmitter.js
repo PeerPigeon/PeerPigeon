@@ -1,3 +1,4 @@
+import DebugLogger from './DebugLogger.js';
 export class EventEmitter {
   constructor() {
     this.eventListeners = {};

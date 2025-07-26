@@ -1,6 +1,7 @@
 import { EventEmitter } from './EventEmitter.js';
 import { PeerConnection } from './PeerConnection.js';
 import { environmentDetector } from './EnvironmentDetector.js';
+import DebugLogger from './DebugLogger.js';
 
 /**
  * Manages individual peer connections, timeouts, and connection attempts
@@ -9,6 +10,7 @@ export class ConnectionManager extends EventEmitter {
   constructor(mesh) {
     super();
     this.mesh = mesh;
+    this.debug = DebugLogger.create('ConnectionManager');
     this.peers = new Map();
     this.connectionAttempts = new Map();
     this.connectionTimeouts = new Map();
@@ -27,28 +29,28 @@ export class ConnectionManager extends EventEmitter {
   }
 
   async connectToPeer(targetPeerId) {
-    console.log(`connectToPeer called for ${targetPeerId.substring(0, 8)}...`);
+    this.debug.log(`connectToPeer called for ${targetPeerId.substring(0, 8)}...`);
 
     // Enhanced duplicate connection prevention
     if (this.peers.has(targetPeerId)) {
-      console.log(`Already connected to ${targetPeerId.substring(0, 8)}...`);
+      this.debug.log(`Already connected to ${targetPeerId.substring(0, 8)}...`);
       return;
     }
 
     // Check if we're already in the process of connecting
     if (this.connectionTimeouts.has(targetPeerId)) {
-      console.log(`Already connecting to ${targetPeerId.substring(0, 8)}... (connection in progress)`);
+      this.debug.log(`Already connecting to ${targetPeerId.substring(0, 8)}... (connection in progress)`);
       return;
     }
 
     // Check if we're already attempting through PeerDiscovery
     if (this.mesh.peerDiscovery.isAttemptingConnection(targetPeerId)) {
-      console.log(`Already attempting connection to ${targetPeerId.substring(0, 8)}... via PeerDiscovery`);
+      this.debug.log(`Already attempting connection to ${targetPeerId.substring(0, 8)}... via PeerDiscovery`);
       return;
     }
 
     if (!this.mesh.canAcceptMorePeers()) {
-      console.log(`Cannot connect to ${targetPeerId.substring(0, 8)}... (max peers reached: ${this.mesh.maxPeers})`);
+      this.debug.log(`Cannot connect to ${targetPeerId.substring(0, 8)}... (max peers reached: ${this.mesh.maxPeers})`);
       return;
     }
 
@@ -64,7 +66,7 @@ export class ConnectionManager extends EventEmitter {
 
       if (now - lastAttempt < retryDelay) {
         const remaining = retryDelay - (now - lastAttempt);
-        console.log(`Connection to ${targetPeerId.substring(0, 8)}... on cooldown (${Math.round(remaining / 1000)}s remaining, isolated: ${connectedCount === 0})`);
+        this.debug.log(`Connection to ${targetPeerId.substring(0, 8)}... on cooldown (${Math.round(remaining / 1000)}s remaining, isolated: ${connectedCount === 0})`);
         return;
       }
     }
@@ -76,7 +78,7 @@ export class ConnectionManager extends EventEmitter {
       return;
     }
 
-    console.log(`Starting connection to ${targetPeerId.substring(0, 8)}... (attempt ${attempts + 1})`);
+    this.debug.log(`Starting connection to ${targetPeerId.substring(0, 8)}... (attempt ${attempts + 1})`);
     this.connectionAttempts.set(targetPeerId, attempts + 1);
     this.lastConnectionAttempt.set(targetPeerId, now);
     this.mesh.peerDiscovery.trackConnectionAttempt(targetPeerId);
@@ -85,26 +87,26 @@ export class ConnectionManager extends EventEmitter {
     const hasMedia = this.mesh.mediaManager.localStream !== null;
     const timeoutDuration = hasMedia ? 45000 : 30000; // 45s for media, 30s for data-only
 
-    console.log(`Setting connection timeout for ${targetPeerId.substring(0, 8)}... - ${timeoutDuration / 1000}s (media: ${hasMedia})`);
+    this.debug.log(`Setting connection timeout for ${targetPeerId.substring(0, 8)}... - ${timeoutDuration / 1000}s (media: ${hasMedia})`);
 
     const timeoutId = setTimeout(() => {
       if (this.peers.has(targetPeerId)) {
         const peer = this.peers.get(targetPeerId);
         const status = peer.getStatus();
         const detailedStatus = peer.getDetailedStatus();
-        console.log(`Connection timeout check for ${targetPeerId.substring(0, 8)}... - current status: ${status}`);
-        console.log('Detailed status:', detailedStatus);
+        this.debug.log(`Connection timeout check for ${targetPeerId.substring(0, 8)}... - current status: ${status}`);
+        this.debug.log('Detailed status:', detailedStatus);
 
         // Cleanup if not fully connected (includes 'connecting', 'new', 'failed', etc.)
         if (status !== 'connected') {
           this.mesh.emit('statusChanged', { type: 'warning', message: `Connection timeout for ${targetPeerId.substring(0, 8)}... (status: ${status}, media: ${hasMedia})` });
           this.handleConnectionTimeout(targetPeerId);
         } else {
-          console.log(`Connection to ${targetPeerId.substring(0, 8)}... is connected, clearing timeout`);
+          this.debug.log(`Connection to ${targetPeerId.substring(0, 8)}... is connected, clearing timeout`);
           this.connectionTimeouts.delete(targetPeerId);
         }
       } else {
-        console.log(`Peer ${targetPeerId.substring(0, 8)}... no longer in peers Map, cleaning up timeout`);
+        this.debug.log(`Peer ${targetPeerId.substring(0, 8)}... no longer in peers Map, cleaning up timeout`);
         this.connectionTimeouts.delete(targetPeerId);
       }
     }, timeoutDuration);
@@ -112,7 +114,7 @@ export class ConnectionManager extends EventEmitter {
     this.connectionTimeouts.set(targetPeerId, timeoutId);
 
     try {
-      console.log(`Creating PeerConnection for ${targetPeerId.substring(0, 8)}...`);
+      this.debug.log(`Creating PeerConnection for ${targetPeerId.substring(0, 8)}...`);
 
       // Get current media stream if available
       const localStream = this.mesh.mediaManager.localStream;
@@ -128,36 +130,35 @@ export class ConnectionManager extends EventEmitter {
       this.setupPeerConnectionHandlers(peerConnection);
       this.peers.set(targetPeerId, peerConnection);
 
-      console.log(`Creating WebRTC connection for ${targetPeerId.substring(0, 8)}...`);
+      this.debug.log(`Creating WebRTC connection for ${targetPeerId.substring(0, 8)}...`);
       await peerConnection.createConnection();
 
-      console.log(`Creating offer for ${targetPeerId.substring(0, 8)}... (with media: ${hasMedia})`);
+      this.debug.log(`Creating offer for ${targetPeerId.substring(0, 8)}... (with media: ${hasMedia})`);
       const offer = await peerConnection.createOffer();
 
-      console.log(`Offer created for ${targetPeerId.substring(0, 8)}...`, {
+      this.debug.log(`Offer created for ${targetPeerId.substring(0, 8)}...`, {
         type: offer.type,
         sdpLength: offer.sdp?.length || 0,
         hasAudio: offer.sdp?.includes('m=audio') || false,
         hasVideo: offer.sdp?.includes('m=video') || false
       });
 
-      console.log(`Sending offer to ${targetPeerId.substring(0, 8)}...`);
-      await this.mesh.signalingClient.sendSignalingMessage({
+      this.debug.log(`Sending offer to ${targetPeerId.substring(0, 8)}...`);
+      await this.mesh.sendSignalingMessage({
         type: 'offer',
-        data: offer,
-        targetPeerId
-      });
+        data: offer
+      }, targetPeerId);
 
       this.mesh.emit('statusChanged', { type: 'info', message: `Offer sent to ${targetPeerId.substring(0, 8)}...` });
     } catch (error) {
-      console.error('Failed to connect to peer:', error);
+      this.debug.error('Failed to connect to peer:', error);
       this.mesh.emit('statusChanged', { type: 'error', message: `Failed to connect to ${targetPeerId.substring(0, 8)}...: ${error.message}` });
       this.cleanupFailedConnection(targetPeerId);
     }
   }
 
   handleConnectionTimeout(peerId) {
-    console.log(`Connection timeout for ${peerId.substring(0, 8)}...`);
+    this.debug.log(`Connection timeout for ${peerId.substring(0, 8)}...`);
 
     const attempts = this.connectionAttempts.get(peerId) || 0;
     if (attempts >= this.maxConnectionAttempts) {
@@ -166,7 +167,7 @@ export class ConnectionManager extends EventEmitter {
       this.connectionAttempts.delete(peerId);
     } else {
       this.mesh.peerDiscovery.clearConnectionAttempt(peerId);
-      console.log(`Will retry connection to ${peerId.substring(0, 8)}... (attempt ${attempts}/${this.maxConnectionAttempts})`);
+      this.debug.log(`Will retry connection to ${peerId.substring(0, 8)}... (attempt ${attempts}/${this.maxConnectionAttempts})`);
     }
 
     // Always cleanup the failed connection and ensure it's removed from peers Map
@@ -174,21 +175,21 @@ export class ConnectionManager extends EventEmitter {
 
     // Double-check that the peer is actually removed from the UI
     if (this.peers.has(peerId)) {
-      console.warn(`Peer ${peerId.substring(0, 8)}... still in peers Map after timeout cleanup, force removing`);
+      this.debug.warn(`Peer ${peerId.substring(0, 8)}... still in peers Map after timeout cleanup, force removing`);
       this.peers.delete(peerId);
       this.emit('peersUpdated');
     }
   }
 
   cleanupFailedConnection(peerId) {
-    console.log(`Cleaning up failed connection for ${peerId.substring(0, 8)}...`);
+    this.debug.log(`Cleaning up failed connection for ${peerId.substring(0, 8)}...`);
 
     // Clear timeout
     const timeoutId = this.connectionTimeouts.get(peerId);
     if (timeoutId) {
       clearTimeout(timeoutId);
       this.connectionTimeouts.delete(peerId);
-      console.log(`Cleared timeout for ${peerId.substring(0, 8)}...`);
+      this.debug.log(`Cleared timeout for ${peerId.substring(0, 8)}...`);
     }
 
     // Remove peer connection
@@ -196,7 +197,7 @@ export class ConnectionManager extends EventEmitter {
     if (this.peers.has(peerId)) {
       const peer = this.peers.get(peerId);
       const status = peer.getStatus();
-      console.log(`Removing peer ${peerId.substring(0, 8)}... with status: ${status}`);
+      this.debug.log(`Removing peer ${peerId.substring(0, 8)}... with status: ${status}`);
 
       try {
         if (typeof peer.markAsFailed === 'function') {
@@ -204,13 +205,13 @@ export class ConnectionManager extends EventEmitter {
         }
         peer.close();
       } catch (error) {
-        console.error('Error closing failed connection:', error);
+        this.debug.error('Error closing failed connection:', error);
       }
       this.peers.delete(peerId);
       peerRemoved = true;
-      console.log(`Successfully removed peer ${peerId.substring(0, 8)}... from peers Map`);
+      this.debug.log(`Successfully removed peer ${peerId.substring(0, 8)}... from peers Map`);
     } else {
-      console.log(`Peer ${peerId.substring(0, 8)}... was not in peers Map`);
+      this.debug.log(`Peer ${peerId.substring(0, 8)}... was not in peers Map`);
     }
 
     // Clean up related data
@@ -219,7 +220,7 @@ export class ConnectionManager extends EventEmitter {
 
     // Always emit peersUpdated if we removed a peer or to force UI refresh
     if (peerRemoved) {
-      console.log(`Emitting peersUpdated after removing ${peerId.substring(0, 8)}...`);
+      this.debug.log(`Emitting peersUpdated after removing ${peerId.substring(0, 8)}...`);
       this.emit('peersUpdated');
     }
   }
@@ -238,7 +239,7 @@ export class ConnectionManager extends EventEmitter {
       try {
         peer.close();
       } catch (error) {
-        console.error('Error closing race condition connection:', error);
+        this.debug.error('Error closing race condition connection:', error);
       }
       this.peers.delete(peerId);
     }
@@ -251,19 +252,18 @@ export class ConnectionManager extends EventEmitter {
   setupPeerConnectionHandlers(peerConnection) {
     peerConnection.addEventListener('iceCandidate', async (event) => {
       try {
-        console.log('Sending ICE candidate to', event.peerId);
-        await this.mesh.signalingClient.sendSignalingMessage({
+        this.debug.log('Sending ICE candidate to', event.peerId);
+        await this.mesh.sendSignalingMessage({
           type: 'ice-candidate',
-          data: event.candidate,
-          targetPeerId: event.peerId
-        });
+          data: event.candidate
+        }, event.peerId);
       } catch (error) {
-        console.error('Failed to send ICE candidate:', error);
+        this.debug.error('Failed to send ICE candidate:', error);
       }
     });
 
     peerConnection.addEventListener('connected', (event) => {
-      console.log(`[EVENT] Connected event received from ${event.peerId.substring(0, 8)}...`);
+      this.debug.log(`[EVENT] Connected event received from ${event.peerId.substring(0, 8)}...`);
 
       // Clear connection timeout on successful connection
       const timeoutId = this.connectionTimeouts.get(event.peerId);
@@ -289,7 +289,7 @@ export class ConnectionManager extends EventEmitter {
     });
 
     peerConnection.addEventListener('dataChannelOpen', (event) => {
-      console.log(`[EVENT] DataChannelOpen event received from ${event.peerId.substring(0, 8)}...`);
+      this.debug.log(`[EVENT] DataChannelOpen event received from ${event.peerId.substring(0, 8)}...`);
 
       this.mesh.emit('statusChanged', { type: 'info', message: `Data channel ready with ${event.peerId.substring(0, 8)}...` });
       this.emit('peersUpdated');
@@ -301,11 +301,11 @@ export class ConnectionManager extends EventEmitter {
 
       // Automatically initiate key exchange when crypto is enabled
       if (this.mesh.cryptoManager) {
-        console.log(`🔐 Automatically exchanging keys with newly connected peer ${event.peerId.substring(0, 8)}...`);
+        this.debug.log(`🔐 Automatically exchanging keys with newly connected peer ${event.peerId.substring(0, 8)}...`);
         // Use setTimeout to ensure the connection is fully established
         setTimeout(() => {
           this.mesh.exchangeKeysWithPeer(event.peerId).catch(error => {
-            console.error(`🔐 Failed to exchange keys with ${event.peerId.substring(0, 8)}:`, error);
+            this.debug.error(`🔐 Failed to exchange keys with ${event.peerId.substring(0, 8)}:`, error);
           });
         }, 100);
       }
@@ -318,27 +318,27 @@ export class ConnectionManager extends EventEmitter {
     });
 
     peerConnection.addEventListener('remoteStream', (event) => {
-      console.log(`[EVENT] Remote stream received from ${event.peerId.substring(0, 8)}...`);
+      this.debug.log(`[EVENT] Remote stream received from ${event.peerId.substring(0, 8)}...`);
       this.emit('remoteStream', event);
     });
 
     peerConnection.addEventListener('renegotiationNeeded', async (event) => {
-      console.log(`🔄 Renegotiation needed for ${event.peerId.substring(0, 8)}...`);
+      this.debug.log(`🔄 Renegotiation needed for ${event.peerId.substring(0, 8)}...`);
 
       try {
         // Check connection state before attempting renegotiation
         if (peerConnection.connection.signalingState !== 'stable') {
-          console.log(`Skipping renegotiation for ${event.peerId.substring(0, 8)}... - connection not stable (${peerConnection.connection.signalingState})`);
+          this.debug.log(`Skipping renegotiation for ${event.peerId.substring(0, 8)}... - connection not stable (${peerConnection.connection.signalingState})`);
           return;
         }
 
         // Additional check for connection state
         if (peerConnection.connection.connectionState !== 'connected') {
-          console.log(`Skipping renegotiation for ${event.peerId.substring(0, 8)}... - not connected (${peerConnection.connection.connectionState})`);
+          this.debug.log(`Skipping renegotiation for ${event.peerId.substring(0, 8)}... - not connected (${peerConnection.connection.connectionState})`);
           return;
         }
 
-        console.log(`🔄 Creating renegotiation offer for ${event.peerId.substring(0, 8)}...`);
+        this.debug.log(`🔄 Creating renegotiation offer for ${event.peerId.substring(0, 8)}...`);
 
         // Create new offer with restartIce flag to avoid m-line issues
         const offerOptions = {
@@ -351,19 +351,18 @@ export class ConnectionManager extends EventEmitter {
         await peerConnection.connection.setLocalDescription(offer);
 
         // Send the new offer to the peer using the correct signaling method
-        await this.mesh.signalingClient.sendSignalingMessage({
+        await this.mesh.sendSignalingMessage({
           type: 'offer',
-          data: offer,
-          targetPeerId: event.peerId
-        });
+          data: offer
+        }, event.peerId);
 
-        console.log(`🔄 Sent renegotiation offer to ${event.peerId.substring(0, 8)}...`);
+        this.debug.log(`🔄 Sent renegotiation offer to ${event.peerId.substring(0, 8)}...`);
       } catch (error) {
-        console.error(`Failed to renegotiate with ${event.peerId}:`, error);
+        this.debug.error(`Failed to renegotiate with ${event.peerId}:`, error);
 
         // If renegotiation fails due to m-line order, log but don't crash
         if (error.name === 'InvalidAccessError' && error.message.includes('m-line')) {
-          console.log(`🔄 M-line order error detected for ${event.peerId.substring(0, 8)}... - this is expected with replaceTrack approach`);
+          this.debug.log(`🔄 M-line order error detected for ${event.peerId.substring(0, 8)}... - this is expected with replaceTrack approach`);
         }
       }
     });
@@ -374,11 +373,11 @@ export class ConnectionManager extends EventEmitter {
   handlePeerDisconnection(peerId, reason) {
     // Prevent duplicate disconnection handling
     if (this.disconnectionInProgress.has(peerId)) {
-      console.log(`Disconnection already in progress for ${peerId.substring(0, 8)}..., skipping duplicate`);
+      this.debug.log(`Disconnection already in progress for ${peerId.substring(0, 8)}..., skipping duplicate`);
       return;
     }
 
-    console.log(`Handling peer disconnection: ${peerId.substring(0, 8)}... (${reason})`);
+    this.debug.log(`Handling peer disconnection: ${peerId.substring(0, 8)}... (${reason})`);
 
     // Mark disconnection in progress
     this.disconnectionInProgress.add(peerId);
@@ -397,7 +396,7 @@ export class ConnectionManager extends EventEmitter {
         try {
           peerConnection.close();
         } catch (error) {
-          console.error('Error closing peer connection:', error);
+          this.debug.error('Error closing peer connection:', error);
         }
 
         this.peers.delete(peerId);
@@ -417,7 +416,7 @@ export class ConnectionManager extends EventEmitter {
       } else if (reason === 'connection failed' || reason === 'connection disconnected' || reason === 'ICE connection closed') {
         // For connection failures, clear the attempt so we can retry later
         this.connectionAttempts.delete(peerId);
-        console.log(`Cleared connection attempt for ${peerId.substring(0, 8)}... due to ${reason} - will retry later`);
+        this.debug.log(`Cleared connection attempt for ${peerId.substring(0, 8)}... due to ${reason} - will retry later`);
       }
 
       this.mesh.emit('peerDisconnected', { peerId, reason });
@@ -428,19 +427,19 @@ export class ConnectionManager extends EventEmitter {
       const needsOptimization = connectedCount === 0; // Only optimize if completely disconnected
 
       if (needsOptimization && this.mesh.autoDiscovery && this.mesh.peerDiscovery.getDiscoveredPeers().length > 0) {
-        console.log(`Completely disconnected (${connectedCount}/${this.mesh.maxPeers}), scheduling mesh optimization`);
+        this.debug.log(`Completely disconnected (${connectedCount}/${this.mesh.maxPeers}), scheduling mesh optimization`);
         setTimeout(() => {
           // Check if we still need optimization
           const currentCount = this.getConnectedPeerCount();
           if (currentCount === 0) {
-            console.log(`Still completely disconnected (${currentCount}/${this.mesh.maxPeers}), attempting optimization`);
+            this.debug.log(`Still completely disconnected (${currentCount}/${this.mesh.maxPeers}), attempting optimization`);
             this.mesh.peerDiscovery.optimizeMeshConnections(this.peers);
           } else {
-            console.log(`Connection recovered (${currentCount}/${this.mesh.maxPeers}), skipping optimization`);
+            this.debug.log(`Connection recovered (${currentCount}/${this.mesh.maxPeers}), skipping optimization`);
           }
         }, 2000); // Wait 2 seconds before optimizing to allow connections to stabilize
       } else {
-        console.log(`Peer count appropriate at ${connectedCount}/${this.mesh.maxPeers}, no optimization needed`);
+        this.debug.log(`Peer count appropriate at ${connectedCount}/${this.mesh.maxPeers}, no optimization needed`);
       }
     } finally {
       // Always clean up the disconnection tracking
@@ -498,12 +497,12 @@ export class ConnectionManager extends EventEmitter {
 
     // Accept if we have stale peers that can be cleaned up
     if (stalePeerCount > 0 && totalPeerCount >= this.mesh.maxPeers) {
-      console.log(`At capacity (${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total) but have ${stalePeerCount} stale peers that can be evicted`);
+      this.debug.log(`At capacity (${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total) but have ${stalePeerCount} stale peers that can be evicted`);
       return true;
     }
 
     // Reject if we're at capacity with all viable peers
-    console.log(`Cannot accept more peers: ${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total peers in Map`);
+    this.debug.log(`Cannot accept more peers: ${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total peers in Map`);
     return false;
   }
 
@@ -554,22 +553,22 @@ export class ConnectionManager extends EventEmitter {
 
   sendMessage(content) {
     if (!content || typeof content !== 'string') {
-      console.error('Invalid message content:', content);
+      this.debug.error('Invalid message content:', content);
       return 0;
     }
 
     // Use gossip protocol to broadcast messages throughout the mesh network
-    console.log(`Broadcasting message via gossip protocol: "${content}"`);
+    this.debug.log(`Broadcasting message via gossip protocol: "${content}"`);
     const messageId = this.mesh.gossipManager.broadcastMessage(content, 'chat');
 
     if (messageId) {
       // Return the number of directly connected peers for UI feedback
       // (the message will propagate to the entire network via gossip)
       const connectedCount = this.getConnectedPeerCount();
-      console.log(`Message broadcasted via gossip to ${connectedCount} directly connected peer(s), will propagate to entire network`);
+      this.debug.log(`Message broadcasted via gossip to ${connectedCount} directly connected peer(s), will propagate to entire network`);
       return connectedCount;
     } else {
-      console.error('Failed to broadcast message via gossip protocol');
+      this.debug.error('Failed to broadcast message via gossip protocol');
       return 0;
     }
   }
@@ -583,33 +582,33 @@ export class ConnectionManager extends EventEmitter {
   sendDirectMessage(peerId, message) {
     const peerConnection = this.peers.get(peerId);
     if (!peerConnection) {
-      console.warn(`Cannot send direct message to ${peerId?.substring(0, 8)}: peer not connected`);
+      this.debug.warn(`Cannot send direct message to ${peerId?.substring(0, 8)}: peer not connected`);
       return false;
     }
 
     try {
-      console.log(`📤 Sending direct message to ${peerId?.substring(0, 8)}:`, message);
+      this.debug.log(`📤 Sending direct message to ${peerId?.substring(0, 8)}:`, message);
       peerConnection.sendMessage(message);
       return true;
     } catch (error) {
-      console.error(`Failed to send direct message to ${peerId?.substring(0, 8)}:`, error);
+      this.debug.error(`Failed to send direct message to ${peerId?.substring(0, 8)}:`, error);
       return false;
     }
   }
 
   async handleIceCandidate(candidate, fromPeerId) {
-    console.log('Handling ICE candidate from', fromPeerId);
+    this.debug.log('Handling ICE candidate from', fromPeerId);
 
     const peerConnection = this.peers.get(fromPeerId);
     if (peerConnection) {
       try {
         await peerConnection.handleIceCandidate(candidate);
       } catch (error) {
-        console.error('Failed to add ICE candidate:', error);
+        this.debug.error('Failed to add ICE candidate:', error);
       }
     } else {
       // No peer connection exists yet - buffer the candidate for when it's created
-      console.log('Buffering ICE candidate for', fromPeerId, '(no peer connection yet)');
+      this.debug.log('Buffering ICE candidate for', fromPeerId, '(no peer connection yet)');
       if (!this.pendingIceCandidates.has(fromPeerId)) {
         this.pendingIceCandidates.set(fromPeerId, []);
       }
@@ -620,7 +619,7 @@ export class ConnectionManager extends EventEmitter {
   async processPendingIceCandidates(peerId) {
     const candidates = this.pendingIceCandidates.get(peerId);
     if (candidates && candidates.length > 0) {
-      console.log(`Processing ${candidates.length} buffered ICE candidates for`, peerId);
+      this.debug.log(`Processing ${candidates.length} buffered ICE candidates for`, peerId);
       const peerConnection = this.peers.get(peerId);
 
       if (peerConnection) {
@@ -628,7 +627,7 @@ export class ConnectionManager extends EventEmitter {
           try {
             await peerConnection.handleIceCandidate(candidate);
           } catch (error) {
-            console.error('Failed to add buffered ICE candidate:', error);
+            this.debug.error('Failed to add buffered ICE candidate:', error);
           }
         }
 
@@ -696,19 +695,19 @@ export class ConnectionManager extends EventEmitter {
 
       // Immediately clean up disconnected peers
       if (status === 'disconnected' && connectionAge > DISCONNECTED_THRESHOLD) {
-        console.log(`Disconnected peer detected: ${peerId.substring(0, 8)}... (status: ${status}, age: ${Math.round(connectionAge / 1000)}s)`);
+        this.debug.log(`Disconnected peer detected: ${peerId.substring(0, 8)}... (status: ${status}, age: ${Math.round(connectionAge / 1000)}s)`);
         peersToCleanup.push(peerId);
       } else if (connectionAge > STALE_THRESHOLD) {
         if (status === 'connecting' || status === 'channel-connecting' ||
                     status === 'failed' || status === 'closed') {
-          console.log(`Stale peer detected: ${peerId.substring(0, 8)}... (status: ${status}, age: ${Math.round(connectionAge / 1000)}s)`);
+          this.debug.log(`Stale peer detected: ${peerId.substring(0, 8)}... (status: ${status}, age: ${Math.round(connectionAge / 1000)}s)`);
           peersToCleanup.push(peerId);
         }
       }
     });
 
     if (peersToCleanup.length > 0) {
-      console.log(`Cleaning up ${peersToCleanup.length} stale peer(s)`);
+      this.debug.log(`Cleaning up ${peersToCleanup.length} stale peer(s)`);
       peersToCleanup.forEach(peerId => {
         this.cleanupFailedConnection(peerId);
       });
@@ -719,24 +718,24 @@ export class ConnectionManager extends EventEmitter {
      * Force cleanup of peers that are not in connected state (for debugging)
      */
   forceCleanupInvalidPeers() {
-    console.log('Force cleaning up peers not in connected state...');
+    this.debug.log('Force cleaning up peers not in connected state...');
     const peersToRemove = [];
 
     this.peers.forEach((peerConnection, peerId) => {
       const status = peerConnection.getStatus();
       if (status !== 'connected') {
-        console.log(`Found peer ${peerId.substring(0, 8)}... in invalid state: ${status}`);
+        this.debug.log(`Found peer ${peerId.substring(0, 8)}... in invalid state: ${status}`);
         peersToRemove.push(peerId);
       }
     });
 
     peersToRemove.forEach(peerId => {
-      console.log(`Force removing peer ${peerId.substring(0, 8)}...`);
+      this.debug.log(`Force removing peer ${peerId.substring(0, 8)}...`);
       this.cleanupFailedConnection(peerId);
     });
 
     if (peersToRemove.length > 0) {
-      console.log(`Force cleaned up ${peersToRemove.length} invalid peers`);
+      this.debug.log(`Force cleaned up ${peersToRemove.length} invalid peers`);
       this.emit('peersUpdated');
     }
 
@@ -813,7 +812,7 @@ export class ConnectionManager extends EventEmitter {
      */
   handleIncomingMessage(message, fromPeerId) {
     if (!message || typeof message !== 'object') {
-      console.warn('Received invalid message from', fromPeerId?.substring(0, 8));
+      this.debug.warn('Received invalid message from', fromPeerId?.substring(0, 8));
       return;
     }
 
@@ -822,7 +821,7 @@ export class ConnectionManager extends EventEmitter {
       case 'gossip':
         // Gossip protocol messages (async call, but we don't wait for it)
         this.mesh.gossipManager.handleGossipMessage(message, fromPeerId).catch(error => {
-          console.error('Error handling gossip message:', error);
+          this.debug.error('Error handling gossip message:', error);
         });
         break;
 
@@ -840,9 +839,9 @@ export class ConnectionManager extends EventEmitter {
 
       default:
         // Unknown message type - try gossip as fallback for backward compatibility
-        console.warn(`Unknown message type '${message.type}' from ${fromPeerId?.substring(0, 8)}, trying gossip handler`);
+        this.debug.warn(`Unknown message type '${message.type}' from ${fromPeerId?.substring(0, 8)}, trying gossip handler`);
         this.mesh.gossipManager.handleGossipMessage(message, fromPeerId).catch(error => {
-          console.error('Error handling unknown message as gossip:', error);
+          this.debug.error('Error handling unknown message as gossip:', error);
         });
         break;
     }
@@ -852,7 +851,7 @@ export class ConnectionManager extends EventEmitter {
      * Handle eviction messages
      */
   handleEvictionMessage(message, fromPeerId) {
-    console.log(`Received eviction notice from ${fromPeerId?.substring(0, 8)}: ${message.reason}`);
+    this.debug.log(`Received eviction notice from ${fromPeerId?.substring(0, 8)}: ${message.reason}`);
 
     // Emit eviction event for UI notification
     this.mesh.emit('peerEvicted', {

@@ -1,5 +1,6 @@
 import { EventEmitter } from './EventEmitter.js';
 import { environmentDetector } from './EnvironmentDetector.js';
+import DebugLogger from './DebugLogger.js';
 
 /**
  * Manages storage operations, URL handling, and configuration persistence
@@ -7,6 +8,7 @@ import { environmentDetector } from './EnvironmentDetector.js';
 export class StorageManager extends EventEmitter {
   constructor(mesh) {
     super();
+    this.debug = DebugLogger.create('StorageManager');
     this.mesh = mesh;
   }
 
@@ -21,7 +23,7 @@ export class StorageManager extends EventEmitter {
       }
     } else if (environmentDetector.isNodeJS) {
       // In Node.js, we could potentially use file-based storage
-      console.log('Local storage not available in Node.js environment');
+      this.debug.log('Local storage not available in Node.js environment');
     }
     return null;
   }
@@ -31,7 +33,7 @@ export class StorageManager extends EventEmitter {
       localStorage.setItem('pigon-signaling-url', url);
     } else if (environmentDetector.isNodeJS) {
       // In Node.js, we could potentially save to a config file
-      console.log('Storage not implemented for Node.js environment');
+      this.debug.log('Storage not implemented for Node.js environment');
     }
   }
 
@@ -93,7 +95,7 @@ export class StorageManager extends EventEmitter {
             array.set(randomBytes);
           }
         } catch (e) {
-          console.warn('Could not use Node.js crypto, falling back to Math.random');
+          this.debug.warn('Could not use Node.js crypto, falling back to Math.random');
           // Fallback to Math.random
           for (let i = 0; i < array.length; i++) {
             array[i] = Math.floor(Math.random() * 256);
@@ -102,7 +104,7 @@ export class StorageManager extends EventEmitter {
       }
     } else {
       // Fallback to less secure random generation
-      console.warn('Secure random values not available, using fallback method');
+      this.debug.warn('Secure random values not available, using fallback method');
       for (let i = 0; i < array.length; i++) {
         array[i] = Math.floor(Math.random() * 256);
       }
@@ -128,7 +130,7 @@ export class StorageManager extends EventEmitter {
         try {
           return JSON.parse(saved);
         } catch (error) {
-          console.error('Failed to parse saved settings:', error);
+          this.debug.error('Failed to parse saved settings:', error);
         }
       }
     }

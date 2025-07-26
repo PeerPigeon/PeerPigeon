@@ -2,6 +2,8 @@
  * EnvironmentDetector - Utility for detecting runtime environment and capabilities
  * Provides comprehensive environment detection for browser, Node.js, Worker contexts
  */
+import DebugLogger from './DebugLogger.js';
+
 export class EnvironmentDetector {
   constructor() {
     this._cache = new Map();
@@ -179,7 +181,7 @@ export class EnvironmentDetector {
         } else {
           // In ES modules, we can't easily check if a package is available
           // without actually importing it, so we'll assume it might be available
-          return false; // Conservative approach
+          return false;
         }
       } catch (e) {
         return false;

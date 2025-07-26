@@ -10,12 +10,15 @@
     }
   },
   "scripts": {
-    "dev": "http-server . -p 8080 -c-1",
+    "dev": "concurrently \"npm run server\" \"npm run dev:http\" --names \"signaling,http\" --prefix-colors \"blue,green\"",
+    "dev:http": "http-server . -p 8080 -c-1 --cors -o examples/browser",
+    "dev:examples": "http-server examples -p 8080 -c-1 --cors",
+    "dev:full": "http-server . -p 8080 -c-1",
     "start": "node websocket-server/server.js",
     "server": "node websocket-server/server.js",
     "lint": "eslint src/ examples/ websocket-server/ --ext .js",
     "lint:fix": "eslint src/ examples/ websocket-server/ --ext .js --fix",
-    "test": "node tests/DistributedStorageManager.test.js",
+    "test": "node examples/node/storage-test.js",
     "test:storage": "node examples/distributed-storage-test.js",
     "ci": "npm run lint && npm run test",
     "prepublishOnly": "npm run ci"
@@ -63,6 +66,7 @@
     "yamljs": "^0.3.0"
   },
   "devDependencies": {
+    "concurrently": "^9.2.0",
     "eslint": "^8.57.1",
     "eslint-config-standard": "^17.1.0",
     "http-server": "^14.1.1",

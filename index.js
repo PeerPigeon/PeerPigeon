@@ -5,6 +5,9 @@ export { SignalingClient } from './src/SignalingClient.js';
 export { WebDHT } from './src/WebDHT.js';
 export { DistributedStorageManager } from './src/DistributedStorageManager.js';
 
+// Export debug logger for controlling console output
+export { default as DebugLogger } from './src/DebugLogger.js';
+
 // Export environment detection utilities
 export {
   EnvironmentDetector,

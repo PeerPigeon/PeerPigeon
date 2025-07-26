@@ -1,4 +1,5 @@
 import { EventEmitter } from './EventEmitter.js';
+import DebugLogger from './DebugLogger.js';
 
 /**
  * Manages mesh optimization, connection strategies, and peer discovery optimization
@@ -6,6 +7,7 @@ import { EventEmitter } from './EventEmitter.js';
 export class MeshOptimizer extends EventEmitter {
   constructor(mesh, connectionManager, evictionManager) {
     super();
+    this.debug = DebugLogger.create('MeshOptimizer');
     this.mesh = mesh;
     this.connectionManager = connectionManager;
     this.evictionManager = evictionManager;
@@ -23,7 +25,7 @@ export class MeshOptimizer extends EventEmitter {
     const belowMinimum = currentConnected < this.mesh.minPeers;
 
     if (hasNoConnections && unconnectedPeers.length > 0) {
-      console.log(`Peer has no connections but found ${unconnectedPeers.length} unconnected peers - forcing connection attempt`);
+      this.debug.log(`Peer has no connections but found ${unconnectedPeers.length} unconnected peers - forcing connection attempt`);
       // Force connection to the closest peer by XOR distance
       const sortedByDistance = unconnectedPeers.sort((a, b) => {
         const distA = this.calculateXorDistance(this.mesh.peerId, a);
@@ -32,13 +34,13 @@ export class MeshOptimizer extends EventEmitter {
       });
 
       const targetPeer = sortedByDistance[0];
-      console.log(`Forcing connection to closest peer: ${targetPeer.substring(0, 8)}... (no connections, mesh connectivity required)`);
+      this.debug.log(`Forcing connection to closest peer: ${targetPeer.substring(0, 8)}... (no connections, mesh connectivity required)`);
       this.connectionManager.connectToPeer(targetPeer);
       return;
     }
 
     if (belowMinimum && unconnectedPeers.length > 0) {
-      console.log(`Below minimum peers (${currentConnected}/${this.mesh.minPeers}) - connecting to additional peers`);
+      this.debug.log(`Below minimum peers (${currentConnected}/${this.mesh.minPeers}) - connecting to additional peers`);
       const needed = Math.min(this.mesh.minPeers - currentConnected, unconnectedPeers.length);
 
       // Sort by XOR distance and connect to closest peers
@@ -50,7 +52,7 @@ export class MeshOptimizer extends EventEmitter {
 
       for (let i = 0; i < needed; i++) {
         const targetPeer = sortedByDistance[i];
-        console.log(`Connecting to reach minimum: ${targetPeer.substring(0, 8)}...`);
+        this.debug.log(`Connecting to reach minimum: ${targetPeer.substring(0, 8)}...`);
         this.connectionManager.connectToPeer(targetPeer);
       }
       return;
@@ -60,14 +62,14 @@ export class MeshOptimizer extends EventEmitter {
     if (this.mesh.maxPeers <= 3) {
       // For small meshes, always try to reach max capacity
       if (currentConnected >= this.mesh.maxPeers) {
-        console.log(`Skipping optimization - already at max capacity ${currentConnected}/${this.mesh.maxPeers}`);
+        this.debug.log(`Skipping optimization - already at max capacity ${currentConnected}/${this.mesh.maxPeers}`);
         return;
       }
     } else {
       // For larger meshes, only optimize if below 70% capacity
       const targetThreshold = Math.floor(this.mesh.maxPeers * 0.7);
       if (currentConnected >= targetThreshold) {
-        console.log(`Skipping optimization - ${currentConnected}/${this.mesh.maxPeers} peers connected (threshold: ${targetThreshold})`);
+        this.debug.log(`Skipping optimization - ${currentConnected}/${this.mesh.maxPeers} peers connected (threshold: ${targetThreshold})`);
         return;
       }
     }
@@ -75,21 +77,21 @@ export class MeshOptimizer extends EventEmitter {
     const availableSlots = this.mesh.maxPeers - currentConnected;
     const peersToConnect = unconnectedPeers.slice(0, Math.min(availableSlots, 1)); // Only connect to 1 peer at a time
 
-    console.log(`Optimizing connections carefully: ${availableSlots} slots available, connecting to ${peersToConnect.length} peer(s)`);
+    this.debug.log(`Optimizing connections carefully: ${availableSlots} slots available, connecting to ${peersToConnect.length} peer(s)`);
 
     peersToConnect.forEach((peerId, _index) => {
       if (this.mesh.peerDiscovery.shouldInitiateConnection(peerId)) {
-        console.log(`Initiating immediate connection to ${peerId.substring(0, 8)}... in optimization`);
+        this.debug.log(`Initiating immediate connection to ${peerId.substring(0, 8)}... in optimization`);
         // Double-check conditions before connecting
         if (this.connectionManager.canAcceptMorePeers() &&
                     !this.connectionManager.hasPeer(peerId) &&
                     !this.mesh.peerDiscovery.isAttemptingConnection(peerId)) {
           this.connectionManager.connectToPeer(peerId);
         } else {
-          console.log(`Skipping connection to ${peerId.substring(0, 8)}... - conditions changed`);
+          this.debug.log(`Skipping connection to ${peerId.substring(0, 8)}... - conditions changed`);
         }
       } else {
-        console.log(`Not initiating connection to ${peerId.substring(0, 8)}... (should not initiate)`);
+        this.debug.log(`Not initiating connection to ${peerId.substring(0, 8)}... (should not initiate)`);
       }
     });
   }
@@ -110,17 +112,17 @@ export class MeshOptimizer extends EventEmitter {
     const discoveredPeers = this.mesh.getDiscoveredPeers();
     let connectionAttempts = 0;
 
-    console.log(`Forcing connections to ${discoveredPeers.length} discovered peers...`);
+    this.debug.log(`Forcing connections to ${discoveredPeers.length} discovered peers...`);
 
     discoveredPeers.forEach(peer => {
       if (!this.connectionManager.hasPeer(peer.peerId) && this.connectionManager.canAcceptMorePeers()) {
-        console.log(`Force connecting to ${peer.peerId.substring(0, 8)}...`);
+        this.debug.log(`Force connecting to ${peer.peerId.substring(0, 8)}...`);
         this.connectionManager.connectToPeer(peer.peerId);
         connectionAttempts++;
       }
     });
 
-    console.log(`Initiated ${connectionAttempts} forced connection attempts`);
+    this.debug.log(`Initiated ${connectionAttempts} forced connection attempts`);
     return connectionAttempts;
   }
 
@@ -130,39 +132,39 @@ export class MeshOptimizer extends EventEmitter {
     const discoveredPeers = this.mesh.getDiscoveredPeers();
     const totalPeers = this.connectionManager.peers.size;
 
-    console.log('=== CONNECTIVITY DEBUG ===');
-    console.log(`My Peer ID: ${this.mesh.peerId}`);
-    console.log(`Connected Peers: ${connectedPeers}/${this.mesh.maxPeers}`);
-    console.log(`Total Peer Objects: ${totalPeers}`);
-    console.log(`Discovered Peers: ${discoveredPeers.length}`);
+    this.debug.log('=== CONNECTIVITY DEBUG ===');
+    this.debug.log(`My Peer ID: ${this.mesh.peerId}`);
+    this.debug.log(`Connected Peers: ${connectedPeers}/${this.mesh.maxPeers}`);
+    this.debug.log(`Total Peer Objects: ${totalPeers}`);
+    this.debug.log(`Discovered Peers: ${discoveredPeers.length}`);
 
-    console.log('\nPeer Details:');
+    this.debug.log('\nPeer Details:');
     this.connectionManager.peers.forEach((peerConnection, peerId) => {
       const status = peerConnection.getStatus();
       const dataChannelReady = peerConnection.dataChannelReady;
       const connectionState = peerConnection.connection?.connectionState || 'unknown';
       const dataChannelState = peerConnection.dataChannel?.readyState || 'unknown';
 
-      console.log(`  ${peerId.substring(0, 8)}... - Status: ${status}, WebRTC: ${connectionState}, DataChannel: ${dataChannelState}, Ready: ${dataChannelReady}`);
+      this.debug.log(`  ${peerId.substring(0, 8)}... - Status: ${status}, WebRTC: ${connectionState}, DataChannel: ${dataChannelState}, Ready: ${dataChannelReady}`);
     });
 
-    console.log('\nDiscovered Peers:');
+    this.debug.log('\nDiscovered Peers:');
     discoveredPeers.forEach(peer => {
       const shouldInitiate = this.mesh.peerId < peer.peerId;
       const isConnected = this.connectionManager.hasPeer(peer.peerId);
-      console.log(`  ${peer.peerId.substring(0, 8)}... - ShouldInitiate: ${shouldInitiate}, IsConnected: ${isConnected}`);
+      this.debug.log(`  ${peer.peerId.substring(0, 8)}... - ShouldInitiate: ${shouldInitiate}, IsConnected: ${isConnected}`);
     });
 
-    console.log('\nConnection Attempts:');
+    this.debug.log('\nConnection Attempts:');
     this.connectionManager.connectionAttempts.forEach((attempts, peerId) => {
-      console.log(`  ${peerId.substring(0, 8)}... - Attempts: ${attempts}/${this.connectionManager.maxConnectionAttempts}`);
+      this.debug.log(`  ${peerId.substring(0, 8)}... - Attempts: ${attempts}/${this.connectionManager.maxConnectionAttempts}`);
     });
 
-    console.log('\nEviction Status:');
-    console.log(`  Eviction Strategy: ${this.mesh.evictionStrategy ? 'enabled' : 'disabled'}`);
-    console.log(`  XOR Routing: ${this.mesh.xorRouting ? 'enabled' : 'disabled'}`);
+    this.debug.log('\nEviction Status:');
+    this.debug.log(`  Eviction Strategy: ${this.mesh.evictionStrategy ? 'enabled' : 'disabled'}`);
+    this.debug.log(`  XOR Routing: ${this.mesh.xorRouting ? 'enabled' : 'disabled'}`);
 
-    console.log('=== END DEBUG ===\n');
+    this.debug.log('=== END DEBUG ===\n');
 
     return {
       connectedPeers,

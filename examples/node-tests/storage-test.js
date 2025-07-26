@@ -121,7 +121,7 @@ class StorageTest {
         throw new Error('Encrypted data not properly decrypted');
       }
 
-      console.log(`   Private data encrypted and decrypted successfully`);
+      console.log('   Private data encrypted and decrypted successfully');
     });
 
     // Test public data
@@ -136,7 +136,7 @@ class StorageTest {
         throw new Error('Public data not properly stored/retrieved');
       }
 
-      console.log(`   Public data stored and retrieved successfully`);
+      console.log('   Public data stored and retrieved successfully');
     });
 
     // Test access control (simulated - would need multiple peers for full test)
@@ -147,7 +147,7 @@ class StorageTest {
 
       await this.storage.store(key, value, {
         isPublic: false,
-        allowedPeers: allowedPeers
+        allowedPeers
       });
 
       const keyInfo = await this.storage.getKeyInfo(key);
@@ -171,7 +171,7 @@ class StorageTest {
       try {
         // This should succeed because we're the owner
         await this.storage.update(key, { constant: 'changed', version: 2 });
-        console.log(`   Owner can update immutable data`);
+        console.log('   Owner can update immutable data');
       } catch (error) {
         throw new Error('Owner should be able to update their own immutable data');
       }
@@ -188,7 +188,7 @@ class StorageTest {
       if (!keyInfo.enableCRDT) throw new Error('CRDT not enabled');
       if (!keyInfo.crdtEnabled) throw new Error('CRDT state not initialized');
 
-      console.log(`   CRDT enabled for collaborative editing`);
+      console.log('   CRDT enabled for collaborative editing');
     });
   }
 
@@ -198,7 +198,7 @@ class StorageTest {
       const value = { temporary: true, expires: 'soon' };
       const ttl = 2000; // 2 seconds
 
-      await this.storage.store(key, value, { ttl: ttl });
+      await this.storage.store(key, value, { ttl });
 
       // Should be available immediately
       const retrieved = await this.storage.retrieve(key);
@@ -370,7 +370,7 @@ class StorageTest {
     await this.runTest('Storage Statistics', async () => {
       const stats = await this.storage.getStats();
 
-      console.log(`   Storage Statistics:`);
+      console.log('   Storage Statistics:');
       console.log(`     - Enabled: ${stats.enabled}`);
       console.log(`     - Items: ${stats.itemCount}`);
       console.log(`     - Total Size: ${stats.totalSize} bytes`);
@@ -400,7 +400,7 @@ class StorageTest {
         throw new Error('Storage should be enabled');
       }
 
-      console.log(`   Storage successfully toggled enabled/disabled`);
+      console.log('   Storage successfully toggled enabled/disabled');
     });
   }
 
@@ -408,13 +408,13 @@ class StorageTest {
     await this.runTest('Storage Cleanup', async () => {
       // Test cleanup function (won't see immediate effects but should not error)
       this.storage.cleanup();
-      console.log(`   Cleanup operation completed successfully`);
+      console.log('   Cleanup operation completed successfully');
     });
   }
 
   async runAllTests() {
     console.log('🧪 Starting Distributed Storage Test Suite');
-    console.log('=' .repeat(60));
+    console.log('='.repeat(60));
     console.log('');
 
     await this.testBasicOperations();
@@ -433,9 +433,9 @@ class StorageTest {
   }
 
   printSummary() {
-    console.log('=' .repeat(60));
+    console.log('='.repeat(60));
     console.log('🏁 TEST SUMMARY');
-    console.log('=' .repeat(60));
+    console.log('='.repeat(60));
 
     const passed = this.testResults.filter(r => r.status === 'PASS').length;
     const failed = this.testResults.filter(r => r.status === 'FAIL').length;

@@ -1,4 +1,5 @@
 import { EventEmitter } from './EventEmitter.js';
+import DebugLogger from './DebugLogger.js';
 
 /**
  * Simple eviction manager for mesh topology optimization
@@ -7,6 +8,7 @@ import { EventEmitter } from './EventEmitter.js';
 export class EvictionManager extends EventEmitter {
   constructor(mesh, connectionManager) {
     super();
+    this.debug = DebugLogger.create('EvictionManager');
     this.mesh = mesh;
     this.connectionManager = connectionManager;
   }
@@ -14,25 +16,25 @@ export class EvictionManager extends EventEmitter {
   shouldEvictForPeer(newPeerId) {
     // Only evict for mesh topology optimization
     if (!this.mesh.evictionStrategy) {
-      console.log('Eviction disabled - evictionStrategy is false');
+      this.debug.log('Eviction disabled - evictionStrategy is false');
       return null;
     }
 
     // Check total peer count (including connecting peers) to prevent race conditions
     const totalPeerCount = this.connectionManager.peers.size;
     if (totalPeerCount < this.mesh.maxPeers) {
-      console.log(`No eviction needed: ${totalPeerCount}/${this.mesh.maxPeers} peers`);
+      this.debug.log(`No eviction needed: ${totalPeerCount}/${this.mesh.maxPeers} peers`);
       return null;
     }
 
     // Special case: if we have 0 connected peers (isolated), be very aggressive about making room
     const connectedCount = this.connectionManager.getConnectedPeerCount();
     if (connectedCount === 0) {
-      console.log(`Isolated peer scenario: finding any peer to evict for ${newPeerId.substring(0, 8)}...`);
+      this.debug.log(`Isolated peer scenario: finding any peer to evict for ${newPeerId.substring(0, 8)}...`);
       // Find any peer to evict (even connecting ones) to make room for this connection
       const anyPeerId = Array.from(this.connectionManager.peers.keys())[0];
       if (anyPeerId) {
-        console.log(`Will evict any peer ${anyPeerId.substring(0, 8)}... to escape isolation for ${newPeerId.substring(0, 8)}...`);
+        this.debug.log(`Will evict any peer ${anyPeerId.substring(0, 8)}... to escape isolation for ${newPeerId.substring(0, 8)}...`);
         return anyPeerId;
       }
     }
@@ -43,13 +45,13 @@ export class EvictionManager extends EventEmitter {
       const farthestPeerId = this.findFarthestPeer();
 
       if (!farthestPeerId) {
-        console.log('No eviction candidate found (no peers to evict)');
+        this.debug.log('No eviction candidate found (no peers to evict)');
         return null;
       }
 
       const farthestDistance = this.calculateXorDistance(this.mesh.peerId, farthestPeerId);
 
-      console.log(`Eviction check: new peer ${newPeerId.substring(0, 8)}... (distance: ${newPeerDistance.toString(16).substring(0, 8)}) vs farthest ${farthestPeerId.substring(0, 8)}... (distance: ${farthestDistance.toString(16).substring(0, 8)})`);
+      this.debug.log(`Eviction check: new peer ${newPeerId.substring(0, 8)}... (distance: ${newPeerDistance.toString(16).substring(0, 8)}) vs farthest ${farthestPeerId.substring(0, 8)}... (distance: ${farthestDistance.toString(16).substring(0, 8)})`);
 
       // LOOSENED RULE: If we're at max capacity, always try to evict the farthest peer
       // even if the new peer isn't strictly closer (helps with network connectivity)
@@ -57,22 +59,22 @@ export class EvictionManager extends EventEmitter {
                                (totalPeerCount >= this.mesh.maxPeers && connectedCount < this.mesh.minPeers);
 
       if (shouldEvict) {
-        console.log(`Will evict ${farthestPeerId.substring(0, 8)}... for ${newPeerDistance < farthestDistance ? 'closer' : 'network connectivity'} peer ${newPeerId.substring(0, 8)}... (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
+        this.debug.log(`Will evict ${farthestPeerId.substring(0, 8)}... for ${newPeerDistance < farthestDistance ? 'closer' : 'network connectivity'} peer ${newPeerId.substring(0, 8)}... (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
         return farthestPeerId;
       }
 
-      console.log(`Not evicting for ${newPeerId.substring(0, 8)}... - criteria not met (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
+      this.debug.log(`Not evicting for ${newPeerId.substring(0, 8)}... - criteria not met (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
       return null;
     } else {
       // If XOR routing is disabled, use simple FIFO eviction - evict oldest peer
-      console.log(`XOR routing disabled - using FIFO eviction for ${newPeerId.substring(0, 8)}...`);
+      this.debug.log(`XOR routing disabled - using FIFO eviction for ${newPeerId.substring(0, 8)}...`);
       const oldestPeerId = this.findOldestPeer();
       if (oldestPeerId) {
-        console.log(`Will evict oldest peer ${oldestPeerId.substring(0, 8)}... for new peer ${newPeerId.substring(0, 8)}... (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
+        this.debug.log(`Will evict oldest peer ${oldestPeerId.substring(0, 8)}... for new peer ${newPeerId.substring(0, 8)}... (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
         return oldestPeerId;
       }
 
-      console.log('No eviction candidate found (no peers to evict)');
+      this.debug.log('No eviction candidate found (no peers to evict)');
       return null;
     }
   }
@@ -80,11 +82,11 @@ export class EvictionManager extends EventEmitter {
   async evictPeer(peerId, reason = 'topology optimization') {
     const peerConnection = this.connectionManager.getPeer(peerId);
     if (!peerConnection) {
-      console.log(`Cannot evict ${peerId.substring(0, 8)}... - peer not found`);
+      this.debug.log(`Cannot evict ${peerId.substring(0, 8)}... - peer not found`);
       return;
     }
 
-    console.log(`Evicting ${peerId.substring(0, 8)}... (${reason})`);
+    this.debug.log(`Evicting ${peerId.substring(0, 8)}... (${reason})`);
 
     // Send eviction notice
     try {
@@ -94,7 +96,7 @@ export class EvictionManager extends EventEmitter {
         from: this.mesh.peerId
       });
     } catch (error) {
-      console.log('Failed to send eviction notice:', error.message);
+      this.debug.log('Failed to send eviction notice:', error.message);
     }
 
     // Close connection and clean up
@@ -107,7 +109,7 @@ export class EvictionManager extends EventEmitter {
   }
 
   handleEvictionNotice(message, fromPeerId) {
-    console.log(`Evicted by ${fromPeerId.substring(0, 8)}... (${message.reason})`);
+    this.debug.log(`Evicted by ${fromPeerId.substring(0, 8)}... (${message.reason})`);
 
     // Clean up the connection
     this.connectionManager.peers.delete(fromPeerId);
@@ -133,7 +135,7 @@ export class EvictionManager extends EventEmitter {
 
   findFarthestPeer() {
     if (this.connectionManager.peers.size === 0) {
-      console.log('No peers available for eviction');
+      this.debug.log('No peers available for eviction');
       return null;
     }
 
@@ -159,7 +161,7 @@ export class EvictionManager extends EventEmitter {
 
     // FALLBACK: If no candidates found with strict criteria, try ANY peer
     if (!farthestPeer && this.connectionManager.peers.size > 0) {
-      console.log('No eviction candidates with connected/connecting status, trying any peer...');
+      this.debug.log('No eviction candidates with connected/connecting status, trying any peer...');
       this.connectionManager.peers.forEach((peerConnection, peerId) => {
         candidateCount++;
         const distance = this.calculateXorDistance(this.mesh.peerId, peerId);
@@ -171,9 +173,9 @@ export class EvictionManager extends EventEmitter {
     }
 
     if (farthestPeer) {
-      console.log(`Found farthest peer for eviction: ${farthestPeer.substring(0, 8)}... (distance: ${maxDistance.toString(16).substring(0, 8)}, ${candidateCount} candidate peers)`);
+      this.debug.log(`Found farthest peer for eviction: ${farthestPeer.substring(0, 8)}... (distance: ${maxDistance.toString(16).substring(0, 8)}, ${candidateCount} candidate peers)`);
     } else {
-      console.log(`No peers available for eviction (${candidateCount} candidate peers)`);
+      this.debug.log(`No peers available for eviction (${candidateCount} candidate peers)`);
     }
 
     return farthestPeer;
@@ -181,7 +183,7 @@ export class EvictionManager extends EventEmitter {
 
   findOldestPeer() {
     if (this.connectionManager.peers.size === 0) {
-      console.log('No peers available for FIFO eviction');
+      this.debug.log('No peers available for FIFO eviction');
       return null;
     }
 
@@ -207,7 +209,7 @@ export class EvictionManager extends EventEmitter {
 
     // FALLBACK: If no candidates found with strict criteria, try ANY peer
     if (!oldestPeer && this.connectionManager.peers.size > 0) {
-      console.log('No FIFO eviction candidates with connected/connecting status, trying any peer...');
+      this.debug.log('No FIFO eviction candidates with connected/connecting status, trying any peer...');
       this.connectionManager.peers.forEach((peerConnection, peerId) => {
         candidateCount++;
         const connectionTime = peerConnection.connectionStartTime || Date.now();
@@ -219,9 +221,9 @@ export class EvictionManager extends EventEmitter {
     }
 
     if (oldestPeer) {
-      console.log(`Found oldest peer for eviction: ${oldestPeer.substring(0, 8)}... (connected at: ${new Date(oldestTime).toLocaleTimeString()}, ${candidateCount} candidates)`);
+      this.debug.log(`Found oldest peer for eviction: ${oldestPeer.substring(0, 8)}... (connected at: ${new Date(oldestTime).toLocaleTimeString()}, ${candidateCount} candidates)`);
     } else {
-      console.log(`No peers available for FIFO eviction (${candidateCount} candidates)`);
+      this.debug.log(`No peers available for FIFO eviction (${candidateCount} candidates)`);
     }
 
     return oldestPeer;
@@ -237,7 +239,7 @@ export class EvictionManager extends EventEmitter {
     const toDisconnect = peerEntries.slice(0, this.connectionManager.peers.size - this.mesh.maxPeers);
 
     toDisconnect.forEach(([peerId, peerConnection]) => {
-      console.log(`Disconnecting ${peerId.substring(0, 8)}... (over max peers limit)`);
+      this.debug.log(`Disconnecting ${peerId.substring(0, 8)}... (over max peers limit)`);
       peerConnection.close();
       this.connectionManager.peers.delete(peerId);
       this.mesh.peerDiscovery.clearConnectionAttempt(peerId);
