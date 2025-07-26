@@ -51,6 +51,22 @@
                 </div>
             </div>
 
+            <div class="connected-peers" aria-expanded="false">
+                <div class="section-header">
+                    <h2>
+                        <button id="connected-peers-toggle" class="toggle-btn" aria-expanded="false">
+                            ▶ Connected Peers
+                        </button>
+                        <span id="connected-peers-count" class="count-badge">0</span>
+                    </h2>
+                </div>
+                <div id="connected-peers-content" class="collapsible-content" style="display: none;">
+                    <div id="peers-list" class="peers-list">
+                        <p class="empty-state">No peers connected</p>
+                    </div>
+                </div>
+            </div>
+
             <div class="media" aria-expanded="false">
                 <div class="section-header">
                     <h2>
@@ -128,22 +144,6 @@
                 <div id="discovered-peers-content" class="collapsible-content" style="display: none;">
                     <div id="discovered-peers-list" class="discovered-peers-list">
                         <p class="empty-state">No peers discovered</p>
-                    </div>
-                </div>
-            </div>
-
-            <div class="connected-peers" aria-expanded="false">
-                <div class="section-header">
-                    <h2>
-                        <button id="connected-peers-toggle" class="toggle-btn" aria-expanded="false">
-                            ▶ Connected Peers
-                        </button>
-                        <span id="connected-peers-count" class="count-badge">0</span>
-                    </h2>
-                </div>
-                <div id="connected-peers-content" class="collapsible-content" style="display: none;">
-                    <div id="peers-list" class="peers-list">
-                        <p class="empty-state">No peers connected</p>
                     </div>
                 </div>
             </div>

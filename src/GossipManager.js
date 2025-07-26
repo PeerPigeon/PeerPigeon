@@ -1,5 +1,6 @@
 import { EventEmitter } from './EventEmitter.js';
 import { environmentDetector } from './EnvironmentDetector.js';
+import DebugLogger from './DebugLogger.js';
 
 /**
  * Manages gossip protocol for message propagation across the mesh network
@@ -10,6 +11,7 @@ export class GossipManager extends EventEmitter {
     super();
     this.mesh = mesh;
     this.connectionManager = connectionManager;
+    this.debug = DebugLogger.create('GossipManager');
 
     // Track message history to prevent infinite loops
     this.seenMessages = new Map(); // messageId -> { timestamp, ttl }
@@ -30,17 +32,17 @@ export class GossipManager extends EventEmitter {
   broadcastMessage(content, messageType = 'chat') {
     // Validate content
     if (content === undefined || content === null) {
-      console.error('Cannot broadcast message with undefined/null content');
+      this.debug.error('Cannot broadcast message with undefined/null content');
       return null;
     }
 
     if (messageType === 'chat' && (typeof content !== 'string' || content.trim().length === 0)) {
-      console.error('Cannot broadcast empty chat message');
+      this.debug.error('Cannot broadcast empty chat message');
       return null;
     }
 
     if (messageType === 'encrypted' && (typeof content !== 'object' || !content.encrypted)) {
-      console.error('Cannot broadcast invalid encrypted message');
+      this.debug.error('Cannot broadcast invalid encrypted message');
       return null;
     }
 
@@ -56,7 +58,7 @@ export class GossipManager extends EventEmitter {
       path: [this.mesh.peerId] // Track propagation path
     };
 
-    console.log(`Broadcasting ${messageType} message: ${messageId.substring(0, 8)}... content: "${content}"`);
+    this.debug.log(`Broadcasting ${messageType} message: ${messageId.substring(0, 8)}... content: "${content}"`);
 
     // Store our own message
     this.seenMessages.set(messageId, {
@@ -91,13 +93,13 @@ export class GossipManager extends EventEmitter {
      */
   sendDirectMessage(targetPeerId, content, subtype = 'dm') {
     if (!targetPeerId || typeof targetPeerId !== 'string') {
-      console.error('Invalid targetPeerId for direct message');
+      this.debug.error('Invalid targetPeerId for direct message');
       return null;
     }
 
     // Validate peer ID format (40-character hex string)
     if (!/^[a-fA-F0-9]{40}$/.test(targetPeerId)) {
-      console.error('Invalid peer ID format for direct message:', targetPeerId);
+      this.debug.error('Invalid peer ID format for direct message:', targetPeerId);
       return null;
     }
 
@@ -128,36 +130,36 @@ export class GossipManager extends EventEmitter {
      * Handle incoming gossip message from a peer
      */
   async handleGossipMessage(message, fromPeerId) {
-    console.log(`🔥🔥🔥 GOSSIP MESSAGE RECEIVED! From: ${fromPeerId?.substring(0, 8)}...`);
-    console.log('🔥🔥🔥 Message:', message);
+    this.debug.log(`🔥🔥🔥 GOSSIP MESSAGE RECEIVED! From: ${fromPeerId?.substring(0, 8)}...`);
+    this.debug.log('🔥🔥🔥 Message:', message);
 
     const { id: messageId, ttl, from: originPeerId, subtype, content, timestamp, path, to } = message;
 
     // Validate message structure
     if (!messageId || !originPeerId || !subtype || content === undefined) {
-      console.error('Invalid gossip message structure:', message);
+      this.debug.error('Invalid gossip message structure:', message);
       return;
     }
 
     // Check if we've already seen this message
     if (this.seenMessages.has(messageId)) {
-      console.log(`Ignoring duplicate message: ${messageId.substring(0, 8)}...`);
+      this.debug.log(`Ignoring duplicate message: ${messageId.substring(0, 8)}...`);
       return;
     }
 
     // Check TTL
     if (ttl <= 0) {
-      console.log(`Message expired: ${messageId.substring(0, 8)}...`);
+      this.debug.log(`Message expired: ${messageId.substring(0, 8)}...`);
       return;
     }
 
     // Check for loops (our peer ID in path)
     if (path && path.includes(this.mesh.peerId)) {
-      console.log(`Preventing message loop: ${messageId.substring(0, 8)}...`);
+      this.debug.log(`Preventing message loop: ${messageId.substring(0, 8)}...`);
       return;
     }
 
-    console.log(`Received gossip message: ${messageId.substring(0, 8)}... from ${fromPeerId.substring(0, 8)}... (TTL: ${ttl}, content: "${content}")`);
+    this.debug.log(`Received gossip message: ${messageId.substring(0, 8)}... from ${fromPeerId.substring(0, 8)}... (TTL: ${ttl}, content: "${content}")`);
 
     // Store message to prevent duplicates
     this.seenMessages.set(messageId, {
@@ -183,9 +185,9 @@ export class GossipManager extends EventEmitter {
       try {
         processedContent = await this.mesh.decryptMessage(content);
         isEncrypted = true;
-        console.log(`🔐 Decrypted message from ${originPeerId.substring(0, 8)}...`);
+        this.debug.log(`🔐 Decrypted message from ${originPeerId.substring(0, 8)}...`);
       } catch (error) {
-        console.error('Failed to decrypt message:', error);
+        this.debug.error('Failed to decrypt message:', error);
         // Continue with original content
         processedContent = content;
       }
@@ -205,7 +207,7 @@ export class GossipManager extends EventEmitter {
           encrypted: isEncrypted
         });
       } else {
-        console.warn('Ignoring gossip chat message with invalid content:', processedContent);
+        this.debug.warn('Ignoring gossip chat message with invalid content:', processedContent);
         return;
       }
     } else if (subtype === 'encrypted') {
@@ -242,7 +244,7 @@ export class GossipManager extends EventEmitter {
     } else if (subtype === 'dht-routing') {
       // DHT routing message - check if we're the target
       if (typeof to === 'string' && typeof this.mesh.peerId === 'string' && to.trim().toLowerCase() === this.mesh.peerId.trim().toLowerCase()) {
-        console.log(`DHT: Received routed message for us from ${originPeerId.substring(0, 8)}`);
+        this.debug.log(`DHT: Received routed message for us from ${originPeerId.substring(0, 8)}`);
         // We are the target, deliver the DHT message locally
         if (this.mesh.webDHT && content) {
           // Simulate receiving the message from the original sender
@@ -251,7 +253,7 @@ export class GossipManager extends EventEmitter {
         // Do NOT relay further since we are the recipient
         return;
       } else {
-        console.log(`DHT: Routing message for ${to?.substring(0, 8)} (not us)`);
+        this.debug.log(`DHT: Routing message for ${to?.substring(0, 8)} (not us)`);
         // Not the target, continue routing
       }
     }
@@ -271,7 +273,7 @@ export class GossipManager extends EventEmitter {
   handlePeerAnnouncement(announcementData, originPeerId) {
     const { peerId: announcedPeerId } = announcementData;
 
-    console.log(`Gossip peer announcement: ${announcedPeerId.substring(0, 8)}... via ${originPeerId.substring(0, 8)}...`);
+    this.debug.log(`Gossip peer announcement: ${announcedPeerId.substring(0, 8)}... via ${originPeerId.substring(0, 8)}...`);
 
     // Add to discovered peers if we don't know about them
     if (!this.mesh.peerDiscovery.hasPeer(announcedPeerId) &&
@@ -294,7 +296,7 @@ export class GossipManager extends EventEmitter {
       timestamp: Date.now()
     };
 
-    console.log(`Gossiping peer announcement for: ${peerId.substring(0, 8)}...`);
+    this.debug.log(`Gossiping peer announcement for: ${peerId.substring(0, 8)}...`);
     this.broadcastMessage(announcementData, 'peer-announcement');
   }
 
@@ -337,9 +339,9 @@ export class GossipManager extends EventEmitter {
           try {
             peer.sendMessage(message);
             const routingType = message.subtype === 'dht-routing' ? 'DHT' : 'DM';
-            console.log(`${routingType} routed to closest peer: ${peer.peerId.substring(0, 8)}...`);
+            this.debug.log(`${routingType} routed to closest peer: ${peer.peerId.substring(0, 8)}...`);
           } catch (error) {
-            console.error(`${message.subtype} routing failed:`, error);
+            this.debug.error(`${message.subtype} routing failed:`, error);
           }
         });
       } else {
@@ -349,9 +351,9 @@ export class GossipManager extends EventEmitter {
           try {
             peerConnection.sendMessage(message);
             const routingType = message.subtype === 'dht-routing' ? 'DHT' : 'DM';
-            console.log(`${routingType} fallback relay to: ${peerConnection.peerId.substring(0, 8)}...`);
+            this.debug.log(`${routingType} fallback relay to: ${peerConnection.peerId.substring(0, 8)}...`);
           } catch (error) {
-            console.error(`${message.subtype} fallback relay failed:`, error);
+            this.debug.error(`${message.subtype} fallback relay failed:`, error);
           }
         });
       }
@@ -367,8 +369,8 @@ export class GossipManager extends EventEmitter {
 
     let propagatedTo = 0;
 
-    console.log(`🚀 AGGRESSIVE GOSSIP: Found ${capablePeers.length}/${allPeers.length} peers with open data channels`);
-    console.log(`Message: ${message.id.substring(0, 8)}..., TTL: ${message.ttl}, Exclude: ${excludePeerId?.substring(0, 8) || 'none'}`);
+    this.debug.log(`🚀 AGGRESSIVE GOSSIP: Found ${capablePeers.length}/${allPeers.length} peers with open data channels`);
+    this.debug.log(`Message: ${message.id.substring(0, 8)}..., TTL: ${message.ttl}, Exclude: ${excludePeerId?.substring(0, 8) || 'none'}`);
 
     // Debug: show state of ALL peers
     allPeers.forEach(peerConnection => {
@@ -376,7 +378,7 @@ export class GossipManager extends EventEmitter {
       const dataChannelState = peerConnection.dataChannel?.readyState || 'none';
       const canSend = peerConnection.dataChannel && peerConnection.dataChannel.readyState === 'open';
       const isExcluded = peerConnection.peerId === excludePeerId;
-      console.log(`  ${peerConnection.peerId.substring(0, 8)}... - Status: ${status}, DataChannel: ${dataChannelState}, CanSend: ${canSend}, Excluded: ${isExcluded}`);
+      this.debug.log(`  ${peerConnection.peerId.substring(0, 8)}... - Status: ${status}, DataChannel: ${dataChannelState}, CanSend: ${canSend}, Excluded: ${isExcluded}`);
     });
 
     capablePeers.forEach(peerConnection => {
@@ -390,16 +392,16 @@ export class GossipManager extends EventEmitter {
       try {
         peerConnection.sendMessage(message);
         propagatedTo++;
-        console.log(`✅ GOSSIP SUCCESS: Sent to ${peerId.substring(0, 8)}...`);
+        this.debug.log(`✅ GOSSIP SUCCESS: Sent to ${peerId.substring(0, 8)}...`);
       } catch (error) {
-        console.error(`❌ GOSSIP FAILED: Could not send to ${peerId.substring(0, 8)}...`, error);
+        this.debug.error(`❌ GOSSIP FAILED: Could not send to ${peerId.substring(0, 8)}...`, error);
       }
     });
 
-    console.log(`🎯 GOSSIP RESULT: Propagated to ${propagatedTo}/${capablePeers.length} capable peers`);
+    this.debug.log(`🎯 GOSSIP RESULT: Propagated to ${propagatedTo}/${capablePeers.length} capable peers`);
 
     if (propagatedTo === 0 && allPeers.length > 0) {
-      console.error(`🚨 GOSSIP FAILURE: NO PROPAGATION! ${allPeers.length} total peers, ${capablePeers.length} with data channels`);
+      this.debug.error(`🚨 GOSSIP FAILURE: NO PROPAGATION! ${allPeers.length} total peers, ${capablePeers.length} with data channels`);
     }
   }
 
@@ -467,7 +469,7 @@ export class GossipManager extends EventEmitter {
     });
 
     if (cleaned > 0) {
-      console.log(`Cleaned up ${cleaned} expired gossip messages`);
+      this.debug.log(`Cleaned up ${cleaned} expired gossip messages`);
     }
   }
 
@@ -490,7 +492,7 @@ export class GossipManager extends EventEmitter {
     // Handle key exchange messages
     if (subtype === 'key_exchange' || subtype === 'key_exchange_response') {
       if (content && (content.type === 'key_exchange' || content.type === 'key_exchange_response') && content.publicKey) {
-        console.log(`🔐 Received ${content.type} from peer ${originPeerId.substring(0, 8)}...`);
+        this.debug.log(`🔐 Received ${content.type} from peer ${originPeerId.substring(0, 8)}...`);
 
         // Use the mesh's key exchange handler which properly handles both pub and epub keys
         this.mesh._handleKeyExchange(content, originPeerId);

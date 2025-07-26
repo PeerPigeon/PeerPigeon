@@ -1,9 +1,11 @@
 import { EventEmitter } from './EventEmitter.js';
 import { environmentDetector } from './EnvironmentDetector.js';
+import DebugLogger from './DebugLogger.js';
 
 export class PeerDiscovery extends EventEmitter {
   constructor(peerId, options = {}) {
     super();
+    this.debug = DebugLogger.create('PeerDiscovery');
     this.peerId = peerId;
     this.discoveredPeers = new Map();
     this.connectionAttempts = new Map();
@@ -46,15 +48,15 @@ export class PeerDiscovery extends EventEmitter {
     this.discoveredPeers.set(peerId, Date.now());
     this.emit('peerDiscovered', { peerId });
 
-    console.log(`Discovered peer ${peerId.substring(0, 8)}...`);
+    this.debug.log(`Discovered peer ${peerId.substring(0, 8)}...`);
 
     // Only auto-connect if we should initiate to this peer and we're not already trying
     if (this.autoDiscovery && this.shouldInitiateConnection(peerId) && !this.connectionAttempts.has(peerId)) {
-      console.log(`Considering connection to ${peerId.substring(0, 8)}...`);
+      this.debug.log(`Considering connection to ${peerId.substring(0, 8)}...`);
 
       const canAccept = this.canAcceptMorePeers();
       if (canAccept) {
-        console.log(`Connecting to ${peerId.substring(0, 8)}...`);
+        this.debug.log(`Connecting to ${peerId.substring(0, 8)}...`);
         this.emit('connectToPeer', { peerId });
       }
     }
@@ -64,7 +66,7 @@ export class PeerDiscovery extends EventEmitter {
 
   // Update connection attempts tracking (no complex isolation logic needed)
   onConnectionEstablished() {
-    console.log('Connection established');
+    this.debug.log('Connection established');
   }
 
   removeDiscoveredPeer(peerId) {
@@ -111,7 +113,7 @@ export class PeerDiscovery extends EventEmitter {
 
       // First priority: peers where we'd naturally be the initiator
       if (naturalInitiators.length > 0 && naturalInitiators.includes(targetPeerId)) {
-        console.log(`shouldInitiateConnection: Isolation override (natural) - ${this.peerId.substring(0, 8)}... will initiate to ${targetPeerId.substring(0, 8)}...`);
+        this.debug.log(`shouldInitiateConnection: Isolation override (natural) - ${this.peerId.substring(0, 8)}... will initiate to ${targetPeerId.substring(0, 8)}...`);
         return true;
       }
 
@@ -127,7 +129,7 @@ export class PeerDiscovery extends EventEmitter {
         const closestPeers = sortedByDistance.slice(0, Math.min(3, sortedByDistance.length));
         if (closestPeers.includes(targetPeerId)) {
           const index = closestPeers.indexOf(targetPeerId);
-          console.log(`shouldInitiateConnection: Isolation override (closest ${index + 1}) - ${this.peerId.substring(0, 8)}... will initiate to ${targetPeerId.substring(0, 8)}...`);
+          this.debug.log(`shouldInitiateConnection: Isolation override (closest ${index + 1}) - ${this.peerId.substring(0, 8)}... will initiate to ${targetPeerId.substring(0, 8)}...`);
           return true;
         }
       }
@@ -136,12 +138,12 @@ export class PeerDiscovery extends EventEmitter {
       // be even more aggressive and try ANY peer to break isolation
       const attemptedConnections = this.connectionAttempts.size;
       if (attemptedConnections >= 2 && discoveredPeers.includes(targetPeerId)) {
-        console.log(`shouldInitiateConnection: Isolation override (desperate) - ${this.peerId.substring(0, 8)}... will initiate to ${targetPeerId.substring(0, 8)}... (${attemptedConnections} attempts failed)`);
+        this.debug.log(`shouldInitiateConnection: Isolation override (desperate) - ${this.peerId.substring(0, 8)}... will initiate to ${targetPeerId.substring(0, 8)}... (${attemptedConnections} attempts failed)`);
         return true;
       }
     }
 
-    console.log(`shouldInitiateConnection: ${this.peerId.substring(0, 8)}... > ${targetPeerId.substring(0, 8)}... = ${lexicographicShouldInitiate}`);
+    this.debug.log(`shouldInitiateConnection: ${this.peerId.substring(0, 8)}... > ${targetPeerId.substring(0, 8)}... = ${lexicographicShouldInitiate}`);
     return lexicographicShouldInitiate;
   }
 
@@ -168,7 +170,7 @@ export class PeerDiscovery extends EventEmitter {
   optimizeMeshConnections(currentPeers) {
     if (!this.autoDiscovery) return;
 
-    console.log('Optimizing mesh connections...');
+    this.debug.log('Optimizing mesh connections...');
 
     // Find unconnected peers that we should initiate connections to
     const unconnectedPeers = Array.from(this.discoveredPeers.keys())
@@ -181,7 +183,7 @@ export class PeerDiscovery extends EventEmitter {
       });
 
     if (unconnectedPeers.length === 0) {
-      console.log('No unconnected peers to optimize');
+      this.debug.log('No unconnected peers to optimize');
       return;
     }
 
@@ -232,7 +234,7 @@ export class PeerDiscovery extends EventEmitter {
         this.discoveredPeers.delete(peerId);
         this.connectionAttempts.delete(peerId);
         removedCount++;
-        console.log('Removed stale peer:', peerId.substring(0, 8));
+        this.debug.log('Removed stale peer:', peerId.substring(0, 8));
       }
     });
 
@@ -283,18 +285,18 @@ export class PeerDiscovery extends EventEmitter {
     const discoveredPeerIds = Array.from(this.discoveredPeers.keys()).map(p => p.substring(0, 8));
     const connectionAttempts = Array.from(this.connectionAttempts.keys()).map(p => p.substring(0, 8));
 
-    console.log('=== PEER DISCOVERY DEBUG ===');
-    console.log(`Our peer ID: ${this.peerId.substring(0, 8)}...`);
-    console.log(`Discovered peers (${discoveredPeerIds.length}): ${discoveredPeerIds.join(', ')}`);
-    console.log(`Connection attempts (${connectionAttempts.length}): ${connectionAttempts.join(', ')}`);
+    this.debug.log('=== PEER DISCOVERY DEBUG ===');
+    this.debug.log(`Our peer ID: ${this.peerId.substring(0, 8)}...`);
+    this.debug.log(`Discovered peers (${discoveredPeerIds.length}): ${discoveredPeerIds.join(', ')}`);
+    this.debug.log(`Connection attempts (${connectionAttempts.length}): ${connectionAttempts.join(', ')}`);
 
     // Show which peers we should/shouldn't initiate to
     discoveredPeerIds.forEach(peerId => {
       const fullPeerId = Array.from(this.discoveredPeers.keys()).find(p => p.startsWith(peerId));
       const shouldInitiate = this.shouldInitiateConnection(fullPeerId);
       const comparison = this.peerId > fullPeerId;
-      console.log(`  ${peerId}...: should initiate = ${shouldInitiate} (${this.peerId.substring(0, 8)}... > ${peerId}... = ${comparison})`);
+      this.debug.log(`  ${peerId}...: should initiate = ${shouldInitiate} (${this.peerId.substring(0, 8)}... > ${peerId}... = ${comparison})`);
     });
-    console.log('=== END DEBUG ===');
+    this.debug.log('=== END DEBUG ===');
   }
 }

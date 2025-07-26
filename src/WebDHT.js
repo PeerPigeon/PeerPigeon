@@ -1,5 +1,6 @@
 import { EventEmitter } from './EventEmitter.js';
 import { safeSetInterval, safeClearInterval, safeSetTimeout, safeClearTimeout } from './TimerUtils.js';
+import DebugLogger from './DebugLogger.js';
 
 /**
  * WebDHT - A Kademlia-like Distributed Hash Table for WebRTC mesh networks
@@ -13,6 +14,7 @@ import { safeSetInterval, safeClearInterval, safeSetTimeout, safeClearTimeout } 
 export class WebDHT extends EventEmitter {
   constructor(mesh) {
     super();
+    this.debug = DebugLogger.create('WebDHT');
     this.mesh = mesh;
     this.peerId = mesh.peerId;
 
@@ -46,81 +48,81 @@ export class WebDHT extends EventEmitter {
     // Start periodic maintenance
     this.startMaintenance();
 
-    console.log(`WebDHT initialized for peer ${this.peerId.substring(0, 8)}...`);
+    this.debug.log(`WebDHT initialized for peer ${this.peerId.substring(0, 8)}...`);
   }
 
   /**
      * Setup message handlers for DHT operations
      */
   setupMessageHandlers() {
-    console.log(`🔥 DHT Setting up message handlers for peer ${this.peerId.substring(0, 8)}`);
+    this.debug.log(`🔥 DHT Setting up message handlers for peer ${this.peerId.substring(0, 8)}`);
 
     // DHT messages now come through ConnectionManager's handleIncomingMessage
     // which routes 'dht' type messages to this.mesh.webDHT.handleMessage
     // So we don't need to listen to gossip manager events anymore
 
-    console.log(`🔥 DHT Message handlers setup complete for peer ${this.peerId.substring(0, 8)}`);
+    this.debug.log(`🔥 DHT Message handlers setup complete for peer ${this.peerId.substring(0, 8)}`);
   }
 
   /**
      * Handle incoming DHT messages - called by ConnectionManager
      */
   async handleMessage(message, fromPeerId) {
-    console.log(`🔥 DHT Message received from ${fromPeerId.substring(0, 8)}:`, message);
+    this.debug.log(`🔥 DHT Message received from ${fromPeerId.substring(0, 8)}:`, message);
 
     // Extract the DHT operation type and data
     const type = message.messageType || message.type;
     const data = message.data;
 
     if (!type || !data) {
-      console.error(`🔥 DHT Invalid message structure from ${fromPeerId.substring(0, 8)}:`, message);
+      this.debug.error(`🔥 DHT Invalid message structure from ${fromPeerId.substring(0, 8)}:`, message);
       return;
     }
 
-    console.log(`🔥 DHT Processing ${type} from ${fromPeerId.substring(0, 8)}, data:`, data);
+    this.debug.log(`🔥 DHT Processing ${type} from ${fromPeerId.substring(0, 8)}, data:`, data);
 
     try {
       switch (type) {
         case 'store':
-          console.log(`🔥 DHT Handling store request from ${fromPeerId.substring(0, 8)}`);
+          this.debug.log(`🔥 DHT Handling store request from ${fromPeerId.substring(0, 8)}`);
           await this.handleStoreRequest(fromPeerId, data);
           break;
         case 'find_value':
-          console.log(`🔥 DHT Handling find_value request from ${fromPeerId.substring(0, 8)}`);
+          this.debug.log(`🔥 DHT Handling find_value request from ${fromPeerId.substring(0, 8)}`);
           await this.handleFindValueRequest(fromPeerId, data);
           break;
         case 'find_node':
-          console.log(`🔥 DHT Handling find_node request from ${fromPeerId.substring(0, 8)}`);
+          this.debug.log(`🔥 DHT Handling find_node request from ${fromPeerId.substring(0, 8)}`);
           await this.handleFindNodeRequest(fromPeerId, data);
           break;
         case 'subscribe':
-          console.log(`🔥 DHT Handling subscribe request from ${fromPeerId.substring(0, 8)}`);
+          this.debug.log(`🔥 DHT Handling subscribe request from ${fromPeerId.substring(0, 8)}`);
           await this.handleSubscribeRequest(fromPeerId, data);
           break;
         case 'unsubscribe':
-          console.log(`🔥 DHT Handling unsubscribe request from ${fromPeerId.substring(0, 8)}`);
+          this.debug.log(`🔥 DHT Handling unsubscribe request from ${fromPeerId.substring(0, 8)}`);
           await this.handleUnsubscribeRequest(fromPeerId, data);
           break;
         case 'value_changed':
-          console.log(`🔥 DHT Handling value_changed notification from ${fromPeerId.substring(0, 8)}`);
+          this.debug.log(`🔥 DHT Handling value_changed notification from ${fromPeerId.substring(0, 8)}`);
           await this.handleValueChangedNotification(fromPeerId, data);
           break;
         case 'update_value':
-          console.log(`🔥 DHT Handling update_value request from ${fromPeerId.substring(0, 8)}`);
+          this.debug.log(`🔥 DHT Handling update_value request from ${fromPeerId.substring(0, 8)}`);
           await this.handleUpdateValueRequest(fromPeerId, data);
           break;
         case 'store_response':
         case 'find_value_response':
         case 'find_node_response':
         case 'update_value_response':
-          console.log(`🔥 DHT Handling response (${type}) from ${fromPeerId.substring(0, 8)}`);
+          this.debug.log(`🔥 DHT Handling response (${type}) from ${fromPeerId.substring(0, 8)}`);
           this.handleResponse(fromPeerId, data);
           break;
         default:
-          console.warn(`Unknown DHT message type: ${type}`);
+          this.debug.warn(`Unknown DHT message type: ${type}`);
       }
     } catch (error) {
-      console.error(`🔥 DHT Error handling message type ${type} from ${fromPeerId.substring(0, 8)}:`, error);
+      this.debug.error(`🔥 DHT Error handling message type ${type} from ${fromPeerId.substring(0, 8)}:`, error);
     }
   }
 
@@ -131,7 +133,7 @@ export class WebDHT extends EventEmitter {
     const keyId = await this.generateKeyId(key);
     const ttl = options.ttl || this.config.ttl;
 
-    console.log(`DHT PUT: ${key} -> ${keyId.substring(0, 8)}...`);
+    this.debug.log(`DHT PUT: ${key} -> ${keyId.substring(0, 8)}...`);
 
     const storeData = {
       key,
@@ -147,7 +149,7 @@ export class WebDHT extends EventEmitter {
 
     // CRITICAL FIX: Always store locally first (the originator always keeps a copy)
     this.storeLocally(keyId, storeData);
-    console.log(`DHT PUT: Stored locally: ${key}`);
+    this.debug.log(`DHT PUT: Stored locally: ${key}`);
 
     // If this is a new key, activate any pending subscriptions
     if (isNewKey) {
@@ -155,7 +157,7 @@ export class WebDHT extends EventEmitter {
 
       // Notify locally activated subscribers about the new key
       if (activatedSubscribers.length > 0) {
-        console.log(`DHT PUT: Notifying ${activatedSubscribers.length} locally pending subscribers about new key ${key}`);
+        this.debug.log(`DHT PUT: Notifying ${activatedSubscribers.length} locally pending subscribers about new key ${key}`);
 
         const notificationPromises = activatedSubscribers.map(async (subscriberId) => {
           if (subscriberId !== this.peerId) {
@@ -168,7 +170,7 @@ export class WebDHT extends EventEmitter {
                 isNewKey: true
               });
             } catch (error) {
-              console.warn(`Failed to notify subscriber ${subscriberId.substring(0, 8)} about new key:`, error.message);
+              this.debug.warn(`Failed to notify subscriber ${subscriberId.substring(0, 8)} about new key:`, error.message);
               return null;
             }
           }
@@ -180,7 +182,7 @@ export class WebDHT extends EventEmitter {
 
     // AUTO-SUBSCRIBE: When putting a value, automatically subscribe to future changes
     this.mySubscriptions.add(keyId);
-    console.log(`DHT PUT: Auto-subscribed to ${key} for future updates`);
+    this.debug.log(`DHT PUT: Auto-subscribed to ${key} for future updates`);
 
     // Find the closest peers to store this key for replication
     const closestPeers = await this.findClosestPeers(keyId, this.config.k); // Get more peers initially
@@ -198,13 +200,13 @@ export class WebDHT extends EventEmitter {
     const subscribe = options.skipSubscribe ? false : (options.subscribe !== false);
     const forceRefresh = options.forceRefresh || false;
 
-    console.log(`DHT GET: ${key} -> ${keyId.substring(0, 8)}... (auto-subscribing: ${subscribe}, forceRefresh: ${forceRefresh})`);
+    this.debug.log(`DHT GET: ${key} -> ${keyId.substring(0, 8)}... (auto-subscribing: ${subscribe}, forceRefresh: ${forceRefresh})`);
 
     // Check local storage FIRST (unless force refresh is requested)
     if (!forceRefresh && this.localStorage.has(keyId)) {
       const data = this.localStorage.get(keyId);
       if (!this.isExpired(data)) {
-        console.log(`DHT GET: Found locally: ${key} (using cached data)`);
+        this.debug.log(`DHT GET: Found locally: ${key} (using cached data)`);
         // Add subscription even for local data (unless skipSubscribe is true)
         if (subscribe) {
           this.mySubscriptions.add(keyId);
@@ -213,14 +215,14 @@ export class WebDHT extends EventEmitter {
       } else {
         // Remove expired data
         this.localStorage.delete(keyId);
-        console.log(`DHT GET: Removed expired local data for: ${key}`);
+        this.debug.log(`DHT GET: Removed expired local data for: ${key}`);
       }
     }
 
     if (forceRefresh) {
-      console.log('DHT GET: Force refresh requested - bypassing local cache, fetching from original storing peers');
+      this.debug.log('DHT GET: Force refresh requested - bypassing local cache, fetching from original storing peers');
     } else {
-      console.log(`DHT GET: Not found locally, routing to network for key: ${key}`);
+      this.debug.log(`DHT GET: Not found locally, routing to network for key: ${key}`);
     }
 
     // Implement iterative Kademlia lookup with automatic subscription
@@ -234,7 +236,7 @@ export class WebDHT extends EventEmitter {
   async subscribe(key) {
     const keyId = await this.generateKeyId(key);
 
-    console.log(`DHT EXPLICIT SUBSCRIBE: ${key} -> ${keyId.substring(0, 8)}...`);
+    this.debug.log(`DHT EXPLICIT SUBSCRIBE: ${key} -> ${keyId.substring(0, 8)}...`);
 
     // Add to our subscriptions immediately
     this.mySubscriptions.add(keyId);
@@ -252,7 +254,7 @@ export class WebDHT extends EventEmitter {
             subscriber: this.peerId
           });
         } catch (error) {
-          console.warn(`DHT SUBSCRIBE: Failed to subscribe to peer ${peerId.substring(0, 8)}:`, error.message);
+          this.debug.warn(`DHT SUBSCRIBE: Failed to subscribe to peer ${peerId.substring(0, 8)}:`, error.message);
           return null;
         }
       }
@@ -270,10 +272,10 @@ export class WebDHT extends EventEmitter {
     try {
       currentValue = await this.get(key, { skipSubscribe: true }); // Skip auto-subscribe since we're already subscribed
     } catch (error) {
-      console.log(`DHT SUBSCRIBE: Key ${key} doesn't exist yet, but subscription is active for when it's created`);
+      this.debug.log(`DHT SUBSCRIBE: Key ${key} doesn't exist yet, but subscription is active for when it's created`);
     }
 
-    console.log(`DHT SUBSCRIBE: Subscribed to ${key}, current value:`, currentValue);
+    this.debug.log(`DHT SUBSCRIBE: Subscribed to ${key}, current value:`, currentValue);
     return currentValue;
   }
 
@@ -319,7 +321,7 @@ export class WebDHT extends EventEmitter {
       }
     }
 
-    console.log(`DHT UNSUBSCRIBE: ${key} -> ${keyId.substring(0, 8)}...`);
+    this.debug.log(`DHT UNSUBSCRIBE: ${key} -> ${keyId.substring(0, 8)}...`);
   }
 
   /**
@@ -328,11 +330,11 @@ export class WebDHT extends EventEmitter {
   async update(key, newValue, options = {}) {
     const keyId = await this.generateKeyId(key);
 
-    console.log(`DHT UPDATE: Updating ${key} with new value across all replicas and subscribers`);
+    this.debug.log(`DHT UPDATE: Updating ${key} with new value across all replicas and subscribers`);
 
     // AUTO-SUBSCRIBE: When updating a value, automatically subscribe to future changes
     this.mySubscriptions.add(keyId);
-    console.log(`DHT UPDATE: Auto-subscribed to ${key} for future updates`);
+    this.debug.log(`DHT UPDATE: Auto-subscribed to ${key} for future updates`);
 
     // Find all peers that should store this key (closest peers)
     const closestPeers = await this.findClosestPeers(keyId, this.config.replicationFactor);
@@ -347,31 +349,31 @@ export class WebDHT extends EventEmitter {
       publisher: this.peerId
     };
 
-    console.log(`DHT UPDATE: Target replica peers for ${key}:`, closestPeers.map(p => p.substring(0, 8)));
+    this.debug.log(`DHT UPDATE: Target replica peers for ${key}:`, closestPeers.map(p => p.substring(0, 8)));
 
     // CRITICAL FIX: Always update locally first if we're among the closest
     let localUpdateSuccess = false;
     if (this.isAmongClosest(keyId, closestPeers)) {
       this.storeLocally(keyId, updateData);
       localUpdateSuccess = true;
-      console.log(`DHT UPDATE: Updated ${key} locally (we are replica peer)`);
+      this.debug.log(`DHT UPDATE: Updated ${key} locally (we are replica peer)`);
     }
 
     // CRITICAL FIX: Send update to ALL replica peers and wait for ALL to succeed
     const updatePromises = closestPeers.map(async (peerId) => {
       if (peerId !== this.peerId) {
         try {
-          console.log(`DHT UPDATE: Sending update to replica peer ${peerId.substring(0, 8)}`);
+          this.debug.log(`DHT UPDATE: Sending update to replica peer ${peerId.substring(0, 8)}`);
           const response = await this.sendDHTMessage(peerId, 'update_value', updateData);
           if (response && response.success) {
-            console.log(`DHT UPDATE: Successfully updated replica peer ${peerId.substring(0, 8)}`);
+            this.debug.log(`DHT UPDATE: Successfully updated replica peer ${peerId.substring(0, 8)}`);
             return { peerId, success: true };
           } else {
-            console.warn(`DHT UPDATE: Replica peer ${peerId.substring(0, 8)} rejected update:`, response);
+            this.debug.warn(`DHT UPDATE: Replica peer ${peerId.substring(0, 8)} rejected update:`, response);
             return { peerId, success: false, response };
           }
         } catch (error) {
-          console.warn(`DHT UPDATE: Failed to update replica peer ${peerId.substring(0, 8)}:`, error.message);
+          this.debug.warn(`DHT UPDATE: Failed to update replica peer ${peerId.substring(0, 8)}:`, error.message);
           return { peerId, success: false, error: error.message };
         }
       }
@@ -386,16 +388,16 @@ export class WebDHT extends EventEmitter {
     const successfulUpdates = updateResults.filter(r => r.success).length;
     const failedUpdates = updateResults.filter(r => !r.success);
 
-    console.log(`DHT UPDATE: Replica peer update results for ${key}:`);
-    console.log(`  - Successful: ${successfulUpdates}`);
-    console.log(`  - Failed: ${failedUpdates.length}`);
-    console.log(`  - Local: ${localUpdateSuccess ? 'success' : 'not applicable'}`);
+    this.debug.log(`DHT UPDATE: Replica peer update results for ${key}:`);
+    this.debug.log(`  - Successful: ${successfulUpdates}`);
+    this.debug.log(`  - Failed: ${failedUpdates.length}`);
+    this.debug.log(`  - Local: ${localUpdateSuccess ? 'success' : 'not applicable'}`);
 
     // ENHANCED: Log failed updates for debugging
     if (failedUpdates.length > 0) {
-      console.warn('DHT UPDATE: Failed to update these replica peers:',
+      this.debug.warn('DHT UPDATE: Failed to update these replica peers:',
         failedUpdates.map(f => ({ peer: f.peerId.substring(0, 8), reason: f.error || f.response })));
-      console.warn('DHT UPDATE: This may lead to consistency issues. Consider implementing retry logic.');
+      this.debug.warn('DHT UPDATE: This may lead to consistency issues. Consider implementing retry logic.');
     }
 
     // CRITICAL: Broadcast value change to ALL peers (including non-replicas)
@@ -409,10 +411,10 @@ export class WebDHT extends EventEmitter {
     const wasSuccessful = totalSuccessful >= totalReplicas;
 
     if (!wasSuccessful) {
-      console.warn(`DHT UPDATE: ${key} update FAILED - only ${totalSuccessful}/${totalReplicas} replicas updated successfully`);
-      console.warn('DHT UPDATE: This may cause consistency issues where GET operations return stale data');
+      this.debug.warn(`DHT UPDATE: ${key} update FAILED - only ${totalSuccessful}/${totalReplicas} replicas updated successfully`);
+      this.debug.warn('DHT UPDATE: This may cause consistency issues where GET operations return stale data');
     } else {
-      console.log(`DHT UPDATE: ${key} update SUCCESSFUL - all ${totalSuccessful}/${totalReplicas} replicas updated`);
+      this.debug.log(`DHT UPDATE: ${key} update SUCCESSFUL - all ${totalSuccessful}/${totalReplicas} replicas updated`);
     }
 
     return wasSuccessful;
@@ -426,7 +428,7 @@ export class WebDHT extends EventEmitter {
     // Get ALL connected peers, not just subscribers
     const allPeers = this.mesh.connectionManager.getConnectedPeers().map(p => p.peerId);
 
-    console.log(`DHT UPDATE: Broadcasting value change for ${key} to ${allPeers.length} peers`);
+    this.debug.log(`DHT UPDATE: Broadcasting value change for ${key} to ${allPeers.length} peers`);
 
     const notificationPromises = allPeers.map(async (peerId) => {
       try {
@@ -438,7 +440,7 @@ export class WebDHT extends EventEmitter {
           timestamp
         });
       } catch (error) {
-        console.warn(`DHT BROADCAST: Failed to notify peer ${peerId.substring(0, 8)}:`, error.message);
+        this.debug.warn(`DHT BROADCAST: Failed to notify peer ${peerId.substring(0, 8)}:`, error.message);
         return null;
       }
     });
@@ -446,7 +448,7 @@ export class WebDHT extends EventEmitter {
     const results = await Promise.allSettled(notificationPromises);
     const successfulNotifications = results.filter(r => r.status === 'fulfilled' && r.value).length;
 
-    console.log(`DHT UPDATE: Broadcasted ${key} change to ${successfulNotifications}/${allPeers.length} peers`);
+    this.debug.log(`DHT UPDATE: Broadcasted ${key} change to ${successfulNotifications}/${allPeers.length} peers`);
 
     // Also emit local event if this peer has subscriptions
     if (this.mySubscriptions.has(keyId)) {
@@ -460,7 +462,7 @@ export class WebDHT extends EventEmitter {
   async handleStoreRequest(fromPeerId, data) {
     const { keyId, key, value, timestamp, ttl, publisher, messageId } = data;
 
-    console.log(`🔥 DHT STORE REQUEST: ${key} from ${fromPeerId.substring(0, 8)}, messageId: ${messageId}`);
+    this.debug.log(`🔥 DHT STORE REQUEST: ${key} from ${fromPeerId.substring(0, 8)}, messageId: ${messageId}`);
 
     // Check if we should store this key (are we close enough?)
     const closestPeers = await this.findClosestPeers(keyId, this.config.replicationFactor);
@@ -477,7 +479,7 @@ export class WebDHT extends EventEmitter {
 
         // Notify newly activated subscribers about the new key
         if (activatedSubscribers.length > 0) {
-          console.log(`DHT STORE: Notifying ${activatedSubscribers.length} subscribers about new key ${key}`);
+          this.debug.log(`DHT STORE: Notifying ${activatedSubscribers.length} subscribers about new key ${key}`);
 
           const notificationPromises = activatedSubscribers.map(async (subscriberId) => {
             if (subscriberId !== this.peerId && subscriberId !== fromPeerId) {
@@ -490,7 +492,7 @@ export class WebDHT extends EventEmitter {
                   isNewKey: true
                 });
               } catch (error) {
-                console.warn(`Failed to notify subscriber ${subscriberId.substring(0, 8)} about new key:`, error.message);
+                this.debug.warn(`Failed to notify subscriber ${subscriberId.substring(0, 8)} about new key:`, error.message);
                 return null;
               }
             }
@@ -500,7 +502,7 @@ export class WebDHT extends EventEmitter {
         }
       }
 
-      console.log(`🔥 DHT STORE: Accepting and storing ${key}, sending success response`);
+      this.debug.log(`🔥 DHT STORE: Accepting and storing ${key}, sending success response`);
 
       // Send response using the same direct messaging structure
       this.sendDirectToPeer(fromPeerId, {
@@ -514,9 +516,9 @@ export class WebDHT extends EventEmitter {
         }
       });
 
-      console.log(`DHT STORE: accepted ${key} from ${fromPeerId.substring(0, 8)}...`);
+      this.debug.log(`DHT STORE: accepted ${key} from ${fromPeerId.substring(0, 8)}...`);
     } else {
-      console.log(`🔥 DHT STORE: Rejecting ${key} (not among closest), sending failure response`);
+      this.debug.log(`🔥 DHT STORE: Rejecting ${key} (not among closest), sending failure response`);
 
       this.sendDirectToPeer(fromPeerId, {
         type: 'dht',
@@ -538,14 +540,14 @@ export class WebDHT extends EventEmitter {
   async handleFindValueRequest(fromPeerId, data) {
     const { keyId, key, subscribe, requester, messageId } = data;
 
-    console.log(`🔥 DHT FIND_VALUE REQUEST: ${key} from ${fromPeerId.substring(0, 8)}, messageId: ${messageId}`);
-    console.log('🔥 DHT FIND_VALUE REQUEST: Full data received:', data);
+    this.debug.log(`🔥 DHT FIND_VALUE REQUEST: ${key} from ${fromPeerId.substring(0, 8)}, messageId: ${messageId}`);
+    this.debug.log('🔥 DHT FIND_VALUE REQUEST: Full data received:', data);
 
     if (this.localStorage.has(keyId)) {
       const storedData = this.localStorage.get(keyId);
 
       if (!this.isExpired(storedData)) {
-        console.log(`🔥 DHT FIND_VALUE: Found ${key} locally, sending success response with messageId: ${messageId}`);
+        this.debug.log(`🔥 DHT FIND_VALUE: Found ${key} locally, sending success response with messageId: ${messageId}`);
 
         // Add subscription if requested
         if (subscribe) {
@@ -564,7 +566,7 @@ export class WebDHT extends EventEmitter {
           publisher: storedData.publisher
         };
 
-        console.log(`🔥 DHT FIND_VALUE: Sending response data with messageId ${messageId}:`, responseData);
+        this.debug.log(`🔥 DHT FIND_VALUE: Sending response data with messageId ${messageId}:`, responseData);
 
         this.sendDirectToPeer(fromPeerId, {
           type: 'dht',
@@ -572,15 +574,15 @@ export class WebDHT extends EventEmitter {
           data: responseData
         });
 
-        console.log(`DHT FIND_VALUE: found ${key} for ${fromPeerId.substring(0, 8)}...`);
+        this.debug.log(`DHT FIND_VALUE: found ${key} for ${fromPeerId.substring(0, 8)}...`);
         return;
       } else {
         this.localStorage.delete(keyId);
-        console.log(`🔥 DHT FIND_VALUE: Found ${key} but expired, removed from storage`);
+        this.debug.log(`🔥 DHT FIND_VALUE: Found ${key} but expired, removed from storage`);
       }
     }
 
-    console.log(`🔥 DHT FIND_VALUE: ${key} not found locally, sending closest peers response with messageId: ${messageId}`);
+    this.debug.log(`🔥 DHT FIND_VALUE: ${key} not found locally, sending closest peers response with messageId: ${messageId}`);
 
     // If not found, return closest peers
     const closestPeers = await this.findClosestPeers(keyId, this.config.k);
@@ -592,7 +594,7 @@ export class WebDHT extends EventEmitter {
       closestPeers
     };
 
-    console.log(`🔥 DHT FIND_VALUE: Sending not-found response data with messageId ${messageId}:`, responseData);
+    this.debug.log(`🔥 DHT FIND_VALUE: Sending not-found response data with messageId ${messageId}:`, responseData);
 
     this.sendDirectToPeer(fromPeerId, {
       type: 'dht',
@@ -607,16 +609,16 @@ export class WebDHT extends EventEmitter {
   async handleSubscribeRequest(fromPeerId, data) {
     const { keyId, key, subscriber } = data;
 
-    console.log(`DHT SUBSCRIBE REQUEST: ${key} from ${fromPeerId.substring(0, 8)} for subscriber ${subscriber.substring(0, 8)}`);
+    this.debug.log(`DHT SUBSCRIBE REQUEST: ${key} from ${fromPeerId.substring(0, 8)} for subscriber ${subscriber.substring(0, 8)}`);
 
     if (this.localStorage.has(keyId)) {
       // Key exists - add to active subscriptions
       this.addSubscription(keyId, subscriber);
-      console.log(`DHT SUBSCRIBE: added ${subscriber.substring(0, 8)}... to ${key} notifications (key exists)`);
+      this.debug.log(`DHT SUBSCRIBE: added ${subscriber.substring(0, 8)}... to ${key} notifications (key exists)`);
     } else {
       // Key doesn't exist yet - add to pending subscriptions
       this.addPendingSubscription(keyId, subscriber);
-      console.log(`DHT SUBSCRIBE: added ${subscriber.substring(0, 8)}... to ${key} pending notifications (key doesn't exist yet)`);
+      this.debug.log(`DHT SUBSCRIBE: added ${subscriber.substring(0, 8)}... to ${key} pending notifications (key doesn't exist yet)`);
     }
   }
 
@@ -632,7 +634,7 @@ export class WebDHT extends EventEmitter {
       if (this.subscriptions.get(keyId).size === 0) {
         this.subscriptions.delete(keyId);
       }
-      console.log(`DHT UNSUBSCRIBE: removed ${subscriber.substring(0, 8)}... from ${key} active notifications`);
+      this.debug.log(`DHT UNSUBSCRIBE: removed ${subscriber.substring(0, 8)}... from ${key} active notifications`);
     }
 
     // Remove from pending subscriptions
@@ -641,7 +643,7 @@ export class WebDHT extends EventEmitter {
       if (this.pendingSubscriptions.get(keyId).size === 0) {
         this.pendingSubscriptions.delete(keyId);
       }
-      console.log(`DHT UNSUBSCRIBE: removed ${subscriber.substring(0, 8)}... from ${key} pending notifications`);
+      this.debug.log(`DHT UNSUBSCRIBE: removed ${subscriber.substring(0, 8)}... from ${key} pending notifications`);
     }
   }
 
@@ -651,7 +653,7 @@ export class WebDHT extends EventEmitter {
   async handleValueChangedNotification(fromPeerId, data) {
     const { key, keyId, newValue, timestamp, isNewKey } = data;
 
-    console.log(`🔥 DHT VALUE_CHANGED notification: ${key} = ${newValue} from ${fromPeerId.substring(0, 8)}${isNewKey ? ' (NEW KEY)' : ''}`);
+    this.debug.log(`🔥 DHT VALUE_CHANGED notification: ${key} = ${newValue} from ${fromPeerId.substring(0, 8)}${isNewKey ? ' (NEW KEY)' : ''}`);
 
     // CRITICAL FIX: Always update local cache if we have it, regardless of subscriptions
     // This prevents stale cached values from being returned by get() operations
@@ -661,14 +663,14 @@ export class WebDHT extends EventEmitter {
       if (!storedData.timestamp || timestamp >= storedData.timestamp) {
         storedData.value = newValue;
         storedData.timestamp = timestamp;
-        console.log(`🔥 DHT VALUE_CHANGED: Updated local cache for ${key} (timestamp: ${timestamp})`);
+        this.debug.log(`🔥 DHT VALUE_CHANGED: Updated local cache for ${key} (timestamp: ${timestamp})`);
       } else {
-        console.log(`🔥 DHT VALUE_CHANGED: Ignoring older notification for ${key} (current: ${storedData.timestamp}, notification: ${timestamp})`);
+        this.debug.log(`🔥 DHT VALUE_CHANGED: Ignoring older notification for ${key} (current: ${storedData.timestamp}, notification: ${timestamp})`);
       }
     } else if (isNewKey) {
       // For new keys, store the data locally even if we don't normally store this key
       // This helps with caching and consistency
-      console.log(`🔥 DHT VALUE_CHANGED: Caching new key ${key} locally`);
+      this.debug.log(`🔥 DHT VALUE_CHANGED: Caching new key ${key} locally`);
       this.storeLocally(keyId, {
         key,
         value: newValue,
@@ -683,18 +685,18 @@ export class WebDHT extends EventEmitter {
     const hasLocalSubscribers = this.subscriptions.has(keyId) && this.subscriptions.get(keyId).size > 0;
 
     if (hasSubscribers || hasLocalSubscribers) {
-      console.log(`🔥 DHT VALUE_CHANGED: Processing notification for ${key} (mySubscriptions: ${hasSubscribers}, localSubscribers: ${hasLocalSubscribers})`);
+      this.debug.log(`🔥 DHT VALUE_CHANGED: Processing notification for ${key} (mySubscriptions: ${hasSubscribers}, localSubscribers: ${hasLocalSubscribers})`);
 
       // Emit change event if this peer is subscribed
       if (hasSubscribers) {
         this.emit('valueChanged', { key, keyId, newValue, timestamp, isNewKey });
-        console.log(`🔥 DHT VALUE_CHANGED: Emitted local event for ${key}${isNewKey ? ' (NEW KEY)' : ''}`);
+        this.debug.log(`🔥 DHT VALUE_CHANGED: Emitted local event for ${key}${isNewKey ? ' (NEW KEY)' : ''}`);
       }
 
       // Forward to local subscribers (other peers that subscribed through this peer)
       if (hasLocalSubscribers) {
         const localSubscribers = Array.from(this.subscriptions.get(keyId));
-        console.log(`🔥 DHT VALUE_CHANGED: Forwarding to ${localSubscribers.length} local subscribers for ${key}`);
+        this.debug.log(`🔥 DHT VALUE_CHANGED: Forwarding to ${localSubscribers.length} local subscribers for ${key}`);
 
         const forwardPromises = localSubscribers.map(async (subscriberId) => {
           if (subscriberId !== this.peerId && subscriberId !== fromPeerId) {
@@ -707,7 +709,7 @@ export class WebDHT extends EventEmitter {
                 isNewKey
               });
             } catch (error) {
-              console.warn(`Failed to forward notification to ${subscriberId.substring(0, 8)}:`, error.message);
+              this.debug.warn(`Failed to forward notification to ${subscriberId.substring(0, 8)}:`, error.message);
               return null;
             }
           }
@@ -716,7 +718,7 @@ export class WebDHT extends EventEmitter {
         await Promise.allSettled(forwardPromises);
       }
     } else {
-      console.log(`🔥 DHT VALUE_CHANGED: No subscriptions for ${key}, but updated cache anyway`);
+      this.debug.log(`🔥 DHT VALUE_CHANGED: No subscriptions for ${key}, but updated cache anyway`);
     }
   }
 
@@ -726,7 +728,7 @@ export class WebDHT extends EventEmitter {
   async handleUpdateValueRequest(fromPeerId, data) {
     const { keyId, key, value, timestamp, ttl, publisher, messageId } = data;
 
-    console.log(`🔥 DHT UPDATE_VALUE REQUEST: ${key} from ${fromPeerId.substring(0, 8)}`);
+    this.debug.log(`🔥 DHT UPDATE_VALUE REQUEST: ${key} from ${fromPeerId.substring(0, 8)}`);
 
     // Check if we should store this key (are we among the closest?)
     const closestPeers = await this.findClosestPeers(keyId, this.config.replicationFactor);
@@ -734,12 +736,12 @@ export class WebDHT extends EventEmitter {
     if (this.isAmongClosest(keyId, closestPeers)) {
       // Update our local copy
       this.storeLocally(keyId, { key, value, timestamp, ttl, publisher });
-      console.log(`DHT UPDATE_VALUE: Updated ${key} locally`);
+      this.debug.log(`DHT UPDATE_VALUE: Updated ${key} locally`);
 
       // Notify any local subscribers
       if (this.subscriptions.has(keyId)) {
         const subscribers = Array.from(this.subscriptions.get(keyId));
-        console.log(`DHT UPDATE_VALUE: Notifying ${subscribers.length} local subscribers for ${key}`);
+        this.debug.log(`DHT UPDATE_VALUE: Notifying ${subscribers.length} local subscribers for ${key}`);
 
         const notificationPromises = subscribers.map(async (subscriberId) => {
           if (subscriberId !== this.peerId) {
@@ -751,7 +753,7 @@ export class WebDHT extends EventEmitter {
                 timestamp
               });
             } catch (error) {
-              console.warn(`Failed to notify subscriber ${subscriberId.substring(0, 8)}:`, error.message);
+              this.debug.warn(`Failed to notify subscriber ${subscriberId.substring(0, 8)}:`, error.message);
               return null;
             }
           }
@@ -772,7 +774,7 @@ export class WebDHT extends EventEmitter {
         }
       });
     } else {
-      console.log(`DHT UPDATE_VALUE: Not responsible for ${key}, rejecting update`);
+      this.debug.log(`DHT UPDATE_VALUE: Not responsible for ${key}, rejecting update`);
 
       // Send failure response
       this.sendDirectToPeer(fromPeerId, {
@@ -795,18 +797,18 @@ export class WebDHT extends EventEmitter {
     return new Promise((resolve, reject) => {
       const messageId = this.generateMessageId();
 
-      console.log(`🔥 DHT Sending ${type} to ${targetPeerId.substring(0, 8)} with messageId ${messageId}`);
-      console.log('🔥 DHT Request data being sent:', { ...data, messageId });
+      this.debug.log(`🔥 DHT Sending ${type} to ${targetPeerId.substring(0, 8)} with messageId ${messageId}`);
+      this.debug.log('🔥 DHT Request data being sent:', { ...data, messageId });
 
       // Set up response handler
       const timeout = safeSetTimeout(() => {
-        console.log(`🔥 DHT Timeout for messageId ${messageId} to peer ${targetPeerId.substring(0, 8)}`);
+        this.debug.log(`🔥 DHT Timeout for messageId ${messageId} to peer ${targetPeerId.substring(0, 8)}`);
         this.removeResponseHandler(messageId);
         reject(new Error('DHT message timeout'));
       }, 5000);
 
       this.setResponseHandler(messageId, (response) => {
-        console.log(`🔥 DHT Response received for ${type} messageId ${messageId}:`, response);
+        this.debug.log(`🔥 DHT Response received for ${type} messageId ${messageId}:`, response);
         safeClearTimeout(timeout);
         resolve(response);
       });
@@ -818,12 +820,12 @@ export class WebDHT extends EventEmitter {
         messageType: type // The actual DHT operation type
       };
 
-      console.log(`🔥 DHT Full message being sent to ${targetPeerId.substring(0, 8)}:`, messageToSend);
+      this.debug.log(`🔥 DHT Full message being sent to ${targetPeerId.substring(0, 8)}:`, messageToSend);
 
       const success = this.sendDirectToPeer(targetPeerId, messageToSend);
 
       if (!success) {
-        console.log(`🔥 DHT Failed to send to ${targetPeerId.substring(0, 8)}, cleaning up messageId ${messageId}`);
+        this.debug.log(`🔥 DHT Failed to send to ${targetPeerId.substring(0, 8)}, cleaning up messageId ${messageId}`);
         safeClearTimeout(timeout);
         this.removeResponseHandler(messageId);
         reject(new Error('Failed to send DHT message - no direct connection'));
@@ -836,16 +838,16 @@ export class WebDHT extends EventEmitter {
      * This implements proper Kademlia routing for peers that aren't directly connected
      */
   sendDirectToPeer(targetPeerId, message) {
-    console.log(`DHT: Attempting to send message to ${targetPeerId.substring(0, 8)}:`, message.type);
+    this.debug.log(`DHT: Attempting to send message to ${targetPeerId.substring(0, 8)}:`, message.type);
 
     // First try direct connection if available
     const success = this.mesh.connectionManager.sendDirectMessage(targetPeerId, message);
 
     if (success) {
-      console.log(`DHT: Successfully sent direct message to ${targetPeerId.substring(0, 8)}`);
+      this.debug.log(`DHT: Successfully sent direct message to ${targetPeerId.substring(0, 8)}`);
       return true;
     } else {
-      console.log(`DHT: No direct connection to ${targetPeerId.substring(0, 8)}, using Kademlia routing`);
+      this.debug.log(`DHT: No direct connection to ${targetPeerId.substring(0, 8)}, using Kademlia routing`);
 
       // Use gossip/routing mechanism to reach the target peer
       // Create a special DHT routing message that will be forwarded through the mesh
@@ -860,7 +862,7 @@ export class WebDHT extends EventEmitter {
         path: [this.peerId] // Track routing path
       };
 
-      console.log(`DHT: Routing message to ${targetPeerId.substring(0, 8)} via gossip network`);
+      this.debug.log(`DHT: Routing message to ${targetPeerId.substring(0, 8)} via gossip network`);
       this.mesh.gossipManager.propagateMessage(routingMessage);
       return true;
     }
@@ -872,7 +874,7 @@ export class WebDHT extends EventEmitter {
   async findClosestPeers(keyId, count) {
     const allPeers = [this.peerId, ...this.mesh.connectionManager.getConnectedPeers().map(p => p.peerId)];
 
-    console.log(`DHT findClosestPeers: Looking for ${count} closest peers to key ${keyId.substring(0, 8)}... from ${allPeers.length} total peers`);
+    this.debug.log(`DHT findClosestPeers: Looking for ${count} closest peers to key ${keyId.substring(0, 8)}... from ${allPeers.length} total peers`);
 
     // Sort by XOR distance to the key
     allPeers.sort((a, b) => {
@@ -883,7 +885,7 @@ export class WebDHT extends EventEmitter {
 
     const result = allPeers.slice(0, count);
 
-    console.log('DHT findClosestPeers result:', result.map(peerId => ({
+    this.debug.log('DHT findClosestPeers result:', result.map(peerId => ({
       peerId: peerId.substring(0, 8) + '...',
       distance: this.xorDistance(keyId, peerId).substring(0, 8) + '...',
       isSelf: peerId === this.peerId
@@ -971,7 +973,7 @@ export class WebDHT extends EventEmitter {
         this.subscriptions.get(keyId).add(subscriberId);
       });
 
-      console.log(`DHT: Activated ${pendingSubscribers.size} pending subscriptions for keyId ${keyId.substring(0, 8)}`);
+      this.debug.log(`DHT: Activated ${pendingSubscribers.size} pending subscriptions for keyId ${keyId.substring(0, 8)}`);
 
       // Clear pending subscriptions for this key
       this.pendingSubscriptions.delete(keyId);
@@ -1017,22 +1019,22 @@ export class WebDHT extends EventEmitter {
   }
 
   handleResponse(fromPeerId, data) {
-    console.log(`🔥 DHT Response received from ${fromPeerId.substring(0, 8)}: messageId=${data.messageId}, type=${data.type || 'unknown'}`);
-    console.log('🔥 DHT Response full data:', data);
-    console.log('🔥 DHT Response available handlers:', this.responseHandlers ? Array.from(this.responseHandlers.keys()) : 'none');
+    this.debug.log(`🔥 DHT Response received from ${fromPeerId.substring(0, 8)}: messageId=${data.messageId}, type=${data.type || 'unknown'}`);
+    this.debug.log('🔥 DHT Response full data:', data);
+    this.debug.log('🔥 DHT Response available handlers:', this.responseHandlers ? Array.from(this.responseHandlers.keys()) : 'none');
 
     if (this.responseHandlers && data.messageId) {
       const handler = this.responseHandlers.get(data.messageId);
       if (handler) {
-        console.log(`🔥 DHT Response: Found handler for messageId ${data.messageId}, calling handler`);
+        this.debug.log(`🔥 DHT Response: Found handler for messageId ${data.messageId}, calling handler`);
         this.removeResponseHandler(data.messageId);
         handler(data);
       } else {
-        console.warn(`🔥 DHT Response: No handler found for messageId ${data.messageId}`);
-        console.log('🔥 DHT Response: Available handlers:', Array.from(this.responseHandlers.keys()));
+        this.debug.warn(`🔥 DHT Response: No handler found for messageId ${data.messageId}`);
+        this.debug.log('🔥 DHT Response: Available handlers:', Array.from(this.responseHandlers.keys()));
       }
     } else {
-      console.warn('🔥 DHT Response: Missing responseHandlers or messageId', {
+      this.debug.warn('🔥 DHT Response: Missing responseHandlers or messageId', {
         hasHandlers: !!this.responseHandlers,
         messageId: data.messageId
       });
@@ -1059,14 +1061,14 @@ export class WebDHT extends EventEmitter {
       if (this.isExpired(data)) {
         this.localStorage.delete(keyId);
         this.subscriptions.delete(keyId);
-        console.log(`DHT MAINTENANCE: removed expired key ${keyId.substring(0, 8)}...`);
+        this.debug.log(`DHT MAINTENANCE: removed expired key ${keyId.substring(0, 8)}...`);
       }
     }
 
     // TODO: Republish keys if needed
     // TODO: Update routing table
 
-    console.log(`DHT MAINTENANCE: ${this.localStorage.size} keys stored, ${this.subscriptions.size} subscriptions active`);
+    this.debug.log(`DHT MAINTENANCE: ${this.localStorage.size} keys stored, ${this.subscriptions.size} subscriptions active`);
   }
 
   /**
@@ -1100,7 +1102,7 @@ export class WebDHT extends EventEmitter {
       this.responseHandlers.clear();
     }
 
-    console.log('WebDHT cleaned up');
+    this.debug.log('WebDHT cleaned up');
   }
 
   /**
@@ -1114,7 +1116,7 @@ export class WebDHT extends EventEmitter {
     // Remove self from the list
     const availablePeers = closestPeers.filter(peerId => peerId !== this.peerId);
 
-    console.log(`DHT Iterative GET: Found ${availablePeers.length} potential peers for key ${key}`);
+    this.debug.log(`DHT Iterative GET: Found ${availablePeers.length} potential peers for key ${key}`);
 
     // Try querying peers in rounds, increasing the number each round
     const maxRounds = 3;
@@ -1130,11 +1132,11 @@ export class WebDHT extends EventEmitter {
         .slice(0, peersPerRound);
 
       if (peersToQuery.length === 0) {
-        console.log(`DHT Iterative GET Round ${currentRound}: No more peers to query`);
+        this.debug.log(`DHT Iterative GET Round ${currentRound}: No more peers to query`);
         break;
       }
 
-      console.log(`DHT Iterative GET Round ${currentRound}: Querying ${peersToQuery.length} peers`);
+      this.debug.log(`DHT Iterative GET Round ${currentRound}: Querying ${peersToQuery.length} peers`);
 
       // Mark these peers as queried
       peersToQuery.forEach(peerId => queriedPeers.add(peerId));
@@ -1149,7 +1151,7 @@ export class WebDHT extends EventEmitter {
             requester: this.peerId
           });
         } catch (error) {
-          console.warn(`DHT GET: Failed to query peer ${peerId.substring(0, 8)}:`, error.message);
+          this.debug.warn(`DHT GET: Failed to query peer ${peerId.substring(0, 8)}:`, error.message);
           return null;
         }
       });
@@ -1168,7 +1170,7 @@ export class WebDHT extends EventEmitter {
               data,
               timestamp: data.timestamp || 0
             });
-            console.log(`DHT Iterative GET: Found value on peer ${peersToQuery[i].substring(0, 8)} with timestamp ${data.timestamp}, value: ${JSON.stringify(data.value).substring(0, 50)}...`);
+            this.debug.log(`DHT Iterative GET: Found value on peer ${peersToQuery[i].substring(0, 8)} with timestamp ${data.timestamp}, value: ${JSON.stringify(data.value).substring(0, 50)}...`);
           }
         }
       }
@@ -1179,16 +1181,16 @@ export class WebDHT extends EventEmitter {
         validResponses.sort((a, b) => b.timestamp - a.timestamp);
         const mostRecent = validResponses[0];
 
-        console.log(`DHT Iterative GET: Selected most recent value from peer ${mostRecent.peerId.substring(0, 8)} (timestamp: ${mostRecent.timestamp}) in round ${currentRound}`);
+        this.debug.log(`DHT Iterative GET: Selected most recent value from peer ${mostRecent.peerId.substring(0, 8)} (timestamp: ${mostRecent.timestamp}) in round ${currentRound}`);
 
         if (validResponses.length > 1) {
-          console.log(`DHT Iterative GET: Found ${validResponses.length} versions, timestamps: ${validResponses.map(r => r.timestamp).join(', ')}`);
+          this.debug.log(`DHT Iterative GET: Found ${validResponses.length} versions, timestamps: ${validResponses.map(r => r.timestamp).join(', ')}`);
           // Log inconsistency warning if timestamps are very different
           const timeDiffs = validResponses.map(r => Math.abs(mostRecent.timestamp - r.timestamp));
           const maxTimeDiff = Math.max(...timeDiffs);
           if (maxTimeDiff > 10000) { // More than 10 seconds difference
-            console.warn(`DHT CONSISTENCY WARNING: Large timestamp differences found (max: ${maxTimeDiff}ms). This suggests replica peers have inconsistent data!`);
-            console.warn('DHT CONSISTENCY: Detailed responses:', validResponses.map(r => ({
+            this.debug.warn(`DHT CONSISTENCY WARNING: Large timestamp differences found (max: ${maxTimeDiff}ms). This suggests replica peers have inconsistent data!`);
+            this.debug.warn('DHT CONSISTENCY: Detailed responses:', validResponses.map(r => ({
               peer: r.peerId.substring(0, 8),
               timestamp: r.timestamp,
               value: JSON.stringify(r.data.value).substring(0, 30) + '...'
@@ -1202,7 +1204,7 @@ export class WebDHT extends EventEmitter {
         // ALWAYS add subscription when we successfully get a value
         if (subscribe) {
           this.mySubscriptions.add(keyId);
-          console.log(`DHT GET: Auto-subscribed to ${key}`);
+          this.debug.log(`DHT GET: Auto-subscribed to ${key}`);
         }
 
         return mostRecent.data.value;
@@ -1212,7 +1214,7 @@ export class WebDHT extends EventEmitter {
       peersPerRound = Math.min(peersPerRound * 2, Math.max(1, Math.floor(availablePeers.length / maxRounds)));
     }
 
-    console.log(`DHT Iterative GET failed: key ${key} not found after querying ${queriedPeers.size - 1} peers`);
+    this.debug.log(`DHT Iterative GET failed: key ${key} not found after querying ${queriedPeers.size - 1} peers`);
     return null;
   }
 
@@ -1223,7 +1225,7 @@ export class WebDHT extends EventEmitter {
     const targetReplicas = this.config.replicationFactor;
     const availablePeers = closestPeers.filter(peerId => peerId !== this.peerId);
 
-    console.log(`DHT Iterative PUT: Attempting to store ${storeData.key} on ${targetReplicas} of ${availablePeers.length} available peers`);
+    this.debug.log(`DHT Iterative PUT: Attempting to store ${storeData.key} on ${targetReplicas} of ${availablePeers.length} available peers`);
 
     let successful = 0;
     let attempted = 0;
@@ -1234,14 +1236,14 @@ export class WebDHT extends EventEmitter {
       const batch = availablePeers.slice(i, i + batchSize);
       attempted += batch.length;
 
-      console.log(`DHT PUT Batch ${Math.floor(i / batchSize) + 1}: Storing on ${batch.length} peers`);
+      this.debug.log(`DHT PUT Batch ${Math.floor(i / batchSize) + 1}: Storing on ${batch.length} peers`);
 
       const storePromises = batch.map(async (peerId) => {
         try {
           const result = await this.sendDHTMessage(peerId, 'store', storeData);
           return { peerId, success: true, result };
         } catch (error) {
-          console.warn(`DHT PUT: Failed to store on peer ${peerId.substring(0, 8)}:`, error.message);
+          this.debug.warn(`DHT PUT: Failed to store on peer ${peerId.substring(0, 8)}:`, error.message);
           return { peerId, success: false, error };
         }
       });
@@ -1255,7 +1257,7 @@ export class WebDHT extends EventEmitter {
 
       successful += batchSuccessful;
 
-      console.log(`DHT PUT Batch completed: ${batchSuccessful}/${batch.length} successful (total: ${successful}/${targetReplicas})`);
+      this.debug.log(`DHT PUT Batch completed: ${batchSuccessful}/${batch.length} successful (total: ${successful}/${targetReplicas})`);
 
       // If we've reached our target, we can stop
       if (successful >= targetReplicas) {
@@ -1268,7 +1270,7 @@ export class WebDHT extends EventEmitter {
       }
     }
 
-    console.log(`DHT PUT completed: ${successful}/${targetReplicas} target replicas stored (${attempted} peers attempted)`);
+    this.debug.log(`DHT PUT completed: ${successful}/${targetReplicas} target replicas stored (${attempted} peers attempted)`);
     return successful > 0;
   }
 }

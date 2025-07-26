@@ -74,27 +74,9 @@ function isConnectionAlive(connection) {
     return false;
   }
 
-  // Check if we've received a recent pong or if this is a fresh connection
-  const now = Date.now();
-  const lastPong = connection.lastPong || connection.connectedAt || now;
-  const timeSinceLastPong = now - lastPong;
-
-  // Consider connection dead if no pong for more than 12 minutes (since we ping every 9 minutes)
-  return timeSinceLastPong < 720000; // 12 minutes
-}
-
-function pingConnection(peerId, connection) {
-  if (connection.readyState === WebSocket.OPEN) {
-    try {
-      connection.ping();
-      return true;
-    } catch (error) {
-      console.log(`🏓 Failed to ping ${peerId.substring(0, 8)}...:`, error.message);
-      cleanupPeer(peerId);
-      return false;
-    }
-  }
-  return false;
+  // Simple alive check - if connection is open, it's considered alive
+  // Detailed health monitoring is handled by the peer mesh itself
+  return true;
 }
 
 function sendToConnection(peerId, data) {
@@ -172,62 +154,8 @@ setInterval(() => {
   }
 }, 30000); // Clean up every 30 seconds
 
-// DHT-based heartbeat ping every 9 minutes (540 seconds)
-// Use DHT logic to select a SINGLE peer to do the pinging instead of server pinging all
-setInterval(() => {
-  const activePeers = Array.from(connections.keys());
-
-  if (activePeers.length === 0) {
-    console.log('🏓 No peers to ping');
-    return;
-  }
-
-  // Use XOR distance to select the peer closest to a deterministic target
-  // This ensures the same peer is consistently selected across intervals
-  const pingTarget = '0000000000000000000000000000000000000000'; // Deterministic target for ping selection
-  const selectedPeer = selectPeerForPing(pingTarget, activePeers);
-
-  if (selectedPeer) {
-    const connection = connections.get(selectedPeer);
-    console.log(`🏓 DHT-selected peer ${selectedPeer.substring(0, 8)}... for heartbeat ping (${activePeers.length} total peers)`);
-
-    if (!pingConnection(selectedPeer, connection)) {
-      console.log(`🧹 DHT-selected peer ${selectedPeer.substring(0, 8)}... failed ping, cleaned up`);
-    }
-  }
-}, 540000); // Ping every 9 minutes (540 seconds)
-
-// DHT-based peer selection for ping duty
-function selectPeerForPing(target, peerIds) {
-  if (!peerIds || peerIds.length === 0) return null;
-
-  // Use XOR distance to find the peer closest to the target
-  let closestPeer = null;
-  let closestDistance = Infinity;
-
-  for (const peerId of peerIds) {
-    const distance = calculateXORDistance(target, peerId);
-    if (distance < closestDistance) {
-      closestDistance = distance;
-      closestPeer = peerId;
-    }
-  }
-
-  return closestPeer;
-}
-
-// XOR distance calculation for DHT peer selection
-function calculateXORDistance(id1, id2) {
-  let distance = 0;
-  const minLength = Math.min(id1.length, id2.length);
-
-  for (let i = 0; i < minLength; i++) {
-    const xor = parseInt(id1[i], 16) ^ parseInt(id2[i], 16);
-    distance += xor;
-  }
-
-  return distance;
-}
+// Note: Signaling servers should NOT initiate pings to peers
+// Health monitoring is the responsibility of the peer mesh network itself
 
 wss.on('connection', (ws, req) => {
   let peerId = null;
@@ -268,12 +196,6 @@ wss.on('connection', (ws, req) => {
 
   // Set up connection metadata
   ws.connectedAt = Date.now();
-  ws.lastPong = Date.now();
-
-  // Set up pong handler for heartbeat
-  ws.on('pong', () => {
-    ws.lastPong = Date.now();
-  });
 
   console.log(`✅ Peer ${peerId.substring(0, 8)}... connected (${connections.size} total)`);
 
@@ -288,7 +210,7 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data) => {
     try {
       const message = JSON.parse(data);
-      const { type, data: messageData, targetPeerId, maxPeers } = message;
+      const { type, data: messageData, targetPeerId } = message;
 
       console.log(`📨 Received ${type} from ${peerId.substring(0, 8)}...`);
 
@@ -300,17 +222,8 @@ wss.on('connection', (ws, req) => {
         timestamp: Date.now()
       };
 
-      // Handle different message types
+      // Handle different message types - SIGNALING ONLY
       switch (type) {
-        case 'ping':
-          // Respond with pong
-          ws.send(JSON.stringify({
-            type: 'pong',
-            timestamp: Date.now(),
-            originalTimestamp: messageData?.timestamp
-          }));
-          break;
-
         case 'announce': {
           // Handle peer announcement
           peerData.set(peerId, {
@@ -330,12 +243,12 @@ wss.on('connection', (ws, req) => {
             if (connection && isConnectionAlive(connection)) {
               validatedPeers.push(otherPeerId);
             } else {
-              console.log(`� Found dead connection during announce: ${otherPeerId.substring(0, 8)}...`);
+              console.log(`🧹 Found dead connection during announce: ${otherPeerId.substring(0, 8)}...`);
               cleanupPeer(otherPeerId);
             }
           }
 
-          console.log(`�📢 Announcing ${peerId.substring(0, 8)}... to ${validatedPeers.length} validated peers`);
+          console.log(`📢 Announcing ${peerId.substring(0, 8)}... to ${validatedPeers.length} validated peers`);
 
           // Send peer-discovered messages to validated peers only
           validatedPeers.forEach(otherPeerId => {
@@ -372,7 +285,7 @@ wss.on('connection', (ws, req) => {
         case 'offer':
         case 'answer':
         case 'ice-candidate': {
-          // Handle WebRTC signaling
+          // Handle WebRTC signaling - this is the server's primary purpose
           if (targetPeerId) {
             const success = sendToSpecificPeer(targetPeerId, responseMessage);
             if (!success) {
@@ -385,12 +298,14 @@ wss.on('connection', (ws, req) => {
         }
 
         default:
-          // Handle generic messages
-          if (targetPeerId) {
-            sendToSpecificPeer(targetPeerId, responseMessage);
-          } else {
-            broadcastToClosestPeers(peerId, responseMessage, maxPeers || 10);
-          }
+          // Signaling server should NOT route regular peer messages
+          // Peers handle their own message routing through WebRTC data channels
+          console.log(`⚠️  Ignoring non-signaling message type '${type}' - peers should route their own messages`);
+          ws.send(JSON.stringify({
+            type: 'error',
+            error: `Signaling server does not route '${type}' messages. Use WebRTC data channels for peer-to-peer communication.`,
+            timestamp: Date.now()
+          }));
           break;
       }
     } catch (error) {

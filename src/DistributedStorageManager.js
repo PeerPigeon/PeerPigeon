@@ -1,4 +1,5 @@
 import { EventEmitter } from './EventEmitter.js';
+import DebugLogger from './DebugLogger.js';
 
 // Dynamic import for unsea to handle both Node.js and browser environments
 let unsea = null;
@@ -55,10 +56,12 @@ async function initializeUnsea() {
  * - Optional immutability with CRDT support for collaborative editing
  * - Mutable layer for data originators
  * - Integration with WebDHT for distributed storage
+ * - Space separation for preventing data overwrites (Private, Public, Frozen)
  */
 export class DistributedStorageManager extends EventEmitter {
   constructor(mesh) {
     super();
+    this.debug = DebugLogger.create('DistributedStorageManager');
     this.mesh = mesh;
     this.webDHT = mesh.webDHT;
     this.cryptoManager = mesh.cryptoManager;
@@ -74,7 +77,15 @@ export class DistributedStorageManager extends EventEmitter {
       defaultTTL: null, // No expiration by default
       maxValueSize: 1024 * 1024, // 1MB default max size
       enableCRDT: true,
-      conflictResolution: 'last-write-wins' // or 'crdt-merge'
+      conflictResolution: 'last-write-wins', // or 'crdt-merge'
+      spaceEnforcement: true // Enable space-based access control
+    };
+
+    // Storage spaces for data separation
+    this.spaces = {
+      PRIVATE: 'private', // Only owner can read/write, encrypted
+      PUBLIC: 'public', // Anyone can read, only owner can write
+      FROZEN: 'frozen' // Immutable once set, anyone can read
     };
 
     // Local storage for metadata and permissions
@@ -82,13 +93,14 @@ export class DistributedStorageManager extends EventEmitter {
     this.accessControl = new Map(); // keyId -> access control info
     this.crdtStates = new Map(); // keyId -> CRDT state for collaborative data
 
-    // Track data ownership
+    // Track data ownership by space
     this.ownedKeys = new Set(); // Keys owned by this peer
+    this.spaceOwnership = new Map(); // space:key -> owner mapping
 
     // Track enabled state
     this.enabled = true; // Enable by default
 
-    console.log(`DistributedStorageManager initialized for peer ${this.mesh.peerId?.substring(0, 8)}...`);
+    this.debug.log(`DistributedStorageManager initialized for peer ${this.mesh.peerId?.substring(0, 8)}...`);
   }
 
   /**
@@ -107,9 +119,9 @@ export class DistributedStorageManager extends EventEmitter {
         this.storageKeypair = await this.unsea.generateRandomPair();
       }
 
-      console.log('📦 Storage encryption initialized with unsea');
+      this.debug.log('📦 Storage encryption initialized with unsea');
     } catch (error) {
-      console.warn('📦 Failed to initialize storage encryption:', error);
+      this.debug.warn('📦 Failed to initialize storage encryption:', error);
       // Disable encryption if unsea fails to load
       this.config.encryptionEnabled = false;
     }
@@ -128,13 +140,191 @@ export class DistributedStorageManager extends EventEmitter {
     const timeout = 5000;
     const start = Date.now();
 
-    while (!this.unsea || !this.storageKeypair) {
-      if (Date.now() - start > timeout) {
-        console.warn('📦 Crypto initialization timeout - proceeding without encryption');
-        this.config.encryptionEnabled = false;
-        break;
-      }
+    while ((!this.unsea || !this.storageKeypair) && (Date.now() - start) < timeout) {
       await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+
+  /**
+   * Parse a storage key to extract space and base key
+   * @param {string} key - The storage key (can be plain or space-prefixed)
+   * @returns {Object} - {space, baseKey, fullKey}
+   */
+  parseStorageKey(key) {
+    // Check if key has space prefix (e.g., "private:user:123" or "public:config")
+    const spacePrefixes = Object.values(this.spaces);
+    for (const space of spacePrefixes) {
+      if (key.startsWith(`${space}:`)) {
+        return {
+          space,
+          baseKey: key.substring(space.length + 1),
+          fullKey: key
+        };
+      }
+    }
+
+    // Default to private space if no prefix specified
+    return {
+      space: this.spaces.PRIVATE,
+      baseKey: key,
+      fullKey: `${this.spaces.PRIVATE}:${key}`
+    };
+  }
+
+  /**
+   * Create a space-prefixed key
+   * @param {string} space - The storage space
+   * @param {string} baseKey - The base key
+   * @returns {string} - The full key with space prefix
+   */
+  createSpacedKey(space, baseKey) {
+    if (!Object.values(this.spaces).includes(space)) {
+      throw new Error(`Invalid storage space: ${space}. Must be one of: ${Object.values(this.spaces).join(', ')}`);
+    }
+    return `${space}:${baseKey}`;
+  }
+
+  /**
+   * Check if a peer can access a key in a specific space
+   * @param {string} space - The storage space
+   * @param {string} key - The storage key
+   * @param {string} peerId - The peer ID requesting access
+   * @param {string} operation - The operation (read, write)
+   * @returns {boolean} - Whether access is allowed
+   */
+  canAccessSpace(space, key, peerId, operation = 'read') {
+    if (!this.config.spaceEnforcement) {
+      return true; // Space enforcement disabled
+    }
+
+    const spaceKey = `${space}:${key}`;
+    const owner = this.spaceOwnership.get(spaceKey);
+
+    switch (space) {
+      case this.spaces.PRIVATE:
+        // Private: Only owner can read/write, or if no owner exists (initial write)
+        return !owner || owner === peerId;
+
+      case this.spaces.PUBLIC:
+        if (operation === 'read') {
+          return true; // Anyone can read public data
+        } else {
+          return !owner || owner === peerId; // Only owner can write, or initial write
+        }
+
+      case this.spaces.FROZEN:
+        if (operation === 'read') {
+          return true; // Anyone can read frozen data
+        } else {
+          // Frozen data cannot be modified after initial write
+          return !owner; // Only allow write if no owner (initial write)
+        }
+
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * Determine appropriate space and access control from options
+   * @param {Object} options - Storage options
+   * @returns {Object} - {space, isPublic, isImmutable}
+   */
+  determineSpaceFromOptions(options = {}) {
+    // Allow explicit space specification
+    if (options.space && Object.values(this.spaces).includes(options.space)) {
+      const space = options.space;
+      return {
+        space,
+        isPublic: space !== this.spaces.PRIVATE,
+        isImmutable: space === this.spaces.FROZEN
+      };
+    }
+
+    // Legacy compatibility - determine space from isPublic/isImmutable
+    if (options.isImmutable) {
+      return {
+        space: this.spaces.FROZEN,
+        isPublic: true,
+        isImmutable: true
+      };
+    } else if (options.isPublic) {
+      return {
+        space: this.spaces.PUBLIC,
+        isPublic: true,
+        isImmutable: false
+      };
+    } else {
+      return {
+        space: this.spaces.PRIVATE,
+        isPublic: false,
+        isImmutable: false
+      };
+    }
+  }
+
+  /**
+   * Find if a base key exists in a different space
+   * @param {string} baseKey - The base key to search for
+   * @param {string} excludeSpace - The space to exclude from search
+   * @returns {string|null} - The space where the key exists, or null if not found
+   */
+  findKeyInDifferentSpace(baseKey, excludeSpace) {
+    for (const space of Object.values(this.spaces)) {
+      if (space !== excludeSpace) {
+        const spacedKey = this.createSpacedKey(space, baseKey);
+        if (this.spaceOwnership.has(spacedKey)) {
+          return space;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Check if the current peer has read access to a key with space awareness
+   * @param {string} keyId - The key ID
+   * @param {Object} metadata - The metadata object
+   * @param {string} space - The storage space
+   * @returns {boolean} - Whether access is allowed
+   */
+  hasReadAccessWithSpace(keyId, metadata, space) {
+    const accessControl = this.accessControl.get(keyId);
+
+    if (!accessControl && metadata) {
+      // Create access control from metadata
+      this.accessControl.set(keyId, {
+        isPublic: metadata.isPublic,
+        owner: metadata.owner,
+        allowedPeers: new Set(metadata.allowedPeers || []),
+        isImmutable: metadata.isImmutable,
+        space: metadata.space || space
+      });
+      return this.hasReadAccessWithSpace(keyId, metadata, space);
+    }
+
+    if (!accessControl) {
+      return false;
+    }
+
+    // Owner always has access
+    if (accessControl.owner === this.mesh.peerId) {
+      return true;
+    }
+
+    // Space-based access control
+    switch (space) {
+      case this.spaces.PRIVATE:
+        // Private: only owner and specifically allowed peers
+        return accessControl.allowedPeers.has(this.mesh.peerId);
+
+      case this.spaces.PUBLIC:
+      case this.spaces.FROZEN:
+        // Public and frozen: anyone can read
+        return true;
+
+      default:
+        return false;
     }
   }
 
@@ -143,8 +333,9 @@ export class DistributedStorageManager extends EventEmitter {
    * @param {string} key - The storage key
    * @param {any} value - The value to store
    * @param {Object} options - Storage options
-   * @param {boolean} options.isPublic - Whether data is publicly readable (default: false - private and encrypted)
-   * @param {boolean} options.isImmutable - Whether data is immutable for other peers (default: false)
+   * @param {string} options.space - Storage space ('private', 'public', 'frozen')
+   * @param {boolean} options.isPublic - Whether data is publicly readable (legacy, use space instead)
+   * @param {boolean} options.isImmutable - Whether data is immutable (legacy, use frozen space instead)
    * @param {boolean} options.enableCRDT - Whether to enable CRDT for collaborative editing (default: false)
    * @param {number} options.ttl - Time to live in milliseconds
    * @param {Array<string>} options.allowedPeers - Specific peers allowed to read private data
@@ -160,9 +351,31 @@ export class DistributedStorageManager extends EventEmitter {
       await this.waitForCrypto();
     }
 
-    const keyId = await this.webDHT.generateKeyId(key);
+    // Parse key and determine storage space
+    const keyInfo = this.parseStorageKey(key);
+    const spaceConfig = this.determineSpaceFromOptions(options);
+
+    // Use explicit space from options if provided, otherwise use parsed space
+    const space = options.space || spaceConfig.space;
+    const fullKey = keyInfo.space === space ? keyInfo.fullKey : this.createSpacedKey(space, keyInfo.baseKey);
+    const baseKey = keyInfo.baseKey;
+
+    // Check space access permissions
+    if (!this.canAccessSpace(space, baseKey, this.mesh.peerId, 'write')) {
+      throw new Error(`Write access denied for space "${space}" and key "${baseKey}"`);
+    }
+
+    // Check if key already exists in a different space
+    if (this.config.spaceEnforcement) {
+      const existingSpaceKey = this.findKeyInDifferentSpace(baseKey, space);
+      if (existingSpaceKey) {
+        throw new Error(`Key "${baseKey}" already exists in space "${existingSpaceKey}" - cannot store in "${space}" space`);
+      }
+    }
+
+    const keyId = await this.webDHT.generateKeyId(fullKey);
     const timestamp = Date.now();
-    console.log(`📦 Storing key: ${key}, keyId: ${keyId.substring(0, 8)}...`);
+    this.debug.log(`📦 Storing key: ${fullKey}, keyId: ${keyId.substring(0, 8)}...`);
 
     // Validate value size
     const serializedValue = JSON.stringify(value);
@@ -170,13 +383,15 @@ export class DistributedStorageManager extends EventEmitter {
       throw new Error(`Value size exceeds maximum allowed size of ${this.config.maxValueSize} bytes`);
     }
 
-    // Create storage metadata - default to private for security
+    // Create storage metadata with space information
     const metadata = {
-      key,
+      key: fullKey,
+      baseKey,
+      space,
       keyId,
       owner: this.mesh.peerId,
-      isPublic: options.isPublic !== undefined ? options.isPublic : false, // Default to private
-      isImmutable: options.isImmutable || false,
+      isPublic: spaceConfig.isPublic,
+      isImmutable: spaceConfig.isImmutable,
       enableCRDT: options.enableCRDT || false,
       allowedPeers: options.allowedPeers || [],
       createdAt: timestamp,
@@ -189,12 +404,16 @@ export class DistributedStorageManager extends EventEmitter {
     this.storageMetadata.set(keyId, metadata);
     this.ownedKeys.add(keyId);
 
+    // Track space ownership
+    this.spaceOwnership.set(fullKey, this.mesh.peerId);
+
     // Set up access control
     this.accessControl.set(keyId, {
       isPublic: metadata.isPublic,
       owner: metadata.owner,
       allowedPeers: new Set(metadata.allowedPeers),
-      isImmutable: metadata.isImmutable
+      isImmutable: metadata.isImmutable,
+      space
     });
 
     // Initialize CRDT state if enabled
@@ -213,8 +432,8 @@ export class DistributedStorageManager extends EventEmitter {
       encrypted: false
     };
 
-    // Only encrypt private data (isPublic: false) to ensure owner-only access
-    if (!metadata.isPublic && this.config.encryptionEnabled && this.unsea && this.storageKeypair) {
+    // Only encrypt private space data
+    if (space === this.spaces.PRIVATE && this.config.encryptionEnabled && this.unsea && this.storageKeypair) {
       try {
         // For private data, encrypt with the owner's keypair so only the owner can decrypt
         const encryptedValue = await this.unsea.encryptMessageWithMeta(serializedValue, this.storageKeypair);
@@ -224,32 +443,35 @@ export class DistributedStorageManager extends EventEmitter {
           encrypted: true,
           encryptedBy: this.mesh.peerId // Track who encrypted it
         };
-        console.log(`📦 Encrypted private storage data for key: ${key} (owner-only access)`);
+        this.debug.log(`📦 Encrypted private space storage data for key: ${fullKey} (owner-only access)`);
       } catch (error) {
-        console.warn(`Failed to encrypt private storage data for key ${key}:`, error);
+        this.debug.warn(`Failed to encrypt private space storage data for key ${fullKey}:`, error);
         // Fall back to unencrypted storage if encryption fails
       }
     } else {
-      console.log(`📦 Storing ${metadata.isPublic ? 'public' : 'unencrypted'} data for key: ${key}`);
+      this.debug.log(`📦 Storing ${space} space data for key: ${fullKey}`);
     }
 
-    // Store in WebDHT
+    // Store in WebDHT with space prefix
     try {
-      console.log(`📦 Storing payload for key ${key}:`, {
+      this.debug.log(`📦 Storing payload for key ${fullKey}:`, {
         hasValue: !!storagePayload.value,
         hasMetadata: !!storagePayload.metadata,
-        encrypted: storagePayload.encrypted
+        encrypted: storagePayload.encrypted,
+        space
       });
 
-      await this.webDHT.put(`storage:${key}`, storagePayload, {
+      await this.webDHT.put(`storage:${fullKey}`, storagePayload, {
         ttl: metadata.ttl
       });
 
-      console.log(`📦 Stored ${metadata.isPublic ? 'public' : 'private'} data for key: ${key}`);
+      this.debug.log(`📦 Stored ${space} space data for key: ${fullKey}`);
 
       // Emit storage event
       this.emit('dataStored', {
-        key,
+        key: fullKey,
+        baseKey,
+        space,
         keyId,
         isPublic: metadata.isPublic,
         isImmutable: metadata.isImmutable,
@@ -258,12 +480,13 @@ export class DistributedStorageManager extends EventEmitter {
 
       return true;
     } catch (error) {
-      console.error(`Failed to store data for key ${key}:`, error);
+      this.debug.error(`Failed to store data for key ${fullKey}:`, error);
       // Clean up local metadata on failure
       this.storageMetadata.delete(keyId);
       this.ownedKeys.delete(keyId);
       this.accessControl.delete(keyId);
       this.crdtStates.delete(keyId);
+      this.spaceOwnership.delete(fullKey);
       throw error;
     }
   }
@@ -285,30 +508,70 @@ export class DistributedStorageManager extends EventEmitter {
       await this.waitForCrypto();
     }
 
-    const keyId = await this.webDHT.generateKeyId(key);
-    console.log(`📦 Retrieving key: ${key}, keyId: ${keyId.substring(0, 8)}...`);
+    // Parse the key to understand space context
+    const keyInfo = this.parseStorageKey(key);
+    const fullKey = keyInfo.fullKey;
+    const { space, baseKey } = keyInfo;
+
+    // Check space access permissions
+    if (!this.canAccessSpace(space, baseKey, this.mesh.peerId, 'read')) {
+      this.debug.warn(`📦 Access denied for space "${space}" and key "${baseKey}"`);
+      return null;
+    }
+
+    const keyId = await this.webDHT.generateKeyId(fullKey);
+    this.debug.log(`📦 Retrieving key: ${fullKey}, keyId: ${keyId.substring(0, 8)}...`);
 
     try {
       // Get data from WebDHT
-      console.log(`📦 Attempting to retrieve data for key: ${key}`);
-      const storagePayload = await this.webDHT.get(`storage:${key}`, {
+      this.debug.log(`📦 Attempting to retrieve data for key: ${fullKey}`);
+      const storagePayload = await this.webDHT.get(`storage:${fullKey}`, {
         forceRefresh: options.forceRefresh
       });
 
-      console.log(`📦 Retrieved payload for key ${key}:`, {
+      this.debug.log(`📦 Retrieved payload for key ${fullKey}:`, {
         payloadExists: !!storagePayload,
         payloadType: typeof storagePayload,
-        payloadValue: storagePayload,
+        space,
         keys: storagePayload ? Object.keys(storagePayload) : 'none'
       });
 
       if (!storagePayload || typeof storagePayload !== 'object') {
-        console.log(`📦 No data found for key: ${key}`);
+        this.debug.log(`📦 No data found for key: ${fullKey}`);
+
+        // For legacy compatibility, if we don't find a key in the default space,
+        // try searching in other spaces (only for bare keys, not space-prefixed ones)
+        if (!key.includes(':') && space === 'private') {
+          this.debug.log(`📦 Attempting legacy compatibility search for key: ${baseKey}`);
+
+          // Try public space first (most common legacy case)
+          try {
+            const publicResult = await this.retrieve(`public:${baseKey}`, options);
+            if (publicResult) {
+              this.debug.log(`📦 Found legacy key in public space: ${baseKey}`);
+              return publicResult;
+            }
+          } catch (e) {
+            // Continue to next space
+          }
+
+          // Try frozen space
+          try {
+            const frozenResult = await this.retrieve(`frozen:${baseKey}`, options);
+            if (frozenResult) {
+              this.debug.log(`📦 Found legacy key in frozen space: ${baseKey}`);
+              return frozenResult;
+            }
+          } catch (e) {
+            // Key not found in any space
+          }
+        }
+
         return null;
       }
 
       // Debug: Log the raw payload structure
-      console.log('📦 Raw payload structure:', JSON.stringify(storagePayload, null, 2));
+      this.debug.log('📦 Raw payload structure:', JSON.stringify(storagePayload, null, 2));
 
       // Safely destructure the payload with detailed logging
       const value = storagePayload.value;
@@ -316,23 +579,30 @@ export class DistributedStorageManager extends EventEmitter {
       const encrypted = storagePayload.encrypted || false;
       const encryptedBy = storagePayload.encryptedBy;
 
-      console.log('📦 Payload components:', {
+      this.debug.log('📦 Payload components:', {
         hasValue: value !== undefined,
         valueType: typeof value,
         hasMetadata: metadata !== undefined,
         metadataType: typeof metadata,
         encrypted,
+        space: metadata?.space || 'unknown',
         encryptedBy: encryptedBy?.substring(0, 8) + '...' || 'unknown'
       });
 
       if (!metadata) {
-        console.warn(`📦 Invalid storage payload for key ${key}: missing metadata`);
+        this.debug.warn(`📦 Invalid storage payload for key ${fullKey}: missing metadata`);
         return null;
       }
 
-      // Check access permissions
-      if (!this.hasReadAccess(keyId, metadata)) {
-        console.warn(`Access denied for key: ${key}`);
+      // Verify space consistency
+      if (metadata.space && metadata.space !== space) {
+        this.debug.warn(`📦 Space mismatch for key ${fullKey}: expected ${space}, got ${metadata.space}`);
+        return null;
+      }
+
+      // Check access permissions using space-aware logic
+      if (!this.hasReadAccessWithSpace(keyId, metadata, space)) {
+        this.debug.warn(`📦 Access denied for key: ${fullKey} in space: ${space}`);
         return null;
       }
 
@@ -341,10 +611,10 @@ export class DistributedStorageManager extends EventEmitter {
       if (encrypted && this.unsea && this.storageKeypair) {
         // Only allow decryption if this peer is the owner (encrypted the data)
         if (encryptedBy && encryptedBy !== this.mesh.peerId) {
-          console.warn(`📦 Cannot decrypt data for key ${key}: encrypted by different peer (${encryptedBy.substring(0, 8)}...), current peer: ${this.mesh.peerId.substring(0, 8)}...`);
+          this.debug.warn(`📦 Cannot decrypt data for key ${key}: encrypted by different peer (${encryptedBy.substring(0, 8)}...), current peer: ${this.mesh.peerId.substring(0, 8)}...`);
           // For private data encrypted by another peer, deny access
           if (!metadata.isPublic) {
-            console.warn(`Access denied for key: ${key} - private data encrypted by different peer`);
+            this.debug.warn(`Access denied for key: ${key} - private data encrypted by different peer`);
             return null;
           }
         }
@@ -352,15 +622,15 @@ export class DistributedStorageManager extends EventEmitter {
         try {
           const decryptedValue = await this.unsea.decryptMessageWithMeta(value, this.storageKeypair.epriv);
           finalValue = JSON.parse(decryptedValue);
-          console.log(`🔓 Decrypted storage data for key: ${key}`);
+          this.debug.log(`🔓 Decrypted storage data for key: ${key}`);
         } catch (error) {
-          console.error(`Failed to decrypt data for key ${key}:`, error);
+          this.debug.error(`Failed to decrypt data for key ${key}:`, error);
           // If this is private data and decryption fails, deny access
           if (!metadata.isPublic) {
             return null;
           }
           // For public data, if decryption fails, try to use the raw value
-          console.warn(`📦 Using raw value for public key ${key} due to decryption failure`);
+          this.debug.warn(`📦 Using raw value for public key ${key} due to decryption failure`);
           finalValue = value;
         }
       }
@@ -372,15 +642,23 @@ export class DistributedStorageManager extends EventEmitter {
           isPublic: metadata.isPublic,
           owner: metadata.owner,
           allowedPeers: new Set(metadata.allowedPeers),
-          isImmutable: metadata.isImmutable
+          isImmutable: metadata.isImmutable,
+          space: metadata.space || space
         });
+
+        // Track space ownership from retrieved metadata
+        if (metadata.owner && !this.spaceOwnership.has(fullKey)) {
+          this.spaceOwnership.set(fullKey, metadata.owner);
+        }
       }
 
-      console.log(`📦 Retrieved ${metadata.isPublic ? 'public' : 'private'} data for key: ${key}`);
+      this.debug.log(`📦 Retrieved ${space} space data for key: ${fullKey}`);
 
       // Emit retrieval event
       this.emit('dataRetrieved', {
-        key,
+        key: fullKey,
+        baseKey,
+        space,
         keyId,
         isPublic: metadata.isPublic,
         owner: metadata.owner
@@ -388,7 +666,7 @@ export class DistributedStorageManager extends EventEmitter {
 
       return finalValue;
     } catch (error) {
-      console.error(`Failed to retrieve data for key ${key}:`, error);
+      this.debug.error(`Failed to retrieve data for key ${key}:`, error);
       return null;
     }
   }
@@ -457,9 +735,9 @@ export class DistributedStorageManager extends EventEmitter {
           encrypted: true,
           encryptedBy: this.mesh.peerId // Track who encrypted it
         };
-        console.log(`📦 Encrypted updated storage data for key: ${key}`);
+        this.debug.log(`📦 Encrypted updated storage data for key: ${key}`);
       } catch (error) {
-        console.warn(`Failed to encrypt updated storage data for key ${key}:`, error);
+        this.debug.warn(`Failed to encrypt updated storage data for key ${key}:`, error);
       }
     }
 
@@ -472,7 +750,7 @@ export class DistributedStorageManager extends EventEmitter {
       // Update local metadata
       this.storageMetadata.set(keyId, metadata);
 
-      console.log(`📦 Updated ${metadata.isPublic ? 'public' : 'private'} data for key: ${key}`);
+      this.debug.log(`📦 Updated ${metadata.isPublic ? 'public' : 'private'} data for key: ${key}`);
 
       // Emit update event
       this.emit('dataUpdated', {
@@ -485,7 +763,7 @@ export class DistributedStorageManager extends EventEmitter {
 
       return true;
     } catch (error) {
-      console.error(`Failed to update data for key ${key}:`, error);
+      this.debug.error(`Failed to update data for key ${key}:`, error);
       throw error;
     }
   }
@@ -587,14 +865,14 @@ export class DistributedStorageManager extends EventEmitter {
       this.accessControl.delete(keyId);
       this.crdtStates.delete(keyId);
 
-      console.log(`📦 Deleted data for key: ${key}`);
+      this.debug.log(`📦 Deleted data for key: ${key}`);
 
       // Emit deletion event
       this.emit('dataDeleted', { key, keyId });
 
       return true;
     } catch (error) {
-      console.error(`Failed to delete data for key ${key}:`, error);
+      this.debug.error(`Failed to delete data for key ${key}:`, error);
       throw error;
     }
   }
@@ -612,7 +890,7 @@ export class DistributedStorageManager extends EventEmitter {
     // Subscribe to the WebDHT key
     const currentValue = await this.webDHT.subscribe(`storage:${key}`);
 
-    console.log(`📦 Subscribed to storage key: ${key}`);
+    this.debug.log(`📦 Subscribed to storage key: ${key}`);
 
     return currentValue;
   }
@@ -627,7 +905,7 @@ export class DistributedStorageManager extends EventEmitter {
     }
 
     await this.webDHT.unsubscribe(`storage:${key}`);
-    console.log(`📦 Unsubscribed from storage key: ${key}`);
+    this.debug.log(`📦 Unsubscribed from storage key: ${key}`);
   }
 
   /**
@@ -698,7 +976,7 @@ export class DistributedStorageManager extends EventEmitter {
         await this.webDHT.update(`storage:${key}`, currentPayload);
       }
 
-      console.log(`📦 Granted access to peer ${peerId.substring(0, 8)}... for key: ${key}`);
+      this.debug.log(`📦 Granted access to peer ${peerId.substring(0, 8)}... for key: ${key}`);
 
       // Emit access granted event
       this.emit('accessGranted', { key, keyId, peerId });
@@ -740,7 +1018,7 @@ export class DistributedStorageManager extends EventEmitter {
         await this.webDHT.update(`storage:${key}`, currentPayload);
       }
 
-      console.log(`📦 Revoked access from peer ${peerId.substring(0, 8)}... for key: ${key}`);
+      this.debug.log(`📦 Revoked access from peer ${peerId.substring(0, 8)}... for key: ${key}`);
 
       // Emit access revoked event
       this.emit('accessRevoked', { key, keyId, peerId });
@@ -827,7 +1105,7 @@ export class DistributedStorageManager extends EventEmitter {
         this.storageMetadata.delete(keyId);
         this.accessControl.delete(keyId);
         this.ownedKeys.delete(keyId);
-        console.log(`📦 Cleaned up expired metadata for key: ${metadata.key}`);
+        this.debug.log(`📦 Cleaned up expired metadata for key: ${metadata.key}`);
       }
     }
 
@@ -835,7 +1113,7 @@ export class DistributedStorageManager extends EventEmitter {
     for (const [keyId, crdtState] of this.crdtStates.entries()) {
       if (crdtState.operations.length > 100) {
         crdtState.operations = crdtState.operations.slice(-100);
-        console.log(`📦 Cleaned up old CRDT operations for key: ${keyId.substring(0, 8)}...`);
+        this.debug.log(`📦 Cleaned up old CRDT operations for key: ${keyId.substring(0, 8)}...`);
       }
     }
   }
@@ -872,12 +1150,12 @@ export class DistributedStorageManager extends EventEmitter {
             });
           }
         } catch (error) {
-          console.warn(`Failed to backup key ${metadata.key}:`, error);
+          this.debug.warn(`Failed to backup key ${metadata.key}:`, error);
         }
       }
     }
 
-    console.log(`📦 Created backup with ${backupData.keys.length} keys`);
+    this.debug.log(`📦 Created backup with ${backupData.keys.length} keys`);
     return backupData;
   }
 
@@ -920,11 +1198,11 @@ export class DistributedStorageManager extends EventEmitter {
           key: keyData.key,
           error: error.message
         });
-        console.warn(`Failed to restore key ${keyData.key}:`, error);
+        this.debug.warn(`Failed to restore key ${keyData.key}:`, error);
       }
     }
 
-    console.log(`📦 Restore complete: ${results.restored} restored, ${results.skipped} skipped, ${results.failed} failed`);
+    this.debug.log(`📦 Restore complete: ${results.restored} restored, ${results.skipped} skipped, ${results.failed} failed`);
     return results;
   }
 
@@ -1006,7 +1284,7 @@ export class DistributedStorageManager extends EventEmitter {
     });
 
     await Promise.allSettled(storePromises);
-    console.log(`📦 Bulk store complete: ${results.stored} stored, ${results.failed} failed`);
+    this.debug.log(`📦 Bulk store complete: ${results.stored} stored, ${results.failed} failed`);
     return results;
   }
 
@@ -1024,7 +1302,7 @@ export class DistributedStorageManager extends EventEmitter {
         const value = await this.retrieve(key, options);
         results[key] = value;
       } catch (error) {
-        console.warn(`Failed to retrieve key ${key}:`, error);
+        this.debug.warn(`Failed to retrieve key ${key}:`, error);
         results[key] = null;
       }
     });
@@ -1108,7 +1386,7 @@ export class DistributedStorageManager extends EventEmitter {
         await this.subscribe(key);
         subscriptions.add(key);
       } catch (error) {
-        console.warn(`Failed to subscribe to key ${key}:`, error);
+        this.debug.warn(`Failed to subscribe to key ${key}:`, error);
       }
     }
 
@@ -1129,7 +1407,7 @@ export class DistributedStorageManager extends EventEmitter {
         try {
           await this.unsubscribe(key);
         } catch (error) {
-          console.warn(`Failed to unsubscribe from key ${key}:`, error);
+          this.debug.warn(`Failed to unsubscribe from key ${key}:`, error);
         }
       }
 
@@ -1180,7 +1458,7 @@ export class DistributedStorageManager extends EventEmitter {
     }
 
     this.enabled = true;
-    console.log('📦 Distributed storage enabled');
+    this.debug.log('📦 Distributed storage enabled');
     this.emit('storageEnabled');
   }
 
@@ -1190,7 +1468,7 @@ export class DistributedStorageManager extends EventEmitter {
    */
   async disable() {
     this.enabled = false;
-    console.log('📦 Distributed storage disabled');
+    this.debug.log('📦 Distributed storage disabled');
     this.emit('storageDisabled');
   }
 
@@ -1215,7 +1493,7 @@ export class DistributedStorageManager extends EventEmitter {
         try {
           await this.delete(metadata.key);
         } catch (error) {
-          console.warn(`Failed to delete key ${metadata.key} during clear:`, error);
+          this.debug.warn(`Failed to delete key ${metadata.key} during clear:`, error);
         }
       }
     }
@@ -1226,7 +1504,7 @@ export class DistributedStorageManager extends EventEmitter {
     this.crdtStates.clear();
     this.ownedKeys.clear();
 
-    console.log('📦 All stored data cleared');
+    this.debug.log('📦 All stored data cleared');
     this.emit('storageCleared');
   }
 
@@ -1262,7 +1540,7 @@ export class DistributedStorageManager extends EventEmitter {
         await this.delete(key);
         deletedCount++;
       } catch (error) {
-        console.warn(`Failed to delete key ${key} during bulk delete:`, error);
+        this.debug.warn(`Failed to delete key ${key} during bulk delete:`, error);
       }
     }
 

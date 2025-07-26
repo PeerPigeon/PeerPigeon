@@ -152,6 +152,40 @@ mesh.addEventListener('messageReceived', (data) => {
 });
 ```
 
+### 🐛 Debug Configuration
+
+PeerPigeon includes a comprehensive debug system that allows you to control console output at a granular level. **By default, all console logging is disabled** to prevent noise in production.
+
+```javascript
+import { PeerPigeonMesh, DebugLogger } from 'peerpigeon';
+
+// Enable debugging for specific modules
+DebugLogger.enableModules(['GossipManager', 'ConnectionManager']);
+
+// Enable all debugging (development mode)
+DebugLogger.enableAll();
+
+// Enable debugging conditionally
+if (process.env.NODE_ENV === 'development') {
+  DebugLogger.enableAll();
+}
+
+// Create your mesh with debug output enabled
+const mesh = new PeerPigeonMesh(options);
+```
+
+**Available Debug Modules:**
+- `PeerPigeonMesh` - Main mesh lifecycle events
+- `GossipManager` - Message propagation debugging  
+- `ConnectionManager` - Peer connection management
+- `PeerConnection` - Individual WebRTC connections
+- `WebDHT` - Distributed hash table operations
+- `CryptoManager` - Encryption operations
+- `MediaManager` - Audio/video streaming
+- And many more...
+
+See [docs/DEBUG.md](docs/DEBUG.md) for complete documentation.
+
 ### WebDHT (Distributed Hash Table) Examples
 
 ```javascript

@@ -1,9 +1,11 @@
 import { EventEmitter } from './EventEmitter.js';
 import { environmentDetector } from './EnvironmentDetector.js';
+import DebugLogger from './DebugLogger.js';
 
 export class MediaManager extends EventEmitter {
   constructor() {
     super();
+    this.debug = DebugLogger.create('MediaManager');
     this.localStream = null;
     this.isVideoEnabled = false;
     this.isAudioEnabled = false;
@@ -33,7 +35,7 @@ export class MediaManager extends EventEmitter {
   async init() {
     // Check if media APIs are available
     if (!environmentDetector.hasGetUserMedia) {
-      console.warn('getUserMedia not available in this environment');
+      this.debug.warn('getUserMedia not available in this environment');
       this.emit('error', { type: 'init', error: new Error('getUserMedia not supported') });
       return false;
     }
@@ -43,7 +45,7 @@ export class MediaManager extends EventEmitter {
       await this.enumerateDevices();
       return true;
     } catch (error) {
-      console.error('Failed to initialize media manager:', error);
+      this.debug.error('Failed to initialize media manager:', error);
       this.emit('error', { type: 'init', error });
       return false;
     }
@@ -57,7 +59,7 @@ export class MediaManager extends EventEmitter {
     if ((!environmentDetector.isBrowser && !environmentDetector.isNativeScript) ||
         typeof navigator === 'undefined' ||
         typeof navigator.mediaDevices === 'undefined') {
-      console.warn('Media device enumeration not available in this environment');
+      this.debug.warn('Media device enumeration not available in this environment');
       return;
     }
 
@@ -71,7 +73,7 @@ export class MediaManager extends EventEmitter {
       this.emit('devicesUpdated', this.devices);
       return this.devices;
     } catch (error) {
-      console.error('Failed to enumerate devices:', error);
+      this.debug.error('Failed to enumerate devices:', error);
       this.emit('error', { type: 'enumerate', error });
       throw error;
     }
@@ -116,7 +118,7 @@ export class MediaManager extends EventEmitter {
       // Mark stream as local origin to prevent confusion with remote streams
       this.markStreamAsLocal(this.localStream);
 
-      console.log('Local media stream started:', {
+      this.debug.log('Local media stream started:', {
         video: this.isVideoEnabled,
         audio: this.isAudioEnabled,
         tracks: this.localStream.getTracks().map(track => ({
@@ -134,7 +136,7 @@ export class MediaManager extends EventEmitter {
 
       return this.localStream;
     } catch (error) {
-      console.error('Failed to start local media stream:', error);
+      this.debug.error('Failed to start local media stream:', error);
       this.emit('error', { type: 'getUserMedia', error });
       throw error;
     }
@@ -145,7 +147,7 @@ export class MediaManager extends EventEmitter {
      */
   stopLocalStream() {
     if (this.localStream) {
-      console.log('Stopping local media stream');
+      this.debug.log('Stopping local media stream');
       this.localStream.getTracks().forEach(track => {
         track.stop();
       });
@@ -237,7 +239,7 @@ export class MediaManager extends EventEmitter {
 
       return permissions;
     } catch (error) {
-      console.warn('Could not check media permissions:', error);
+      this.debug.warn('Could not check media permissions:', error);
       return {};
     }
   }
@@ -256,9 +258,9 @@ export class MediaManager extends EventEmitter {
         configurable: false
       });
 
-      console.log(`🔒 Stream ${stream.id} marked as local origin in MediaManager`);
+      this.debug.log(`🔒 Stream ${stream.id} marked as local origin in MediaManager`);
     } catch (error) {
-      console.warn('Could not mark stream as local origin:', error);
+      this.debug.warn('Could not mark stream as local origin:', error);
     }
   }
 }

@@ -13,10 +13,12 @@ import { WebDHT } from './WebDHT.js';
 import { CryptoManager } from './CryptoManager.js';
 import { DistributedStorageManager } from './DistributedStorageManager.js';
 import { environmentDetector } from './EnvironmentDetector.js';
+import DebugLogger from './DebugLogger.js';
 
 export class PeerPigeonMesh extends EventEmitter {
   constructor(options = {}) {
     super();
+    this.debug = DebugLogger.create('PeerPigeonMesh');
 
     // Validate environment capabilities
     this.environmentReport = this.validateEnvironment(options);
@@ -78,7 +80,7 @@ export class PeerPigeonMesh extends EventEmitter {
 
     // Handle peer disconnections and trigger keep-alive ping coordination
     this.addEventListener('peerDisconnected', (data) => {
-      console.log(`Peer ${data.peerId.substring(0, 8)}... disconnected: ${data.reason}`);
+      this.debug.log(`Peer ${data.peerId.substring(0, 8)}... disconnected: ${data.reason}`);
       // Trigger immediate keep-alive ping check in case the disconnected peer was the designated sender
       if (this.signalingClient && this.signalingClient.connected) {
         setTimeout(() => {
@@ -87,8 +89,20 @@ export class PeerPigeonMesh extends EventEmitter {
       }
     });
 
-    // Handle gossip messages
+    // Handle gossip messages and intercept mesh signaling
     this.gossipManager.addEventListener('messageReceived', (data) => {
+      // Check if this is a mesh signaling message
+      if (data.message && data.message.type === 'mesh_signaling') {
+        this._handleMeshSignalingMessage(data.message, data.from);
+        return; // Don't emit as regular message
+      }
+      
+      // Handle crypto key exchange messages
+      if (data.message && (data.message.type === 'key_exchange' || data.message.type === 'key_exchange_response')) {
+        this._handleKeyExchange(data.message, data.from);
+        return; // Don't emit as regular message
+      }
+      
       this.emit('messageReceived', data);
     });
 
@@ -136,7 +150,7 @@ export class PeerPigeonMesh extends EventEmitter {
     const errors = [];
 
     // Log environment info
-    console.log('🔍 PeerPigeon Environment Detection:', {
+    this.debug.log('🔍 PeerPigeon Environment Detection:', {
       runtime: `${report.runtime.isBrowser ? 'Browser' : ''}${report.runtime.isNodeJS ? 'Node.js' : ''}${report.runtime.isWorker ? 'Worker' : ''}${report.runtime.isNativeScript ? 'NativeScript' : ''}`,
       webrtc: report.capabilities.webrtc,
       websocket: report.capabilities.webSocket,
@@ -199,7 +213,7 @@ export class PeerPigeonMesh extends EventEmitter {
       // NativeScript-specific checks
       const nativeScript = report.nativescript;
       if (nativeScript && nativeScript.platform) {
-        console.log(`🔮 Running on NativeScript ${nativeScript.platform} platform`);
+        this.debug.log(`🔮 Running on NativeScript ${nativeScript.platform} platform`);
 
         // Platform-specific considerations
         if (nativeScript.platform === 'android') {
@@ -213,14 +227,14 @@ export class PeerPigeonMesh extends EventEmitter {
     // Handle errors and warnings
     if (errors.length > 0) {
       const errorMessage = 'PeerPigeon environment validation failed:\n' + errors.join('\n');
-      console.error(errorMessage);
+      this.debug.error(errorMessage);
       if (!options.ignoreEnvironmentErrors) {
         throw new Error(errorMessage);
       }
     }
 
     if (warnings.length > 0) {
-      console.warn('PeerPigeon environment warnings:\n' + warnings.join('\n'));
+      this.debug.warn('PeerPigeon environment warnings:\n' + warnings.join('\n'));
     }
 
     // Store capabilities for runtime checks
@@ -236,9 +250,9 @@ export class PeerPigeonMesh extends EventEmitter {
       if (this.providedPeerId) {
         if (this.storageManager.validatePeerId(this.providedPeerId)) {
           this.peerId = this.providedPeerId;
-          console.log(`Using provided peer ID: ${this.peerId}`);
+          this.debug.log(`Using provided peer ID: ${this.peerId}`);
         } else {
-          console.warn(`Invalid peer ID provided: ${this.providedPeerId}. Must be 40-character SHA-1 hex string. Generating new one.`);
+          this.debug.warn(`Invalid peer ID provided: ${this.providedPeerId}. Must be 40-character SHA-1 hex string. Generating new one.`);
           this.peerId = await this.storageManager.generatePeerId();
         }
       } else {
@@ -248,19 +262,19 @@ export class PeerPigeonMesh extends EventEmitter {
       // Initialize WebDHT now that we have a peerId (if enabled)
       if (this.enableWebDHT) {
         this.webDHT = new WebDHT(this);
-        console.log('WebDHT initialized and enabled');
+        this.debug.log('WebDHT initialized and enabled');
 
         // Setup WebDHT event handlers now that it's initialized
         this.setupWebDHTEventHandlers();
 
         // Initialize DistributedStorageManager if WebDHT is enabled
         this.distributedStorage = new DistributedStorageManager(this);
-        console.log('DistributedStorageManager initialized');
+        this.debug.log('DistributedStorageManager initialized');
 
         // Setup DistributedStorageManager event handlers
         this.setupDistributedStorageEventHandlers();
       } else {
-        console.log('WebDHT disabled by configuration');
+        this.debug.log('WebDHT disabled by configuration');
       }
 
       // Load signaling URL from query params or storage
@@ -284,11 +298,11 @@ export class PeerPigeonMesh extends EventEmitter {
       // Initialize crypto manager if enabled
       if (this.cryptoManager) {
         try {
-          console.log('🔐 Initializing crypto manager...');
+          this.debug.log('🔐 Initializing crypto manager...');
           await this.cryptoManager.init({ generateKeypair: true });
-          console.log('🔐 Crypto manager initialized successfully');
+          this.debug.log('🔐 Crypto manager initialized successfully');
         } catch (error) {
-          console.error('Failed to initialize crypto manager:', error);
+          this.debug.error('Failed to initialize crypto manager:', error);
           // Continue without crypto - don't fail the entire init
           this.enableCrypto = false;
           this.cryptoManager = null;
@@ -297,7 +311,7 @@ export class PeerPigeonMesh extends EventEmitter {
 
       this.emit('statusChanged', { type: 'initialized', peerId: this.peerId });
     } catch (error) {
-      console.error('Failed to initialize mesh:', error);
+      this.debug.error('Failed to initialize mesh:', error);
       this.emit('statusChanged', { type: 'error', message: `Initialization failed: ${error.message}` });
       throw error;
     }
@@ -339,7 +353,7 @@ export class PeerPigeonMesh extends EventEmitter {
     });
 
     this.peerDiscovery.addEventListener('connectToPeer', (data) => {
-      console.log(`PeerDiscovery requested connection to: ${data.peerId.substring(0, 8)}...`);
+      this.debug.log(`PeerDiscovery requested connection to: ${data.peerId.substring(0, 8)}...`);
       this.connectionManager.connectToPeer(data.peerId);
     });
 
@@ -364,7 +378,7 @@ export class PeerPigeonMesh extends EventEmitter {
     this.peerDiscovery.addEventListener('checkCapacity', () => {
       const canAccept = this.connectionManager.canAcceptMorePeers();
       const currentConnectionCount = this.connectionManager.getConnectedPeerCount();
-      console.log(`Capacity check: ${canAccept} (${currentConnectionCount}/${this.maxPeers} peers)`);
+      this.debug.log(`Capacity check: ${canAccept} (${currentConnectionCount}/${this.maxPeers} peers)`);
       this.peerDiscovery._canAcceptMorePeers = canAccept;
       this.peerDiscovery._currentConnectionCount = currentConnectionCount;
     });
@@ -372,7 +386,7 @@ export class PeerPigeonMesh extends EventEmitter {
     // Handle eviction checks
     this.peerDiscovery.addEventListener('checkEviction', (data) => {
       const evictPeerId = this.evictionManager.shouldEvictForPeer(data.newPeerId);
-      console.log(`Eviction check for ${data.newPeerId.substring(0, 8)}...: ${evictPeerId ? evictPeerId.substring(0, 8) + '...' : 'none'}`);
+      this.debug.log(`Eviction check for ${data.newPeerId.substring(0, 8)}...: ${evictPeerId ? evictPeerId.substring(0, 8) + '...' : 'none'}`);
       this.peerDiscovery._shouldEvictForPeer = evictPeerId;
     });
   }
@@ -386,7 +400,7 @@ export class PeerPigeonMesh extends EventEmitter {
     try {
       await this.signalingClient.connect(signalingUrl);
     } catch (error) {
-      console.error('Connection failed:', error);
+      this.debug.error('Connection failed:', error);
       this.polling = false;
       this.emit('statusChanged', { type: 'error', message: `Connection failed: ${error.message}` });
       throw error;
@@ -527,7 +541,7 @@ export class PeerPigeonMesh extends EventEmitter {
      */
   sendDirectMessage(targetPeerId, content) {
     if (!targetPeerId || typeof targetPeerId !== 'string') {
-      console.error('Invalid targetPeerId for direct message');
+      this.debug.error('Invalid targetPeerId for direct message');
       return null;
     }
     return this.gossipManager.sendDirectMessage(targetPeerId, content);
@@ -581,12 +595,12 @@ export class PeerPigeonMesh extends EventEmitter {
 
   // Debugging and maintenance methods
   forceCleanupInvalidPeers() {
-    console.log('Force cleaning up peers not in connected state...');
+    this.debug.log('Force cleaning up peers not in connected state...');
     return this.connectionManager.forceCleanupInvalidPeers();
   }
 
   cleanupStalePeers() {
-    console.log('Manually cleaning up stale peers...');
+    this.debug.log('Manually cleaning up stale peers...');
     return this.connectionManager.cleanupStalePeers();
   }
 
@@ -609,13 +623,13 @@ export class PeerPigeonMesh extends EventEmitter {
     const intervalCallback = () => {
       if (this.signalingClient) {
         const stats = this.signalingClient.getConnectionStats();
-        console.log('Connection monitoring:', stats);
+        this.debug.log('Connection monitoring:', stats);
 
         // Force health check if connection seems problematic
         if (stats.connected && stats.lastPingTime && stats.lastPongTime) {
           const timeSinceLastPong = Date.now() - stats.lastPongTime;
           if (timeSinceLastPong > 60000) { // 1 minute without pong
-            console.warn('Connection may be unhealthy, forcing health check');
+            this.debug.warn('Connection may be unhealthy, forcing health check');
             this.signalingClient.forceHealthCheck();
           }
         }
@@ -631,14 +645,14 @@ export class PeerPigeonMesh extends EventEmitter {
       this.connectionMonitorInterval = setInterval(intervalCallback, 120000);
     }
 
-    console.log('Started connection monitoring');
+    this.debug.log('Started connection monitoring');
   }
 
   stopConnectionMonitoring() {
     if (this.connectionMonitorInterval) {
       clearInterval(this.connectionMonitorInterval);
       this.connectionMonitorInterval = null;
-      console.log('Stopped connection monitoring');
+      this.debug.log('Stopped connection monitoring');
     }
   }
 
@@ -661,7 +675,7 @@ export class PeerPigeonMesh extends EventEmitter {
 
       return stream;
     } catch (error) {
-      console.error('Failed to start media:', error);
+      this.debug.error('Failed to start media:', error);
       throw error;
     }
   }
@@ -1005,7 +1019,7 @@ export class PeerPigeonMesh extends EventEmitter {
       await this.cryptoManager.init(options);
       return true;
     } catch (error) {
-      console.error('Failed to initialize crypto:', error);
+      this.debug.error('Failed to initialize crypto:', error);
       throw error;
     }
   }
@@ -1070,9 +1084,118 @@ export class PeerPigeonMesh extends EventEmitter {
         }
       }
     } catch (error) {
-      console.error('Failed to encrypt message:', error);
+      this.debug.error('Failed to encrypt message:', error);
       throw error;
     }
+  }
+
+  /**
+   * Send a signaling message over the mesh (peer-to-peer) instead of the signaling server
+   * This allows peers to coordinate without the signaling server after initial connection
+   * @param {Object} message - The signaling message
+   * @param {string} targetPeerId - Target peer ID (optional, for direct signaling)
+   * @returns {Promise<boolean>} Success status
+   */
+  async sendMeshSignalingMessage(message, targetPeerId = null) {
+    if (!this.connected) {
+      this.debug.warn('Cannot send mesh signaling message - mesh not connected');
+      return false;
+    }
+
+    const signalingMessage = {
+      type: 'mesh_signaling',
+      meshSignalingType: message.type,
+      data: message.data,
+      fromPeerId: this.peerId,
+      targetPeerId,
+      timestamp: Date.now(),
+      messageId: this.generateMessageId()
+    };
+
+    this.debug.log(`📡 Sending mesh signaling message: ${message.type} ${targetPeerId ? `to ${targetPeerId.substring(0, 8)}...` : '(broadcast)'}`);
+
+    try {
+      if (targetPeerId) {
+        // Send directly to target peer
+        return this.sendDirectMessage(targetPeerId, signalingMessage);
+      } else {
+        // Broadcast to all connected peers
+        return this.broadcast(signalingMessage);
+      }
+    } catch (error) {
+      this.debug.error('Failed to send mesh signaling message:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Handle incoming mesh signaling messages
+   * @param {Object} message - The mesh signaling message
+   * @param {string} from - Sender peer ID
+   * @private
+   */
+  _handleMeshSignalingMessage(message, from) {
+    if (!message.meshSignalingType || !message.data) {
+      this.debug.warn('Invalid mesh signaling message format');
+      return;
+    }
+
+    // Only process messages intended for us or broadcasts
+    if (message.targetPeerId && message.targetPeerId !== this.peerId) {
+      this.debug.log(`Ignoring mesh signaling message not intended for us (target: ${message.targetPeerId?.substring(0, 8)}...)`);
+      return;
+    }
+
+    this.debug.log(`📡 Received mesh signaling message: ${message.meshSignalingType} from ${from.substring(0, 8)}...`);
+
+    // Create a signaling message format that our existing handler can process
+    const reconstitutedMessage = {
+      type: message.meshSignalingType,
+      data: message.data,
+      fromPeerId: from,
+      targetPeerId: message.targetPeerId,
+      timestamp: message.timestamp,
+      messageId: message.messageId,
+      viaWebSocket: false, // Mark as coming from mesh, not WebSocket
+      viaMesh: true
+    };
+
+    // Forward to our existing signaling handler
+    this.signalingHandler.handleSignalingMessage(reconstitutedMessage);
+  }
+
+  /**
+   * Send a signaling message, preferring mesh over WebSocket when possible
+   * @param {Object} message - The signaling message
+   * @param {string} targetPeerId - Target peer ID (optional)
+   * @returns {Promise<boolean>} Success status
+   */
+  async sendSignalingMessage(message, targetPeerId = null) {
+    // For initial connection and peer discovery, use WebSocket if available
+    const isInitialConnectionMessage = message.type === 'offer' || message.type === 'answer' ||
+                                     message.type === 'ice-candidate' || message.type === 'announce';
+    
+    // If we have mesh connectivity and this isn't an initial connection message, use mesh
+    if (this.connected && this.connectionManager.getConnectedPeerCount() > 0 && !isInitialConnectionMessage) {
+      this.debug.log(`📡 Using mesh signaling for ${message.type} (${this.connectionManager.getConnectedPeerCount()} peers connected)`);
+      return await this.sendMeshSignalingMessage(message, targetPeerId);
+    }
+    
+    // Fall back to WebSocket signaling
+    if (this.signalingClient && this.signalingClient.isConnected()) {
+      this.debug.log(`📡 Using WebSocket signaling for ${message.type} (mesh: ${this.connected}, peers: ${this.connectionManager.getConnectedPeerCount()})`);
+      
+      // Include targetPeerId in the message if provided
+      const messageWithTarget = { ...message };
+      if (targetPeerId) {
+        messageWithTarget.targetPeerId = targetPeerId;
+      }
+      
+      return await this.signalingClient.sendSignalingMessage(messageWithTarget);
+    }
+    
+    this.debug.warn(`📡 Cannot send signaling message ${message.type} - no connectivity (mesh: ${this.connected}, WebSocket: ${this.signalingClient?.isConnected()})`);
+    return false;
   }
 
   /**
@@ -1091,7 +1214,7 @@ export class PeerPigeonMesh extends EventEmitter {
       const encryptedContent = await this.cryptoManager.encryptForPeer(content, peerId);
       return this.sendDirectMessage(peerId, encryptedContent);
     } catch (error) {
-      console.error('Failed to send encrypted message:', error);
+      this.debug.error('Failed to send encrypted message:', error);
       throw error;
     }
   }
@@ -1125,7 +1248,7 @@ export class PeerPigeonMesh extends EventEmitter {
       // Use 'encrypted' message type instead of 'chat' for encrypted broadcasts
       return this.gossipManager.broadcastMessage(encryptedContent, 'encrypted');
     } catch (error) {
-      console.error('Failed to send encrypted broadcast:', error);
+      this.debug.error('Failed to send encrypted broadcast:', error);
       throw error;
     }
   }
@@ -1147,7 +1270,7 @@ export class PeerPigeonMesh extends EventEmitter {
         return await this.cryptoManager.decryptFromPeer(encryptedData);
       }
     } catch (error) {
-      console.error('Failed to decrypt message:', error);
+      this.debug.error('Failed to decrypt message:', error);
       throw error;
     }
   }
@@ -1287,7 +1410,7 @@ export class PeerPigeonMesh extends EventEmitter {
   _handleKeyExchange(data, from) {
     if ((data.type === 'key_exchange' || data.type === 'key_exchange_response') && data.publicKey && this.cryptoManager) {
       this.cryptoManager.addPeerKey(from, data.publicKey);
-      console.log(`🔐 Stored public key for peer ${from.substring(0, 8)}...`);
+      this.debug.log(`🔐 Stored public key for peer ${from.substring(0, 8)}...`);
 
       // Send our public key back if this was an initial exchange (not a response)
       if (data.type === 'key_exchange') {
