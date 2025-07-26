@@ -223,6 +223,9 @@ export class GossipManager extends EventEmitter {
       });
     } else if (subtype === 'peer-announcement') {
       this.handlePeerAnnouncement(content, originPeerId);
+    } else if (subtype === 'mediaEvent') {
+      // Handle media streaming events
+      this.handleMediaEvent(content, originPeerId);
     } else if (subtype === 'dm') {
       // Direct message logic
       if (typeof to === 'string' && typeof this.mesh.peerId === 'string' && to.trim().toLowerCase() === this.mesh.peerId.trim().toLowerCase()) {
@@ -284,6 +287,37 @@ export class GossipManager extends EventEmitter {
       });
 
       this.mesh.peerDiscovery.addDiscoveredPeer(announcedPeerId);
+    }
+  }
+
+  /**
+   * Handle media streaming events received via gossip
+   */
+  handleMediaEvent(eventData, originPeerId) {
+    const { event, peerId, hasVideo, hasAudio, timestamp } = eventData;
+
+    this.debug.log(`Media event gossip: ${event} from ${peerId.substring(0, 8)}... via ${originPeerId.substring(0, 8)}...`);
+
+    // Don't process our own events
+    if (peerId === this.mesh.peerId) {
+      return;
+    }
+
+    // Emit the media event for the UI to handle
+    if (event === 'streamStarted') {
+      this.mesh.emit('remoteStreamAnnouncement', {
+        peerId,
+        hasVideo,
+        hasAudio,
+        timestamp,
+        event: 'started'
+      });
+    } else if (event === 'streamStopped') {
+      this.mesh.emit('remoteStreamAnnouncement', {
+        peerId,
+        timestamp,
+        event: 'stopped'
+      });
     }
   }
 

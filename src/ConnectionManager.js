@@ -26,6 +26,9 @@ export class ConnectionManager extends EventEmitter {
 
     // Start periodic cleanup of stale peers
     this.startPeriodicCleanup();
+
+    // Start monitoring for stuck connections
+    this.startStuckConnectionMonitoring();
   }
 
   async connectToPeer(targetPeerId) {
@@ -120,8 +123,10 @@ export class ConnectionManager extends EventEmitter {
       const localStream = this.mesh.mediaManager.localStream;
       const options = {
         localStream,
-        enableAudio: hasMedia && localStream.getAudioTracks().length > 0,
-        enableVideo: hasMedia && localStream.getVideoTracks().length > 0
+        // ALWAYS enable both audio and video transceivers for maximum compatibility
+        // This allows peers to receive media even if they don't have media when connecting
+        enableAudio: true,
+        enableVideo: true
       };
 
       const peerConnection = new PeerConnection(targetPeerId, true, options);
@@ -320,16 +325,62 @@ export class ConnectionManager extends EventEmitter {
     peerConnection.addEventListener('remoteStream', (event) => {
       this.debug.log(`[EVENT] Remote stream received from ${event.peerId.substring(0, 8)}...`);
       this.emit('remoteStream', event);
+
+      // CRITICAL: Forward the stream to other connected peers (media forwarding)
+      this._forwardStreamToOtherPeers(event.stream, event.peerId);
     });
 
     peerConnection.addEventListener('renegotiationNeeded', async (event) => {
       this.debug.log(`🔄 Renegotiation needed for ${event.peerId.substring(0, 8)}...`);
 
       try {
-        // Check connection state before attempting renegotiation
-        if (peerConnection.connection.signalingState !== 'stable') {
-          this.debug.log(`Skipping renegotiation for ${event.peerId.substring(0, 8)}... - connection not stable (${peerConnection.connection.signalingState})`);
+        // Check connection state - allow renegotiation for stable connections or those stuck in "have-local-offer"
+        // The latter case indicates an incomplete initial handshake that needs to be completed
+        const signalingState = peerConnection.connection.signalingState;
+        if (signalingState !== 'stable' && signalingState !== 'have-local-offer') {
+          this.debug.log(`Skipping renegotiation for ${event.peerId.substring(0, 8)}... - connection in unsupported state (${signalingState})`);
           return;
+        }
+
+        // CRITICAL FIX: Check for stuck "have-local-offer" connections and force recovery
+        if (signalingState === 'have-local-offer') {
+          this.debug.log(`� STUCK CONNECTION RECOVERY: Connection with ${event.peerId.substring(0, 8)}... stuck in "have-local-offer" - forcing complete recovery`);
+
+          try {
+            // DIRECT FIX: Force the connection back to working state by bypassing the stuck offer
+            this.debug.log(`🔄 RECOVERY: Creating bypass connection for stuck peer ${event.peerId.substring(0, 8)}...`);
+
+            // Get the current local stream to preserve media state
+            const currentLocalStream = peerConnection.getLocalStream();
+
+            // Close and recreate the connection completely
+            peerConnection.close();
+
+            // Remove the old connection
+            this.peers.delete(event.peerId);
+
+            // Create a fresh connection with media
+            const freshConnection = await this.connectToPeer(event.peerId, false, {
+              localStream: currentLocalStream
+            });
+
+            if (freshConnection) {
+              this.debug.log(`✅ RECOVERY: Successfully created fresh connection for ${event.peerId.substring(0, 8)}... - media should work now`);
+
+              // Apply media stream to the fresh connection
+              if (currentLocalStream) {
+                await freshConnection.setLocalStream(currentLocalStream);
+                this.debug.log(`✅ RECOVERY: Applied media stream to fresh connection for ${event.peerId.substring(0, 8)}...`);
+              }
+            } else {
+              this.debug.error(`❌ RECOVERY: Failed to create fresh connection for ${event.peerId.substring(0, 8)}...`);
+            }
+
+            return; // Exit early - fresh connection will handle renegotiation naturally
+          } catch (error) {
+            this.debug.error(`❌ RECOVERY: Complete recovery failed for ${event.peerId.substring(0, 8)}...`, error);
+            // Continue with existing fallback logic
+          }
         }
 
         // Additional check for connection state
@@ -338,25 +389,45 @@ export class ConnectionManager extends EventEmitter {
           return;
         }
 
-        this.debug.log(`🔄 Creating renegotiation offer for ${event.peerId.substring(0, 8)}...`);
+        this.debug.log(`🔄 Creating renegotiation offer for ${event.peerId.substring(0, 8)}... (signaling state: ${signalingState})`);
 
-        // Create new offer with restartIce flag to avoid m-line issues
-        const offerOptions = {
-          iceRestart: false, // Don't restart ICE unless necessary
-          offerToReceiveAudio: true,
-          offerToReceiveVideo: true
-        };
+        // Create new offer for renegotiation - no need for special options since we have pre-allocated transceivers
+        const offer = await peerConnection.connection.createOffer();
 
-        const offer = await peerConnection.connection.createOffer(offerOptions);
+        // CRITICAL DEBUG: Check if offer SDP contains media information
+        this.debug.log('🔍 RENEGOTIATION OFFER SDP DEBUG:');
+        this.debug.log(`   SDP length: ${offer.sdp.length}`);
+        this.debug.log(`   Contains video: ${offer.sdp.includes('m=video')}`);
+        this.debug.log(`   Contains audio: ${offer.sdp.includes('m=audio')}`);
+        this.debug.log(`   Send recv: ${offer.sdp.includes('sendrecv')}`);
+        const videoLines = offer.sdp.split('\n').filter(line => line.includes('video')).length;
+        const audioLines = offer.sdp.split('\n').filter(line => line.includes('audio')).length;
+        this.debug.log(`   Video lines: ${videoLines}, Audio lines: ${audioLines}`);
+
         await peerConnection.connection.setLocalDescription(offer);
 
-        // Send the new offer to the peer using the correct signaling method
+        // Send the renegotiation offer via regular signaling (NOT as a new offer, but as renegotiation)
         await this.mesh.sendSignalingMessage({
-          type: 'offer',
+          type: 'renegotiation-offer',
           data: offer
         }, event.peerId);
 
-        this.debug.log(`🔄 Sent renegotiation offer to ${event.peerId.substring(0, 8)}...`);
+        // AGGRESSIVE FIX: Set up stuck connection watchdog timer
+        setTimeout(() => {
+          if (peerConnection.connection.signalingState === 'have-local-offer') {
+            this.debug.log(`⚠️ WATCHDOG: Connection with ${event.peerId.substring(0, 8)}... still stuck after 10 seconds - forcing emergency recovery`);
+
+            // Emergency recovery: Create immediate bypass
+            this.connectToPeer(event.peerId, false, {
+              localStream: peerConnection.getLocalStream(),
+              emergency: true
+            }).catch(err => {
+              this.debug.error(`❌ EMERGENCY: Failed emergency recovery for ${event.peerId.substring(0, 8)}...`, err);
+            });
+          }
+        }, 10000); // 10 second watchdog
+
+        this.debug.log(`🔄 Sent renegotiation offer to ${event.peerId.substring(0, 8)}... (signaling state: ${signalingState})`);
       } catch (error) {
         this.debug.error(`Failed to renegotiate with ${event.peerId}:`, error);
 
@@ -837,6 +908,34 @@ export class ConnectionManager extends EventEmitter {
         }
         break;
 
+      case 'renegotiation-offer':
+        // Handle renegotiation offers from peers
+        this.handleRenegotiationOffer(message, fromPeerId);
+        break;
+
+      case 'renegotiation-answer':
+        // Handle renegotiation answers from peers
+        this.handleRenegotiationAnswer(message, fromPeerId);
+        break;
+
+      case 'signaling':
+        // Handle wrapped signaling messages sent via mesh
+        this.debug.log(`🔄 MESH SIGNALING: Received ${message.data?.type} from ${fromPeerId?.substring(0, 8)}...`);
+        if (message.data && message.data.type) {
+          // Unwrap and handle the signaling message
+          const signalingMessage = {
+            type: message.data.type,
+            data: message.data.data,
+            fromPeerId: message.fromPeerId || fromPeerId,
+            targetPeerId: this.mesh.peerId,
+            timestamp: message.timestamp
+          };
+
+          // Route to signaling handler
+          this.mesh.signalingHandler.handleSignalingMessage(signalingMessage);
+        }
+        break;
+
       default:
         // Unknown message type - try gossip as fallback for backward compatibility
         this.debug.warn(`Unknown message type '${message.type}' from ${fromPeerId?.substring(0, 8)}, trying gossip handler`);
@@ -866,5 +965,212 @@ export class ConnectionManager extends EventEmitter {
       peerConnection.close();
       this.peers.delete(fromPeerId);
     }
+  }
+
+  /**
+   * Handle renegotiation offers from peers
+   */
+  async handleRenegotiationOffer(message, fromPeerId) {
+    this.debug.log(`🔄 Handling renegotiation offer via mesh from ${fromPeerId.substring(0, 8)}...`);
+
+    // Find the existing peer connection
+    const peerConnection = this.peers.get(fromPeerId);
+    if (!peerConnection) {
+      this.debug.error(`No peer connection found for renegotiation from ${fromPeerId.substring(0, 8)}...`);
+      return;
+    }
+
+    try {
+      // Handle the renegotiation offer and get the answer
+      const answer = await peerConnection.handleOffer(message.data);
+      this.debug.log(`✅ Renegotiation offer processed, sending answer to ${fromPeerId.substring(0, 8)}...`);
+
+      // Send the answer back to complete the renegotiation handshake
+      await this.mesh.sendSignalingMessage({
+        type: 'renegotiation-answer',
+        data: answer
+      }, fromPeerId);
+
+      this.debug.log(`✅ Renegotiation completed via mesh with ${fromPeerId.substring(0, 8)}...`);
+    } catch (error) {
+      this.debug.error(`❌ Failed to handle renegotiation offer via mesh from ${fromPeerId.substring(0, 8)}...`, error);
+    }
+  }
+
+  async handleRenegotiationAnswer(message, fromPeerId) {
+    this.debug.log(`🔄 Handling renegotiation answer via mesh from ${fromPeerId.substring(0, 8)}...`);
+
+    // Find the existing peer connection
+    const peerConnection = this.peers.get(fromPeerId);
+    if (!peerConnection) {
+      this.debug.error(`No peer connection found for renegotiation answer from ${fromPeerId.substring(0, 8)}...`);
+      return;
+    }
+
+    try {
+      // Handle the renegotiation answer
+      await peerConnection.handleAnswer(message.data);
+      this.debug.log(`✅ Renegotiation answer processed from ${fromPeerId.substring(0, 8)}... - renegotiation complete`);
+    } catch (error) {
+      this.debug.error(`❌ Failed to handle renegotiation answer via mesh from ${fromPeerId.substring(0, 8)}...`, error);
+    }
+  }
+
+  /**
+   * Monitor and fix stuck connections that remain in "have-local-offer" state
+   * This is called periodically to detect and fix connections that get stuck
+   */
+  monitorAndFixStuckConnections() {
+    if (!this.mesh.connected) return;
+
+    const stuckConnections = [];
+
+    for (const [peerId, peerConnection] of this.peers) {
+      if (peerConnection.connection?.signalingState === 'have-local-offer') {
+        const connectionAge = Date.now() - peerConnection.connectionStartTime;
+
+        // If connection has been stuck in "have-local-offer" for more than 10 seconds, fix it
+        if (connectionAge > 10000) {
+          stuckConnections.push(peerId);
+        }
+      }
+    }
+
+    if (stuckConnections.length > 0) {
+      this.debug.log(`🚨 STUCK MONITOR: Found ${stuckConnections.length} stuck connections - forcing recovery`);
+
+      for (const peerId of stuckConnections) {
+        this.forceConnectionRecovery(peerId).catch(error => {
+          this.debug.error(`Failed to recover stuck connection for ${peerId}:`, error);
+        });
+      }
+    }
+  }
+
+  /**
+   * Force recovery of a stuck connection by completely recreating it
+   */
+  async forceConnectionRecovery(peerId) {
+    const peerConnection = this.getPeer(peerId);
+    if (!peerConnection) {
+      this.debug.error(`Cannot recover - peer ${peerId} not found`);
+      return null;
+    }
+
+    this.debug.log(`🔄 FORCE RECOVERY: Completely recreating connection for ${peerId.substring(0, 8)}...`);
+
+    try {
+      // Preserve the current media stream
+      const currentLocalStream = peerConnection.getLocalStream();
+
+      // Close the stuck connection
+      peerConnection.close();
+
+      // Remove from peers map
+      this.peers.delete(peerId);
+
+      // Create a completely fresh connection
+      const freshConnection = await this.connectToPeer(peerId, false, {
+        localStream: currentLocalStream
+      });
+
+      if (freshConnection && currentLocalStream) {
+        // Apply the media stream to the fresh connection
+        await freshConnection.setLocalStream(currentLocalStream);
+        this.debug.log(`✅ FORCE RECOVERY: Fresh connection created with media for ${peerId.substring(0, 8)}...`);
+      }
+
+      return freshConnection;
+    } catch (error) {
+      this.debug.error(`❌ FORCE RECOVERY: Failed to recreate connection for ${peerId.substring(0, 8)}...`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Start monitoring for stuck connections
+   */
+  startStuckConnectionMonitoring() {
+    // Check every 15 seconds for stuck connections
+    setInterval(() => {
+      this.monitorAndFixStuckConnections();
+    }, 15000);
+
+    this.debug.log('🔍 Started stuck connection monitoring');
+  }
+
+  /**
+   * Forward a received stream to all other connected peers (except the sender)
+   * This implements media forwarding through the mesh topology
+   * @param {MediaStream} stream - The stream to forward
+   * @param {string} sourcePeerId - The peer ID that sent the stream (don't forward back to them)
+   * @private
+   */
+  async _forwardStreamToOtherPeers(stream, sourcePeerId) {
+    if (!stream || !sourcePeerId) {
+      this.debug.warn('Cannot forward stream - invalid parameters');
+      return;
+    }
+
+    this.debug.log(`🔄 FORWARD STREAM: Forwarding stream from ${sourcePeerId.substring(0, 8)}... to other connected peers`);
+
+    // Get the original source peer ID from the stream metadata
+    const originalSourcePeerId = stream._peerPigeonSourcePeerId || sourcePeerId;
+
+    // Count how many peers we're forwarding to
+    let forwardCount = 0;
+
+    // Forward to all connected peers except the source and the original sender
+    for (const [peerId, connection] of this.peers) {
+      // Skip the peer who sent us the stream
+      if (peerId === sourcePeerId) {
+        this.debug.log(`🔄 FORWARD STREAM: Skipping source peer ${peerId.substring(0, 8)}...`);
+        continue;
+      }
+
+      // Skip the original peer who created the stream (to prevent loops)
+      if (peerId === originalSourcePeerId) {
+        this.debug.log(`🔄 FORWARD STREAM: Skipping original stream creator ${peerId.substring(0, 8)}...`);
+        continue;
+      }
+
+      // Only forward to connected peers
+      if (connection.getStatus() !== 'connected') {
+        this.debug.log(`🔄 FORWARD STREAM: Skipping disconnected peer ${peerId.substring(0, 8)}...`);
+        continue;
+      }
+
+      try {
+        this.debug.log(`🔄 FORWARD STREAM: Setting forwarded stream for peer ${peerId.substring(0, 8)}...`);
+
+        // CRITICAL: Clone the stream to avoid conflicts
+        const forwardedStream = stream.clone();
+
+        // Mark the forwarded stream with original source information
+        Object.defineProperty(forwardedStream, '_peerPigeonSourcePeerId', {
+          value: originalSourcePeerId,
+          writable: false,
+          enumerable: false,
+          configurable: false
+        });
+
+        Object.defineProperty(forwardedStream, '_peerPigeonOrigin', {
+          value: 'forwarded',
+          writable: false,
+          enumerable: false,
+          configurable: false
+        });
+
+        // Set the cloned stream as the local stream for this connection
+        await connection.setLocalStream(forwardedStream);
+
+        forwardCount++;
+        this.debug.log(`✅ FORWARD STREAM: Successfully forwarded stream to peer ${peerId.substring(0, 8)}...`);
+      } catch (error) {
+        this.debug.error(`❌ FORWARD STREAM: Failed to forward stream to peer ${peerId.substring(0, 8)}...`, error);
+      }
+    }
+
+    this.debug.log(`🔄 FORWARD STREAM: Forwarded stream from ${sourcePeerId.substring(0, 8)}... to ${forwardCount} peer(s)`);
   }
 }

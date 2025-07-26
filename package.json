@@ -1,6 +1,6 @@
 {
   "name": "peerpigeon",
-  "version": "0.0.9",
+  "version": "0.1.0",
   "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
   "main": "index.js",
   "type": "module",
@@ -11,15 +11,16 @@
   },
   "scripts": {
     "dev": "concurrently \"npm run server\" \"npm run dev:http\" --names \"signaling,http\" --prefix-colors \"blue,green\"",
-    "dev:http": "http-server . -p 8080 -c-1 --cors -o examples/browser",
-    "dev:examples": "http-server examples -p 8080 -c-1 --cors",
-    "dev:full": "http-server . -p 8080 -c-1",
+    "dev:http": "node dev-server.js",
     "start": "node websocket-server/server.js",
     "server": "node websocket-server/server.js",
     "lint": "eslint src/ examples/ websocket-server/ --ext .js",
     "lint:fix": "eslint src/ examples/ websocket-server/ --ext .js --fix",
-    "test": "node examples/node/storage-test.js",
-    "test:storage": "node examples/distributed-storage-test.js",
+    "test": "node test/test-reporter.js",
+    "test:storage": "node examples/node/storage-test.js",
+    "test:browser": "node test/browser-integration-test.js",
+    "test:browser:headless": "HEADLESS=true node test/browser-integration-test.js",
+    "test:legacy": "npm run test:storage && npm run test:browser:headless",
     "ci": "npm run lint && npm run test",
     "prepublishOnly": "npm run ci"
   },
@@ -69,9 +70,9 @@
     "concurrently": "^9.2.0",
     "eslint": "^8.57.1",
     "eslint-config-standard": "^17.1.0",
-    "http-server": "^14.1.1",
+    "express": "^4.19.2",
     "jsdoc": "^4.0.4",
-    "swagger-ui-express": "^5.0.1"
+    "puppeteer": "^22.0.0"
   },
   "engines": {
     "node": ">=14.0.0"

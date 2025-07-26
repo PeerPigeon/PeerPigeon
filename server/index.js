@@ -10,7 +10,7 @@ import { EventEmitter } from 'events';
 export class PeerPigeonServer extends EventEmitter {
     constructor(options = {}) {
         super();
-        
+
         this.port = options.port || 3000;
         this.host = options.host || 'localhost';
         this.maxConnections = options.maxConnections || 1000;
@@ -18,7 +18,7 @@ export class PeerPigeonServer extends EventEmitter {
         this.peerTimeout = options.peerTimeout || 300000; // 5 minutes
         this.corsOrigin = options.corsOrigin || '*';
         this.maxMessageSize = options.maxMessageSize || 1048576; // 1MB
-        
+
         this.httpServer = null;
         this.wss = null;
         this.connections = new Map(); // peerId -> WebSocket
@@ -87,12 +87,12 @@ export class PeerPigeonServer extends EventEmitter {
                 this.httpServer.listen(this.port, this.host, () => {
                     this.isRunning = true;
                     this.startCleanupTimer();
-                    
+
                     console.log(`🚀 PeerPigeon WebSocket server started on ws://${this.host}:${this.port}`);
                     console.log(`📊 Max connections: ${this.maxConnections}`);
                     console.log(`🧹 Cleanup interval: ${this.cleanupInterval}ms`);
                     console.log(`⏰ Peer timeout: ${this.peerTimeout}ms`);
-                    
+
                     this.emit('started', { host: this.host, port: this.port });
                     resolve();
                 });
@@ -120,7 +120,7 @@ export class PeerPigeonServer extends EventEmitter {
 
         return new Promise((resolve) => {
             console.log('🛑 Stopping PeerPigeon WebSocket server...');
-            
+
             // Stop cleanup timer
             if (this.cleanupTimer) {
                 clearInterval(this.cleanupTimer);
@@ -140,7 +140,7 @@ export class PeerPigeonServer extends EventEmitter {
             if (this.wss) {
                 this.wss.close(() => {
                     console.log('✅ WebSocket server closed');
-                    
+
                     // Close HTTP server
                     if (this.httpServer) {
                         this.httpServer.close(() => {
@@ -170,7 +170,7 @@ export class PeerPigeonServer extends EventEmitter {
         this.wss.on('connection', (ws, req) => {
             const url = new URL(req.url, `http://${req.headers.host}`);
             const peerId = url.searchParams.get('peerId');
-            
+
             // Validate peer ID
             if (!peerId || !/^[a-fA-F0-9]{40}$/.test(peerId)) {
                 console.log('❌ Invalid peer ID, closing connection');
@@ -281,7 +281,7 @@ export class PeerPigeonServer extends EventEmitter {
      */
     handleAnnounce(peerId, message) {
         console.log(`📢 Peer announced: ${peerId.substring(0, 8)}...`);
-        
+
         // Update peer data
         const peerInfo = this.peerData.get(peerId);
         if (peerInfo) {
@@ -309,7 +309,7 @@ export class PeerPigeonServer extends EventEmitter {
      */
     handleGoodbye(peerId, message) {
         console.log(`👋 Peer goodbye: ${peerId.substring(0, 8)}...`);
-        
+
         // Notify other peers about disconnection
         this.broadcastToOthers(peerId, {
             type: 'peer-disconnected',
@@ -383,7 +383,7 @@ export class PeerPigeonServer extends EventEmitter {
      */
     handleDisconnection(peerId, code, reason) {
         console.log(`❌ Peer disconnected: ${peerId.substring(0, 8)}... (code: ${code}, reason: ${reason})`);
-        
+
         // Notify other peers about disconnection
         this.broadcastToOthers(peerId, {
             type: 'peer-disconnected',
@@ -464,7 +464,7 @@ export class PeerPigeonServer extends EventEmitter {
         for (const [peerId, peerInfo] of this.peerData) {
             if (now - peerInfo.lastActivity > this.peerTimeout) {
                 console.log(`🧹 Cleaning up inactive peer: ${peerId.substring(0, 8)}...`);
-                
+
                 const connection = this.connections.get(peerId);
                 if (connection) {
                     try {
@@ -473,7 +473,7 @@ export class PeerPigeonServer extends EventEmitter {
                         console.error(`Error closing inactive connection for ${peerId}:`, error);
                     }
                 }
-                
+
                 disconnectedPeers.push(peerId);
             }
         }
