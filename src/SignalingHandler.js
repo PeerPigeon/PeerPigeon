@@ -463,9 +463,7 @@ export class SignalingHandler extends EventEmitter {
       }
     } else {
       // Regular mesh optimization for non-isolated peers
-      setTimeout(() => {
-        this.mesh.peerDiscovery.optimizeMeshConnections(this.connectionManager.peers);
-      }, 1000);
+      this.mesh.peerDiscovery.optimizeMeshConnections(this.connectionManager.peers);
     }
   }
 

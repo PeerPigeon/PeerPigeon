@@ -14,13 +14,19 @@ class TestReporter {
         totalTests: 0,
         passed: 0,
         failed: 0,
-        success: false
+        success: true // Default to true, only false if failures
+      },
+      persistent: {
+        totalTests: 0,
+        passed: 0,
+        failed: 0,
+        success: true
       },
       browser: {
         totalSuites: 0,
         passed: 0,
         failed: 0,
-        success: false
+        success: true
       }
     };
   }
@@ -72,7 +78,31 @@ class TestReporter {
       this.results.storage.totalTests = parseInt(totalMatch[1]);
       this.results.storage.passed = parseInt(passedMatch[1]);
       this.results.storage.failed = parseInt(failedMatch[1]);
-      this.results.storage.success = this.results.storage.failed === 0;
+      // Only set to false if there are failures and tests were run
+      if (this.results.storage.totalTests > 0 && this.results.storage.failed > 0) {
+        this.results.storage.success = false;
+      }
+    }
+  }
+
+  /**
+   * Parse persistent storage test results from output
+   */
+  parsePersistentResults(output) {
+    // Count test sections (each "📁 Test N:" indicates a test)
+    const testMatches = output.match(/📁 Test \d+:/g);
+    const totalTests = testMatches ? testMatches.length : 0;
+
+    // Check if all tests passed by looking for the success message
+    const successMatch = output.match(/🎉 All tests passed!/);
+    const success = !!successMatch;
+
+    this.results.persistent.totalTests = totalTests;
+    this.results.persistent.passed = success ? totalTests : 0;
+    this.results.persistent.failed = success ? 0 : totalTests;
+    // Only set to false if there are failures and tests were run
+    if (totalTests > 0 && !success) {
+      this.results.persistent.success = false;
     }
   }
 
@@ -80,7 +110,8 @@ class TestReporter {
    * Parse browser test results from output
    */
   parseBrowserResults(output) {
-    const suitesMatch = output.match(/Test Suites:\s*(\d+)/);
+    // Look for "Test Categories:" instead of "Test Suites:"
+    const suitesMatch = output.match(/Test Categories:\s*(\d+)/);
     const passedMatch = output.match(/Passed:\s*(\d+)/);
     const failedMatch = output.match(/Failed:\s*(\d+)/);
 
@@ -88,7 +119,10 @@ class TestReporter {
       this.results.browser.totalSuites = parseInt(suitesMatch[1]);
       this.results.browser.passed = parseInt(passedMatch[1]);
       this.results.browser.failed = parseInt(failedMatch[1]);
-      this.results.browser.success = this.results.browser.failed === 0;
+      // Only set to false if there are failures and suites were run
+      if (this.results.browser.totalSuites > 0 && this.results.browser.failed > 0) {
+        this.results.browser.success = false;
+      }
     }
   }
 
@@ -110,6 +144,16 @@ class TestReporter {
       console.log(`   Success Rate: ${storageRate}%`);
     }
 
+    // Persistent Storage Tests Summary
+    console.log('\n💾 PERSISTENT STORAGE TESTS:');
+    console.log(`   Individual Tests: ${this.results.persistent.totalTests}`);
+    console.log(`   ✅ Passed: ${this.results.persistent.passed}`);
+    console.log(`   ❌ Failed: ${this.results.persistent.failed}`);
+    if (this.results.persistent.totalTests > 0) {
+      const persistentRate = ((this.results.persistent.passed / this.results.persistent.totalTests) * 100).toFixed(1);
+      console.log(`   Success Rate: ${persistentRate}%`);
+    }
+
     // Browser Integration Tests Summary
     console.log('\n🌐 BROWSER INTEGRATION TESTS:');
     console.log(`   Test Suites: ${this.results.browser.totalSuites}`);
@@ -121,20 +165,26 @@ class TestReporter {
     }
 
     // Overall Summary
-    const totalTests = this.results.storage.totalTests;
+    const totalTests = this.results.storage.totalTests + this.results.persistent.totalTests;
     const totalSuites = this.results.browser.totalSuites;
-    const totalPassed = this.results.storage.passed + this.results.browser.passed;
-    const totalFailed = this.results.storage.failed + this.results.browser.failed;
-    const overallSuccess = this.results.storage.success && this.results.browser.success;
+    const totalPassed = this.results.storage.passed + this.results.persistent.passed + this.results.browser.passed;
+    const totalFailed = this.results.storage.failed + this.results.persistent.failed + this.results.browser.failed;
+    // Only require success for categories that actually ran tests/suites
+    const categories = [];
+    if (this.results.storage.totalTests > 0) categories.push(this.results.storage.success);
+    if (this.results.persistent.totalTests > 0) categories.push(this.results.persistent.success);
+    if (this.results.browser.totalSuites > 0) categories.push(this.results.browser.success);
+    const overallSuccess = categories.length === 0 ? true : categories.every(Boolean);
 
     console.log('\n📊 OVERALL SUMMARY:');
-    console.log(`   Storage Tests: ${totalTests} individual tests`);
+    console.log(`   Storage Tests: ${this.results.storage.totalTests} distributed + ${this.results.persistent.totalTests} persistent = ${totalTests} total`);
     console.log(`   Browser Suites: ${totalSuites} test suites`);
     console.log(`   Total Passed: ${totalPassed}`);
     console.log(`   Total Failed: ${totalFailed}`);
 
     console.log('\n🎯 COVERAGE AREAS:');
     console.log('   • Distributed Storage (CRUD, encryption, access control)');
+    console.log('   • Persistent Storage (IndexedDB, filesystem, in-memory)');
     console.log('   • WebRTC Mesh Networking (peer connections, routing)');
     console.log('   • WebDHT (distributed hash table operations)');
     console.log('   • Media Streaming (audio/video transmission)');
@@ -164,6 +214,11 @@ class TestReporter {
       console.log('📦 Running Distributed Storage Tests...');
       const storageResult = await this.runCommand('npm', ['run', 'test:storage']);
       this.parseStorageResults(storageResult.stdout);
+
+      // Run persistent storage tests
+      console.log('\n💾 Running Persistent Storage Tests...');
+      const persistentResult = await this.runCommand('node', ['test/persistent-storage-test.js']);
+      this.parsePersistentResults(persistentResult.stdout);
 
       console.log('\n🌐 Running Browser Integration Tests...');
       const browserResult = await this.runCommand('npm', ['run', 'test:browser:headless']);

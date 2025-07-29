@@ -1,7 +1,10 @@
 // Updated: 2025-07-04 - Fixed getConnectionStatus method name
+import DebugLogger from '../../src/DebugLogger.js';
+
 export class PeerPigeonUI {
   constructor(mesh) {
     this.mesh = mesh;
+    this.debug = DebugLogger.create('PeerPigeonUI');
     this.lastCleanupTime = 0; // Track when we last did cleanup
     this.setupEventListeners();
     this.bindDOMEvents();
@@ -246,7 +249,7 @@ export class PeerPigeonUI {
     const dhtTtl = document.getElementById('dht-ttl');
 
     // Debug: Check if elements are found
-    console.log('DHT Controls setup - Elements found:', {
+    this.debug.log('DHT Controls setup - Elements found:', {
       dhtKey: !!dhtKey,
       dhtValue: !!dhtValue,
       dhtGetKey: !!dhtGetKey,
@@ -259,17 +262,17 @@ export class PeerPigeonUI {
     });
 
     if (!dhtKey) {
-      console.error('DHT key input element not found!');
+      this.debug.error('DHT key input element not found!');
       this.addDHTLogEntry('❌ Error: DHT key input field not found in DOM');
     }
 
     if (!dhtValue) {
-      console.error('DHT value input element not found!');
+      this.debug.error('DHT value input element not found!');
       this.addDHTLogEntry('❌ Error: DHT value input field not found in DOM');
     }
 
     if (!dhtGetKey) {
-      console.error('DHT get-key input element not found!');
+      this.debug.error('DHT get-key input element not found!');
       this.addDHTLogEntry('❌ Error: DHT get-key input field not found in DOM');
     }
 
@@ -287,7 +290,7 @@ export class PeerPigeonUI {
         const value = dhtValue?.value?.trim();
 
         // Debug logging
-        console.log('DHT PUT - Elements found:', {
+        this.debug.log('DHT PUT - Elements found:', {
           dhtKey: !!dhtKey,
           dhtValue: !!dhtValue,
           keyValue: key,
@@ -350,7 +353,7 @@ export class PeerPigeonUI {
         const value = dhtValue?.value?.trim();
 
         // Debug logging
-        console.log('DHT UPDATE - Elements found:', {
+        this.debug.log('DHT UPDATE - Elements found:', {
           dhtKey: !!dhtKey,
           dhtValue: !!dhtValue,
           keyValue: key,
@@ -412,7 +415,7 @@ export class PeerPigeonUI {
         const key = dhtGetKey?.value?.trim(); // Fixed: Use dhtGetKey instead of dhtKey
 
         // Debug logging
-        console.log('DHT GET - Elements found:', {
+        this.debug.log('DHT GET - Elements found:', {
           dhtGetKey: !!dhtGetKey,
           keyValue: key
         });
@@ -660,7 +663,7 @@ export class PeerPigeonUI {
               }
             } catch (metaError) {
               // Metadata display is optional, don't fail the retrieval
-              console.warn('Could not get metadata for display:', metaError);
+              this.debug.warn('Could not get metadata for display:', metaError);
             }
           } else {
             this.addStorageLogEntry(`❌ Key not found or access denied: ${key}`);
@@ -1406,6 +1409,30 @@ export class PeerPigeonUI {
       document.getElementById('storage-item-count').textContent = '0';
       document.getElementById('storage-total-size').textContent = '0 bytes';
     });
+
+    // Get persistent storage stats if available
+    if (this.mesh.distributedStorage.getStorageStats) {
+      this.mesh.distributedStorage.getStorageStats().then(persistentStats => {
+        // Update storage type display
+        const storageTypeElement = document.getElementById('storage-type');
+        if (storageTypeElement) {
+          storageTypeElement.textContent = persistentStats.type;
+        }
+
+        // Update persistent storage stats
+        const persistentKeysElement = document.getElementById('storage-persistent-keys');
+        if (persistentKeysElement) {
+          persistentKeysElement.textContent = persistentStats.keys.toString();
+        }
+
+        const persistentSizeElement = document.getElementById('storage-persistent-size');
+        if (persistentSizeElement) {
+          persistentSizeElement.textContent = this.formatBytes(persistentStats.estimatedSize || 0);
+        }
+      }).catch(error => {
+        this.debug.warn('Failed to get persistent storage stats:', error);
+      });
+    }
   }
 
   formatBytes(bytes) {
@@ -1848,14 +1875,14 @@ export class PeerPigeonUI {
     const content = document.getElementById(`${sectionId}-content`);
 
     if (!toggle || !content) {
-      console.warn(`Could not find elements for section: ${sectionId}`);
+      this.debug.warn(`Could not find elements for section: ${sectionId}`);
       return;
     }
 
     const section = toggle.closest(`.${sectionId}`);
 
     if (!section) {
-      console.warn(`Could not find section container for: ${sectionId}`, {
+      this.debug.warn(`Could not find section container for: ${sectionId}`, {
         toggle,
         toggleParent: toggle.parentElement,
         toggleParentParent: toggle.parentElement?.parentElement,
@@ -1904,9 +1931,9 @@ export class PeerPigeonUI {
       // Update button states
       this.updateMediaButtonStates();
 
-      console.log('Media initialized successfully');
+      this.debug.log('Media initialized successfully');
     } catch (error) {
-      console.error('Failed to initialize media:', error);
+      this.debug.error('Failed to initialize media:', error);
       this.addMessage('System', `Failed to initialize media: ${error.message}`, 'error');
     }
   }
@@ -1941,7 +1968,7 @@ export class PeerPigeonUI {
         micSelect.disabled = devices.microphones.length === 0;
       }
     } catch (error) {
-      console.error('Failed to update device lists:', error);
+      this.debug.error('Failed to update device lists:', error);
     }
   }
 
@@ -1989,11 +2016,11 @@ export class PeerPigeonUI {
           const audioContext = new AudioContext();
           if (audioContext.state === 'suspended') {
             await audioContext.resume();
-            console.log('Audio context resumed for local media');
+            this.debug.log('Audio context resumed for local media');
           }
-          console.log('Audio context state:', audioContext.state);
+          this.debug.log('Audio context state:', audioContext.state);
         } catch (e) {
-          console.log('Could not initialize audio context:', e);
+          this.debug.log('Could not initialize audio context:', e);
         }
       }
 
@@ -2018,7 +2045,7 @@ export class PeerPigeonUI {
       this.addMessage('System', 'Media started successfully');
       this.updateMediaButtonStates();
     } catch (error) {
-      console.error('Failed to start media:', error);
+      this.debug.error('Failed to start media:', error);
       this.addMessage('System', `Failed to start media: ${error.message}`, 'error');
     }
   }
@@ -2030,7 +2057,7 @@ export class PeerPigeonUI {
       this.updateMediaButtonStates();
       this.clearLocalVideo();
     } catch (error) {
-      console.error('Failed to stop media:', error);
+      this.debug.error('Failed to stop media:', error);
       this.addMessage('System', `Failed to stop media: ${error.message}`, 'error');
     }
   }
@@ -2041,7 +2068,7 @@ export class PeerPigeonUI {
       this.addMessage('System', `Video ${enabled ? 'enabled' : 'disabled'}`);
       this.updateMediaButtonStates();
     } catch (error) {
-      console.error('Failed to toggle video:', error);
+      this.debug.error('Failed to toggle video:', error);
       this.addMessage('System', `Failed to toggle video: ${error.message}`, 'error');
     }
   }
@@ -2052,14 +2079,14 @@ export class PeerPigeonUI {
       this.addMessage('System', `Audio ${enabled ? 'enabled' : 'disabled'}`);
       this.updateMediaButtonStates();
     } catch (error) {
-      console.error('Failed to toggle audio:', error);
+      this.debug.error('Failed to toggle audio:', error);
       this.addMessage('System', `Failed to toggle audio: ${error.message}`, 'error');
     }
   }
 
   async testAudio() {
     try {
-      console.log('🔊 Starting audio test...');
+      this.debug.log('🔊 Starting audio test...');
       this.addMessage('System', '🔊 Testing audio system...', 'info');
 
       // First, run diagnostics to understand current state
@@ -2073,14 +2100,14 @@ export class PeerPigeonUI {
         return peerConnection && (peerConnection.remoteStream || peerConnection.connection?.connectionState === 'connected');
       });
 
-      console.log('🔊 All peers:', allPeers.length);
-      console.log('🔊 Connected peers (data channel):', connectedPeers.length);
-      console.log('🔊 Peers with media/WebRTC:', peersWithMedia.length);
+      this.debug.log('🔊 All peers:', allPeers.length);
+      this.debug.log('🔊 Connected peers (data channel):', connectedPeers.length);
+      this.debug.log('🔊 Peers with media/WebRTC:', peersWithMedia.length);
 
       // Log detailed peer status
       allPeers.forEach(peer => {
         const peerConnection = this.mesh.connectionManager.getPeer(peer.peerId);
-        console.log(`🔊 Peer ${peer.peerId.substring(0, 8)}:`, {
+        this.debug.log(`🔊 Peer ${peer.peerId.substring(0, 8)}:`, {
           status: peer.status,
           webrtcState: peerConnection?.connection?.connectionState,
           dataChannelState: peerConnection?.dataChannel?.readyState,
@@ -2093,7 +2120,7 @@ export class PeerPigeonUI {
 
       if (peersWithMedia.length === 0) {
         this.addMessage('System', '❌ No peers with active media! You need to open this in TWO different browser tabs/windows and connect them.', 'error');
-        console.log('❌ NO PEERS WITH MEDIA: Open this URL in two different browser tabs and ensure they connect to each other');
+        this.debug.log('❌ NO PEERS WITH MEDIA: Open this URL in two different browser tabs and ensure they connect to each other');
         return;
       }
 
@@ -2101,7 +2128,7 @@ export class PeerPigeonUI {
       peersWithMedia.forEach((peer, index) => {
         const connection = this.mesh.connectionManager.peers.get(peer.peerId);
         if (connection) {
-          console.log(`🔊 Peer ${index + 1} (${peer.peerId.substring(0, 8)}...):`);
+          this.debug.log(`🔊 Peer ${index + 1} (${peer.peerId.substring(0, 8)}...):`);
 
           const localStream = connection.getLocalStream();
           const remoteStream = connection.getRemoteStream();
@@ -2109,32 +2136,32 @@ export class PeerPigeonUI {
           // Check local stream
           if (localStream) {
             const localAudioTracks = localStream.getAudioTracks();
-            console.log(`  - Local audio tracks: ${localAudioTracks.length}`);
+            this.debug.log(`  - Local audio tracks: ${localAudioTracks.length}`);
             this.addMessage('System', `  Peer ${index + 1} - Local audio: ${localAudioTracks.length} tracks`, 'info');
             localAudioTracks.forEach((track, i) => {
-              console.log(`    Track ${i}: enabled=${track.enabled}, id=${track.id.substring(0, 8)}...`);
+              this.debug.log(`    Track ${i}: enabled=${track.enabled}, id=${track.id.substring(0, 8)}...`);
             });
           } else {
-            console.log('  - No local stream');
+            this.debug.log('  - No local stream');
             this.addMessage('System', `  Peer ${index + 1} - No local stream`, 'warning');
           }
 
           // Check remote stream
           if (remoteStream) {
             const remoteAudioTracks = remoteStream.getAudioTracks();
-            console.log(`  - Remote audio tracks: ${remoteAudioTracks.length}`);
+            this.debug.log(`  - Remote audio tracks: ${remoteAudioTracks.length}`);
             this.addMessage('System', `  Peer ${index + 1} - Remote audio: ${remoteAudioTracks.length} tracks`, remoteAudioTracks.length > 0 ? 'success' : 'warning');
 
             remoteAudioTracks.forEach((track, i) => {
-              console.log(`    Track ${i}: enabled=${track.enabled}, id=${track.id.substring(0, 8)}..., readyState=${track.readyState}`);
+              this.debug.log(`    Track ${i}: enabled=${track.enabled}, id=${track.id.substring(0, 8)}..., readyState=${track.readyState}`);
             });
 
             // CRITICAL: Check if remote stream ID matches local stream ID (loopback detection)
             if (localStream && remoteStream.id === localStream.id) {
-              console.error('❌ LOOPBACK DETECTED: Remote stream ID matches local stream ID!');
+              this.debug.error('❌ LOOPBACK DETECTED: Remote stream ID matches local stream ID!');
               this.addMessage('System', `❌ Peer ${index + 1} - LOOPBACK: Getting own audio back!`, 'error');
             } else {
-              console.log(`✅ Stream IDs different: local=${localStream?.id.substring(0, 8) || 'none'}, remote=${remoteStream.id.substring(0, 8)}`);
+              this.debug.log(`✅ Stream IDs different: local=${localStream?.id.substring(0, 8) || 'none'}, remote=${remoteStream.id.substring(0, 8)}`);
               this.addMessage('System', `✅ Peer ${index + 1} - Stream IDs are different (good!)`, 'success');
             }
 
@@ -2144,21 +2171,21 @@ export class PeerPigeonUI {
             videoElements.forEach(video => {
               if (video.srcObject === remoteStream) {
                 foundVideoElement = true;
-                console.log(`  - Video element: volume=${video.volume}, muted=${video.muted}, paused=${video.paused}, readyState=${video.readyState}`);
+                this.debug.log(`  - Video element: volume=${video.volume}, muted=${video.muted}, paused=${video.paused}, readyState=${video.readyState}`);
                 this.addMessage('System', `  Peer ${index + 1} - Video element: volume=${video.volume}, muted=${video.muted}`, video.muted ? 'warning' : 'success');
               }
             });
 
             if (!foundVideoElement) {
-              console.log('  - ❌ No video element found for this remote stream');
+              this.debug.log('  - ❌ No video element found for this remote stream');
               this.addMessage('System', `  Peer ${index + 1} - ❌ No video element displaying this stream`, 'error');
             }
           } else {
-            console.log('  - ❌ No remote stream');
+            this.debug.log('  - ❌ No remote stream');
             this.addMessage('System', `  Peer ${index + 1} - ❌ No remote stream received`, 'error');
           }
         } else {
-          console.log(`❌ No connection object found for peer ${peer.peerId}`);
+          this.debug.log(`❌ No connection object found for peer ${peer.peerId}`);
           this.addMessage('System', `❌ No connection for peer ${index + 1}`, 'error');
         }
       });
@@ -2167,11 +2194,11 @@ export class PeerPigeonUI {
       if (window.AudioContext || window.webkitAudioContext) {
         const AudioContext = window.AudioContext || window.webkitAudioContext;
         const audioContext = new AudioContext();
-        console.log('Audio context state:', audioContext.state);
+        this.debug.log('Audio context state:', audioContext.state);
 
         if (audioContext.state === 'suspended') {
           await audioContext.resume();
-          console.log('Audio context resumed');
+          this.debug.log('Audio context resumed');
         }
 
         // Generate a test tone
@@ -2194,7 +2221,7 @@ export class PeerPigeonUI {
 
       // Test 2: Check current media streams
       const peers = this.mesh.getPeers();
-      console.log('Current peers:', peers.length);
+      this.debug.log('Current peers:', peers.length);
 
       peers.forEach(peer => {
         const connection = this.mesh.connectionManager.peers.get(peer.peerId);
@@ -2202,27 +2229,27 @@ export class PeerPigeonUI {
           const localStream = connection.getLocalStream();
           const remoteStream = connection.getRemoteStream();
 
-          console.log(`Peer ${peer.peerId.substring(0, 8)}:`);
+          this.debug.log(`Peer ${peer.peerId.substring(0, 8)}:`);
           if (localStream) {
             const audioTracks = localStream.getAudioTracks();
-            console.log(`- Local audio tracks: ${audioTracks.length}`);
+            this.debug.log(`- Local audio tracks: ${audioTracks.length}`);
             audioTracks.forEach((track, i) => {
-              console.log(`  Track ${i}: enabled=${track.enabled}, readyState=${track.readyState}, muted=${track.muted}`);
+              this.debug.log(`  Track ${i}: enabled=${track.enabled}, readyState=${track.readyState}, muted=${track.muted}`);
             });
           }
 
           if (remoteStream) {
             const audioTracks = remoteStream.getAudioTracks();
-            console.log(`- Remote audio tracks: ${audioTracks.length}`);
+            this.debug.log(`- Remote audio tracks: ${audioTracks.length}`);
             audioTracks.forEach((track, i) => {
-              console.log(`  Track ${i}: enabled=${track.enabled}, readyState=${track.readyState}, muted=${track.muted}`);
+              this.debug.log(`  Track ${i}: enabled=${track.enabled}, readyState=${track.readyState}, muted=${track.muted}`);
             });
 
             // Check if there are video elements for this stream
             const videoElements = document.querySelectorAll('video');
             videoElements.forEach(video => {
               if (video.srcObject === remoteStream) {
-                console.log(`- Video element: volume=${video.volume}, muted=${video.muted}, paused=${video.paused}`);
+                this.debug.log(`- Video element: volume=${video.volume}, muted=${video.muted}, paused=${video.paused}`);
               }
             });
           }
@@ -2232,15 +2259,15 @@ export class PeerPigeonUI {
       // Test 3: Check microphone access
       try {
         const testStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        console.log('✅ Microphone access working');
+        this.debug.log('✅ Microphone access working');
         this.addMessage('System', '✅ Microphone access: OK', 'success');
         testStream.getTracks().forEach(track => track.stop());
       } catch (error) {
-        console.log('❌ Microphone access failed:', error);
+        this.debug.log('❌ Microphone access failed:', error);
         this.addMessage('System', `❌ Microphone access failed: ${error.message}`, 'error');
       }
     } catch (error) {
-      console.error('Audio test failed:', error);
+      this.debug.error('Audio test failed:', error);
       this.addMessage('System', `❌ Audio test failed: ${error.message}`, 'error');
     }
   }
@@ -2296,13 +2323,13 @@ export class PeerPigeonUI {
   }
 
   handleRemoteStream(data) {
-    console.log('🎵 Handling remote stream:', data);
+    this.debug.log('🎵 Handling remote stream:', data);
     const { peerId, stream } = data;
 
     // CRITICAL: Prevent audio loopback - check if this is our own stream
     if (peerId === this.mesh.peerId) {
-      console.warn('🚨 LOOPBACK DETECTED: Received our own stream as remote! This should not happen.');
-      console.warn('Stream ID:', stream.id);
+      this.debug.warn('🚨 LOOPBACK DETECTED: Received our own stream as remote! This should not happen.');
+      this.debug.warn('Stream ID:', stream.id);
       // Still display it but it will be muted by displayRemoteVideo
     }
 
@@ -2310,10 +2337,10 @@ export class PeerPigeonUI {
     const audioTracks = stream.getAudioTracks();
     const videoTracks = stream.getVideoTracks();
 
-    console.log(`Stream from ${peerId.substring(0, 8)}: ${audioTracks.length} audio, ${videoTracks.length} video tracks`);
+    this.debug.log(`Stream from ${peerId.substring(0, 8)}: ${audioTracks.length} audio, ${videoTracks.length} video tracks`);
 
     audioTracks.forEach((track, i) => {
-      console.log(`🎵 Audio track ${i}:`, {
+      this.debug.log(`🎵 Audio track ${i}:`, {
         id: track.id,
         kind: track.kind,
         enabled: track.enabled,
@@ -2324,15 +2351,15 @@ export class PeerPigeonUI {
 
       // Add track event listeners for state monitoring
       track.addEventListener('ended', () => {
-        console.log(`🎵 Audio track ${i} from peer ${peerId.substring(0, 8)} ENDED`);
+        this.debug.log(`🎵 Audio track ${i} from peer ${peerId.substring(0, 8)} ENDED`);
       });
 
       track.addEventListener('mute', () => {
-        console.log(`🎵 Audio track ${i} from peer ${peerId.substring(0, 8)} MUTED`);
+        this.debug.log(`🎵 Audio track ${i} from peer ${peerId.substring(0, 8)} MUTED`);
       });
 
       track.addEventListener('unmute', () => {
-        console.log(`🎵 Audio track ${i} from peer ${peerId.substring(0, 8)} UNMUTED`);
+        this.debug.log(`🎵 Audio track ${i} from peer ${peerId.substring(0, 8)} UNMUTED`);
       });
     });
 
@@ -2348,25 +2375,25 @@ export class PeerPigeonUI {
       streamId: stream.id
     };
 
-    console.log(`🎵 AUDIO DATA EXPECTATION for peer ${audioSummary.peerIdShort}:`, audioSummary);
+    this.debug.log(`🎵 AUDIO DATA EXPECTATION for peer ${audioSummary.peerIdShort}:`, audioSummary);
 
     if (audioTracks.length > 0) {
-      console.log(`✅ EXPECTING AUDIO DATA from peer ${audioSummary.peerIdShort} - ${audioSummary.audioTracksEnabled}/${audioSummary.audioTrackCount} tracks enabled`);
+      this.debug.log(`✅ EXPECTING AUDIO DATA from peer ${audioSummary.peerIdShort} - ${audioSummary.audioTracksEnabled}/${audioSummary.audioTrackCount} tracks enabled`);
     } else {
-      console.log(`❌ NO AUDIO TRACKS from peer ${audioSummary.peerIdShort} - video only`);
+      this.debug.log(`❌ NO AUDIO TRACKS from peer ${audioSummary.peerIdShort} - video only`);
     }
 
     this.addMessage('System', `🎵 Remote stream received from ${peerId.substring(0, 8)}... (${audioTracks.length} audio, ${videoTracks.length} video)`);
   }
 
   displayRemoteVideo(peerId, stream) {
-    console.log(`Displaying remote video for ${peerId}:`, stream);
-    console.log('Stream tracks:', stream.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled })));
+    this.debug.log(`Displaying remote video for ${peerId}:`, stream);
+    this.debug.log('Stream tracks:', stream.getTracks().map(t => ({ kind: t.kind, enabled: t.enabled })));
 
     // CRITICAL: Prevent audio loopback - check if this is our own stream
     const isOwnStream = peerId === this.mesh.peerId;
     if (isOwnStream) {
-      console.warn('🚨 LOOPBACK DETECTED: Received our own stream! Muting audio to prevent feedback.');
+      this.debug.warn('🚨 LOOPBACK DETECTED: Received our own stream! Muting audio to prevent feedback.');
     }
 
     const remoteVideosContainer = document.getElementById('remote-videos-container');
@@ -2394,7 +2421,7 @@ export class PeerPigeonUI {
 
       // Enhanced audio debugging
       video.addEventListener('loadedmetadata', () => {
-        console.log('Video element loaded metadata:', {
+        this.debug.log('Video element loaded metadata:', {
           duration: video.duration,
           audioTracks: video.audioTracks?.length || 'N/A',
           volume: video.volume,
@@ -2402,14 +2429,14 @@ export class PeerPigeonUI {
         });
 
         video.play().then(() => {
-          console.log('Video/audio playback started successfully');
+          this.debug.log('Video/audio playback started successfully');
           // Check audio context state
           if (window.AudioContext || window.webkitAudioContext) {
             const AudioContext = window.AudioContext || window.webkitAudioContext;
             const audioContext = new AudioContext();
-            console.log('Audio context state:', audioContext.state);
+            this.debug.log('Audio context state:', audioContext.state);
             if (audioContext.state === 'suspended') {
-              console.log('Audio context is suspended - may need user interaction');
+              this.debug.log('Audio context is suspended - may need user interaction');
             }
           }
           // Hide any play button if playback started
@@ -2418,7 +2445,7 @@ export class PeerPigeonUI {
             playButton.style.display = 'none';
           }
         }).catch(error => {
-          console.log('Autoplay failed, user interaction required:', error);
+          this.debug.log('Autoplay failed, user interaction required:', error);
           // Show a manual play button
           const playButton = document.createElement('button');
           playButton.className = 'manual-play-button';
@@ -2429,9 +2456,9 @@ export class PeerPigeonUI {
             try {
               await video.play();
               playButton.style.display = 'none';
-              console.log('Manual play successful');
+              this.debug.log('Manual play successful');
             } catch (e) {
-              console.error('Manual play failed:', e);
+              this.debug.error('Manual play failed:', e);
             }
           });
 
@@ -2442,15 +2469,15 @@ export class PeerPigeonUI {
 
       // Add event listeners for audio debugging
       video.addEventListener('play', () => {
-        console.log('Video element started playing');
+        this.debug.log('Video element started playing');
       });
 
       video.addEventListener('pause', () => {
-        console.log('Video element paused');
+        this.debug.log('Video element paused');
       });
 
       video.addEventListener('volumechange', () => {
-        console.log('Volume changed:', video.volume, 'Muted:', video.muted);
+        this.debug.log('Volume changed:', video.volume, 'Muted:', video.muted);
       });
 
       const status = document.createElement('div');
@@ -2469,7 +2496,7 @@ export class PeerPigeonUI {
     video.srcObject = stream;
 
     // EXPLICIT AUDIO DEBUGGING
-    console.log('🎵 Setting srcObject for video element:', {
+    this.debug.log('🎵 Setting srcObject for video element:', {
       stream,
       streamId: stream.id,
       streamActive: stream.active,
@@ -2482,7 +2509,7 @@ export class PeerPigeonUI {
     const audioTracks = stream.getAudioTracks();
     const videoTracks = stream.getVideoTracks();
 
-    console.log('🎵 Stream tracks assigned:', {
+    this.debug.log('🎵 Stream tracks assigned:', {
       audioTracks: audioTracks.map(t => ({
         id: t.id,
         enabled: t.enabled,
@@ -2499,7 +2526,7 @@ export class PeerPigeonUI {
 
     // CRITICAL: Set audio state based on whether this is our own stream
     if (isOwnStream) {
-      console.warn('🚨 Muting our own stream to prevent audio feedback');
+      this.debug.warn('🚨 Muting our own stream to prevent audio feedback');
       video.muted = true;
       video.volume = 0;
     } else {
@@ -2512,14 +2539,14 @@ export class PeerPigeonUI {
     }
 
     // Update status based on stream tracks
-    console.log(`Video tracks: ${videoTracks.length}, Audio tracks: ${audioTracks.length}`);
+    this.debug.log(`Video tracks: ${videoTracks.length}, Audio tracks: ${audioTracks.length}`);
     audioTracks.forEach((track, i) => {
-      console.log(`Audio track ${i}:`, { enabled: track.enabled, muted: track.muted, label: track.label });
+      this.debug.log(`Audio track ${i}:`, { enabled: track.enabled, muted: track.muted, label: track.label });
     });
 
     // For audio-only streams, ensure the video element is properly configured
     if (audioTracks.length > 0 && videoTracks.length === 0) {
-      console.log('Audio-only stream detected - configuring for audio playback');
+      this.debug.log('Audio-only stream detected - configuring for audio playback');
       video.style.height = '60px'; // Smaller height for audio-only
       video.style.backgroundColor = '#f0f0f0';
 
@@ -2530,7 +2557,7 @@ export class PeerPigeonUI {
           const audioContext = new AudioContext();
           if (audioContext.state === 'suspended') {
             audioContext.resume().then(() => {
-              console.log('Audio context resumed for remote stream');
+              this.debug.log('Audio context resumed for remote stream');
             });
           }
 
@@ -2545,7 +2572,7 @@ export class PeerPigeonUI {
               analyser.getByteFrequencyData(dataArray);
               const sum = dataArray.reduce((a, b) => a + b, 0);
               if (sum > 0) {
-                console.log('Remote audio data detected! Sum:', sum);
+                this.debug.log('Remote audio data detected! Sum:', sum);
               }
             };
 
@@ -2553,10 +2580,10 @@ export class PeerPigeonUI {
             const audioChecker = setInterval(checkAudio, 1000);
             setTimeout(() => clearInterval(audioChecker), 10000); // Stop after 10 seconds
           } catch (audioAnalysisError) {
-            console.log('Could not analyze remote audio:', audioAnalysisError);
+            this.debug.log('Could not analyze remote audio:', audioAnalysisError);
           }
         } catch (e) {
-          console.log('Could not create/resume audio context:', e);
+          this.debug.log('Could not create/resume audio context:', e);
         }
       }
     }
@@ -2576,17 +2603,17 @@ export class PeerPigeonUI {
      */
   setupAudioPlaybackMonitoring(videoElement, peerId, audioTracks) {
     const peerIdShort = peerId.substring(0, 8);
-    console.log(`🎵 Setting up audio playback monitoring for peer ${peerIdShort}`);
+    this.debug.log(`🎵 Setting up audio playback monitoring for peer ${peerIdShort}`);
 
     if (audioTracks.length === 0) {
-      console.log(`🎵 No audio tracks to monitor for peer ${peerIdShort}`);
+      this.debug.log(`🎵 No audio tracks to monitor for peer ${peerIdShort}`);
       return;
     }
 
     try {
       // Monitor video element audio events
       videoElement.addEventListener('play', () => {
-        console.log(`🎵 Video element started playing for peer ${peerIdShort}`, {
+        this.debug.log(`🎵 Video element started playing for peer ${peerIdShort}`, {
           muted: videoElement.muted,
           volume: videoElement.volume,
           audioTracks: audioTracks.length
@@ -2594,11 +2621,11 @@ export class PeerPigeonUI {
       });
 
       videoElement.addEventListener('pause', () => {
-        console.log(`🎵 Video element paused for peer ${peerIdShort}`);
+        this.debug.log(`🎵 Video element paused for peer ${peerIdShort}`);
       });
 
       videoElement.addEventListener('volumechange', () => {
-        console.log(`🎵 Volume changed for peer ${peerIdShort}:`, {
+        this.debug.log(`🎵 Volume changed for peer ${peerIdShort}:`, {
           volume: videoElement.volume,
           muted: videoElement.muted
         });
@@ -2607,7 +2634,7 @@ export class PeerPigeonUI {
       // Create audio context for monitoring actual audio data playback
       const AudioContext = window.AudioContext || window.webkitAudioContext;
       if (!AudioContext) {
-        console.warn('🎵 AudioContext not available - basic monitoring only');
+        this.debug.warn('🎵 AudioContext not available - basic monitoring only');
         return;
       }
 
@@ -2653,7 +2680,7 @@ export class PeerPigeonUI {
             // Log every 3 seconds
             if (currentTime - lastLogTime > 3000) {
               const playbackActivity = totalSamples > 0 ? (playbackSamples / totalSamples * 100) : 0;
-              console.log(`🔊 Audio PLAYBACK from peer ${peerIdShort}:`, {
+              this.debug.log(`🔊 Audio PLAYBACK from peer ${peerIdShort}:`, {
                 videoElementMuted: videoElement.muted,
                 videoElementVolume: videoElement.volume,
                 currentPlaybackLevel: Math.round(average),
@@ -2678,7 +2705,7 @@ export class PeerPigeonUI {
 
           // Start monitoring when video plays
           videoElement.addEventListener('play', () => {
-            console.log(`🔊 Starting audio playback monitoring for peer ${peerIdShort}`);
+            this.debug.log(`🔊 Starting audio playback monitoring for peer ${peerIdShort}`);
             if (audioContext.state === 'suspended') {
               audioContext.resume().then(() => {
                 requestAnimationFrame(monitorPlayback);
@@ -2688,9 +2715,9 @@ export class PeerPigeonUI {
             }
           });
 
-          console.log(`🔊 Audio playback analysis setup complete for peer ${peerIdShort}`);
+          this.debug.log(`🔊 Audio playback analysis setup complete for peer ${peerIdShort}`);
         } catch (error) {
-          console.error(`🔊 Failed to setup audio playback analysis for peer ${peerIdShort}:`, error);
+          this.debug.error(`🔊 Failed to setup audio playback analysis for peer ${peerIdShort}:`, error);
         }
       };
 
@@ -2702,7 +2729,7 @@ export class PeerPigeonUI {
         videoElement.addEventListener('loadedmetadata', setupAudioAnalysis, { once: true });
       }
     } catch (error) {
-      console.error(`🎵 Failed to setup audio playback monitoring for peer ${peerIdShort}:`, error);
+      this.debug.error(`🎵 Failed to setup audio playback monitoring for peer ${peerIdShort}:`, error);
     }
   }
 
@@ -2710,42 +2737,42 @@ export class PeerPigeonUI {
      * Diagnostic method to log complete peer connection state
      */
   logPeerDiagnostics() {
-    console.log('🔍 PEER DIAGNOSTICS:');
+    this.debug.log('🔍 PEER DIAGNOSTICS:');
     const allPeers = this.mesh.getPeers();
 
-    console.log(`📊 Total peers in mesh: ${allPeers.length}`);
+    this.debug.log(`📊 Total peers in mesh: ${allPeers.length}`);
 
     allPeers.forEach((peer, index) => {
       const peerConnection = this.mesh.connectionManager.getPeer(peer.peerId);
 
-      console.log(`\n🔍 Peer ${index + 1}: ${peer.peerId.substring(0, 8)}...`);
-      console.log(`   Status: ${peer.status}`);
+      this.debug.log(`\n🔍 Peer ${index + 1}: ${peer.peerId.substring(0, 8)}...`);
+      this.debug.log(`   Status: ${peer.status}`);
 
       if (peerConnection) {
-        console.log(`   WebRTC Connection State: ${peerConnection.connection?.connectionState || 'none'}`);
-        console.log(`   ICE Connection State: ${peerConnection.connection?.iceConnectionState || 'none'}`);
-        console.log(`   Data Channel State: ${peerConnection.dataChannel?.readyState || 'none'}`);
-        console.log(`   Data Channel Ready: ${peerConnection.dataChannelReady}`);
-        console.log(`   Has Local Stream: ${!!peerConnection.localStream}`);
-        console.log(`   Has Remote Stream: ${!!peerConnection.remoteStream}`);
+        this.debug.log(`   WebRTC Connection State: ${peerConnection.connection?.connectionState || 'none'}`);
+        this.debug.log(`   ICE Connection State: ${peerConnection.connection?.iceConnectionState || 'none'}`);
+        this.debug.log(`   Data Channel State: ${peerConnection.dataChannel?.readyState || 'none'}`);
+        this.debug.log(`   Data Channel Ready: ${peerConnection.dataChannelReady}`);
+        this.debug.log(`   Has Local Stream: ${!!peerConnection.localStream}`);
+        this.debug.log(`   Has Remote Stream: ${!!peerConnection.remoteStream}`);
 
         if (peerConnection.localStream) {
           const audioTracks = peerConnection.localStream.getAudioTracks();
           const videoTracks = peerConnection.localStream.getVideoTracks();
-          console.log(`   Local Stream Tracks: ${audioTracks.length} audio, ${videoTracks.length} video`);
+          this.debug.log(`   Local Stream Tracks: ${audioTracks.length} audio, ${videoTracks.length} video`);
         }
 
         if (peerConnection.remoteStream) {
           const audioTracks = peerConnection.remoteStream.getAudioTracks();
           const videoTracks = peerConnection.remoteStream.getVideoTracks();
-          console.log(`   Remote Stream Tracks: ${audioTracks.length} audio, ${videoTracks.length} video`);
+          this.debug.log(`   Remote Stream Tracks: ${audioTracks.length} audio, ${videoTracks.length} video`);
         }
       } else {
-        console.log('   ❌ No PeerConnection object found');
+        this.debug.log('   ❌ No PeerConnection object found');
       }
     });
 
-    console.log('\n🔍 END PEER DIAGNOSTICS\n');
+    this.debug.log('\n🔍 END PEER DIAGNOSTICS\n');
   }
 
   // Existing UI methods (keeping the rest of the original functionality)
@@ -2760,7 +2787,7 @@ export class PeerPigeonUI {
       this.updateButtonStates({ connecting: true });
       await this.mesh.connect(url);
     } catch (error) {
-      console.error('Connection failed:', error);
+      this.debug.error('Connection failed:', error);
       this.addMessage('System', `Connection failed: ${error.message}`, 'error');
       this.updateButtonStates({ connecting: false });
     }
@@ -2771,7 +2798,7 @@ export class PeerPigeonUI {
       this.updateButtonStates({ disconnecting: true });
       await this.mesh.disconnect();
     } catch (error) {
-      console.error('Disconnection failed:', error);
+      this.debug.error('Disconnection failed:', error);
       this.addMessage('System', `Disconnection failed: ${error.message}`, 'error');
     } finally {
       this.updateButtonStates({ disconnecting: false });
@@ -2793,7 +2820,7 @@ export class PeerPigeonUI {
       await this.mesh.cleanupSignalingData();
       this.addMessage('System', 'Signaling data cleanup initiated');
     } catch (error) {
-      console.error('Cleanup failed:', error);
+      this.debug.error('Cleanup failed:', error);
       this.addMessage('System', `Cleanup failed: ${error.message}`, 'error');
     }
   }
@@ -2807,7 +2834,7 @@ export class PeerPigeonUI {
         this.addMessage('System', `Health check failed: ${result.issues.join(', ')}`, 'warning');
       }
     } catch (error) {
-      console.error('Health check failed:', error);
+      this.debug.error('Health check failed:', error);
       this.addMessage('System', `Health check error: ${error.message}`, 'error');
     }
   }
@@ -2858,7 +2885,7 @@ export class PeerPigeonUI {
               try {
                 await this.mesh.sendEncryptedMessage(peer.peerId, message);
               } catch (error) {
-                console.warn(`Failed to send encrypted message to ${peer.peerId}:`, error);
+                this.debug.warn(`Failed to send encrypted message to ${peer.peerId}:`, error);
               }
             }
             this.addMessage('You', `🔐 ${message}`, 'encrypted');
@@ -2874,7 +2901,7 @@ export class PeerPigeonUI {
 
       messageInput.value = '';
     } catch (error) {
-      console.error('Failed to send message:', error);
+      this.debug.error('Failed to send message:', error);
       this.addMessage('System', `Failed to send message: ${error.message}`, 'error');
     }
   }
@@ -2903,7 +2930,7 @@ export class PeerPigeonUI {
       this.addMessage('System', `Attempting to connect to ${targetPeerId.substring(0, 8)}...`);
       targetPeerInput.value = '';
     } catch (error) {
-      console.error('Failed to initiate connection:', error);
+      this.debug.error('Failed to initiate connection:', error);
       this.addMessage('System', `Failed to connect: ${error.message}`, 'error');
     }
   }
@@ -2932,7 +2959,7 @@ export class PeerPigeonUI {
         button.textContent = 'Connect';
       }, 3000);
     } catch (error) {
-      console.error('Failed to initiate connection:', error);
+      this.debug.error('Failed to initiate connection:', error);
       this.addMessage('System', `Failed to connect: ${error.message}`, 'error');
 
       // Re-enable button immediately on error
