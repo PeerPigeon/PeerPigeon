@@ -14,8 +14,6 @@ export class PeerConnection extends EventEmitter {
     this.dataChannelReady = false;
     this.connectionStartTime = Date.now();
     this.pendingIceCandidates = [];
-    this.iceCheckingTimeout = null; // Timeout for ICE checking state
-    this.connectingTimeout = null; // Timeout for stuck connecting state
     this.dataChannelHealthMonitor = null; // Health monitoring for data channel when signaling is unavailable
     this.isClosing = false; // Flag to prevent disconnection events during intentional close
     this._forcedStatus = null; // Track forced status (e.g., failed)

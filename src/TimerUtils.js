@@ -4,7 +4,6 @@
  */
 
 import { environmentDetector } from './EnvironmentDetector.js';
-import DebugLogger from './DebugLogger.js';
 
 // Store original timer functions to avoid issues with wrapped functions
 let originalSetInterval, originalSetTimeout, originalClearInterval, originalClearTimeout;

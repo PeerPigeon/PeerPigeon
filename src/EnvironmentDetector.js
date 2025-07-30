@@ -2,7 +2,6 @@
  * EnvironmentDetector - Utility for detecting runtime environment and capabilities
  * Provides comprehensive environment detection for browser, Node.js, Worker contexts
  */
-import DebugLogger from './DebugLogger.js';
 
 export class EnvironmentDetector {
   constructor() {

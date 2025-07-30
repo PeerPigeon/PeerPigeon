@@ -96,6 +96,69 @@ export class MeshOptimizer extends EventEmitter {
     });
   }
 
+  /**
+   * Rebalance mesh connections to achieve better distribution
+   * This method considers dropping excess connections to allow better overall mesh balance
+   */
+  rebalanceMeshConnections() {
+    if (!this.mesh.autoDiscovery || !this.mesh.evictionStrategy) return;
+
+    const currentConnected = this.connectionManager.getConnectedPeerCount();
+    const targetConnections = Math.min(this.mesh.maxPeers, 3); // Target ideal connection count
+
+    // Never drop connections if we're at or below minimum peers required
+    if (currentConnected <= this.mesh.minPeers) {
+      this.debug.log(`No rebalancing - at minimum connectivity: ${currentConnected} <= ${this.mesh.minPeers}`);
+      return;
+    }
+
+    // Only rebalance if we have significantly more connections than target
+    if (currentConnected <= targetConnections) {
+      this.debug.log(`No rebalancing needed: ${currentConnected} <= ${targetConnections} target connections`);
+      return;
+    }
+
+    // Only rebalance if we have a significant excess (at least 2 more than target)
+    const excessConnections = currentConnected - targetConnections;
+    if (excessConnections < 2) {
+      this.debug.log(`Insufficient excess for rebalancing: ${excessConnections} excess connections (need >= 2)`);
+      return;
+    }
+
+    this.debug.log(`Considering mesh rebalancing: ${currentConnected} connections > ${targetConnections} target (excess: ${excessConnections})`);
+
+    // Find the farthest peer connection that could be dropped
+    const farthestPeerId = this.evictionManager.findFarthestPeer();
+    if (!farthestPeerId) {
+      this.debug.log('No candidate peer found for rebalancing');
+      return;
+    }
+
+    this.debug.log(`Rebalancing: dropping connection to ${farthestPeerId.substring(0, 8)}... to improve mesh distribution (${currentConnected} -> ${currentConnected - 1})`);
+
+    // Send a friendly disconnect message rather than an eviction
+    const peerConnection = this.connectionManager.getPeer(farthestPeerId);
+    if (peerConnection) {
+      try {
+        peerConnection.sendMessage({
+          type: 'rebalance_disconnect',
+          reason: 'mesh_rebalancing',
+          from: this.mesh.peerId
+        });
+      } catch (error) {
+        this.debug.log('Failed to send rebalancing notice:', error.message);
+      }
+
+      // Close the connection
+      peerConnection.close();
+      this.connectionManager.peers.delete(farthestPeerId);
+      this.mesh.peerDiscovery.clearConnectionAttempt(farthestPeerId);
+
+      this.mesh.emit('peerDisconnected', { peerId: farthestPeerId, reason: 'mesh rebalancing' });
+      this.connectionManager.emit('peersUpdated');
+    }
+  }
+
   calculateXorDistance(peerId1, peerId2) {
     let distance = 0n;
     for (let i = 0; i < Math.min(peerId1.length, peerId2.length); i += 2) {

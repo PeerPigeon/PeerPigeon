@@ -38,6 +38,24 @@ class StorageTest {
 
     console.log(`✅ Mesh initialized with peer ID: ${this.mesh.peerId.substring(0, 16)}...`);
     console.log(`📦 Storage enabled: ${this.storage.isEnabled()}`);
+
+    // Connect to signaling server for P2P functionality
+    const signalingUrl = process.env.SIGNALING_URL || 'ws://localhost:3000';
+    try {
+      console.log(`🔗 Connecting to signaling server: ${signalingUrl}`);
+      await this.mesh.connect(signalingUrl);
+      console.log('✅ Connected to signaling server for P2P testing');
+
+      // Wait a bit for peer discovery
+      console.log('⏳ Waiting for peer discovery...');
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      const connectedPeers = this.mesh.connectionManager.getConnectedPeerCount();
+      console.log(`🔍 Found ${connectedPeers} connected peers for distributed storage testing`);
+    } catch (error) {
+      console.warn(`⚠️  Could not connect to signaling server: ${error.message}`);
+      console.warn('📝 Running storage tests in single-node mode (limited functionality)');
+    }
     console.log('');
   }
 
@@ -614,12 +632,23 @@ class StorageTest {
   async cleanup() {
     if (this.mesh) {
       console.log('🧹 Cleaning up test environment...');
+
       // Clear all test data
       try {
         await this.storage.clear();
         console.log('✅ Test data cleared');
       } catch (error) {
         console.warn('⚠️  Failed to clear test data:', error.message);
+      }
+
+      // Disconnect from signaling server
+      try {
+        if (this.mesh.connected) {
+          this.mesh.disconnect();
+          console.log('✅ Disconnected from signaling server');
+        }
+      } catch (error) {
+        console.warn('⚠️  Failed to disconnect from signaling server:', error.message);
       }
     }
   }

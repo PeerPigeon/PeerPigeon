@@ -10,7 +10,6 @@ export class PeerDiscovery extends EventEmitter {
     this.discoveredPeers = new Map();
     this.connectionAttempts = new Map();
     this.cleanupInterval = null;
-    this.meshOptimizationTimeout = null;
     this.autoDiscovery = options.autoDiscovery ?? true;
     this.evictionStrategy = options.evictionStrategy ?? true;
     this.xorRouting = options.xorRouting ?? true;
@@ -26,11 +25,6 @@ export class PeerDiscovery extends EventEmitter {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
-    }
-
-    if (this.meshOptimizationTimeout) {
-      clearTimeout(this.meshOptimizationTimeout);
-      this.meshOptimizationTimeout = null;
     }
 
     this.discoveredPeers.clear();
@@ -143,6 +137,16 @@ export class PeerDiscovery extends EventEmitter {
       }
     }
 
+    // SAFETY: If we have very few connections (below minimum), override lexicographic order
+    // to ensure every peer gets at least minimum connectivity
+    const currentConnectedCount = this.mesh.connectionManager.getConnectedPeerCount();
+    const allDiscoveredPeers = Array.from(this.discoveredPeers.keys());
+
+    if (currentConnectedCount < this.mesh.minPeers && allDiscoveredPeers.includes(targetPeerId)) {
+      this.debug.log(`shouldInitiateConnection: Below minimum connectivity (${currentConnectedCount}/${this.mesh.minPeers}) - overriding lexicographic order for ${targetPeerId.substring(0, 8)}...`);
+      return true;
+    }
+
     this.debug.log(`shouldInitiateConnection: ${this.peerId.substring(0, 8)}... > ${targetPeerId.substring(0, 8)}... = ${lexicographicShouldInitiate}`);
     return lexicographicShouldInitiate;
   }
@@ -184,6 +188,12 @@ export class PeerDiscovery extends EventEmitter {
 
     if (unconnectedPeers.length === 0) {
       this.debug.log('No unconnected peers to optimize');
+
+      // DISABLED: Aggressive rebalancing causing connection drops
+      // Only do gentle rebalancing if we're significantly over-connected
+      // if (this.mesh.meshOptimizer && this.mesh.meshOptimizer.rebalanceMeshConnections) {
+      //   this.mesh.meshOptimizer.rebalanceMeshConnections();
+      // }
       return;
     }
 
@@ -197,19 +207,6 @@ export class PeerDiscovery extends EventEmitter {
     }
 
     this.emit('optimizeConnections', { unconnectedPeers });
-  }
-
-  scheduleMeshOptimization() {
-    if (this.meshOptimizationTimeout) {
-      clearTimeout(this.meshOptimizationTimeout);
-    }
-
-    // Simple scheduling - optimize every 10-15 seconds
-    const delay = 10000 + Math.random() * 5000;
-
-    this.meshOptimizationTimeout = setTimeout(() => {
-      this.emit('optimizeMesh');
-    }, delay);
   }
 
   startCleanupInterval() {
