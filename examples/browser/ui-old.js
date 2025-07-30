@@ -1,7 +1,10 @@
 // Updated: 2025-07-04 - Fixed getConnectionStatus method name
+import DebugLogger from '../../src/DebugLogger.js';
+
 export class PeerPigeonUI {
   constructor(mesh) {
     this.mesh = mesh;
+    this.debug = DebugLogger.create('PeerPigeonUI');
     this.lastCleanupTime = 0; // Track when we last did cleanup
     this.setupEventListeners();
     this.bindDOMEvents();

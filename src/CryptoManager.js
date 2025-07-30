@@ -485,13 +485,10 @@ export class CryptoManager extends EventEmitter {
      * Start periodic cleanup of old nonces
      */
   startNonceCleanup() {
-    setInterval(() => {
-      // Remove old nonces (this is a simplified approach)
-      // In a real implementation, you'd store nonces with timestamps
-      if (this.messageNonces.size > 1000) {
-        this.messageNonces.clear();
-      }
-    }, 60000); // Clean up every minute
+    // No periodic cleanup - clear nonces immediately when size exceeds limit
+    if (this.messageNonces.size > 1000) {
+      this.messageNonces.clear();
+    }
   }
 
   /**

@@ -10,7 +10,6 @@ export class PeerDiscovery extends EventEmitter {
     this.discoveredPeers = new Map();
     this.connectionAttempts = new Map();
     this.cleanupInterval = null;
-    this.meshOptimizationTimeout = null;
     this.autoDiscovery = options.autoDiscovery ?? true;
     this.evictionStrategy = options.evictionStrategy ?? true;
     this.xorRouting = options.xorRouting ?? true;
@@ -26,11 +25,6 @@ export class PeerDiscovery extends EventEmitter {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
-    }
-
-    if (this.meshOptimizationTimeout) {
-      clearTimeout(this.meshOptimizationTimeout);
-      this.meshOptimizationTimeout = null;
     }
 
     this.discoveredPeers.clear();
@@ -197,19 +191,6 @@ export class PeerDiscovery extends EventEmitter {
     }
 
     this.emit('optimizeConnections', { unconnectedPeers });
-  }
-
-  scheduleMeshOptimization() {
-    if (this.meshOptimizationTimeout) {
-      clearTimeout(this.meshOptimizationTimeout);
-    }
-
-    // Simple scheduling - optimize every 10-15 seconds
-    const delay = 10000 + Math.random() * 5000;
-
-    this.meshOptimizationTimeout = setTimeout(() => {
-      this.emit('optimizeMesh');
-    }, delay);
   }
 
   startCleanupInterval() {
