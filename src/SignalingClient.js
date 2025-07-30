@@ -17,19 +17,7 @@ export class SignalingClient extends EventEmitter {
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 10; // Increased for better persistence
     this.connectionPromise = null;
-    this.reconnectTimeout = null;
     this.isReconnecting = false;
-
-    // Add keep-alive ping to prevent WebSocket timeout
-    this.keepAliveInterval = null;
-    this.keepAliveIntervalMs = 9 * 60 * 1000; // Ping every 9 minutes for large safety margin
-
-    // Health monitoring
-    this.lastPingTime = null;
-    this.lastPongTime = null;
-    this.pingTimeout = null;
-    this.healthCheckInterval = null;
-    this.connectionQualityTimeout = 10000; // 10 seconds to consider connection unhealthy
   }
 
   setConnectionType(type) {

@@ -21,12 +21,25 @@ import path from 'path';
 import express from 'express';
 const HEADLESS = process.env.HEADLESS !== 'false'; // Default to headless unless explicitly disabled
 const NUM_PEERS = 7;
-const SIGNALING_PORT = 3000;
-const HTTP_PORT = 8080;
+const SIGNALING_PORT = process.env.SIGNALING_PORT ? parseInt(process.env.SIGNALING_PORT) : 3000;
+const HTTP_PORT = process.env.HTTP_PORT ? parseInt(process.env.HTTP_PORT) : 8080;
 const TEST_TIMEOUT = 300000; // 5 minutes
 const PEER_CONNECTION_TIMEOUT = 60000; // 60 seconds
 const PEER_ID_TIMEOUT = 30000; // 30 seconds for peer ID generation
-const OPERATION_DELAY = 2000; // 2 seconds between operations
+const OPERATION_DELAY = 1000; // Reduced from 2 seconds to 1 second
+const VERBOSE = process.env.VERBOSE === 'true'; // Only show verbose logging if explicitly enabled
+const QUIET = process.env.QUIET === 'true'; // Show only test results and final report
+
+// Logging utility
+const log = {
+  info: (...args) => VERBOSE && console.log(...args),
+  setup: (...args) => !QUIET && console.log(...args),
+  success: (testName) => console.log(`✅ ${testName}`),
+  fail: (testName, error) => console.log(`❌ ${testName}${error ? `: ${error}` : ''}`),
+  warn: (...args) => console.warn(...args),
+  error: (...args) => console.error(...args),
+  always: (...args) => console.log(...args)
+};
 class BrowserIntegrationTest {
   constructor() {
     this.signalingServer = null;
@@ -34,11 +47,17 @@ class BrowserIntegrationTest {
     this.browser = null;
     this.pages = [];
     this.peerIds = [];
+    this.externalSignalingServer = false; // Track if we're using an external server
     this.testResults = {
       total: 0,
       passed: 0,
       failed: 0,
       errors: []
+    };
+    this.individualTests = {
+      total: 0,
+      passed: 0,
+      failed: 0
     };
   }
   /**
@@ -46,27 +65,35 @@ class BrowserIntegrationTest {
    */
 
   async startServers() {
-    console.log('🚀 Starting servers...');
+    log.info('🚀 Starting servers...');
 
-    // Start signaling server
-    this.signalingServer = spawn('node', ['websocket-server/server.js'], {
-      stdio: 'pipe',
-      env: { ...process.env, PORT: SIGNALING_PORT }
-    });
+    // Check if signaling server is already running
+    const signalingServerRunning = await this.checkPortInUse(SIGNALING_PORT);
+    if (signalingServerRunning) {
+      log.info(`🔄 Signaling server already running on port ${SIGNALING_PORT}, skipping server startup`);
+      this.externalSignalingServer = true;
+    } else {
+      // Start signaling server
+      this.signalingServer = spawn('node', ['websocket-server/server.js'], {
+        stdio: 'pipe',
+        env: { ...process.env, PORT: SIGNALING_PORT }
+      });
 
-    // Add error handling for signaling server
-    this.signalingServer.on('error', (error) => {
-      console.error('❌ Signaling server error:', error);
-    });
+      // Add error handling for signaling server
+      this.signalingServer.on('error', (error) => {
+        log.error('❌ Signaling server error:', error);
+      });
 
-    this.signalingServer.on('exit', (code, _signal) => {
-      if (code !== 0 && code !== null) {
-        console.error(`❌ Signaling server exited with code ${code}`);
-      }
-    });
+      this.signalingServer.on('exit', (code, _signal) => {
+        if (code !== 0 && code !== null) {
+          log.error(`❌ Signaling server exited with code ${code}`);
+        }
+      });
+      this.externalSignalingServer = false;
+    }
 
     // Start Express HTTP server serving only examples/browser and src/
-    console.log('🌐 Starting Express HTTP server...');
+    log.info('🌐 Starting Express HTTP server...');
     const app = express();
 
     // Enable CORS for all routes
@@ -96,13 +123,14 @@ class BrowserIntegrationTest {
       console.log(`✅ Express server started on port ${HTTP_PORT}`);
     });
 
-    // Give servers a moment to start
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // Give servers a moment to start (reduced delay if using external signaling server)
+    const startupDelay = this.externalSignalingServer ? 500 : 1000;
+    await new Promise(resolve => setTimeout(resolve, startupDelay));
 
     // Wait for servers to start
     await this.waitForServer(`http://localhost:${HTTP_PORT}/health`, 15000);
     await this.waitForServer(`ws://localhost:${SIGNALING_PORT}`, 10000);
-    console.log('✅ Servers started successfully');
+    log.info('✅ Servers started successfully');
   }
   /**
    * Wait for a server to be ready
@@ -172,6 +200,36 @@ class BrowserIntegrationTest {
     }
     throw new Error(`Server at ${url} did not start within ${timeout}ms`);
   }
+
+  /**
+   * Check if a port is already in use
+   */
+  async checkPortInUse(port) {
+    try {
+      // Try to connect to the port to see if something is already running
+      const ws = new (await import('ws')).WebSocket(`ws://localhost:${port}`);
+      return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          ws.close();
+          resolve(false); // Port not in use or not responding
+        }, 1000);
+
+        ws.on('open', () => {
+          clearTimeout(timeout);
+          ws.close();
+          resolve(true); // Port is in use
+        });
+
+        ws.on('error', () => {
+          clearTimeout(timeout);
+          resolve(false); // Port not in use or connection failed
+        });
+      });
+    } catch (error) {
+      return false; // Port not in use
+    }
+  }
+
   /**
    * Initialize Puppeteer browser and create pages
    */
@@ -231,8 +289,9 @@ class BrowserIntegrationTest {
       // DEBUG: Enable console logging to capture renegotiation issues
       page.on('console', (msg) => {
         const text = msg.text();
-        if (text.includes('RENEGOTIATION') || text.includes('MESH SIGNALING') || text.includes('ANSWER HANDLER') || text.includes('🔄') || text.includes('🚨')) {
-          console.log(`🐛 Page ${i + 1} Console:`, text);
+        // Only show console messages in verbose mode or if they are critical errors
+        if (VERBOSE && (text.includes('RENEGOTIATION') || text.includes('MESH SIGNALING') || text.includes('ANSWER HANDLER') || text.includes('🔄') || text.includes('🚨'))) {
+          log.info(`🐛 Page ${i + 1} Console:`, text);
         }
       });
       await page.evaluate(() => {
@@ -276,7 +335,7 @@ class BrowserIntegrationTest {
       console.log(`📄 Page ${i + 1} initialized`);
       // Small delay between page initializations to reduce resource contention
       if (i < NUM_PEERS - 1) {
-        await new Promise(resolve => setTimeout(resolve, 300)); // Reduced from 1 second
+        await new Promise(resolve => setTimeout(resolve, 200)); // Reduced from 300ms
       }
     }
     console.log('✅ Browser initialized with all pages');
@@ -342,7 +401,7 @@ class BrowserIntegrationTest {
       }, { timeout: PEER_CONNECTION_TIMEOUT });
       console.log(`✅ Peer ${i + 1} connected to signaling server`);
       // Small delay between connections to avoid overwhelming the server
-      await new Promise(resolve => setTimeout(resolve, 1500));
+      await new Promise(resolve => setTimeout(resolve, 1000)); // Reduced from 1500ms
     }
     console.log('✅ All peers connected to signaling server');
   }
@@ -354,7 +413,7 @@ class BrowserIntegrationTest {
     console.log('🔍 Waiting for peer discovery...');
     // Give more time for peer discovery and WebRTC connections
     console.log('⏳ Allowing time for peer discovery and WebRTC connection establishment...');
-    await new Promise(resolve => setTimeout(resolve, 3000)); // Reduced from 10 seconds since peers connect quickly
+    await new Promise(resolve => setTimeout(resolve, 2000)); // Reduced from 3 seconds since peers connect quickly
     for (let i = 0; i < this.pages.length; i++) {
       const page = this.pages[i];
       // Check discovered peers
@@ -394,6 +453,8 @@ class BrowserIntegrationTest {
         return log && log.textContent.includes(msg);
       }, { timeout: 10000 }, testMessage);
       console.log('📨 Message appeared in sender log');
+      this.recordIndividualTest('Broadcast message appears in sender log', true);
+
       // Check if other peers received the message
       let receivedCount = 0;
       for (let i = 1; i < this.pages.length; i++) {
@@ -406,11 +467,14 @@ class BrowserIntegrationTest {
           }, { timeout: 10000 }, testMessage);
           receivedCount++;
           console.log(`📨 Peer ${i + 1} received broadcast message`);
+          this.recordIndividualTest(`Peer ${i + 1} receives broadcast message`, true);
         } catch (error) {
           console.warn(`⚠️  Peer ${i + 1} did not receive broadcast message within timeout`);
+          this.recordIndividualTest(`Peer ${i + 1} receives broadcast message`, false, 'Message not received within timeout');
         }
       }
       console.log(`📨 Broadcast message received by ${receivedCount}/${NUM_PEERS - 1} peers`);
+
       // Test direct message if we have enough peers
       if (this.peerIds.length >= 2) {
         await senderPage.bringToFront(); // Make sender tab active again
@@ -425,11 +489,16 @@ class BrowserIntegrationTest {
         // Check if target peer received the DM
         const targetPage = this.pages[1];
         await targetPage.bringToFront(); // Make target tab active
-        await targetPage.waitForFunction((msg) => {
-          const log = document.querySelector('#messages-log');
-          return log && log.textContent.includes(msg);
-        }, { timeout: 10000 }, dmMessage);
-        console.log('📧 Direct message test passed');
+        try {
+          await targetPage.waitForFunction((msg) => {
+            const log = document.querySelector('#messages-log');
+            return log && log.textContent.includes(msg);
+          }, { timeout: 10000 }, dmMessage);
+          console.log('📧 Direct message test passed');
+          this.recordIndividualTest('Direct message delivery', true);
+        } catch (error) {
+          this.recordIndividualTest('Direct message delivery', false, 'Direct message not received within timeout');
+        }
       }
       this.recordTestResult('Messaging', true);
     } catch (error) {
@@ -460,7 +529,7 @@ class BrowserIntegrationTest {
       await page.click('#dht-put-btn');
 
       // DHT should be fast in a 7-peer network - just wait for UI update
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise(resolve => setTimeout(resolve, 1500)); // Reduced from 2 seconds
 
       // Test retrieving data from another peer
       const retrievePage = this.pages[1];
@@ -472,11 +541,16 @@ class BrowserIntegrationTest {
       await retrievePage.click('#dht-get-btn');
 
       // DHT retrieval should also be fast
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise(resolve => setTimeout(resolve, 1500)); // Reduced from 2 seconds
 
       // Check DHT log for success
       const logContent = await retrievePage.$eval('#dht-log', el => el.textContent);
-      const success = logContent.includes(testKey) && logContent.includes('Hello WebDHT!');
+      const keyFound = logContent.includes(testKey);
+      const valueFound = logContent.includes('Hello WebDHT!');
+      const success = keyFound && valueFound;
+
+      this.recordIndividualTest('DHT key storage and retrieval', keyFound, keyFound ? null : `Key ${testKey} not found in DHT log`);
+      this.recordIndividualTest('DHT value integrity', valueFound, valueFound ? null : 'Expected value "Hello WebDHT!" not found in DHT log');
 
       if (success) {
         console.log('✅ WebDHT store/retrieve test passed');
@@ -490,8 +564,9 @@ class BrowserIntegrationTest {
         const page1DhtState = await page.evaluate(() => {
           return window.peerPigeonMesh
             ? {
-                hasDht: !!window.peerPigeonMesh.dht,
-                connectionCount: window.peerPigeonMesh.connections ? Object.keys(window.peerPigeonMesh.connections).length : 0
+                hasDht: !!window.peerPigeonMesh.webDHT,
+                enableWebDHT: window.peerPigeonMesh.enableWebDHT,
+                connectionCount: window.peerPigeonMesh.connectionManager ? window.peerPigeonMesh.connectionManager.getConnectedPeerCount() : 0
               }
             : { error: 'No mesh instance' };
         });
@@ -499,8 +574,9 @@ class BrowserIntegrationTest {
         const page2DhtState = await retrievePage.evaluate(() => {
           return window.peerPigeonMesh
             ? {
-                hasDht: !!window.peerPigeonMesh.dht,
-                connectionCount: window.peerPigeonMesh.connections ? Object.keys(window.peerPigeonMesh.connections).length : 0
+                hasDht: !!window.peerPigeonMesh.webDHT,
+                enableWebDHT: window.peerPigeonMesh.enableWebDHT,
+                connectionCount: window.peerPigeonMesh.connectionManager ? window.peerPigeonMesh.connectionManager.getConnectedPeerCount() : 0
               }
             : { error: 'No mesh instance' };
         });
@@ -521,34 +597,40 @@ class BrowserIntegrationTest {
 
   async testCrypto() {
     console.log('🔐 Testing crypto functionality...');
+    let overallPassed = true;
+
     try {
       const page = this.pages[0];
       await page.bringToFront(); // Make tab active
       // Expand crypto section
       await page.click('#crypto-toggle');
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      // Generate keypair
+      await new Promise(resolve => setTimeout(resolve, 500)); // Reduced from 1 second
+
+      // Test 1: Generate keypair
       await page.click('#crypto-generate-btn');
       await new Promise(resolve => setTimeout(resolve, OPERATION_DELAY));
       // Check if public key was generated
       const publicKey = await page.$eval('#crypto-public-key', el => el.textContent);
       const hasKey = publicKey && publicKey !== 'None';
-      if (hasKey) {
-        console.log('✅ Crypto keypair generation passed');
-      }
-      // Test self-test
+      this.recordIndividualTest('Crypto keypair generation', hasKey);
+      if (!hasKey) overallPassed = false;
+
+      // Test 2: Self-test
       await page.click('#crypto-self-test-btn');
       await new Promise(resolve => setTimeout(resolve, OPERATION_DELAY));
       // Check test results
       const testLog = await page.$eval('#crypto-test-log', el => el.textContent);
       const selfTestPassed = testLog.includes('passed') || testLog.includes('success');
-      if (selfTestPassed) {
-        console.log('✅ Crypto self-test passed');
-      }
-      this.recordTestResult('Crypto', hasKey && selfTestPassed);
+      this.recordIndividualTest('Crypto self-test', selfTestPassed);
+      if (!selfTestPassed) overallPassed = false;
+
+      // Record overall category result for summary
+      this.recordTestResult('Crypto', overallPassed);
     } catch (error) {
       console.error('❌ Crypto test failed:', error.message);
-      this.recordTestResult('Crypto', false, error.message);
+      this.recordIndividualTest('Crypto test execution', false, error.message);
+      overallPassed = false;
+      this.recordTestResult('Crypto', overallPassed);
     }
   }
   /**
@@ -600,7 +682,7 @@ class BrowserIntegrationTest {
       // Wait and capture any PeerPigeon debug logs from the browser console
       await new Promise(resolve => setTimeout(resolve, 500)); // Brief wait for initial setup
       // Capture console logs from the streamer page to see PeerPigeon debug output
-      console.log('📝 Capturing PeerPigeon debug logs from streamer page...');
+      log.info('📝 Capturing PeerPigeon debug logs from streamer page...');
       const streamerLogs = await streamerPage.evaluate(() => {
         // Enable PeerPigeon debugging if not already enabled
         if (window.peerPigeonMesh && window.peerPigeonMesh.setDebugLevel) {
@@ -613,8 +695,8 @@ class BrowserIntegrationTest {
           debugEnabled: window.peerPigeonMesh?.debug?.enabled || false
         };
       });
-      console.log('📝 Streamer debug state:', JSON.stringify(streamerLogs, null, 2));
-      await new Promise(resolve => setTimeout(resolve, 1000)); // Reduced from 3 seconds since media starts quickly
+      log.info('📝 Streamer debug state:', JSON.stringify(streamerLogs, null, 2));
+      await new Promise(resolve => setTimeout(resolve, 800)); // Reduced from 1 second since media starts quickly
       // Verify local stream started
       const hasLocalVideo = await streamerPage.$eval('#local-video-container', el => {
         const video = el.querySelector('video');
@@ -622,6 +704,7 @@ class BrowserIntegrationTest {
         const noPlaceholder = !el.textContent.includes('No video stream');
         return hasVideoElement || noPlaceholder;
       }).catch(() => false);
+      this.recordIndividualTest('Local video stream starts successfully', hasLocalVideo, hasLocalVideo ? null : 'Local video stream failed to start');
       if (!hasLocalVideo) {
         console.log('❌ Failed to start local video stream on peer 1');
         this.recordTestResult('Media Streaming', false, 'Local video stream failed to start');
@@ -629,7 +712,7 @@ class BrowserIntegrationTest {
       }
       console.log('✅ Peer 1 started local media stream');
       // Give some time for renegotiation to happen
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await new Promise(resolve => setTimeout(resolve, 1500)); // Reduced from 2 seconds
       // DEBUG: Check browser console for renegotiation logs
       const consoleLogs = await streamerPage.evaluate(() => {
         // Try to capture any console logs that might have renegotiation info
@@ -667,7 +750,7 @@ class BrowserIntegrationTest {
         }
         return { error: 'No mesh instance found' };
       });
-      console.log('📡 Peer 1 (sender) WebRTC Debug Info:', JSON.stringify(peer1DebugInfo, null, 2));
+      log.info('📡 Peer 1 (sender) WebRTC Debug Info:', JSON.stringify(peer1DebugInfo, null, 2));
       // DEBUG: Let's check connection states to see if renegotiation conditions are met
       const connectionStates = await streamerPage.evaluate(() => {
         const meshInstance = window.peerPigeonMesh;
@@ -690,7 +773,7 @@ class BrowserIntegrationTest {
         }
         return { error: 'No mesh instance found' };
       });
-      console.log('🔍 Connection states for renegotiation:', JSON.stringify(connectionStates, null, 2));
+      log.info('🔍 Connection states for renegotiation:', JSON.stringify(connectionStates, null, 2));
       // Check if other tabs are receiving the stream WHILE it's streaming
       let streamsReceived = 0;
       // CRITICAL FIX: Check peers that are actually connected to peer 1 (the sender)
@@ -726,12 +809,12 @@ class BrowserIntegrationTest {
           debugInfo: [`No mesh found - available: ${Object.keys(window).filter(k => k.toLowerCase().includes('mesh') || k.toLowerCase().includes('peer')).join(', ')}`]
         };
       });
-      console.log('🔍 Connection debug info:', senderConnections.debugInfo.join(', '));
-      console.log(`📺 Peer 1 is connected to peers: ${senderConnections.connectedPeers.map(id => id.substring(0, 8)).join(', ')}`);
+      log.info('🔍 Connection debug info:', senderConnections.debugInfo.join(', '));
+      log.info(`📺 Peer 1 is connected to peers: ${senderConnections.connectedPeers.map(id => id.substring(0, 8)).join(', ')}`);
       // CRITICAL: Wait for gossip protocol to propagate stream announcements
       // and for peers to establish connections automatically
-      console.log('⏳ Waiting for gossip protocol to propagate stream announcements...');
-      await new Promise(resolve => setTimeout(resolve, 5000)); // 5 second delay for gossip + connection establishment
+      log.info('⏳ Waiting for gossip protocol to propagate stream announcements...');
+      await new Promise(resolve => setTimeout(resolve, 3000)); // Reduced from 5 seconds for gossip + connection establishment
       // UPDATED: Check ALL peers for media streams (not just directly connected ones)
       // The gossip protocol should establish connections to streaming peers automatically
       console.log(`📺 Checking ALL peers (2-${this.pages.length}) for media streams via gossip protocol...`);
@@ -820,12 +903,14 @@ class BrowserIntegrationTest {
             peersType: meshInstance && meshInstance.connectionManager && meshInstance.connectionManager.peers ? typeof meshInstance.connectionManager.peers : 'undefined'
           };
         }).catch(error => ({ error: error.message }));
-        console.log(`📺 WebRTC Debug Info for peer ${i + 1}:`, JSON.stringify(webrtcDebugInfo, null, 2));
+        log.info(`📺 WebRTC Debug Info for peer ${i + 1}:`, JSON.stringify(webrtcDebugInfo, null, 2));
         if (hasRemoteVideo && (remoteVideoCount > 0 || !remoteVideoContainerText.includes('No remote video streams'))) {
-          console.log(`✅ Peer ${i + 1} is receiving remote video stream - ${remoteVideoCount} video elements`);
+          log.info(`✅ Peer ${i + 1} is receiving remote video stream - ${remoteVideoCount} video elements`);
+          this.recordIndividualTest(`Peer ${i + 1} receives media stream`, true);
           streamsReceived++;
         } else {
-          console.log(`❌ Peer ${i + 1} is NOT receiving remote video stream - ${remoteVideoCount} video elements, container: "${remoteVideoContainerText}"`);
+          log.info(`❌ Peer ${i + 1} is NOT receiving remote video stream - ${remoteVideoCount} video elements, container: "${remoteVideoContainerText}"`);
+          this.recordIndividualTest(`Peer ${i + 1} receives media stream`, false, `No video streams received (${remoteVideoCount} video elements)`);
         }
       }
       // Stop streaming after checking reception
@@ -1039,17 +1124,17 @@ class BrowserIntegrationTest {
       }
       // Evaluate test results
       const totalPeers = this.pages.length;
-      const successThreshold = Math.floor(totalPeers * 0.7); // 70% of peers should receive streams
-      const testPassed = totalStreamersFound >= successThreshold;
+      // Require ALL peers to receive the expected number of streams
+      const testPassed = Object.values(results).every(result => result.receivedStreams >= result.expectedStreams);
       console.log('\n📊 2-WAY STREAMING RESULTS:');
       Object.entries(results).forEach(([peerNum, result]) => {
         const status = result.receivedStreams >= result.expectedStreams ? '✅' : '❌';
         console.log(`  ${status} Peer ${peerNum}: ${result.receivedStreams}/${result.expectedStreams} streams ${result.isStreamer ? '(also streaming)' : '(receiver only)'}`);
       });
       if (testPassed) {
-        console.log(`\n✅ 2-WAY STREAMING TEST PASSED - ${totalStreamersFound}/${totalPeers} peers successfully received expected streams`);
+        console.log(`\n✅ 2-WAY STREAMING TEST PASSED - All ${totalPeers} peers successfully received expected streams`);
       } else {
-        console.log(`\n❌ 2-WAY STREAMING TEST FAILED - Only ${totalStreamersFound}/${totalPeers} peers received expected streams (threshold: ${successThreshold})`);
+        console.log(`\n❌ 2-WAY STREAMING TEST FAILED - Only ${totalStreamersFound}/${totalPeers} peers received expected streams (all must succeed)`);
       }
       console.log(`\n🔍 GOSSIP ANALYSIS: ${streamerIndices.length} simultaneous streamers, ${totalPeers} total peers, forwarding through mesh topology`);
       this.recordTestResult('2-Way Media Streaming', testPassed);
@@ -1107,6 +1192,8 @@ class BrowserIntegrationTest {
       }
 
       console.log('✅ Basic lexical operations passed');
+      this.recordIndividualTest('Lexical storage basic put/get operations', true);
+      this.recordIndividualTest('Lexical storage object reconstruction', true);
 
       // Test property access via proxy
       const proxyResult = await testPage.evaluate(async () => {
@@ -1136,6 +1223,7 @@ class BrowserIntegrationTest {
       }
 
       console.log('✅ Property access via proxy passed');
+      this.recordIndividualTest('Lexical storage proxy-based property access', true);
 
       // Test set operations
       const setResult = await testPage.evaluate(async () => {
@@ -1166,6 +1254,7 @@ class BrowserIntegrationTest {
       }
 
       console.log('✅ Set operations passed');
+      this.recordIndividualTest('Lexical storage set operations', true);
 
       // Test utility methods
       const utilityResult = await testPage.evaluate(async () => {
@@ -1205,6 +1294,7 @@ class BrowserIntegrationTest {
       }
 
       console.log('✅ Utility methods passed');
+      this.recordIndividualTest('Lexical storage utility methods (exists, keys, getPath)', true);
 
       console.log('\n✅ LEXICAL STORAGE INTERFACE TEST PASSED');
       this.recordTestResult('Lexical Storage Interface', true);
@@ -1318,8 +1408,27 @@ class BrowserIntegrationTest {
     this.testResults.total++;
     if (passed) {
       this.testResults.passed++;
+      log.success(testName);
     } else {
       this.testResults.failed++;
+      log.fail(testName, error);
+      if (error) {
+        this.testResults.errors.push(`${testName}: ${error}`);
+      }
+    }
+  }
+
+  /**
+   * Record individual test assertion
+   */
+  recordIndividualTest(testName, passed, error = null) {
+    this.individualTests.total++;
+    if (passed) {
+      this.individualTests.passed++;
+      log.info(`  ✅ ${testName}`);
+    } else {
+      this.individualTests.failed++;
+      log.info(`  ❌ ${testName}`);
       if (error) {
         this.testResults.errors.push(`${testName}: ${error}`);
       }
@@ -1416,6 +1525,7 @@ class BrowserIntegrationTest {
   async checkFinalPeerConnections() {
     console.log('🔗 Checking final peer connections...');
     let totalConnections = 0;
+    let peersWithConnections = 0;
     for (let i = 0; i < this.pages.length; i++) {
       const page = this.pages[i];
       const connectedCount = await page.$eval('#connected-peers-count', el =>
@@ -1423,10 +1533,18 @@ class BrowserIntegrationTest {
       );
       totalConnections += connectedCount;
       console.log(`🔗 Peer ${i + 1} has ${connectedCount} connections`);
+      // Record individual test for each peer having connections
+      const hasConnections = connectedCount > 0;
+      this.recordIndividualTest(`Peer ${i + 1} maintains network connections`, hasConnections, hasConnections ? null : 'Peer has no connections');
+      if (hasConnections) {
+        peersWithConnections++;
+      }
     }
     const avgConnections = totalConnections / this.pages.length;
     console.log(`📊 Average connections per peer: ${avgConnections.toFixed(2)}`);
-    this.recordTestResult('Peer Connections', avgConnections > 0);
+    // Record overall connection health test
+    const networkHealthy = avgConnections > 0 && peersWithConnections >= this.pages.length * 0.7; // At least 70% of peers connected
+    this.recordTestResult('Peer Connections', networkHealthy);
   }
   /**
    * Generate test report
@@ -1437,34 +1555,39 @@ class BrowserIntegrationTest {
       timestamp: new Date().toISOString(),
       totalPeers: NUM_PEERS,
       testResults: this.testResults,
+      individualTests: this.individualTests,
       summary: {
         passRate: ((this.testResults.passed / this.testResults.total) * 100).toFixed(2) + '%',
         totalTestSuites: this.testResults.total,
-        passed: this.testResults.passed,
-        failed: this.testResults.failed
+        totalIndividualTests: this.individualTests.total,
+        individualTestsPassRate: this.individualTests.total > 0 ? ((this.individualTests.passed / this.individualTests.total) * 100).toFixed(2) + '%' : '0%',
+        categoriesPassed: this.testResults.passed,
+        categoriesFailed: this.testResults.failed,
+        individualTestsPassed: this.individualTests.passed,
+        individualTestsFailed: this.individualTests.failed
       }
     };
-    console.log('\n📊 BROWSER INTEGRATION TEST REPORT');
-    console.log('='.repeat(60));
-    console.log(`Test Suites: ${report.summary.totalTestSuites}`);
-    console.log(`Passed: ${report.summary.passed}`);
-    console.log(`Failed: ${report.summary.failed}`);
-    console.log(`Pass Rate: ${report.summary.passRate}`);
-    console.log('');
-    console.log('🔍 Test Suites Covered:');
-    console.log('  • Messaging (broadcast & direct)');
-    console.log('  • WebDHT (distributed hash table)');
-    console.log('  • Crypto (key generation & self-test)');
-    console.log('  • Distributed Storage (multi-space)');
-    console.log('  • Media Streaming (single direction)');
-    console.log('  • 2-Way Media Streaming (bidirectional)');
-    console.log('  • Manual Connection (peer management)');
-    console.log('  • Settings (configuration)');
-    console.log('  • Health Check (system monitoring)');
-    console.log('  • Connection (peer network topology)');
+    log.always('\n📊 BROWSER INTEGRATION TEST REPORT');
+    log.always('='.repeat(60));
+    log.always(`Test Categories: ${report.summary.totalTestSuites} (${report.summary.categoriesPassed} passed, ${report.summary.categoriesFailed} failed)`);
+    log.always(`Individual Tests: ${report.summary.totalIndividualTests} (${report.summary.individualTestsPassed} passed, ${report.summary.individualTestsFailed} failed)`);
+    log.always(`Category Pass Rate: ${report.summary.passRate}`);
+    log.always(`Individual Test Pass Rate: ${report.summary.individualTestsPassRate}`);
+    log.always('');
+    log.always('🔍 Test Categories Covered:');
+    log.always('  • Messaging (broadcast & direct)');
+    log.always('  • WebDHT (distributed hash table)');
+    log.always('  • Crypto (key generation & self-test)');
+    log.always('  • Distributed Storage (multi-space)');
+    log.always('  • Media Streaming (single direction)');
+    log.always('  • 2-Way Media Streaming (bidirectional)');
+    log.always('  • Manual Connection (peer management)');
+    log.always('  • Settings (configuration)');
+    log.always('  • Health Check (system monitoring)');
+    log.always('  • Connection (peer network topology)');
     if (this.testResults.errors.length > 0) {
-      console.log('\n❌ ERRORS:');
-      this.testResults.errors.forEach(error => console.log(`  - ${error}`));
+      log.always('\n❌ ERRORS:');
+      this.testResults.errors.forEach(error => log.always(`  - ${error}`));
     }
     return report;
   }
@@ -1481,25 +1604,28 @@ class BrowserIntegrationTest {
     }
     const reportFile = path.join(reportsDir, `browser-integration-${Date.now()}.json`);
     await fs.writeFile(reportFile, JSON.stringify(report, null, 2));
-    console.log(`📄 Test report saved to: ${reportFile}`);
+    log.always(`📄 Test report saved to: ${reportFile}`);
   }
   /**
    * Cleanup resources
    */
 
   async cleanup() {
-    console.log('🧹 Cleaning up...');
+    log.info('🧹 Cleaning up...');
     if (this.browser) {
       await this.browser.close();
     }
-    if (this.signalingServer) {
+    if (this.signalingServer && !this.externalSignalingServer) {
       this.signalingServer.kill();
+      log.info('🛑 Stopped test signaling server');
+    } else if (this.externalSignalingServer) {
+      log.info('ℹ️  Left external signaling server running');
     }
     if (this.httpServer) {
       this.httpServer.close();
     }
 
-    console.log('✅ Cleanup completed');
+    log.info('✅ Cleanup completed');
   }
   /**
    * Main test runner
@@ -1507,25 +1633,27 @@ class BrowserIntegrationTest {
 
   async run() {
     const startTime = Date.now();
+    log.always('🧪 Starting comprehensive browser integration tests...');
+
     // Set test timeout
     const timeout = setTimeout(() => {
-      console.error('❌ Test timeout reached');
+      log.error('❌ Test timeout reached');
       process.exit(1);
     }, TEST_TIMEOUT);
     try {
       await this.runTests();
-      const report = this.generateTestReport();
-      await this.saveTestReport(report);
+      // const report = this.generateTestReport(); // Disabled: do not export browser integration reports
       const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-      console.log(`\n⏱️  Total test duration: ${duration}s`);
+      log.always(`\n⏱️  Total test duration: ${duration}s`);
+
       // Exit with appropriate code
       const exitCode = this.testResults.failed > 0 ? 1 : 0;
       clearTimeout(timeout);
       await this.cleanup();
-      console.log(exitCode === 0 ? '✅ All tests completed successfully!' : '❌ Some tests failed');
+      log.always(exitCode === 0 ? '✅ All tests completed successfully!' : '❌ Some tests failed');
       process.exit(exitCode);
     } catch (error) {
-      console.error('❌ Test runner failed:', error);
+      log.error('❌ Test runner failed:', error);
       clearTimeout(timeout);
       await this.cleanup();
       process.exit(1);

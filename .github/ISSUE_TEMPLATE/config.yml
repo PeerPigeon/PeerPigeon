@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Discussions
+    url: https://github.com/draeder/unsea/discussions
+    about: Ask questions, share ideas, or discuss the project
+  - name: 🔒 Private Security Report
+    url: https://github.com/draeder/unsea/security/advisories
+    about: Report security vulnerabilities privately (recommended for critical issues)
+  - name: 📚 Documentation
+    url: https://github.com/draeder/unsea#readme
+    about: Check the README and documentation first

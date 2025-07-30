@@ -1,0 +1,139 @@
+name: 🔒 Security Issue
+description: Report a security vulnerability (private disclosure recommended)
+title: "[Security]: "
+labels: ["security", "priority-high"]
+assignees:
+  - draeder
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        🚨 **IMPORTANT**: If this is a critical security vulnerability, please consider using private vulnerability disclosure instead of a public issue.
+        
+        You can report security issues privately by:
+        1. Going to the repository's Security tab
+        2. Clicking "Report a vulnerability"
+        3. Following the private disclosure process
+        
+        This ensures responsible disclosure and gives time to fix the issue before it becomes public.
+
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: 🔐 Disclosure Type
+      description: Please select the appropriate disclosure method
+      options:
+        - label: This is a low-risk security issue suitable for public discussion
+        - label: I have already reported this privately and am following up publicly
+        - label: I understand this should be private but am choosing public disclosure anyway
+    validations:
+      required: true
+
+  - type: textarea
+    id: vulnerability
+    attributes:
+      label: 🔍 Vulnerability Description
+      description: Describe the security vulnerability in detail
+      placeholder: Please provide a detailed description of the security issue...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: ⚠️ Severity Level
+      description: How severe do you consider this vulnerability?
+      options:
+        - "Low - Minimal impact"
+        - "Medium - Moderate impact" 
+        - "High - Significant impact"
+        - "Critical - Severe impact"
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: 💥 Impact Assessment
+      description: What is the potential impact of this vulnerability?
+      placeholder: |
+        - What data could be compromised?
+        - What operations could be affected?
+        - Who would be affected (all users, specific scenarios, etc.)?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 🔄 Steps to Reproduce
+      description: Provide steps to reproduce the vulnerability
+      placeholder: |
+        1. Step one...
+        2. Step two...
+        3. Observe the security issue...
+    validations:
+      required: true
+
+  - type: textarea
+    id: poc
+    attributes:
+      label: 🧪 Proof of Concept
+      description: If you have a proof of concept, provide it here (be careful not to expose sensitive details)
+      render: javascript
+      placeholder: |
+        // Proof of concept code (sanitize sensitive details)
+
+  - type: textarea
+    id: mitigation
+    attributes:
+      label: 🛡️ Suggested Mitigation
+      description: If you have suggestions for fixing this vulnerability, please provide them
+      placeholder: How do you think this vulnerability could be fixed?
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 🌍 Affected Environment
+      description: Which environments are affected?
+      placeholder: |
+        - Unsea version: [e.g. 1.1.2]
+        - Environment: [e.g. browser, Node.js, both]
+        - Platform: [e.g. all platforms, specific OS]
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: categories
+    attributes:
+      label: 🏷️ Vulnerability Categories
+      description: Which categories does this vulnerability fall into? (Check all that apply)
+      options:
+        - label: 🔑 Cryptographic weakness
+        - label: 🔐 Key management flaw
+        - label: 💾 Insecure storage
+        - label: 🌐 Cross-platform compatibility issue
+        - label: ⚡ Timing attack vulnerability
+        - label: 📝 Input validation bypass
+        - label: 🔄 Implementation flaw
+        - label: 📦 Dependency vulnerability
+        - label: 🌍 Browser-specific security issue
+        - label: 🔧 Configuration security issue
+
+  - type: textarea
+    id: references
+    attributes:
+      label: 📚 References
+      description: Any relevant security advisories, CVEs, or documentation
+      placeholder: |
+        - CVE-XXXX-XXXX
+        - https://example.com/security-advisory
+        - Related security research...
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: 📋 Additional Information
+      description: Any other information that might be relevant
+      placeholder: Any additional context about this security issue...

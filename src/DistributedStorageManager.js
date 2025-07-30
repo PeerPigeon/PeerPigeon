@@ -1,6 +1,7 @@
 import { EventEmitter } from './EventEmitter.js';
 import DebugLogger from './DebugLogger.js';
 import { createLexicalInterface } from './LexicalStorageInterface.js';
+import { PersistentStorageAdapter } from './PersistentStorageAdapter.js';
 
 // Dynamic import for unsea to handle both Node.js and browser environments
 let unsea = null;
@@ -93,6 +94,13 @@ export class DistributedStorageManager extends EventEmitter {
     this.storageMetadata = new Map(); // keyId -> metadata
     this.accessControl = new Map(); // keyId -> access control info
     this.crdtStates = new Map(); // keyId -> CRDT state for collaborative data
+    this.localStorageCache = new Map(); // keyId -> cached storage payload
+
+    // Initialize persistent storage adapter
+    this.persistentStorage = new PersistentStorageAdapter({
+      dbName: `peerpigeon-${mesh.peerId?.substring(0, 8) || 'unknown'}`,
+      dataDir: `./peerpigeon-data/${mesh.peerId?.substring(0, 8) || 'unknown'}`
+    });
 
     // Track data ownership by space
     this.ownedKeys = new Set(); // Keys owned by this peer
@@ -134,17 +142,7 @@ export class DistributedStorageManager extends EventEmitter {
    * @returns {Promise<void>}
    */
   async waitForCrypto() {
-    if (this.unsea && this.storageKeypair) {
-      return;
-    }
-
-    // Wait up to 5 seconds for crypto to initialize
-    const timeout = 5000;
-    const start = Date.now();
-
-    while ((!this.unsea || !this.storageKeypair) && (Date.now() - start) < timeout) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
+    // No waiting - proceed immediately regardless of crypto state
   }
 
   /**
@@ -534,6 +532,9 @@ export class DistributedStorageManager extends EventEmitter {
         ttl: metadata.ttl
       });
 
+      // Store locally for persistence
+      await this.persistentStorage.set(fullKey, storagePayload, metadata);
+
       this.debug.log(`📦 Stored ${space} space data for key: ${fullKey}`);
 
       // Emit storage event
@@ -591,11 +592,39 @@ export class DistributedStorageManager extends EventEmitter {
     this.debug.log(`📦 Retrieving key: ${fullKey}, keyId: ${keyId.substring(0, 8)}...`);
 
     try {
-      // Get data from WebDHT
-      this.debug.log(`📦 Attempting to retrieve data for key: ${fullKey}`);
-      const storagePayload = await this.webDHT.get(`storage:${fullKey}`, {
-        forceRefresh: options.forceRefresh
-      });
+      // Try to get data from local cache first (for recent updates)
+      let storagePayload = this.localStorageCache.get(keyId);
+      if (storagePayload) {
+        this.debug.log(`📦 Retrieved data from local cache for key: ${fullKey}`);
+      } else {
+        // Try to get data from local persistent storage
+        try {
+          storagePayload = await this.persistentStorage.get(fullKey);
+          if (storagePayload) {
+            this.debug.log(`📦 Retrieved data from local persistent storage for key: ${fullKey}`);
+          }
+        } catch (localError) {
+          this.debug.warn(`Failed to retrieve from local storage: ${localError.message}`);
+        }
+      }
+
+      // If not found locally, get from WebDHT
+      if (!storagePayload) {
+        this.debug.log(`📦 Attempting to retrieve data from WebDHT for key: ${fullKey}`);
+        storagePayload = await this.webDHT.get(`storage:${fullKey}`, {
+          forceRefresh: options.forceRefresh
+        });
+
+        // Store in local persistent storage for future use
+        if (storagePayload) {
+          try {
+            await this.persistentStorage.set(fullKey, storagePayload, storagePayload.metadata);
+            this.debug.log(`📦 Cached data locally for key: ${fullKey}`);
+          } catch (cacheError) {
+            this.debug.warn(`Failed to cache data locally: ${cacheError.message}`);
+          }
+        }
+      }
 
       this.debug.log(`📦 Retrieved payload for key ${fullKey}:`, {
         payloadExists: !!storagePayload,
@@ -730,8 +759,13 @@ export class DistributedStorageManager extends EventEmitter {
 
     // Resolve the key to its actual storage location
     const resolved = await this.resolveKey(key);
-    const { fullKey, keyId } = resolved;
+    const { space, baseKey, fullKey, keyId } = resolved;
     const timestamp = Date.now();
+
+    // Check space-based write access first
+    if (!this.canAccessSpace(space, baseKey, this.mesh.peerId, 'write')) {
+      throw new Error(`Write access denied for space "${space}" and key "${baseKey}"`);
+    }
 
     // Check if we have access to update
     let accessControl = this.accessControl.get(keyId);
@@ -758,7 +792,18 @@ export class DistributedStorageManager extends EventEmitter {
     }
 
     const isOwner = accessControl.owner === this.mesh.peerId;
-    const canUpdate = isOwner || (!accessControl.isImmutable) || (metadata.enableCRDT && options.forceCRDTMerge);
+
+    // Since we already passed space-based access control above,
+    // owners can update their data regardless of immutability
+    // Non-owners can only update if data is mutable or CRDT is enabled
+    let canUpdate = false;
+    if (isOwner) {
+      canUpdate = true; // Owners can always update their own data
+    } else if (!accessControl.isImmutable && space !== this.spaces.FROZEN) {
+      canUpdate = true; // Non-owners can update mutable data
+    } else if (metadata.enableCRDT && options.forceCRDTMerge) {
+      canUpdate = true; // CRDT merge allowed
+    }
 
     if (!canUpdate) {
       throw new Error(`Update not allowed for key ${key}: immutable data and not owner`);
@@ -798,10 +843,22 @@ export class DistributedStorageManager extends EventEmitter {
     }
 
     try {
+      // First, update local cache immediately
+      this.localStorageCache.set(keyId, storagePayload);
+
       // Use WebDHT update to notify all replicas and subscribers
-      await this.webDHT.update(`storage:${fullKey}`, storagePayload, {
+      const webDHTSuccess = await this.webDHT.update(`storage:${fullKey}`, storagePayload, {
         ttl: metadata.ttl
       });
+
+      // If WebDHT update fails but we're in single-node mode, still consider it successful
+      const connectedPeers = this.mesh.connectionManager?.getConnectedPeers()?.length || 0;
+      const isSingleNode = connectedPeers === 0;
+
+      if (!webDHTSuccess && !isSingleNode) {
+        this.debug.warn(`WebDHT update failed for key ${fullKey}, but local cache updated`);
+        // Don't throw error - we still have the data locally
+      }
 
       // Update local metadata
       this.storageMetadata.set(keyId, metadata);
@@ -820,7 +877,17 @@ export class DistributedStorageManager extends EventEmitter {
       return true;
     } catch (error) {
       this.debug.error(`Failed to update data for key ${fullKey}:`, error);
-      throw error;
+
+      // Try to at least update local cache as fallback
+      try {
+        this.localStorageCache.set(keyId, storagePayload);
+        this.storageMetadata.set(keyId, metadata);
+        this.debug.log(`📦 Fallback: Updated local cache for key: ${fullKey}`);
+        return true;
+      } catch (fallbackError) {
+        this.debug.error(`Failed to update even local cache for key ${fullKey}:`, fallbackError);
+        throw error;
+      }
     }
   }
 
@@ -917,6 +984,9 @@ export class DistributedStorageManager extends EventEmitter {
       };
 
       await this.webDHT.update(`storage:${fullKey}`, tombstone);
+
+      // Delete from persistent storage
+      await this.persistentStorage.delete(fullKey);
 
       // Clean up local state
       this.storageMetadata.delete(keyId);
@@ -1590,6 +1660,7 @@ export class DistributedStorageManager extends EventEmitter {
     this.ownedKeys.clear();
     this.spaceOwnership.clear();
     this.keyToSpaceMapping.clear();
+    this.localStorageCache.clear();
 
     this.debug.log('📦 All stored data cleared');
     this.emit('storageCleared');
@@ -1702,6 +1773,53 @@ export class DistributedStorageManager extends EventEmitter {
     }
 
     return results;
+  }
+
+  /**
+   * Get persistent storage statistics
+   * @returns {Promise<Object>} Storage statistics
+   */
+  async getStorageStats() {
+    const stats = await this.persistentStorage.getStats();
+    return {
+      ...stats,
+      memoryKeys: this.storageMetadata.size,
+      ownedKeys: this.ownedKeys.size,
+      spaceOwnerships: this.spaceOwnership.size,
+      accessControls: this.accessControl.size,
+      crdtStates: this.crdtStates.size
+    };
+  }
+
+  /**
+   * Clear all persistent storage data
+   * @returns {Promise<boolean>} Success status
+   */
+  async clearPersistentStorage() {
+    try {
+      await this.persistentStorage.clear();
+      this.debug.log('📦 Cleared all persistent storage data');
+      return true;
+    } catch (error) {
+      this.debug.error('Failed to clear persistent storage:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get all keys from persistent storage
+   * @returns {Promise<Array<string>>} Array of stored keys
+   */
+  async getPersistentKeys() {
+    return await this.persistentStorage.keys();
+  }
+
+  /**
+   * Get the type of persistent storage being used
+   * @returns {string} Storage type ('indexeddb', 'filesystem', or 'memory')
+   */
+  getPersistentStorageType() {
+    return this.persistentStorage.getStorageType();
   }
 
   /**

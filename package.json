@@ -18,8 +18,12 @@
     "lint:fix": "eslint --cache --cache-location .eslintcache src/ examples/ websocket-server/ --ext .js --fix",
     "test": "node test/test-reporter.js",
     "test:storage": "node examples/node/storage-test.js",
+    "test:persistent": "node test/persistent-storage-test.js",
     "test:browser": "node test/browser-integration-test.js",
     "test:browser:headless": "HEADLESS=true node test/browser-integration-test.js",
+    "test:browser:quiet": "HEADLESS=true QUIET=true node test/browser-integration-test.js",
+    "test:browser:alt-ports": "./test/run-browser-test.sh --signaling-port 3001 --http-port 8081",
+    "test:browser:external": "./test/run-browser-test.sh --quiet",
     "test:legacy": "npm run test:storage && npm run test:browser:headless",
     "ci": "npm run lint && npm run test",
     "prepublishOnly": "npm run ci"
@@ -62,7 +66,7 @@
   "homepage": "https://github.com/draeder/peerpigeon#readme",
   "dependencies": {
     "@koush/wrtc": "^0.5.3",
-    "unsea": "^1.1.0",
+    "unsea": "^1.1.2",
     "ws": "^8.18.0",
     "yamljs": "^0.3.0"
   },
@@ -70,7 +74,7 @@
     "concurrently": "^9.2.0",
     "eslint": "^8.57.1",
     "eslint-config-standard": "^17.1.0",
-    "express": "^4.19.2",
+    "express": "^5.1.0",
     "jsdoc": "^4.0.4",
     "puppeteer": "^22.0.0"
   },
