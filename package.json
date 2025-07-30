@@ -76,7 +76,7 @@
     "eslint-config-standard": "^17.1.0",
     "express": "^4.19.2",
     "jsdoc": "^4.0.4",
-    "puppeteer": "^22.0.0"
+    "puppeteer": "^24.15.0"
   },
   "engines": {
     "node": ">=20.0.0"
