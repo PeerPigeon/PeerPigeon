@@ -1,0 +1,27 @@
+name: "PeerPigeon Security Analysis"
+
+disable-default-queries: false
+
+queries:
+  - uses: security-and-quality
+  - uses: security-extended
+
+query-filters:
+  - exclude:
+      id: js/incomplete-sanitization
+  - exclude:
+      id: js/incomplete-multi-character-sanitization
+
+paths:
+  - src/
+  - test/
+  - examples/
+  - server/
+  - websocket-server/
+
+paths-ignore:
+  - node_modules/
+  - docs/
+  - peerpigeon-data/
+
+# Use built-in query suites for JavaScript/Node.js security scanning

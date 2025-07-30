@@ -1,5 +1,4 @@
 import { EventEmitter } from './EventEmitter.js';
-import { environmentDetector } from './EnvironmentDetector.js';
 import DebugLogger from './DebugLogger.js';
 
 /**
@@ -464,29 +463,14 @@ export class GossipManager extends EventEmitter {
      * Clean up expired messages
      */
   startCleanupTimer() {
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-    }
-
-    if (environmentDetector.isBrowser) {
-      this.cleanupTimer = window.setInterval(() => {
-        this.cleanupExpiredMessages();
-      }, this.cleanupInterval);
-    } else {
-      this.cleanupTimer = setInterval(() => {
-        this.cleanupExpiredMessages();
-      }, this.cleanupInterval);
-    }
+    // No periodic cleanup - perform immediate cleanup when needed
   }
 
   /**
      * Stop cleanup timer
      */
   stopCleanupTimer() {
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-      this.cleanupTimer = null;
-    }
+    // No timer to stop
   }
 
   cleanupExpiredMessages() {
