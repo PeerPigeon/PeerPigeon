@@ -9,6 +9,7 @@ import { spawn } from 'child_process';
 
 class TestReporter {
   constructor() {
+    this.externalSignalingServer = false; // Track if we're using an external server
     this.results = {
       storage: {
         totalTests: 0,
@@ -110,18 +111,36 @@ class TestReporter {
    * Parse browser test results from output
    */
   parseBrowserResults(output) {
-    // Look for "Test Categories:" instead of "Test Suites:"
-    const suitesMatch = output.match(/Test Categories:\s*(\d+)/);
-    const passedMatch = output.match(/Passed:\s*(\d+)/);
-    const failedMatch = output.match(/Failed:\s*(\d+)/);
+    // Look for "Test Categories: X (Y passed, Z failed)" format
+    const categoriesMatch = output.match(/Test Categories:\s*(\d+)\s*\((\d+)\s*passed,\s*(\d+)\s*failed\)/);
 
-    if (suitesMatch && passedMatch && failedMatch) {
-      this.results.browser.totalSuites = parseInt(suitesMatch[1]);
-      this.results.browser.passed = parseInt(passedMatch[1]);
-      this.results.browser.failed = parseInt(failedMatch[1]);
-      // Only set to false if there are failures and suites were run
-      if (this.results.browser.totalSuites > 0 && this.results.browser.failed > 0) {
+    if (categoriesMatch) {
+      const totalSuites = parseInt(categoriesMatch[1]);
+      const passed = parseInt(categoriesMatch[2]);
+      const failed = parseInt(categoriesMatch[3]);
+
+      this.results.browser.totalSuites = totalSuites;
+      this.results.browser.passed = passed;
+      this.results.browser.failed = failed;
+
+      // Set success to false if there are failures
+      if (totalSuites > 0 && failed > 0) {
         this.results.browser.success = false;
+      }
+    } else {
+      // Fallback: try old format patterns
+      const suitesMatch = output.match(/Test Categories:\s*(\d+)/);
+      const passedMatch = output.match(/Passed:\s*(\d+)/);
+      const failedMatch = output.match(/Failed:\s*(\d+)/);
+
+      if (suitesMatch && passedMatch && failedMatch) {
+        this.results.browser.totalSuites = parseInt(suitesMatch[1]);
+        this.results.browser.passed = parseInt(passedMatch[1]);
+        this.results.browser.failed = parseInt(failedMatch[1]);
+        // Only set to false if there are failures and suites were run
+        if (this.results.browser.totalSuites > 0 && this.results.browser.failed > 0) {
+          this.results.browser.success = false;
+        }
       }
     }
   }
@@ -204,33 +223,139 @@ class TestReporter {
   }
 
   /**
+   * Start the signaling server for tests that need it
+   */
+  async startSignalingServer() {
+    const SIGNALING_PORT = process.env.SIGNALING_PORT ? parseInt(process.env.SIGNALING_PORT) : 3000;
+
+    console.log(`🚀 Starting signaling server on port ${SIGNALING_PORT}...`);
+
+    // Check if signaling server is already running
+    const { spawn } = await import('child_process');
+    const { WebSocket } = await import('ws');
+
+    const checkPortInUse = async (port) => {
+      try {
+        const ws = new WebSocket(`ws://localhost:${port}`);
+        return new Promise((resolve) => {
+          const timeout = setTimeout(() => {
+            ws.close();
+            resolve(false);
+          }, 1000);
+
+          ws.on('open', () => {
+            clearTimeout(timeout);
+            ws.close();
+            resolve(true);
+          });
+
+          ws.on('error', () => {
+            clearTimeout(timeout);
+            resolve(false);
+          });
+        });
+      } catch (error) {
+        return false;
+      }
+    };
+
+    const signalingServerRunning = await checkPortInUse(SIGNALING_PORT);
+    if (signalingServerRunning) {
+      console.log(`🔄 Signaling server already running on port ${SIGNALING_PORT}, using existing server`);
+      this.externalSignalingServer = true;
+      return null;
+    }
+
+    // Start signaling server
+    const signalingServer = spawn('node', ['websocket-server/server.js'], {
+      stdio: 'pipe',
+      env: { ...process.env, PORT: SIGNALING_PORT }
+    });
+
+    // Add error handling
+    signalingServer.on('error', (error) => {
+      console.error('❌ Signaling server error:', error);
+    });
+
+    signalingServer.on('exit', (code, _signal) => {
+      if (code !== 0 && code !== null) {
+        console.error(`❌ Signaling server exited with code ${code}`);
+      }
+    });
+
+    // Wait for server to start
+    console.log('⏳ Waiting for signaling server to start...');
+    const maxAttempts = 30;
+    let attempts = 0;
+    while (attempts < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const isRunning = await checkPortInUse(SIGNALING_PORT);
+      if (isRunning) {
+        console.log(`✅ Signaling server started successfully on port ${SIGNALING_PORT}`);
+        this.externalSignalingServer = false;
+        return signalingServer;
+      }
+      attempts++;
+    }
+
+    throw new Error(`Signaling server failed to start within ${maxAttempts} seconds`);
+  }
+
+  /**
+   * Stop the signaling server if we started it
+   */
+  async stopSignalingServer(signalingServer) {
+    if (signalingServer && !this.externalSignalingServer) {
+      console.log('🛑 Stopping signaling server...');
+      signalingServer.kill();
+      // Give it a moment to shut down
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } else if (this.externalSignalingServer) {
+      console.log('ℹ️  Left external signaling server running');
+    }
+  }
+
+  /**
    * Run all tests and generate comprehensive report
    */
   async runAllTests() {
     console.log('🚀 Starting PeerPigeon Test Suite...\n');
 
+    let signalingServer = null;
+
     try {
-      // Run storage tests
-      console.log('📦 Running Distributed Storage Tests...');
+      // Start signaling server first for ALL P2P tests
+      signalingServer = await this.startSignalingServer();
+
+      // Run distributed storage tests (NEED signaling server for P2P functionality)
+      console.log('\n📦 Running Distributed Storage Tests...');
       const storageResult = await this.runCommand('npm', ['run', 'test:storage']);
       this.parseStorageResults(storageResult.stdout);
 
-      // Run persistent storage tests
+      // Run persistent storage tests (local storage - doesn't need signaling server)
       console.log('\n💾 Running Persistent Storage Tests...');
       const persistentResult = await this.runCommand('node', ['test/persistent-storage-test.js']);
       this.parsePersistentResults(persistentResult.stdout);
 
+      // Run browser integration tests (NEED signaling server for P2P functionality)
       console.log('\n🌐 Running Browser Integration Tests...');
-      const browserResult = await this.runCommand('npm', ['run', 'test:browser:headless']);
+      const browserResult = await this.runCommand('npm', ['run', 'test:browser:external']);
       this.parseBrowserResults(browserResult.stdout);
 
       // Generate comprehensive summary
       const overallSuccess = this.printSummary();
 
+      // Stop signaling server
+      await this.stopSignalingServer(signalingServer);
+
       // Exit with appropriate code
       process.exit(overallSuccess ? 0 : 1);
     } catch (error) {
       console.error('❌ Test execution failed:', error.message);
+
+      // Clean up signaling server on error
+      await this.stopSignalingServer(signalingServer);
+
       process.exit(1);
     }
   }

@@ -640,6 +640,9 @@ export class PeerPigeonMesh extends EventEmitter {
       clearInterval(this.connectionMonitorInterval);
     }
 
+    // Counter for periodic mesh optimization (every 3rd cycle)
+    this.monitoringCycleCount = 0;
+
     // Environment-aware timer
     const intervalCallback = () => {
       if (this.signalingClient) {
@@ -657,6 +660,13 @@ export class PeerPigeonMesh extends EventEmitter {
 
         // Emit connection status for UI
         this.emit('connectionStats', stats);
+
+        // Optimize mesh connections periodically (every 3rd cycle = every 6 minutes)
+        this.monitoringCycleCount = (this.monitoringCycleCount || 0) + 1;
+        if (this.peerDiscovery && this.autoDiscovery && this.monitoringCycleCount % 3 === 0) {
+          this.debug.log('Periodic mesh optimization triggered');
+          this.peerDiscovery.optimizeMeshConnections(this.connectionManager.peers);
+        }
       }
     };
 

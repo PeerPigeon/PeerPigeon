@@ -70,10 +70,10 @@ class MaxPeersTest {
 
     for (let i = 0; i < NUM_PEERS; i++) {
       const page = await this.browser.newPage();
-      
+
       await page.goto(`http://localhost:${HTTP_PORT}/examples/browser/index.html?api=ws://localhost:${SIGNALING_PORT}`);
       await page.waitForSelector('#peer-id', { timeout: 30000 });
-      
+
       await page.evaluate((signalingUrl) => {
         if (window.peerPigeonUI && window.peerPigeonUI.setSignalingServer) {
           window.peerPigeonUI.setSignalingServer(signalingUrl);
@@ -82,7 +82,7 @@ class MaxPeersTest {
 
       this.pages.push(page);
       console.log(`📄 Page ${i + 1} initialized`);
-      
+
       await new Promise(resolve => setTimeout(resolve, 500));
     }
     console.log('✅ Browser initialized with all pages');
@@ -93,15 +93,15 @@ class MaxPeersTest {
     for (let i = 0; i < this.pages.length; i++) {
       const page = this.pages[i];
       await page.bringToFront();
-      
+
       await page.waitForSelector('#connect-btn', { visible: true, timeout: 5000 });
       await page.click('#connect-btn');
-      
+
       await page.waitForFunction(() => {
         const status = document.querySelector('#status');
         return status && status.textContent === 'Connected';
       }, { timeout: 30000 });
-      
+
       console.log(`✅ Peer ${i + 1} connected to signaling server`);
       await new Promise(resolve => setTimeout(resolve, 1500));
     }
@@ -111,7 +111,7 @@ class MaxPeersTest {
   async waitForPeerDiscovery() {
     console.log('🔍 Waiting for peer discovery...');
     await new Promise(resolve => setTimeout(resolve, 5000));
-    
+
     for (let i = 0; i < this.pages.length; i++) {
       const page = this.pages[i];
       const connectedCount = await page.$eval('#connected-peers-count', el =>
@@ -124,69 +124,69 @@ class MaxPeersTest {
 
   async testMaxPeersEnforcement() {
     console.log('🧪 Testing maxPeers enforcement...');
-    
+
     // Step 1: Check initial connections (should be limited to 3)
     console.log('\n📊 INITIAL CONNECTION COUNTS (maxPeers=3):');
     let allWithinLimit = true;
-    
+
     for (let i = 0; i < this.pages.length; i++) {
       const page = this.pages[i];
       const connectedCount = await page.$eval('#connected-peers-count', el =>
         parseInt(el.textContent) || 0
       );
-      
+
       const status = connectedCount <= 3 ? '✅' : '❌';
       console.log(`  ${status} Peer ${i + 1}: ${connectedCount}/3 connections`);
-      
+
       if (connectedCount > 3) {
         allWithinLimit = false;
       }
     }
-    
+
     if (!allWithinLimit) {
       throw new Error('Some peers exceeded maxPeers=3 limit');
     }
-    
+
     // Step 2: Change maxPeers to 2 and verify eviction
     console.log('\n🔧 Changing maxPeers to 2 and testing eviction...');
     const testPage = this.pages[0];
     await testPage.bringToFront();
-    
+
     await testPage.click('#settings-toggle');
     await new Promise(resolve => setTimeout(resolve, 1000));
-    
+
     await testPage.click('#max-peers', { clickCount: 3 });
     await testPage.type('#max-peers', '2');
-    
+
     // Wait for eviction to take effect
     await new Promise(resolve => setTimeout(resolve, 3000));
-    
+
     // Check if peer 1 now has <= 2 connections
     const newConnectionCount = await testPage.$eval('#connected-peers-count', el =>
       parseInt(el.textContent) || 0
     );
-    
+
     console.log(`📊 Peer 1 after setting maxPeers=2: ${newConnectionCount}/2 connections`);
-    
+
     if (newConnectionCount > 2) {
       throw new Error(`Peer 1 has ${newConnectionCount} connections but maxPeers=2`);
     }
-    
+
     // Step 3: Change maxPeers to 4 and verify more connections can be made
     console.log('\n🔧 Changing maxPeers to 4 and testing expansion...');
-    
+
     await testPage.click('#max-peers', { clickCount: 3 });
     await testPage.type('#max-peers', '4');
-    
+
     // Wait for new connections to be established
     await new Promise(resolve => setTimeout(resolve, 5000));
-    
+
     const finalConnectionCount = await testPage.$eval('#connected-peers-count', el =>
       parseInt(el.textContent) || 0
     );
-    
+
     console.log(`📊 Peer 1 after setting maxPeers=4: ${finalConnectionCount}/4 connections`);
-    
+
     console.log('\n✅ MaxPeers enforcement test PASSED');
     return true;
   }
@@ -212,7 +212,7 @@ class MaxPeersTest {
       await this.connectAllPeers();
       await this.waitForPeerDiscovery();
       await this.testMaxPeersEnforcement();
-      
+
       console.log('\n🎉 MaxPeers test completed successfully!');
       await this.cleanup();
       process.exit(0);

@@ -3041,7 +3041,8 @@ export class PeerPigeonUI {
     if (!peersList || !connectedPeersCount) return;
 
     const peers = this.mesh.getPeers();
-    connectedPeersCount.textContent = peers.length;
+    const connectedPeers = peers.filter(peer => peer.status === 'connected');
+    connectedPeersCount.textContent = connectedPeers.length;
 
     if (peers.length === 0) {
       peersList.innerHTML = '<p class="empty-state">No peers connected</p>';

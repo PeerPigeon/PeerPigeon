@@ -185,7 +185,14 @@ export class WebDHT extends EventEmitter {
     this.debug.log(`DHT PUT: Auto-subscribed to ${key} for future updates`);
 
     // Find the closest peers to store this key for replication
-    const closestPeers = await this.findClosestPeers(keyId, this.config.k); // Get more peers initially
+    const closestPeers = await this.findClosestPeers(keyId, Math.max(this.config.k, 5)); // Get at least 5 peers if available
+
+    // If we have very few peers, still try to replicate to what we have
+    const availablePeers = closestPeers.filter(peerId => peerId !== this.peerId);
+    if (availablePeers.length === 0) {
+      this.debug.log(`DHT PUT: No other peers available for replication of ${key}, storing locally only`);
+      return true; // Still consider this successful since we stored locally
+    }
 
     // Implement iterative storage for better replication success
     return await this.performIterativePut(keyId, storeData, closestPeers);
@@ -800,12 +807,12 @@ export class WebDHT extends EventEmitter {
       this.debug.log(`🔥 DHT Sending ${type} to ${targetPeerId.substring(0, 8)} with messageId ${messageId}`);
       this.debug.log('🔥 DHT Request data being sent:', { ...data, messageId });
 
-      // Set up response handler
+      // Set up response handler with longer timeout for better reliability
       const timeout = safeSetTimeout(() => {
         this.debug.log(`🔥 DHT Timeout for messageId ${messageId} to peer ${targetPeerId.substring(0, 8)}`);
         this.removeResponseHandler(messageId);
         reject(new Error('DHT message timeout'));
-      }, 5000);
+      }, 10000); // Increased to 10 seconds for better reliability
 
       this.setResponseHandler(messageId, (response) => {
         this.debug.log(`🔥 DHT Response received for ${type} messageId ${messageId}:`, response);
@@ -847,7 +854,15 @@ export class WebDHT extends EventEmitter {
       this.debug.log(`DHT: Successfully sent direct message to ${targetPeerId.substring(0, 8)}`);
       return true;
     } else {
-      this.debug.log(`DHT: No direct connection to ${targetPeerId.substring(0, 8)}, using Kademlia routing`);
+      this.debug.log(`DHT: No direct connection to ${targetPeerId.substring(0, 8)}, trying alternative routing methods`);
+
+      // Try to see if we have any connected peers that might route the message
+      const connectedPeers = this.mesh.connectionManager.getConnectedPeers();
+
+      if (connectedPeers.length === 0) {
+        this.debug.warn(`DHT: No connected peers available for routing to ${targetPeerId.substring(0, 8)}`);
+        return false;
+      }
 
       // Use gossip/routing mechanism to reach the target peer
       // Create a special DHT routing message that will be forwarded through the mesh
@@ -862,7 +877,7 @@ export class WebDHT extends EventEmitter {
         path: [this.peerId] // Track routing path
       };
 
-      this.debug.log(`DHT: Routing message to ${targetPeerId.substring(0, 8)} via gossip network`);
+      this.debug.log(`DHT: Routing message to ${targetPeerId.substring(0, 8)} via gossip network (${connectedPeers.length} potential routes)`);
       this.mesh.gossipManager.propagateMessage(routingMessage);
       return true;
     }
@@ -1222,8 +1237,16 @@ export class WebDHT extends EventEmitter {
      * Perform iterative storage for PUT operations with better replication
      */
   async performIterativePut(keyId, storeData, closestPeers) {
-    const targetReplicas = this.config.replicationFactor;
+    let targetReplicas = this.config.replicationFactor;
     const availablePeers = closestPeers.filter(peerId => peerId !== this.peerId);
+
+    // Adjust target replicas based on available peers
+    targetReplicas = Math.min(targetReplicas, availablePeers.length);
+
+    if (targetReplicas === 0) {
+      this.debug.log(`DHT Iterative PUT: No peers available for replication of ${storeData.key}, local storage only`);
+      return true; // Local storage already completed
+    }
 
     this.debug.log(`DHT Iterative PUT: Attempting to store ${storeData.key} on ${targetReplicas} of ${availablePeers.length} available peers`);
 
@@ -1270,7 +1293,8 @@ export class WebDHT extends EventEmitter {
       }
     }
 
-    this.debug.log(`DHT PUT completed: ${successful}/${targetReplicas} target replicas stored (${attempted} peers attempted)`);
-    return successful > 0;
+    const success = successful > 0 || targetReplicas === 0; // Success if we stored on at least one peer OR no peers available
+    this.debug.log(`DHT PUT completed: ${successful}/${targetReplicas} target replicas stored (${attempted} peers attempted) - ${success ? 'SUCCESS' : 'FAILED'}`);
+    return success;
   }
 }

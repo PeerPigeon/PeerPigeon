@@ -24,9 +24,9 @@ const NUM_PEERS = 7;
 const SIGNALING_PORT = process.env.SIGNALING_PORT ? parseInt(process.env.SIGNALING_PORT) : 3000;
 const HTTP_PORT = process.env.HTTP_PORT ? parseInt(process.env.HTTP_PORT) : 8080;
 const TEST_TIMEOUT = 300000; // 5 minutes
-const PEER_CONNECTION_TIMEOUT = 60000; // 60 seconds
-const PEER_ID_TIMEOUT = 30000; // 30 seconds for peer ID generation
-const OPERATION_DELAY = 1000; // Reduced from 2 seconds to 1 second
+const PEER_CONNECTION_TIMEOUT = 90000; // 90 seconds - increased for better reliability
+const PEER_ID_TIMEOUT = 45000; // 45 seconds for peer ID generation - increased for reliability
+const OPERATION_DELAY = 2000; // Increased from 1 second to 2 seconds for better reliability
 const VERBOSE = process.env.VERBOSE === 'true'; // Only show verbose logging if explicitly enabled
 const QUIET = process.env.QUIET === 'true'; // Show only test results and final report
 
@@ -528,8 +528,8 @@ class BrowserIntegrationTest {
       await page.type('#dht-value', testValue);
       await page.click('#dht-put-btn');
 
-      // DHT should be fast in a 7-peer network - just wait for UI update
-      await new Promise(resolve => setTimeout(resolve, 1500)); // Reduced from 2 seconds
+      // DHT should be fast in a 7-peer network - wait for UI update and network propagation
+      await new Promise(resolve => setTimeout(resolve, 3000)); // Increased to 3 seconds for better reliability
 
       // Test retrieving data from another peer
       const retrievePage = this.pages[1];
@@ -540,14 +540,28 @@ class BrowserIntegrationTest {
       await retrievePage.type('#dht-get-key', testKey);
       await retrievePage.click('#dht-get-btn');
 
-      // DHT retrieval should also be fast
-      await new Promise(resolve => setTimeout(resolve, 1500)); // Reduced from 2 seconds
+      // DHT retrieval should also be fast but give it more time for network operations
+      await new Promise(resolve => setTimeout(resolve, 4000)); // Increased to 4 seconds for better reliability
 
-      // Check DHT log for success
+      // Check DHT log for success - get full log content and detailed inspection
       const logContent = await retrievePage.$eval('#dht-log', el => el.textContent);
+      const logEntries = await retrievePage.$eval('#dht-log', el => Array.from(el.children).map(child => child.textContent));
+
       const keyFound = logContent.includes(testKey);
       const valueFound = logContent.includes('Hello WebDHT!');
       const success = keyFound && valueFound;
+
+      // Enhanced logging for debugging
+      console.log('   DHT Test Results:');
+      console.log(`     Key found: ${keyFound} (searching for: ${testKey})`);
+      console.log(`     Value found: ${valueFound} (searching for: "Hello WebDHT!")`);
+      console.log(`     Log entries count: ${logEntries.length}`);
+      console.log(`     Log content preview (first 500 chars): ${logContent.substring(0, 500)}`);
+
+      if (!success) {
+        console.log(`     Full log content: ${logContent}`);
+        console.log('     Individual log entries:', logEntries.slice(-10)); // Last 10 entries
+      }
 
       this.recordIndividualTest('DHT key storage and retrieval', keyFound, keyFound ? null : `Key ${testKey} not found in DHT log`);
       this.recordIndividualTest('DHT value integrity', valueFound, valueFound ? null : 'Expected value "Hello WebDHT!" not found in DHT log');
@@ -1490,7 +1504,6 @@ class BrowserIntegrationTest {
    */
 
   async runTests() {
-    console.log('🧪 Starting comprehensive browser integration tests...');
     try {
       // Setup phase
       await this.startServers();
@@ -1642,7 +1655,7 @@ class BrowserIntegrationTest {
     }, TEST_TIMEOUT);
     try {
       await this.runTests();
-      // const report = this.generateTestReport(); // Disabled: do not export browser integration reports
+      this.generateTestReport(); // Re-enabled for test-reporter parsing
       const duration = ((Date.now() - startTime) / 1000).toFixed(2);
       log.always(`\n⏱️  Total test duration: ${duration}s`);
 

@@ -2,7 +2,7 @@ import { PeerPigeonMesh } from '../src/PeerPigeonMesh.js';
 
 async function testDistributedPersistentStorage() {
   console.log('🧪 Testing Distributed Storage with Persistence...');
-  
+
   try {
     // Create a mesh instance
     const mesh = new PeerPigeonMesh({

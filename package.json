@@ -15,7 +15,7 @@
     "start": "node websocket-server/server.js",
     "server": "node websocket-server/server.js",
     "lint": "node -c src/*.js examples/**/*.js websocket-server/*.js",
-    "lint:fix": "eslint --cache --cache-location .eslintcache src/ examples/ websocket-server/ --ext .js --fix",
+    "lint:fix": "eslint --cache --cache-location .eslintcache test/ src/ examples/ websocket-server/ --ext .js --fix",
     "test": "node test/test-reporter.js",
     "test:storage": "node examples/node/storage-test.js",
     "test:persistent": "node test/persistent-storage-test.js",
@@ -79,6 +79,6 @@
     "puppeteer": "^22.0.0"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=20.0.0"
   }
 }

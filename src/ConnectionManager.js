@@ -60,11 +60,12 @@ export class ConnectionManager extends EventEmitter {
     // Check retry cooldown (only apply after first attempt)
     const now = Date.now();
     const attempts = this.connectionAttempts.get(targetPeerId) || 0;
+    const connectedCount = this.getConnectedPeerCount(); // Calculate once and reuse
+
     if (attempts > 0) {
       const lastAttempt = this.lastConnectionAttempt.get(targetPeerId) || 0;
 
       // Use shorter delay for isolated peers to help them connect faster
-      const connectedCount = this.getConnectedPeerCount();
       const retryDelay = connectedCount === 0 ? 500 : this.retryDelay; // 500ms for isolated peers, 1500ms otherwise
 
       if (now - lastAttempt < retryDelay) {
@@ -74,9 +75,10 @@ export class ConnectionManager extends EventEmitter {
       }
     }
 
-    // Check connection attempt count
-    if (attempts >= this.maxConnectionAttempts) {
-      this.mesh.emit('statusChanged', { type: 'warning', message: `Max connection attempts reached for ${targetPeerId.substring(0, 8)}...` });
+    // Check connection attempt count - be more lenient with isolated peers
+    const maxAttempts = connectedCount === 0 ? 5 : this.maxConnectionAttempts; // 5 attempts for isolated peers
+    if (attempts >= maxAttempts) {
+      this.mesh.emit('statusChanged', { type: 'warning', message: `Max connection attempts reached for ${targetPeerId.substring(0, 8)}... (${attempts}/${maxAttempts}, isolated: ${connectedCount === 0})` });
       this.mesh.peerDiscovery.removeDiscoveredPeer(targetPeerId);
       return;
     }
@@ -86,11 +88,12 @@ export class ConnectionManager extends EventEmitter {
     this.lastConnectionAttempt.set(targetPeerId, now);
     this.mesh.peerDiscovery.trackConnectionAttempt(targetPeerId);
 
-    // Set connection timeout - longer for media-enabled connections
+    // Set connection timeout - longer for media-enabled connections and extra time for isolated peers
     const hasMedia = this.mesh.mediaManager.localStream !== null;
-    const timeoutDuration = hasMedia ? 45000 : 30000; // 45s for media, 30s for data-only
+    const baseTimeout = hasMedia ? 60000 : 45000; // 60s for media, 45s for data-only (increased)
+    const timeoutDuration = connectedCount === 0 ? baseTimeout + 15000 : baseTimeout; // Extra 15s for isolated peers
 
-    this.debug.log(`Setting connection timeout for ${targetPeerId.substring(0, 8)}... - ${timeoutDuration / 1000}s (media: ${hasMedia})`);
+    this.debug.log(`Setting connection timeout for ${targetPeerId.substring(0, 8)}... - ${timeoutDuration / 1000}s (media: ${hasMedia}, isolated: ${connectedCount === 0})`);
 
     const timeoutId = setTimeout(() => {
       if (this.peers.has(targetPeerId)) {
@@ -1091,12 +1094,52 @@ export class ConnectionManager extends EventEmitter {
    * Start monitoring for stuck connections
    */
   startStuckConnectionMonitoring() {
-    // Check every 15 seconds for stuck connections
+    // Check every 5 seconds for stuck connections (more aggressive)
     setInterval(() => {
       this.monitorAndFixStuckConnections();
-    }, 15000);
+    }, 5000);
 
-    this.debug.log('🔍 Started stuck connection monitoring');
+    // Additional check specifically for isolated peers every 10 seconds
+    setInterval(() => {
+      this.checkForIsolatedPeer();
+    }, 10000);
+
+    this.debug.log('🔍 Started stuck connection monitoring (5s intervals) and isolation monitoring (10s intervals)');
+  }
+
+  /**
+   * Check specifically for isolated peers and force aggressive reconnection
+   */
+  checkForIsolatedPeer() {
+    const activeConnections = this.getActiveConnections().length;
+
+    if (activeConnections === 0) {
+      const availablePeers = this.mesh.peerDiscovery.getAvailablePeers();
+      this.debug.warn(`🚨 ISOLATED PEER DETECTED: ${activeConnections} connections, ${availablePeers.length} peers available`);
+
+      // Clear existing connection attempts to reset retry logic
+      this.connectionAttempts.clear();
+      this.lastConnectionAttempt.clear();
+
+      // Attempt connections to up to 3 peers with staggered timing
+      const peersToTry = availablePeers.slice(0, 3);
+      peersToTry.forEach((peerId, index) => {
+        setTimeout(() => {
+          this.debug.log(`🚀 Emergency connection attempt to ${peerId.substring(0, 8)}...`);
+          this.connectToPeer(peerId);
+        }, index * 1000); // Stagger by 1 second
+      });
+
+      // If still isolated after 3 seconds, try peer discovery refresh
+      setTimeout(() => {
+        if (this.getActiveConnections().length === 0) {
+          this.debug.warn('🔴 Still isolated after emergency attempts, refreshing peer discovery');
+          if (this.mesh.peerDiscovery.refreshPeerList) {
+            this.mesh.peerDiscovery.refreshPeerList();
+          }
+        }
+      }, 3000);
+    }
   }
 
   /**

@@ -500,7 +500,6 @@ export class SignalingHandler extends EventEmitter {
       } else {
         this.debug.error(`❌ CRITICAL: Connection still not stable after answer - state: ${newState}`);
       }
-
     } catch (error) {
       this.debug.error(`❌ CRITICAL: FAILED to apply renegotiation answer from ${fromPeerId.substring(0, 8)}...`, error);
 
