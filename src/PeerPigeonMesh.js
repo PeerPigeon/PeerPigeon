@@ -698,23 +698,22 @@ export class PeerPigeonMesh extends EventEmitter {
 
         // FORCE IMMEDIATE RENEGOTIATION: Don't wait for the automatic trigger
         this.debug.log(`📡 MEDIA START: Forcing immediate renegotiation for peer ${connection.peerId.substring(0, 8)}...`);
-        setTimeout(async () => {
-          try {
-            if (connection.connection && connection.connection.signalingState === 'stable') {
-              // Create and send a renegotiation offer immediately
-              const offer = await connection.createOffer();
-              await this.sendSignalingMessage({
-                type: 'renegotiation-offer',
-                data: offer,
-                timestamp: Date.now(),
-                forced: true // Mark as forced renegotiation
-              }, connection.peerId);
-              this.debug.log(`✅ MEDIA START: Forced renegotiation offer sent to ${connection.peerId.substring(0, 8)}...`);
-            }
-          } catch (error) {
-            this.debug.error(`❌ MEDIA START: Failed to force renegotiation for ${connection.peerId.substring(0, 8)}...`, error);
+        // Force immediate renegotiation without delay for faster connection
+        try {
+          if (connection.connection && connection.connection.signalingState === 'stable') {
+            // Create and send a renegotiation offer immediately
+            const offer = await connection.createOffer();
+            await this.sendSignalingMessage({
+              type: 'renegotiation-offer',
+              data: offer,
+              timestamp: Date.now(),
+              forced: true // Mark as forced renegotiation
+            }, connection.peerId);
+            this.debug.log(`✅ MEDIA START: Forced renegotiation offer sent to ${connection.peerId.substring(0, 8)}...`);
           }
-        }, 500); // Small delay to ensure setLocalStream completes
+        } catch (error) {
+          this.debug.error(`❌ MEDIA START: Failed to force renegotiation for ${connection.peerId.substring(0, 8)}...`, error);
+        }
       }
 
       return stream;

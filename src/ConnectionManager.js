@@ -22,7 +22,7 @@ export class ConnectionManager extends EventEmitter {
     // Configuration
     this.maxConnectionAttempts = 3;
     this.connectionTimeout = 30000; // Reduced to 30 seconds for faster retry
-    this.retryDelay = 1500; // 1.5 second cooldown between attempts to same peer
+    this.retryDelay = 500; // Faster retry - 500ms between attempts to same peer
 
     // Start periodic cleanup of stale peers
     this.startPeriodicCleanup();
@@ -65,7 +65,7 @@ export class ConnectionManager extends EventEmitter {
 
       // Use shorter delay for isolated peers to help them connect faster
       const connectedCount = this.getConnectedPeerCount();
-      const retryDelay = connectedCount === 0 ? 500 : this.retryDelay; // 500ms for isolated peers, 1500ms otherwise
+      const retryDelay = connectedCount === 0 ? 200 : this.retryDelay; // 200ms for isolated peers, 500ms otherwise
 
       if (now - lastAttempt < retryDelay) {
         const remaining = retryDelay - (now - lastAttempt);
@@ -86,9 +86,9 @@ export class ConnectionManager extends EventEmitter {
     this.lastConnectionAttempt.set(targetPeerId, now);
     this.mesh.peerDiscovery.trackConnectionAttempt(targetPeerId);
 
-    // Set connection timeout - longer for media-enabled connections
+    // Set connection timeout - shorter for faster connections
     const hasMedia = this.mesh.mediaManager.localStream !== null;
-    const timeoutDuration = hasMedia ? 45000 : 30000; // 45s for media, 30s for data-only
+    const timeoutDuration = hasMedia ? 8000 : 5000; // 8s for media, 5s for data-only
 
     this.debug.log(`Setting connection timeout for ${targetPeerId.substring(0, 8)}... - ${timeoutDuration / 1000}s (media: ${hasMedia})`);
 
@@ -307,12 +307,10 @@ export class ConnectionManager extends EventEmitter {
       // Automatically initiate key exchange when crypto is enabled
       if (this.mesh.cryptoManager) {
         this.debug.log(`🔐 Automatically exchanging keys with newly connected peer ${event.peerId.substring(0, 8)}...`);
-        // Use setTimeout to ensure the connection is fully established
-        setTimeout(() => {
-          this.mesh.exchangeKeysWithPeer(event.peerId).catch(error => {
-            this.debug.error(`🔐 Failed to exchange keys with ${event.peerId.substring(0, 8)}:`, error);
-          });
-        }, 100);
+        // Exchange keys immediately without delay for faster setup
+        this.mesh.exchangeKeysWithPeer(event.peerId).catch(error => {
+          this.debug.error(`🔐 Failed to exchange keys with ${event.peerId.substring(0, 8)}:`, error);
+        });
       }
 
       this.mesh.emit('peerConnected', { peerId: event.peerId });
@@ -412,10 +410,10 @@ export class ConnectionManager extends EventEmitter {
           data: offer
         }, event.peerId);
 
-        // AGGRESSIVE FIX: Set up stuck connection watchdog timer
+        // Faster watchdog timer for stuck connections
         setTimeout(() => {
           if (peerConnection.connection.signalingState === 'have-local-offer') {
-            this.debug.log(`⚠️ WATCHDOG: Connection with ${event.peerId.substring(0, 8)}... still stuck after 10 seconds - forcing emergency recovery`);
+            this.debug.log(`⚠️ WATCHDOG: Connection with ${event.peerId.substring(0, 8)}... still stuck after 3 seconds - forcing emergency recovery`);
 
             // Emergency recovery: Create immediate bypass
             this.connectToPeer(event.peerId, false, {
@@ -425,7 +423,7 @@ export class ConnectionManager extends EventEmitter {
               this.debug.error(`❌ EMERGENCY: Failed emergency recovery for ${event.peerId.substring(0, 8)}...`, err);
             });
           }
-        }, 10000); // 10 second watchdog
+        }, 3000); // 3 second watchdog - much faster
 
         this.debug.log(`🔄 Sent renegotiation offer to ${event.peerId.substring(0, 8)}... (signaling state: ${signalingState})`);
       } catch (error) {
@@ -508,7 +506,7 @@ export class ConnectionManager extends EventEmitter {
           } else {
             this.debug.log(`Connection recovered (${currentCount}/${this.mesh.maxPeers}), skipping optimization`);
           }
-        }, 2000); // Wait 2 seconds before optimizing to allow connections to stabilize
+        }, 500); // Wait 500ms before optimizing - faster response
       } else {
         this.debug.log(`Peer count appropriate at ${connectedCount}/${this.mesh.maxPeers}, no optimization needed`);
       }
@@ -1029,8 +1027,8 @@ export class ConnectionManager extends EventEmitter {
       if (peerConnection.connection?.signalingState === 'have-local-offer') {
         const connectionAge = Date.now() - peerConnection.connectionStartTime;
 
-        // If connection has been stuck in "have-local-offer" for more than 10 seconds, fix it
-        if (connectionAge > 10000) {
+        // If connection has been stuck in "have-local-offer" for more than 2 seconds, fix it
+        if (connectionAge > 2000) {
           stuckConnections.push(peerId);
         }
       }
@@ -1091,10 +1089,10 @@ export class ConnectionManager extends EventEmitter {
    * Start monitoring for stuck connections
    */
   startStuckConnectionMonitoring() {
-    // Check every 15 seconds for stuck connections
+    // Check every 2 seconds for stuck connections - much more responsive
     setInterval(() => {
       this.monitorAndFixStuckConnections();
-    }, 15000);
+    }, 2000);
 
     this.debug.log('🔍 Started stuck connection monitoring');
   }

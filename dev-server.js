@@ -42,6 +42,10 @@ app.get('/ui.js', (req, res) => {
   res.sendFile(path.join(__dirname, 'examples/browser/ui.js'));
 });
 
+app.get('/app.js', (req, res) => {
+  res.sendFile(path.join(__dirname, 'examples/browser/app.js'));
+});
+
 // Serve assets directory
 app.use('/assets', express.static(path.join(__dirname, 'examples/browser/assets')));
 
