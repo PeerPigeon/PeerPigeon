@@ -50,8 +50,14 @@ export class PeerConnection extends EventEmitter {
     this.connection = new RTCPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' }
-      ]
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' }
+      ],
+      iceCandidatePoolSize: 10, // Pre-gather ICE candidates for faster connection
+      bundlePolicy: 'max-bundle', // Bundle all media on single transport for efficiency
+      rtcpMuxPolicy: 'require' // Multiplex RTP and RTCP for faster setup
     });
 
     this.setupConnectionHandlers();
@@ -179,7 +185,7 @@ export class PeerConnection extends EventEmitter {
             this.debug.log(`⏰ Connection stuck in connecting state for ${this.peerId}, treating as failed`);
             this.emit('disconnected', { peerId: this.peerId, reason: 'connection timeout' });
           }
-        }, 20000); // Increased timeout to 20 seconds for better stability
+        }, 5000); // Faster timeout - 5 seconds for connecting state
       } else if (this.connection.connectionState === 'disconnected') {
         // Give WebRTC more time to recover - it's common for connections to briefly disconnect during renegotiation
         this.debug.log(`⚠️ WebRTC connection disconnected for ${this.peerId}, waiting for potential recovery...`);
@@ -190,7 +196,7 @@ export class PeerConnection extends EventEmitter {
             this.debug.log(`❌ WebRTC connection remained disconnected for ${this.peerId}, treating as failed`);
             this.emit('disconnected', { peerId: this.peerId, reason: 'connection disconnected' });
           }
-        }, 8000); // Increased wait time to 8 seconds to account for renegotiation
+        }, 3000); // Faster recovery - 3 seconds for disconnected state
       } else if (this.connection.connectionState === 'failed') {
         if (!this.isClosing) {
           this.debug.log(`❌ Connection failed for ${this.peerId}`);
@@ -242,7 +248,7 @@ export class PeerConnection extends EventEmitter {
               // Don't disconnect - peer connection may still work without signaling server
             }
           }
-        }, 30000); // Increased timeout to 30 seconds to be more tolerant
+        }, 10000); // Faster ICE checking timeout - 10 seconds
       } else if (this.connection.iceConnectionState === 'failed') {
         // Check if signaling is available before attempting ICE restart
         const hasSignaling = this.mesh && this.mesh.signalingClient && this.mesh.signalingClient.isConnected();
@@ -293,7 +299,7 @@ export class PeerConnection extends EventEmitter {
               this.monitorDataChannelHealth();
             }
           }
-        }, 15000); // Increased wait time to 15 seconds for ICE reconnection
+        }, 5000); // Faster ICE reconnection - 5 seconds
       }
     };
 
@@ -398,7 +404,12 @@ export class PeerConnection extends EventEmitter {
   }
 
   async createOffer() {
-    const offer = await this.connection.createOffer();
+    // Create offer with optimized settings for faster connection
+    const offer = await this.connection.createOffer({
+      offerToReceiveAudio: true,
+      offerToReceiveVideo: true,
+      iceRestart: false // Don't restart ICE unless necessary
+    });
     await this.connection.setLocalDescription(offer);
     return offer;
   }
@@ -647,6 +658,16 @@ export class PeerConnection extends EventEmitter {
   validateRemoteStream(stream, track) {
     this.debug.log('🔍 VALIDATION: Starting remote stream validation...');
 
+    // Check 0: Ensure stream and track are valid
+    if (!stream) {
+      this.debug.error('❌ VALIDATION: Stream is null or undefined');
+      return false;
+    }
+    if (!track) {
+      this.debug.error('❌ VALIDATION: Track is null or undefined');
+      return false;
+    }
+
     // Check 1: Stream ID collision (basic loopback detection)
     if (this.localStream && stream.id === this.localStream.id) {
       this.debug.error('❌ LOOPBACK DETECTED: Received our own local stream as remote!');
@@ -694,8 +715,8 @@ export class PeerConnection extends EventEmitter {
       }
     }
 
-    // Check 4: Verify stream hasn't been marked as local origin
-    if (stream._peerPigeonOrigin === 'local') {
+    // Check 4: Verify stream hasn't been marked as local origin (with safe property access)
+    if (stream && stream._peerPigeonOrigin === 'local') {
       this.debug.error('❌ Stream marked as local origin - preventing synchronization loop');
       return false;
     }

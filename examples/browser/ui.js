@@ -2382,6 +2382,8 @@ export class PeerPigeonUI {
       const title = document.createElement('div');
       title.className = 'video-title';
       title.textContent = `Peer ${peerId.substring(0, 8)}...`;
+      title.className = 'video-title';
+      title.textContent = `Peer ${peerId.substring(0, 8)}...`;
 
       const video = document.createElement('video');
       video.autoplay = true;
@@ -2461,6 +2463,12 @@ export class PeerPigeonUI {
       remoteVideoItem.appendChild(status);
 
       remoteVideosContainer.appendChild(remoteVideoItem);
+    } else {
+      // Clean up existing audio context if video element is being replaced
+      const existingVideo = remoteVideoItem.querySelector('video');
+      if (existingVideo) {
+        this.cleanupVideoAudioContext(existingVideo);
+      }
     }
 
     const video = remoteVideoItem.querySelector('video');
@@ -2572,6 +2580,22 @@ export class PeerPigeonUI {
   }
 
   /**
+   * Clean up audio context associated with a video element
+   */
+  cleanupVideoAudioContext(videoElement) {
+    if (videoElement._peerPigeonAudioContext) {
+      try {
+        console.log(`🎵 Cleaning up audio context for peer ${videoElement._peerPigeonPeerId?.substring(0, 8) || 'unknown'}`);
+        videoElement._peerPigeonAudioContext.close();
+        delete videoElement._peerPigeonAudioContext;
+        delete videoElement._peerPigeonPeerId;
+      } catch (error) {
+        console.error('🎵 Error cleaning up audio context:', error);
+      }
+    }
+  }
+
+  /**
      * Setup audio playback monitoring for video elements playing remote streams
      */
   setupAudioPlaybackMonitoring(videoElement, peerId, audioTracks) {
@@ -2580,6 +2604,12 @@ export class PeerPigeonUI {
 
     if (audioTracks.length === 0) {
       console.log(`🎵 No audio tracks to monitor for peer ${peerIdShort}`);
+      return;
+    }
+
+    // Check if this video element already has audio monitoring setup
+    if (videoElement._peerPigeonAudioContext) {
+      console.log(`🎵 Audio monitoring already setup for peer ${peerIdShort}, skipping duplicate setup`);
       return;
     }
 
@@ -2614,7 +2644,18 @@ export class PeerPigeonUI {
       // Wait for video to load before setting up audio analysis
       const setupAudioAnalysis = () => {
         try {
+          // Check again if already setup (race condition protection)
+          if (videoElement._peerPigeonAudioContext) {
+            console.log(`🎵 Audio analysis already setup for peer ${peerIdShort}, aborting duplicate setup`);
+            return;
+          }
+
           const audioContext = new AudioContext();
+          
+          // Mark the video element as having audio monitoring to prevent duplicates
+          videoElement._peerPigeonAudioContext = audioContext;
+          videoElement._peerPigeonPeerId = peerId;
+
           const source = audioContext.createMediaElementSource(videoElement);
           const analyser = audioContext.createAnalyser();
           const gainNode = audioContext.createGain();
