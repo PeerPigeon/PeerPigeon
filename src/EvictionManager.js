@@ -22,13 +22,15 @@ export class EvictionManager extends EventEmitter {
 
     // Check total peer count (including connecting peers) to prevent race conditions
     const totalPeerCount = this.connectionManager.peers.size;
+    const connectedCount = this.connectionManager.getConnectedPeerCount();
+    
+    // STRICT RULE: Never evict if we're under max capacity, unless we're completely isolated
     if (totalPeerCount < this.mesh.maxPeers) {
-      this.debug.log(`No eviction needed: ${totalPeerCount}/${this.mesh.maxPeers} peers`);
+      this.debug.log(`No eviction needed: ${totalPeerCount}/${this.mesh.maxPeers} peers (connected: ${connectedCount})`);
       return null;
     }
 
-    // Special case: if we have 0 connected peers (isolated), be very aggressive about making room
-    const connectedCount = this.connectionManager.getConnectedPeerCount();
+    // Special case: if we have 0 connected peers (isolated), be aggressive about making room
     if (connectedCount === 0) {
       this.debug.log(`Isolated peer scenario: finding any peer to evict for ${newPeerId.substring(0, 8)}...`);
       // Find any peer to evict (even connecting ones) to make room for this connection
@@ -53,17 +55,16 @@ export class EvictionManager extends EventEmitter {
 
       this.debug.log(`Eviction check: new peer ${newPeerId.substring(0, 8)}... (distance: ${newPeerDistance.toString(16).substring(0, 8)}) vs farthest ${farthestPeerId.substring(0, 8)}... (distance: ${farthestDistance.toString(16).substring(0, 8)})`);
 
-      // LOOSENED RULE: If we're at max capacity, always try to evict the farthest peer
-      // even if the new peer isn't strictly closer (helps with network connectivity)
-      const shouldEvict = newPeerDistance < farthestDistance ||
-                               (totalPeerCount >= this.mesh.maxPeers && connectedCount < this.mesh.minPeers);
+      // STRICT RULE: Only evict if we're at max capacity AND the new peer is closer
+      // Removed the aggressive eviction condition that could evict when under capacity
+      const shouldEvict = newPeerDistance < farthestDistance;
 
       if (shouldEvict) {
-        this.debug.log(`Will evict ${farthestPeerId.substring(0, 8)}... for ${newPeerDistance < farthestDistance ? 'closer' : 'network connectivity'} peer ${newPeerId.substring(0, 8)}... (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
+        this.debug.log(`Will evict ${farthestPeerId.substring(0, 8)}... for closer peer ${newPeerId.substring(0, 8)}... (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
         return farthestPeerId;
       }
 
-      this.debug.log(`Not evicting for ${newPeerId.substring(0, 8)}... - criteria not met (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
+      this.debug.log(`Not evicting for ${newPeerId.substring(0, 8)}... - new peer is not closer (${totalPeerCount}/${this.mesh.maxPeers} peers)`);
       return null;
     } else {
       // If XOR routing is disabled, use simple FIFO eviction - evict oldest peer

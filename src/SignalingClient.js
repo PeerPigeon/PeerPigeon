@@ -19,17 +19,6 @@ export class SignalingClient extends EventEmitter {
     this.connectionPromise = null;
     this.reconnectTimeout = null;
     this.isReconnecting = false;
-
-    // Add keep-alive ping to prevent WebSocket timeout
-    this.keepAliveInterval = null;
-    this.keepAliveIntervalMs = 9 * 60 * 1000; // Ping every 9 minutes for large safety margin
-
-    // Health monitoring
-    this.lastPingTime = null;
-    this.lastPongTime = null;
-    this.pingTimeout = null;
-    this.healthCheckInterval = null;
-    this.connectionQualityTimeout = 10000; // 10 seconds to consider connection unhealthy
   }
 
   setConnectionType(type) {
@@ -71,7 +60,7 @@ export class SignalingClient extends EventEmitter {
   }
 
   async sendSignalingMessage(message) {
-    // Check connection health before sending
+    // Check connection status before sending
     if (!this.isConnected()) {
       this.debug.log('WebSocket not connected, attempting to reconnect...');
       if (!this.isReconnecting) {
@@ -169,14 +158,10 @@ export class SignalingClient extends EventEmitter {
             type: 'announce',
             data: { peerId: this.peerId }
           }).then(() => {
-            this.startKeepAlive();
-            // Removed health monitoring - keep-alive pings are sufficient
             this.emit('connected');
             resolve();
           }).catch(error => {
             this.debug.error('Failed to send announce message:', error);
-            this.startKeepAlive();
-            // Removed health monitoring - keep-alive pings are sufficient
             this.emit('connected'); // Still emit connected even if announce fails
             resolve();
           });
@@ -190,9 +175,6 @@ export class SignalingClient extends EventEmitter {
             if (message.type === 'connected') {
               // Connection confirmation from server
               this.debug.log('WebSocket connection confirmed by server');
-            } else if (message.type === 'pong') {
-              // Handle pong response for health monitoring
-              this.handlePong();
             } else {
               // Forward signaling message to mesh
               this.emit('signalingMessage', message);
@@ -206,8 +188,6 @@ export class SignalingClient extends EventEmitter {
           clearTimeout(connectTimeout);
           this.connected = false;
           this.connectionPromise = null;
-          this.stopKeepAlive();
-          // Removed health monitoring stop - not using health monitoring
 
           this.debug.log('WebSocket closed:', event.code, event.reason);
 
@@ -316,8 +296,6 @@ export class SignalingClient extends EventEmitter {
     // The sendGoodbyeMessage is often called from an unload handler,
     // so we don't want to make it part of the standard disconnect flow here.
     // The CleanupManager handles sending goodbye on unload.
-    this.stopKeepAlive();
-    this.stopHealthMonitoring(); // FIX: Stop health monitoring to prevent memory leaks
 
     this.connected = false;
     this.connectionPromise = null;
@@ -376,227 +354,11 @@ export class SignalingClient extends EventEmitter {
     }
   }
 
-  startKeepAlive() {
-    if (this.keepAliveInterval) return;
-
-    this.debug.log('Starting keep-alive pings every', this.keepAliveIntervalMs / 1000, 'seconds');
-
-    const keepAliveCallback = () => {
-      if (this.connected) {
-        // Check if this peer should send the ping
-        if (this.shouldSendKeepAlivePing()) {
-          this.debug.log('Sending keep-alive ping (designated peer)');
-          this.sendSignalingMessage({
-            type: 'ping',
-            data: { peerId: this.peerId }
-          }).catch(error => {
-            this.debug.error('Keep-alive ping failed:', error);
-          });
-        } else {
-          this.debug.log('Skipping keep-alive ping (not designated peer)');
-        }
-      }
-    };
-
-    if (environmentDetector.isBrowser || environmentDetector.isNativeScript) {
-      this.keepAliveInterval = (typeof window !== 'undefined' ? window.setInterval : setInterval)(keepAliveCallback, this.keepAliveIntervalMs);
-    } else {
-      this.keepAliveInterval = setInterval(keepAliveCallback, this.keepAliveIntervalMs);
-    }
-  }
-
-  /**
-     * Determine if this peer should send the keep-alive ping.
-     * Only one peer should send it when there are multiple peers connected.
-     * The peer with the lexicographically smallest ID becomes the designated sender.
-     */
-  shouldSendKeepAlivePing() {
-    // If no mesh reference available, always send (fallback)
-    if (!this.mesh) {
-      return true;
-    }
-
-    // Get all connected peers
-    const connectedPeers = this.mesh.connectionManager.getConnectedPeers();
-
-    // If no peers connected, always send
-    if (connectedPeers.length === 0) {
-      return true;
-    }
-
-    // Get all peer IDs including this one
-    const allPeerIds = [this.peerId, ...connectedPeers.map(peer => peer.peerId)];
-
-    // Sort lexicographically and check if this peer is the smallest
-    allPeerIds.sort();
-    const designatedPeer = allPeerIds[0];
-
-    const isDesignated = designatedPeer === this.peerId;
-    this.debug.log(`Keep-alive ping decision: ${isDesignated ? 'SEND' : 'SKIP'} (this: ${this.peerId.substring(0, 8)}, designated: ${designatedPeer.substring(0, 8)}, total peers: ${allPeerIds.length})`);
-
-    return isDesignated;
-  }
-
-  stopKeepAlive() {
-    if (this.keepAliveInterval) {
-      clearInterval(this.keepAliveInterval);
-      this.keepAliveInterval = null;
-      this.debug.log('Stopped keep-alive pings');
-    }
-  }
-
-  startHealthMonitoring() {
-    if (this.healthCheckInterval) return;
-
-    this.debug.log('Starting connection health monitoring');
-
-    const healthCheckCallback = () => {
-      // Check WebSocket state first
-      if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
-        this.debug.warn('WebSocket is not in OPEN state:', this.websocket?.readyState);
-        this.handleUnhealthyConnection();
-        return;
-      }
-
-      if (this.connected) {
-        const now = Date.now();
-
-        // Only check for pong timeout if we have a pending ping
-        if (this.pingTimeout) {
-          // There's already a ping waiting for pong, don't send another
-          this.debug.log('Ping already pending, waiting for pong...');
-          return;
-        }
-
-        // Check if we have an old pong that indicates connection issues
-        if (this.lastPingTime && this.lastPongTime &&
-                    (this.lastPingTime > this.lastPongTime) &&
-                    (now - this.lastPingTime > this.connectionQualityTimeout)) {
-          this.debug.warn('Connection unhealthy - ping/pong timeout');
-          this.handleUnhealthyConnection();
-          return;
-        }
-
-        // Send health ping
-        this.sendHealthPing();
-      }
-    };
-
-    if (environmentDetector.isBrowser || environmentDetector.isNativeScript) {
-      this.healthCheckInterval = (typeof window !== 'undefined' ? window.setInterval : setInterval)(healthCheckCallback, 30000);
-    } else {
-      this.healthCheckInterval = setInterval(healthCheckCallback, 30000);
-    }
-  }
-
-  stopHealthMonitoring() {
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-      this.healthCheckInterval = null;
-      this.debug.log('Stopped connection health monitoring');
-    }
-
-    if (this.pingTimeout) {
-      clearTimeout(this.pingTimeout);
-      this.pingTimeout = null;
-    }
-  }
-
-  sendHealthPing() {
-    if (!this.isConnected()) return;
-
-    try {
-      this.lastPingTime = Date.now();
-
-      // Set timeout for pong response
-      if (this.pingTimeout) {
-        clearTimeout(this.pingTimeout);
-      }
-
-      this.pingTimeout = setTimeout(() => {
-        this.debug.warn('Health ping timeout - connection may be unhealthy');
-        this.handleUnhealthyConnection();
-      }, this.connectionQualityTimeout);
-
-      // Send ping as a regular message (server will handle it)
-      this.websocket.send(JSON.stringify({
-        type: 'ping',
-        data: { peerId: this.peerId, timestamp: this.lastPingTime }
-      }));
-
-      this.debug.log('Sent health ping');
-    } catch (error) {
-      this.debug.error('Failed to send health ping:', error);
-      this.handleUnhealthyConnection();
-    }
-  }
-
-  handlePong() {
-    this.lastPongTime = Date.now();
-
-    if (this.pingTimeout) {
-      clearTimeout(this.pingTimeout);
-      this.pingTimeout = null;
-    }
-
-    this.debug.log('Received pong - connection healthy');
-  }
-
-  handleUnhealthyConnection() {
-    this.debug.warn('Detected unhealthy WebSocket connection, forcing reconnection');
-    this.emit('statusChanged', { type: 'warning', message: 'Connection health degraded - reconnecting...' });
-
-    // Force close and reconnect
-    this.connected = false;
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      this.websocket.close(3000, 'Health check failed'); // Use valid close code 3000-4999
-    }
-
-    if (!this.isReconnecting) {
-      this.attemptReconnect();
-    }
-  }
-
-  forceHealthCheck() {
-    if (!this.isConnected()) {
-      this.debug.log('Connection not healthy, triggering reconnection');
-      if (!this.isReconnecting) {
-        this.attemptReconnect();
-      }
-      return false;
-    }
-
-    this.sendHealthPing();
-    return true;
-  }
-
-  /**
-     * Force an immediate keep-alive ping check when peer topology changes.
-     * This ensures quick takeover when the designated ping sender disconnects.
-     */
-  triggerKeepAlivePingCheck() {
-    if (!this.connected) return;
-
-    if (this.shouldSendKeepAlivePing()) {
-      this.debug.log('Topology changed - sending immediate keep-alive ping as new designated peer');
-      this.sendSignalingMessage({
-        type: 'ping',
-        data: { peerId: this.peerId }
-      }).catch(error => {
-        this.debug.error('Immediate keep-alive ping failed:', error);
-      });
-    } else {
-      this.debug.log('Topology changed - not designated for keep-alive pings');
-    }
-  }
-
   getConnectionStats() {
     return {
       connected: this.connected,
       isReconnecting: this.isReconnecting,
       reconnectAttempts: this.reconnectAttempts,
-      lastPingTime: this.lastPingTime,
-      lastPongTime: this.lastPongTime,
       websocketState: this.websocket ? this.websocket.readyState : 'not created'
     };
   }

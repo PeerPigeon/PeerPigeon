@@ -28,21 +28,27 @@ export class PeerPigeonMesh extends EventEmitter {
     this.signalingClient = null;
     this.peerDiscovery = null;
 
-    // Configuration
-    this.maxPeers = 3;
-    this.minPeers = 2;
-    this.autoDiscovery = true;
-    this.evictionStrategy = true;
-    this.xorRouting = true;
+    // Configuration - Optional features enabled by default (opt-out)
+    this.maxPeers = options.maxPeers !== undefined ? options.maxPeers : 3;
+    this.minPeers = options.minPeers !== undefined ? options.minPeers : 2;
+    this.autoConnect = options.autoConnect !== false; // Default to true, can be disabled by setting to false
+    this.autoDiscovery = options.autoDiscovery !== false;
+    this.evictionStrategy = options.evictionStrategy !== false;
+    this.xorRouting = options.xorRouting !== false;
     this.enableWebDHT = options.enableWebDHT !== false; // Default to true, can be disabled by setting to false
-    this.enableCrypto = options.enableCrypto === true; // Default to false, must be explicitly enabled
+    this.enableCrypto = options.enableCrypto !== false; // Default to true, can be disabled by setting to false
 
     // State
     this.connected = false;
     this.polling = false; // Only WebSocket is supported
     this.signalingUrl = null;
     this.discoveredPeers = new Map();
-    this.connectionMonitorInterval = null;
+
+    // Track ongoing key exchange attempts to prevent duplicates across all channels
+    this.ongoingKeyExchanges = new Set();
+    
+    // Track peers for which we've already emitted peerKeyAdded events to prevent UI spam
+    this.emittedPeerKeyEvents = new Set();
 
     // Initialize managers
     this.storageManager = new StorageManager(this);
@@ -78,15 +84,13 @@ export class PeerPigeonMesh extends EventEmitter {
       this.emit('peersUpdated');
     });
 
-    // Handle peer disconnections and trigger keep-alive ping coordination
+    // Handle peer disconnections
     this.addEventListener('peerDisconnected', (data) => {
       this.debug.log(`Peer ${data.peerId.substring(0, 8)}... disconnected: ${data.reason}`);
-      // Trigger immediate keep-alive ping check in case the disconnected peer was the designated sender
-      if (this.signalingClient && this.signalingClient.connected) {
-        setTimeout(() => {
-          this.signalingClient.triggerKeepAlivePingCheck();
-        }, 1000); // Small delay to let peer lists update
-      }
+      
+      // Clear tracking for this peer to allow fresh key exchange if they reconnect
+      this.emittedPeerKeyEvents.delete(data.peerId);
+      this.ongoingKeyExchanges.delete(data.peerId);
     });
 
     // Handle gossip messages and intercept mesh signaling
@@ -100,6 +104,12 @@ export class PeerPigeonMesh extends EventEmitter {
       // Handle crypto key exchange messages
       if (data.message && (data.message.type === 'key_exchange' || data.message.type === 'key_exchange_response')) {
         this._handleKeyExchange(data.message, data.from);
+        return; // Don't emit as regular message
+      }
+
+      // Handle DHT messages - route to WebDHT
+      if (data.message && data.message.type === 'dht' && this.webDHT) {
+        this.webDHT.handleMessage(data.message, data.from);
         return; // Don't emit as regular message
       }
 
@@ -156,7 +166,11 @@ export class PeerPigeonMesh extends EventEmitter {
       });
 
       this.cryptoManager.addEventListener('peerKeyAdded', (data) => {
-        this.emit('peerKeyAdded', data);
+        // Only emit peerKeyAdded event once per peer to prevent UI spam from duplicate key exchanges
+        if (!this.emittedPeerKeyEvents.has(data.peerId)) {
+          this.emittedPeerKeyEvents.add(data.peerId);
+          this.emit('peerKeyAdded', data);
+        }
       });
 
       this.cryptoManager.addEventListener('userAuthenticated', (data) => {
@@ -269,28 +283,30 @@ export class PeerPigeonMesh extends EventEmitter {
     try {
       // Use provided peer ID if valid, otherwise generate one
       if (this.providedPeerId) {
-        if (this.storageManager.validatePeerId(this.providedPeerId)) {
+        if (PeerPigeonMesh.validatePeerId(this.providedPeerId)) {
           this.peerId = this.providedPeerId;
           this.debug.log(`Using provided peer ID: ${this.peerId}`);
         } else {
           this.debug.warn(`Invalid peer ID provided: ${this.providedPeerId}. Must be 40-character SHA-1 hex string. Generating new one.`);
-          this.peerId = await this.storageManager.generatePeerId();
+          this.peerId = await PeerPigeonMesh.generatePeerId();
         }
       } else {
-        this.peerId = await this.storageManager.generatePeerId();
+        this.peerId = await PeerPigeonMesh.generatePeerId();
       }
 
       // Initialize WebDHT now that we have a peerId (if enabled)
       if (this.enableWebDHT) {
+        // Initialize WebDHT - Low-level distributed hash table for raw key-value storage
         this.webDHT = new WebDHT(this);
-        this.debug.log('WebDHT initialized and enabled');
+        this.debug.log('WebDHT (low-level DHT) initialized and enabled');
 
         // Setup WebDHT event handlers now that it's initialized
         this.setupWebDHTEventHandlers();
 
-        // Initialize DistributedStorageManager if WebDHT is enabled
+        // Initialize DistributedStorageManager - High-level storage with encryption/access control
+        // Note: This uses WebDHT as its storage backend but provides a separate high-level API
         this.distributedStorage = new DistributedStorageManager(this);
-        this.debug.log('DistributedStorageManager initialized');
+        this.debug.log('DistributedStorageManager (high-level encrypted storage) initialized');
 
         // Setup DistributedStorageManager event handlers
         this.setupDistributedStorageEventHandlers();
@@ -319,9 +335,16 @@ export class PeerPigeonMesh extends EventEmitter {
       // Initialize crypto manager if enabled
       if (this.cryptoManager) {
         try {
-          this.debug.log('🔐 Initializing crypto manager...');
-          await this.cryptoManager.init({ generateKeypair: true });
-          this.debug.log('🔐 Crypto manager initialized successfully');
+          this.debug.log('🔐 Initializing crypto manager with automatic key persistence...');
+          
+          // Add timeout to prevent hanging
+          const cryptoInitPromise = this.cryptoManager.initWithPeerId(this.peerId);
+          const timeoutPromise = new Promise((resolve, reject) => {
+            setTimeout(() => reject(new Error('Crypto initialization timeout')), 10000);
+          });
+          
+          await Promise.race([cryptoInitPromise, timeoutPromise]);
+          this.debug.log('🔐 Crypto manager initialized successfully with persistent keys');
         } catch (error) {
           this.debug.error('Failed to initialize crypto manager:', error);
           // Continue without crypto - don't fail the entire init
@@ -344,9 +367,6 @@ export class PeerPigeonMesh extends EventEmitter {
       this.polling = false;
       this.peerDiscovery.start();
 
-      // Start periodic health monitoring
-      this.startConnectionMonitoring();
-
       this.emit('statusChanged', { type: 'connected' });
     });
 
@@ -355,7 +375,6 @@ export class PeerPigeonMesh extends EventEmitter {
       this.polling = false;
       this.peerDiscovery.stop();
       this.connectionManager.disconnectAllPeers();
-      this.stopConnectionMonitoring();
       this.emit('statusChanged', { type: 'disconnected' });
     });
 
@@ -436,9 +455,6 @@ export class PeerPigeonMesh extends EventEmitter {
     this.connected = false;
     this.polling = false;
 
-    // Stop connection monitoring
-    this.stopConnectionMonitoring();
-
     if (this.signalingClient) {
       this.signalingClient.disconnect();
     }
@@ -498,6 +514,11 @@ export class PeerPigeonMesh extends EventEmitter {
     this.emit('statusChanged', { type: 'setting', setting: 'autoDiscovery', value: enabled });
   }
 
+  setAutoConnect(enabled) {
+    this.autoConnect = enabled;
+    this.emit('statusChanged', { type: 'setting', setting: 'autoConnect', value: enabled });
+  }
+
   setEvictionStrategy(enabled) {
     this.evictionStrategy = enabled;
     this.emit('statusChanged', { type: 'setting', setting: 'evictionStrategy', value: enabled });
@@ -511,11 +532,13 @@ export class PeerPigeonMesh extends EventEmitter {
       peerId: this.peerId,
       connected: this.connected,
       polling: false, // Only WebSocket is supported
+      signalingUrl: this.signalingUrl,
       connectedCount,
       totalPeerCount: totalCount, // Include total count for debugging
       minPeers: this.minPeers,
       maxPeers: this.maxPeers,
       discoveredCount: this.discoveredPeers.size,
+      autoConnect: this.autoConnect,
       autoDiscovery: this.autoDiscovery,
       evictionStrategy: this.evictionStrategy,
       xorRouting: this.xorRouting
@@ -633,50 +656,6 @@ export class PeerPigeonMesh extends EventEmitter {
     return this.meshOptimizer.debugConnectivity();
   }
 
-  // Connection monitoring methods
-  startConnectionMonitoring() {
-    // Monitor connection health every 2 minutes
-    if (this.connectionMonitorInterval) {
-      clearInterval(this.connectionMonitorInterval);
-    }
-
-    // Environment-aware timer
-    const intervalCallback = () => {
-      if (this.signalingClient) {
-        const stats = this.signalingClient.getConnectionStats();
-        this.debug.log('Connection monitoring:', stats);
-
-        // Force health check if connection seems problematic
-        if (stats.connected && stats.lastPingTime && stats.lastPongTime) {
-          const timeSinceLastPong = Date.now() - stats.lastPongTime;
-          if (timeSinceLastPong > 60000) { // 1 minute without pong
-            this.debug.warn('Connection may be unhealthy, forcing health check');
-            this.signalingClient.forceHealthCheck();
-          }
-        }
-
-        // Emit connection status for UI
-        this.emit('connectionStats', stats);
-      }
-    };
-
-    if (environmentDetector.isBrowser) {
-      this.connectionMonitorInterval = window.setInterval(intervalCallback, 120000);
-    } else {
-      this.connectionMonitorInterval = setInterval(intervalCallback, 120000);
-    }
-
-    this.debug.log('Started connection monitoring');
-  }
-
-  stopConnectionMonitoring() {
-    if (this.connectionMonitorInterval) {
-      clearInterval(this.connectionMonitorInterval);
-      this.connectionMonitorInterval = null;
-      this.debug.log('Stopped connection monitoring');
-    }
-  }
-
   // Media management methods
   async initializeMedia() {
     return await this.mediaManager.init();
@@ -688,33 +667,50 @@ export class PeerPigeonMesh extends EventEmitter {
     try {
       const stream = await this.mediaManager.startLocalStream({ video, audio, deviceIds });
 
-      // Update all existing peer connections with the new stream
+      // Update all existing peer connections with the new stream - but only if crypto allows it
       const connections = this.connectionManager.getAllConnections();
-      this.debug.log(`📡 MEDIA START: Applying stream to ${connections.length} connections`);
+      this.debug.log(`📡 MEDIA START: Applying stream to ${connections.length} connections (with crypto verification)`);
 
       for (const connection of connections) {
-        this.debug.log(`📡 MEDIA START: Setting stream for peer ${connection.peerId.substring(0, 8)}...`);
-        await connection.setLocalStream(stream);
-
-        // FORCE IMMEDIATE RENEGOTIATION: Don't wait for the automatic trigger
-        this.debug.log(`📡 MEDIA START: Forcing immediate renegotiation for peer ${connection.peerId.substring(0, 8)}...`);
-        // Force immediate renegotiation without delay for faster connection
-        try {
-          if (connection.connection && connection.connection.signalingState === 'stable') {
-            // Create and send a renegotiation offer immediately
-            const offer = await connection.createOffer();
-            await this.sendSignalingMessage({
-              type: 'renegotiation-offer',
-              data: offer,
-              timestamp: Date.now(),
-              forced: true // Mark as forced renegotiation
-            }, connection.peerId);
-            this.debug.log(`✅ MEDIA START: Forced renegotiation offer sent to ${connection.peerId.substring(0, 8)}...`);
+        // SECURITY: Only share media if crypto keys are established or crypto is disabled
+        let shouldShareMedia = true;
+        
+        if (this.enableCrypto && this.cryptoManager) {
+          const hasKeys = this.cryptoManager.peerKeys && this.cryptoManager.peerKeys.has(connection.peerId);
+          if (!hasKeys) {
+            this.debug.log(`� MEDIA START: Skipping media share with ${connection.peerId.substring(0, 8)}... - no crypto keys established`);
+            shouldShareMedia = false;
+          } else {
+            this.debug.log(`🔒 MEDIA START: Crypto keys verified for ${connection.peerId.substring(0, 8)}... - sharing media`);
           }
-        } catch (error) {
-          this.debug.error(`❌ MEDIA START: Failed to force renegotiation for ${connection.peerId.substring(0, 8)}...`, error);
         }
-      }
+        
+        if (shouldShareMedia) {
+          this.debug.log(`📡 MEDIA START: Setting stream for peer ${connection.peerId.substring(0, 8)}...`);
+          this.debug.log('🎥 MESH: About to call setLocalStream on peer connection');
+          await connection.setLocalStream(stream);
+          this.debug.log('🎥 MESH: setLocalStream completed for peer ' + connection.peerId.substring(0, 8) + '...');
+
+          // FORCE IMMEDIATE RENEGOTIATION: Don't wait for the automatic trigger
+          this.debug.log(`📡 MEDIA START: Forcing immediate renegotiation for peer ${connection.peerId.substring(0, 8)}...`);
+          // Force immediate renegotiation without delay for faster connection
+          try {
+            if (connection.connection && connection.connection.signalingState === 'stable') {
+              // Create and send a renegotiation offer immediately
+              const offer = await connection.createOffer();
+              await this.sendSignalingMessage({
+                type: 'renegotiation-offer',
+                data: offer,
+                timestamp: Date.now(),
+                forced: true // Mark as forced renegotiation
+              }, connection.peerId);
+              this.debug.log(`✅ MEDIA START: Forced renegotiation offer sent to ${connection.peerId.substring(0, 8)}...`);
+            }
+          } catch (error) {
+            this.debug.error(`❌ MEDIA START: Failed to force renegotiation for ${connection.peerId.substring(0, 8)}...`, error);
+          }
+        } // End of shouldShareMedia block
+      } // End of connections loop
 
       return stream;
     } catch (error) {
@@ -779,13 +775,39 @@ export class PeerPigeonMesh extends EventEmitter {
 
   static async generatePeerId() {
     const array = new Uint8Array(20);
-    crypto.getRandomValues(array);
+    
+    // Environment-aware random value generation
+    if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+      // Browser environment
+      crypto.getRandomValues(array);
+    } else if (typeof process !== 'undefined' && process.versions && process.versions.node) {
+      // Node.js environment
+      try {
+        const crypto = await import('crypto');
+        const randomBytes = crypto.randomBytes(20);
+        array.set(randomBytes);
+      } catch (e) {
+        console.warn('Could not use Node.js crypto, falling back to Math.random');
+        // Fallback to Math.random
+        for (let i = 0; i < array.length; i++) {
+          array[i] = Math.floor(Math.random() * 256);
+        }
+      }
+    } else {
+      // Fallback for unknown environments
+      console.warn('Secure random values not available, using fallback method');
+      for (let i = 0; i < array.length; i++) {
+        array[i] = Math.floor(Math.random() * 256);
+      }
+    }
+    
     return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
   }
 
-  // WebDHT methods - Distributed Hash Table
+  // WebDHT methods - Low-level Distributed Hash Table for raw key-value storage
+  // Note: For encrypted storage with access control, use this.distributedStorage instead
   /**
-     * Store a key-value pair in the distributed hash table
+     * Store a key-value pair in the distributed hash table (low-level, no encryption)
      * @param {string} key - The key to store
      * @param {any} value - The value to store
      * @param {object} options - Storage options (ttl, etc.)
@@ -802,7 +824,7 @@ export class PeerPigeonMesh extends EventEmitter {
   }
 
   /**
-     * Retrieve a value from the distributed hash table
+     * Retrieve a value from the distributed hash table (low-level, no encryption)
      * @param {string} key - The key to retrieve
      * @param {object} options - Retrieval options (subscribe, etc.)
      * @returns {Promise<any>} The stored value or null if not found
@@ -1347,20 +1369,51 @@ export class PeerPigeonMesh extends EventEmitter {
       throw new Error('Crypto not enabled or initialized');
     }
 
+    // Check if we're already in the process of exchanging keys with this peer
+    if (this.ongoingKeyExchanges.has(peerId)) {
+      this.debug.log(`🔐 Skipping key exchange with ${peerId.substring(0, 8)}... - exchange already in progress`);
+      return;
+    }
+
+    // Check if we already have this peer's key to avoid duplicate exchanges
+    const hasExistingKey = this.cryptoManager.peerKeys.has(peerId);
+    if (hasExistingKey) {
+      this.debug.log(`🔐 Skipping key exchange with ${peerId.substring(0, 8)}... - key already exists`);
+      return;
+    }
+
     const keypair = this.cryptoManager.keypair;
     if (!keypair || !keypair.pub || !keypair.epub) {
       throw new Error('No complete keypair available (need both pub and epub)');
     }
 
-    // Send both our public key (pub) and encryption public key (epub) to the peer
-    return this.gossipManager.sendDirectMessage(peerId, {
-      type: 'key_exchange',
-      publicKey: {
-        pub: keypair.pub,
-        epub: keypair.epub
-      },
-      timestamp: Date.now()
-    }, 'key_exchange');
+    this.debug.log(`🔐 Initiating key exchange with ${peerId.substring(0, 8)}...`);
+
+    // Mark this peer as having an ongoing key exchange
+    this.ongoingKeyExchanges.add(peerId);
+
+    try {
+      // Send both our public key (pub) and encryption public key (epub) to the peer
+      const result = await this.gossipManager.sendDirectMessage(peerId, {
+        type: 'key_exchange',
+        publicKey: {
+          pub: keypair.pub,
+          epub: keypair.epub
+        },
+        timestamp: Date.now()
+      }, 'key_exchange');
+
+      // Clear the ongoing exchange after a short delay (allow time for response)
+      setTimeout(() => {
+        this.ongoingKeyExchanges.delete(peerId);
+      }, 5000); // 5 second timeout
+
+      return result;
+    } catch (error) {
+      // Clear the ongoing exchange on error
+      this.ongoingKeyExchanges.delete(peerId);
+      throw error;
+    }
   }
 
   /**
@@ -1462,6 +1515,10 @@ export class PeerPigeonMesh extends EventEmitter {
     if (this.cryptoManager) {
       this.cryptoManager.reset();
     }
+    // Clear ongoing key exchange tracking
+    this.ongoingKeyExchanges.clear();
+    // Clear emitted key event tracking
+    this.emittedPeerKeyEvents.clear();
   }
 
   /**
@@ -1472,11 +1529,19 @@ export class PeerPigeonMesh extends EventEmitter {
      */
   _handleKeyExchange(data, from) {
     if ((data.type === 'key_exchange' || data.type === 'key_exchange_response') && data.publicKey && this.cryptoManager) {
-      this.cryptoManager.addPeerKey(from, data.publicKey);
-      this.debug.log(`🔐 Stored public key for peer ${from.substring(0, 8)}...`);
+      // Try to add the peer key - will return false if it's a duplicate
+      const keyAdded = this.cryptoManager.addPeerKey(from, data.publicKey);
+      
+      if (keyAdded) {
+        this.debug.log(`🔐 Stored public key for peer ${from.substring(0, 8)}...`);
+        // Clear any ongoing key exchange tracking for this peer since we now have their key
+        this.ongoingKeyExchanges.delete(from);
+      } else {
+        this.debug.log(`🔐 Key exchange ignored for peer ${from.substring(0, 8)}... - duplicate key`);
+      }
 
-      // Send our public key back if this was an initial exchange (not a response)
-      if (data.type === 'key_exchange') {
+      // Send our public key back if this was an initial exchange (not a response) and the key was actually new
+      if (data.type === 'key_exchange' && keyAdded) {
         const keypair = this.cryptoManager.keypair;
         if (keypair && keypair.pub && keypair.epub) {
           this.gossipManager.sendDirectMessage(from, {
@@ -1510,6 +1575,6 @@ export class PeerPigeonMesh extends EventEmitter {
 
     // Stream forwarding is now handled automatically by ConnectionManager
     // when remoteStream events are received, so we just emit for UI handling
-    this.emit('remoteStreamAnnouncement', data);
+    this.emit('remoteStreamAnnouncementReceived', data);
   }
 }

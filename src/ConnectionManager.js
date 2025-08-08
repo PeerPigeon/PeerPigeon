@@ -13,7 +13,6 @@ export class ConnectionManager extends EventEmitter {
     this.debug = DebugLogger.create('ConnectionManager');
     this.peers = new Map();
     this.connectionAttempts = new Map();
-    this.connectionTimeouts = new Map();
     this.pendingIceCandidates = new Map();
     this.disconnectionInProgress = new Set();
     this.cleanupInProgress = new Set();
@@ -21,7 +20,6 @@ export class ConnectionManager extends EventEmitter {
 
     // Configuration
     this.maxConnectionAttempts = 3;
-    this.connectionTimeout = 30000; // Reduced to 30 seconds for faster retry
     this.retryDelay = 500; // Faster retry - 500ms between attempts to same peer
 
     // Start periodic cleanup of stale peers
@@ -29,6 +27,32 @@ export class ConnectionManager extends EventEmitter {
 
     // Start monitoring for stuck connections
     this.startStuckConnectionMonitoring();
+    
+    // Set up mesh-level event listeners for crypto-gated media
+    this.setupMeshEventListeners();
+  }
+  
+  /**
+   * Set up event listeners for mesh-level events
+   */
+  setupMeshEventListeners() {
+    // Listen for successful key exchanges to enable media sharing
+    this.mesh.addEventListener('peerKeyAdded', (event) => {
+      this.handlePeerKeyAdded(event.peerId);
+    });
+  }
+  
+  /**
+   * Handle when a peer's crypto key is successfully added
+   * @param {string} peerId - The peer ID whose key was added
+   */
+  async handlePeerKeyAdded(peerId) {
+    this.debug.log(`🔐 Key added for ${peerId.substring(0, 8)}... - crypto verification complete`);
+    
+    // NOTE: We do NOT automatically enable remote streams here
+    // Media streams (both local and remote) must be manually invoked by the user via the "Start Media" button
+    // This ensures complete control over when ANY media streams are allowed
+    this.debug.log(`🔐 Crypto verified for ${peerId.substring(0, 8)}... - user must manually invoke media to enable streams`);
   }
 
   async connectToPeer(targetPeerId) {
@@ -40,17 +64,21 @@ export class ConnectionManager extends EventEmitter {
       return;
     }
 
-    // Check if we're already in the process of connecting
-    if (this.connectionTimeouts.has(targetPeerId)) {
-      this.debug.log(`Already connecting to ${targetPeerId.substring(0, 8)}... (connection in progress)`);
-      return;
-    }
-
     // Check if we're already attempting through PeerDiscovery
     if (this.mesh.peerDiscovery.isAttemptingConnection(targetPeerId)) {
       this.debug.log(`Already attempting connection to ${targetPeerId.substring(0, 8)}... via PeerDiscovery`);
       return;
     }
+
+    // INITIATOR LOGIC: Use deterministic peer ID comparison to prevent race conditions
+    // Only become initiator if our peer ID is lexicographically greater than target's
+    const shouldBeInitiator = this.mesh.peerId > targetPeerId;
+    if (!shouldBeInitiator) {
+      this.debug.log(`🔄 INITIATOR LOGIC: Not becoming initiator for ${targetPeerId.substring(0, 8)}... (our ID: ${this.mesh.peerId.substring(0, 8)}... is smaller)`);
+      return; // Let the other peer initiate
+    }
+
+    this.debug.log(`🔄 INITIATOR LOGIC: Becoming initiator for ${targetPeerId.substring(0, 8)}... (our ID: ${this.mesh.peerId.substring(0, 8)}... is greater)`);
 
     if (!this.mesh.canAcceptMorePeers()) {
       this.debug.log(`Cannot connect to ${targetPeerId.substring(0, 8)}... (max peers reached: ${this.mesh.maxPeers})`);
@@ -86,49 +114,20 @@ export class ConnectionManager extends EventEmitter {
     this.lastConnectionAttempt.set(targetPeerId, now);
     this.mesh.peerDiscovery.trackConnectionAttempt(targetPeerId);
 
-    // Set connection timeout - shorter for faster connections
-    const hasMedia = this.mesh.mediaManager.localStream !== null;
-    const timeoutDuration = hasMedia ? 8000 : 5000; // 8s for media, 5s for data-only
-
-    this.debug.log(`Setting connection timeout for ${targetPeerId.substring(0, 8)}... - ${timeoutDuration / 1000}s (media: ${hasMedia})`);
-
-    const timeoutId = setTimeout(() => {
-      if (this.peers.has(targetPeerId)) {
-        const peer = this.peers.get(targetPeerId);
-        const status = peer.getStatus();
-        const detailedStatus = peer.getDetailedStatus();
-        this.debug.log(`Connection timeout check for ${targetPeerId.substring(0, 8)}... - current status: ${status}`);
-        this.debug.log('Detailed status:', detailedStatus);
-
-        // Cleanup if not fully connected (includes 'connecting', 'new', 'failed', etc.)
-        if (status !== 'connected') {
-          this.mesh.emit('statusChanged', { type: 'warning', message: `Connection timeout for ${targetPeerId.substring(0, 8)}... (status: ${status}, media: ${hasMedia})` });
-          this.handleConnectionTimeout(targetPeerId);
-        } else {
-          this.debug.log(`Connection to ${targetPeerId.substring(0, 8)}... is connected, clearing timeout`);
-          this.connectionTimeouts.delete(targetPeerId);
-        }
-      } else {
-        this.debug.log(`Peer ${targetPeerId.substring(0, 8)}... no longer in peers Map, cleaning up timeout`);
-        this.connectionTimeouts.delete(targetPeerId);
-      }
-    }, timeoutDuration);
-
-    this.connectionTimeouts.set(targetPeerId, timeoutId);
-
     try {
       this.debug.log(`Creating PeerConnection for ${targetPeerId.substring(0, 8)}...`);
 
-      // Get current media stream if available
-      const localStream = this.mesh.mediaManager.localStream;
+      // SECURITY: NO automatic media sharing - all media must be manually invoked
       const options = {
-        localStream,
+        localStream: null, // Always null - media must be manually added later
         // ALWAYS enable both audio and video transceivers for maximum compatibility
         // This allows peers to receive media even if they don't have media when connecting
         enableAudio: true,
         enableVideo: true
+        // allowRemoteStreams defaults to false - streams only invoked when user clicks "Start Media"
       };
 
+      this.debug.log(`🔄 INITIATOR SETUP: Creating PeerConnection(${targetPeerId.substring(0, 8)}..., isInitiator=true)`);
       const peerConnection = new PeerConnection(targetPeerId, true, options);
 
       // Set up event handlers BEFORE creating connection to catch all events
@@ -138,7 +137,7 @@ export class ConnectionManager extends EventEmitter {
       this.debug.log(`Creating WebRTC connection for ${targetPeerId.substring(0, 8)}...`);
       await peerConnection.createConnection();
 
-      this.debug.log(`Creating offer for ${targetPeerId.substring(0, 8)}... (with media: ${hasMedia})`);
+      this.debug.log(`Creating offer for ${targetPeerId.substring(0, 8)}...`);
       const offer = await peerConnection.createOffer();
 
       this.debug.log(`Offer created for ${targetPeerId.substring(0, 8)}...`, {
@@ -162,40 +161,8 @@ export class ConnectionManager extends EventEmitter {
     }
   }
 
-  handleConnectionTimeout(peerId) {
-    this.debug.log(`Connection timeout for ${peerId.substring(0, 8)}...`);
-
-    const attempts = this.connectionAttempts.get(peerId) || 0;
-    if (attempts >= this.maxConnectionAttempts) {
-      this.mesh.emit('statusChanged', { type: 'warning', message: `Removing unresponsive peer ${peerId.substring(0, 8)}... after ${attempts} attempts` });
-      this.mesh.peerDiscovery.removeDiscoveredPeer(peerId);
-      this.connectionAttempts.delete(peerId);
-    } else {
-      this.mesh.peerDiscovery.clearConnectionAttempt(peerId);
-      this.debug.log(`Will retry connection to ${peerId.substring(0, 8)}... (attempt ${attempts}/${this.maxConnectionAttempts})`);
-    }
-
-    // Always cleanup the failed connection and ensure it's removed from peers Map
-    this.cleanupFailedConnection(peerId);
-
-    // Double-check that the peer is actually removed from the UI
-    if (this.peers.has(peerId)) {
-      this.debug.warn(`Peer ${peerId.substring(0, 8)}... still in peers Map after timeout cleanup, force removing`);
-      this.peers.delete(peerId);
-      this.emit('peersUpdated');
-    }
-  }
-
   cleanupFailedConnection(peerId) {
     this.debug.log(`Cleaning up failed connection for ${peerId.substring(0, 8)}...`);
-
-    // Clear timeout
-    const timeoutId = this.connectionTimeouts.get(peerId);
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-      this.connectionTimeouts.delete(peerId);
-      this.debug.log(`Cleared timeout for ${peerId.substring(0, 8)}...`);
-    }
 
     // Remove peer connection
     let peerRemoved = false;
@@ -231,13 +198,6 @@ export class ConnectionManager extends EventEmitter {
   }
 
   cleanupRaceCondition(peerId) {
-    // Clear timeout
-    const timeoutId = this.connectionTimeouts.get(peerId);
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-      this.connectionTimeouts.delete(peerId);
-    }
-
     // Remove peer connection but preserve connection attempts
     if (this.peers.has(peerId)) {
       const peer = this.peers.get(peerId);
@@ -270,13 +230,6 @@ export class ConnectionManager extends EventEmitter {
     peerConnection.addEventListener('connected', (event) => {
       this.debug.log(`[EVENT] Connected event received from ${event.peerId.substring(0, 8)}...`);
 
-      // Clear connection timeout on successful connection
-      const timeoutId = this.connectionTimeouts.get(event.peerId);
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-        this.connectionTimeouts.delete(event.peerId);
-      }
-
       // Reset connection attempts on successful connection
       this.connectionAttempts.delete(event.peerId);
 
@@ -306,11 +259,19 @@ export class ConnectionManager extends EventEmitter {
 
       // Automatically initiate key exchange when crypto is enabled
       if (this.mesh.cryptoManager) {
-        this.debug.log(`🔐 Automatically exchanging keys with newly connected peer ${event.peerId.substring(0, 8)}...`);
-        // Exchange keys immediately without delay for faster setup
-        this.mesh.exchangeKeysWithPeer(event.peerId).catch(error => {
-          this.debug.error(`🔐 Failed to exchange keys with ${event.peerId.substring(0, 8)}:`, error);
-        });
+        // Check if we already have this peer's key to avoid duplicate exchanges
+        const hasExistingKey = this.mesh.cryptoManager.peerKeys.has(event.peerId);
+        if (!hasExistingKey) {
+          this.debug.log(`🔐 Automatically exchanging keys with newly connected peer ${event.peerId.substring(0, 8)}...`);
+          // PERFORMANCE: Defer key exchange to prevent blocking data channel establishment
+          setTimeout(() => {
+            this.mesh.exchangeKeysWithPeer(event.peerId).catch(error => {
+              this.debug.error(`🔐 Failed to exchange keys with ${event.peerId.substring(0, 8)}:`, error);
+            });
+          }, 0);
+        } else {
+          this.debug.log(`🔐 Skipping key exchange with ${event.peerId.substring(0, 8)}... - key already exists`);
+        }
       }
 
       this.mesh.emit('peerConnected', { peerId: event.peerId });
@@ -453,12 +414,6 @@ export class ConnectionManager extends EventEmitter {
 
     try {
       // Clear all related data
-      const timeoutId = this.connectionTimeouts.get(peerId);
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-        this.connectionTimeouts.delete(peerId);
-      }
-
       if (this.peers.has(peerId)) {
         const peerConnection = this.peers.get(peerId);
 
@@ -531,13 +486,6 @@ export class ConnectionManager extends EventEmitter {
     this.mesh.peerDiscovery.removeDiscoveredPeer(peerId);
     this.mesh.peerDiscovery.clearConnectionAttempt(peerId);
     this.connectionAttempts.delete(peerId);
-
-    // Clear timeout if exists
-    const timeoutId = this.connectionTimeouts.get(peerId);
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-      this.connectionTimeouts.delete(peerId);
-    }
 
     if (this.peers.has(peerId)) {
       const peer = this.peers.get(peerId);
@@ -712,7 +660,6 @@ export class ConnectionManager extends EventEmitter {
 
     this.peers.clear();
     this.connectionAttempts.clear();
-    this.connectionTimeouts.clear();
     this.pendingIceCandidates.clear();
     this.disconnectionInProgress.clear();
     this.cleanupInProgress.clear();

@@ -4,33 +4,51 @@
   "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
   "main": "index.js",
   "type": "module",
+  "bin": {
+    "peerpigeon": "./cli.js"
+  },
   "exports": {
     ".": {
+      "browser": "./dist/peerpigeon-browser.js",
       "import": "./index.js"
     }
   },
   "scripts": {
-    "dev": "concurrently \"npm run server\" \"npm run dev:http\" --names \"signaling,http\" --prefix-colors \"blue,green\"",
+    "build": "node scripts/build-browser.js",
+    "prebuild": "mkdir -p dist",
+    "cli": "node cli.js",
+    "cli:server": "node cli.js server",
+    "cli:interactive": "node cli.js interactive",
+    "dev": "npm run build && node dev-runner.js",
     "dev:http": "node dev-server.js",
     "start": "node websocket-server/server.js",
     "server": "node websocket-server/server.js",
     "lint": "node -c src/*.js examples/**/*.js websocket-server/*.js",
     "lint:fix": "eslint --cache --cache-location .eslintcache src/ examples/ websocket-server/ --ext .js --fix",
-    "test": "node test/test-reporter.js",
+    "test": "node test/browser-integration-test.js",
     "test:storage": "node examples/node/storage-test.js",
     "test:browser": "node test/browser-integration-test.js",
-    "test:browser:headless": "HEADLESS=true node test/browser-integration-test.js",
-    "test:legacy": "npm run test:storage && npm run test:browser:headless",
+    "test:browser:visual": "HEADLESS=false node test/browser-integration-test.js",
+    "test:video": "node test/video-streaming-test.js",
+    "test:video:visual": "HEADLESS=false node test/video-streaming-test.js",
+    "test:video:runner": "node test/run-video-streaming-test.js",
+    "test:video:manual": "node test/manual-video-streaming-test.js",
+    "test:video:manual:visual": "HEADLESS=false node test/manual-video-streaming-test.js",
     "ci": "npm run lint && npm run test",
-    "prepublishOnly": "npm run ci"
+    "prepublishOnly": "npm run build && npm run ci"
   },
   "files": [
     "index.js",
+    "cli.js",
+    "cli-examples.js",
     "src/",
     "server/",
     "websocket-server/",
     "examples/",
+    "dist/",
     "README.md",
+    "CLI_README.md",
+    "API_DOCUMENTATION.md",
     "LICENSE"
   ],
   "repository": {
@@ -62,16 +80,18 @@
   "homepage": "https://github.com/draeder/peerpigeon#readme",
   "dependencies": {
     "@koush/wrtc": "^0.5.3",
-    "unsea": "^1.1.0",
+    "unsea": "^1.1.2",
     "ws": "^8.18.0",
     "yamljs": "^0.3.0"
   },
   "devDependencies": {
     "concurrently": "^9.2.0",
+    "esbuild": "^0.25.8",
     "eslint": "^8.57.1",
     "eslint-config-standard": "^17.1.0",
     "express": "^4.19.2",
     "jsdoc": "^4.0.4",
+    "nodemon": "^3.1.10",
     "puppeteer": "^22.0.0"
   },
   "engines": {

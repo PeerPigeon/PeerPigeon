@@ -101,8 +101,8 @@ Each example initializes a PeerPigeon mesh with the required features:
 
 ```javascript
 const mesh = new PeerPigeonMesh({
-  enableWebDHT: true,        // Distributed hash table
-  enableCrypto: true,        // Encryption/decryption
+  enableWebDHT: true,        // Distributed hash table (default: true)
+  enableCrypto: true,        // Encryption/decryption (default: true)
   enableDistributedStorage: true  // Optional storage layer
 });
 ```

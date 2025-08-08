@@ -4,6 +4,7 @@ export interface PeerPigeonOptions {
     peerId?: string;
     maxPeers?: number;
     minPeers?: number;
+    autoConnect?: boolean;
     autoDiscovery?: boolean;
     evictionStrategy?: boolean;
     xorRouting?: boolean;
@@ -20,6 +21,7 @@ export interface PeerStatus {
     discoveredCount: number;
     maxPeers: number;
     minPeers: number;
+    autoConnect: boolean;
     autoDiscovery: boolean;
     evictionStrategy: boolean;
     xorRouting: boolean;
@@ -72,6 +74,7 @@ export declare class PeerPigeonMesh {
     // Configuration
     setMaxPeers(count: number): void;
     setMinPeers(count: number): void;
+    setAutoConnect(enabled: boolean): void;
     setAutoDiscovery(enabled: boolean): void;
     setEvictionStrategy(enabled: boolean): void;
     setXorRouting(enabled: boolean): void;

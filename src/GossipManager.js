@@ -17,6 +17,9 @@ export class GossipManager extends EventEmitter {
     this.seenMessages = new Map(); // messageId -> { timestamp, ttl }
     this.messageHistory = new Map(); // messageId -> message content
 
+    // Track key exchanges to prevent duplicates (separate from general message deduplication)
+    this.processedKeyExchanges = new Map(); // "peerId:keyType" -> timestamp
+
     // Configuration
     this.maxTTL = 10; // Maximum hops before message expires
     this.messageExpiryTime = 5 * 60 * 1000; // 5 minutes
@@ -492,6 +495,7 @@ export class GossipManager extends EventEmitter {
   cleanupExpiredMessages() {
     const now = Date.now();
     let cleaned = 0;
+    let keyExchangesCleaned = 0;
 
     // Clean up seen messages
     this.seenMessages.forEach((data, messageId) => {
@@ -502,8 +506,19 @@ export class GossipManager extends EventEmitter {
       }
     });
 
+    // Clean up old key exchange tracking (keep for shorter time - 1 minute)
+    this.processedKeyExchanges.forEach((timestamp, keyExchangeId) => {
+      if (now - timestamp > 60000) { // 1 minute
+        this.processedKeyExchanges.delete(keyExchangeId);
+        keyExchangesCleaned++;
+      }
+    });
+
     if (cleaned > 0) {
       this.debug.log(`Cleaned up ${cleaned} expired gossip messages`);
+    }
+    if (keyExchangesCleaned > 0) {
+      this.debug.log(`Cleaned up ${keyExchangesCleaned} old key exchange tracking entries`);
     }
   }
 
@@ -514,6 +529,7 @@ export class GossipManager extends EventEmitter {
     this.stopCleanupTimer();
     this.seenMessages.clear();
     this.messageHistory.clear();
+    this.processedKeyExchanges.clear();
   }
 
   /**
@@ -526,7 +542,37 @@ export class GossipManager extends EventEmitter {
     // Handle key exchange messages
     if (subtype === 'key_exchange' || subtype === 'key_exchange_response') {
       if (content && (content.type === 'key_exchange' || content.type === 'key_exchange_response') && content.publicKey) {
-        this.debug.log(`🔐 Received ${content.type} from peer ${originPeerId.substring(0, 8)}...`);
+        
+        // Create a unique identifier for this key exchange to prevent duplicates
+        const keyExchangeId = `${originPeerId}:${content.type}:${content.timestamp || Date.now()}`;
+        
+        // Check if we've already processed this key exchange
+        if (this.processedKeyExchanges.has(keyExchangeId)) {
+          this.debug.log(`🔐 Ignoring duplicate ${content.type} from peer ${originPeerId.substring(0, 8)}... (already processed)`);
+          return true; // Mark as handled to prevent further propagation
+        }
+        
+        // Also check for recent key exchanges from the same peer (within last 5 seconds)
+        const recentKeyExchangePattern = `${originPeerId}:${content.type}:`;
+        const now = Date.now();
+        let foundRecent = false;
+        
+        for (const [existingId, timestamp] of this.processedKeyExchanges.entries()) {
+          if (existingId.startsWith(recentKeyExchangePattern) && (now - timestamp) < 5000) {
+            foundRecent = true;
+            break;
+          }
+        }
+        
+        if (foundRecent) {
+          this.debug.log(`🔐 Ignoring recent duplicate ${content.type} from peer ${originPeerId.substring(0, 8)}... (processed recently)`);
+          return true;
+        }
+
+        this.debug.log(`🔐 Processing ${content.type} from peer ${originPeerId.substring(0, 8)}...`);
+        
+        // Mark this key exchange as processed
+        this.processedKeyExchanges.set(keyExchangeId, now);
 
         // Use the mesh's key exchange handler which properly handles both pub and epub keys
         this.mesh._handleKeyExchange(content, originPeerId);

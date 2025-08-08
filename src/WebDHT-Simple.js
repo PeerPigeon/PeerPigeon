@@ -17,7 +17,7 @@ import DebugLogger from './DebugLogger.js';
  * - Automatic peer discovery and failure handling
  * - No complex Kademlia routing - just simple consistent hashing
  */
-export class WebDHT extends EventEmitter {
+export class SimpleWebDHT extends EventEmitter {
   constructor(mesh) {
     super();
     this.debug = DebugLogger.create('SimpleWebDHT');
@@ -122,29 +122,22 @@ export class WebDHT extends EventEmitter {
     // Find closest peers for replication
     const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
     
-    this.debug.log(`PUT: Replicating ${key} to ${targetPeers.length} peers`);
-    
-    // Simple fire-and-forget replication
+    // Simple gossip replication - fire and forget
     const replicationPromises = targetPeers.map(async (peerId) => {
       if (peerId !== this.peerId) {
         try {
           this.sendMessage(peerId, 'dht_store', storeData);
-          // Add small delay to ensure message is sent
-          await new Promise(resolve => setTimeout(resolve, 50));
-          return { peerId, success: true };
         } catch (error) {
+          // Silent failure - gossip is best effort
           this.debug.warn(`Replication to ${peerId.substring(0, 8)} failed:`, error.message);
-          return { peerId, success: false, error: error.message };
         }
       }
-      return { peerId, success: true };
     });
 
-    // Wait for all sends to complete
-    await Promise.allSettled(replicationPromises);
+    // Don't wait for replication - fire and forget for speed
+    Promise.allSettled(replicationPromises);
     
     this.debug.log(`PUT: ${key} replicated to ${targetPeers.length} peers`);
-    
     return true;
   }
 
@@ -165,17 +158,14 @@ export class WebDHT extends EventEmitter {
     const keyHash = await this.hash(key);
     const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
     
-    this.debug.log(`GET: Querying ${targetPeers.length} peers for ${key}: ${targetPeers.map(p => p.substring(0, 8)).join(', ')}`);
+    this.debug.log(`GET: Querying ${targetPeers.length} peers for ${key}`);
 
     // Query peers in parallel
     const queryPromises = targetPeers.map(async (peerId) => {
       if (peerId === this.peerId) return null;
       
       try {
-        this.debug.log(`GET: Querying peer ${peerId.substring(0, 8)} for ${key}`);
-        const result = await this.queryPeer(peerId, key);
-        this.debug.log(`GET: Peer ${peerId.substring(0, 8)} response for ${key}:`, result ? 'found' : 'not found');
-        return result;
+        return await this.queryPeer(peerId, key);
       } catch (error) {
         this.debug.warn(`Query to ${peerId.substring(0, 8)} failed:`, error.message);
         return null;
@@ -197,7 +187,7 @@ export class WebDHT extends EventEmitter {
       }
     }
 
-    this.debug.log(`GET: ${key} not found after querying ${targetPeers.length} peers`);
+    this.debug.log(`GET: ${key} not found`);
     return null;
   }
 
@@ -245,7 +235,7 @@ export class WebDHT extends EventEmitter {
 
     const peer = this.mesh.connectionManager.peers.get(peerId);
     if (peer && peer.getStatus() === 'connected') {
-      peer.sendMessage(message);
+      peer.send(message);
     } else {
       throw new Error(`Peer ${peerId} not connected`);
     }
@@ -288,21 +278,17 @@ export class WebDHT extends EventEmitter {
   handleStore(data, fromPeerId) {
     const { key, value, timestamp, publisher } = data;
     
-    try {
-      // Simple conflict resolution: latest timestamp wins
-      if (this.storage.has(key)) {
-        const existing = this.storage.get(key);
-        if (existing.timestamp >= timestamp) {
-          return; // Ignore older data
-        }
+    // Simple conflict resolution: latest timestamp wins
+    if (this.storage.has(key)) {
+      const existing = this.storage.get(key);
+      if (existing.timestamp >= timestamp) {
+        return; // Ignore older data
       }
-
-      // Store the data
-      this.storage.set(key, { key, value, timestamp, publisher });
-      this.debug.log(`STORE: Received ${key} from ${fromPeerId.substring(0, 8)}`);
-    } catch (error) {
-      this.debug.warn(`Store failed for ${key}:`, error.message);
     }
+
+    // Store the data
+    this.storage.set(key, { key, value, timestamp, publisher });
+    this.debug.log(`STORE: Received ${key} from ${fromPeerId.substring(0, 8)}`);
   }
 
   /**
