@@ -1,0 +1,21 @@
+{
+  "name": "peerpigeon-vue-example",
+  "version": "1.0.0",
+  "description": "Comprehensive Vue 3 example showcasing all PeerPigeon features",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.4.0",
+    "@vueuse/core": "^10.9.0",
+    "vue-router": "^4.3.0",
+    "pinia": "^2.1.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "vite": "^5.2.0"
+  }
+}

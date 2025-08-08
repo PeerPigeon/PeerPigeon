@@ -3,750 +3,571 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PeerPigeon - WebRTC P2P Mesh</title>
+    <title>PeerPigeon - Complete API Testing Suite</title>
     <link rel="stylesheet" href="styles.css">
-    <link rel="icon" type="image/png" sizes="32x32" href="assets/images/favicon.png">
-    <link rel="icon" type="image/png" sizes="16x16" href="assets/images/favicon.png">
-    <link rel="apple-touch-icon" href="assets/images/favicon.png">
-    <link rel="shortcut icon" href="assets/images/favicon.png">
-    <!-- Load unsea crypto library from CDN for browser environment -->
-    <script src="https://cdn.jsdelivr.net/npm/unsea@1.3.0/dist/sea.min.js"></script>
+    <link rel="icon" type="image/png" sizes="32x32" href="../browser/assets/images/favicon.png">
 </head>
 <body>
     <div class="container">
         <header>
-            <h1><img src="assets/images/favicon.png" alt="PeerPigeon Logo" style="height: 2.5em; width: auto; vertical-align: middle; margin-right: 0.5em;"> PeerPigeon</h1>
-            <p>WebRTC P2P mesh networking with XOR-based routing</p>
-            <div class="usage-hint">
-                <strong>Tip:</strong> You can pass the API Gateway URL via query parameter:<br>
-                <code>?api=ws://localhost:3000</code>
+            <h1>🐦 PeerPigeon - Complete API Testing Suite</h1>
+            <p>Comprehensive browser-based tool for testing all PeerPigeon features</p>
+            <div class="peer-info">
+                <span><strong>Peer ID:</strong> <code id="peer-id">Initializing...</code></span>
+                <span><strong>Status:</strong> <span id="status" class="status disconnected">Disconnected</span></span>
             </div>
         </header>
 
-        <main>
-            <div class="peer-info">
-                <h2>Peer Information</h2>
-                <div class="info-group">
-                    <label>Your Peer ID:</label>
-                    <code id="peer-id">Generating...</code>
-                </div>
-                <div class="info-group">
-                    <label>Status:</label>
-                    <span id="status" class="status disconnected">Disconnected</span>
-                </div>
-            </div>
+        <nav class="feature-tabs">
+            <button class="tab-btn active" data-tab="connection">Connection</button>
+            <button class="tab-btn" data-tab="messaging">Messaging</button>
+            <button class="tab-btn" data-tab="media">Media</button>
+            <button class="tab-btn" data-tab="dht">WebDHT & Storage</button>
+            <button class="tab-btn" data-tab="crypto">Encryption</button>
+            <button class="tab-btn" data-tab="network">Network Info</button>
+            <button class="tab-btn" data-tab="testing">API Testing</button>
+        </nav>
 
-            <div class="connection-controls">
-                <h2>Connection</h2>
+        <!-- Global Message History - Visible across all tabs -->
+        <section class="global-message-history">
+            <div class="card">
+                <h3>📬 Message History</h3>
+                <div class="message-filters">
+                    <select id="message-filter">
+                        <option value="all">All Messages</option>
+                        <option value="sent">Sent Messages</option>
+                        <option value="received">Received Messages</option>
+                        <option value="broadcast">Broadcast Messages</option>
+                        <option value="direct">Direct Messages</option>
+                        <option value="group">Group Messages</option>
+                    </select>
+                    <button id="export-messages-btn" class="btn tertiary">📥 Export History</button>
+                </div>
+                <div id="message-history" class="message-history">
+                    <p class="empty-state">No messages yet</p>
+                </div>
                 <div class="button-group">
-                    <button id="connect-btn" class="btn primary">Connect</button>
-                    <button id="disconnect-btn" class="btn secondary" disabled>Disconnect</button>
-                    <button id="cleanup-btn" class="btn tertiary" disabled>Clean Signaling Data</button>
-                    <button id="health-check-btn" class="btn quaternary" disabled>Health Check</button>
-                    <button id="refresh-btn" class="btn quaternary">🔄 Refresh Page</button>
-                </div>
-                
-                <div class="system-messages-container">
-                    <div id="system-messages" class="system-messages"></div>
+                    <button id="clear-messages-btn" class="btn tertiary">Clear History</button>
+                    <button id="refresh-messages-btn" class="btn tertiary">Refresh</button>
                 </div>
             </div>
+        </section>
 
-            <div class="connected-peers" aria-expanded="false">
-                <div class="section-header">
-                    <h2>
-                        <button id="connected-peers-toggle" class="toggle-btn" aria-expanded="false">
-                            ▶ Connected Peers
-                        </button>
-                        <span id="connected-peers-count" class="count-badge">0</span>
-                    </h2>
+        <main>
+            <!-- Connection Management Tab -->
+            <section id="connection-tab" class="tab-content active">
+                <h2>🌐 Connection Management</h2>
+                
+                <div class="card">
+                    <h3>Signaling Server</h3>
+                    <div class="input-group">
+                        <label for="signaling-url">Server URL:</label>
+                        <input type="text" id="signaling-url" value="ws://localhost:3000" placeholder="ws://localhost:3000">
+                    </div>
+                    <div class="button-group">
+                        <button id="connect-btn" class="btn primary">Connect</button>
+                        <button id="disconnect-btn" class="btn secondary" disabled>Disconnect</button>
+                        <button id="cleanup-btn" class="btn tertiary">Cleanup Stale Data</button>
+                    </div>
                 </div>
-                <div id="connected-peers-content" class="collapsible-content" style="display: none;">
+
+                <div class="card">
+                    <h3>Mesh Configuration</h3>
+                    <div class="config-grid">
+                        <div class="input-group">
+                            <label for="max-peers">Max Peers:</label>
+                            <input type="number" id="max-peers" value="3" min="1" max="10">
+                        </div>
+                        <div class="input-group">
+                            <label for="min-peers">Min Peers:</label>
+                            <input type="number" id="min-peers" value="2" min="1" max="10">
+                        </div>
+                        <div class="checkbox-group">
+                            <label><input type="checkbox" id="auto-connect" checked> Auto Connect</label>
+                            <label><input type="checkbox" id="auto-discovery" checked> Auto Discovery</label>
+                            <label><input type="checkbox" id="eviction-strategy" checked> Eviction Strategy</label>
+                            <label><input type="checkbox" id="xor-routing" checked> XOR Routing</label>
+                        </div>
+                        <div class="checkbox-group">
+                            <label><input type="checkbox" id="enable-crypto" checked> Enable Crypto</label>
+                            <label><input type="checkbox" id="enable-webdht" checked> Enable WebDHT</label>
+                            <label><input type="checkbox" id="enable-distributed-storage" checked> Enable Distributed Storage</label>
+                        </div>
+                        <div class="checkbox-group">
+                            <label><input type="checkbox" id="enable-gossip"> Disable Gossip Protocol</label>
+                            <label><input type="checkbox" id="enable-hole-punching"> Disable Hole Punching</label>
+                            <label><input type="checkbox" id="enable-backup-connections"> Disable Backup Connections</label>
+                        </div>
+                    </div>
+                    <button id="apply-config-btn" class="btn tertiary">Apply Configuration</button>
+                    <button id="get-current-config-btn" class="btn tertiary">Show Current Config</button>
+                </div>
+
+                <div class="card">
+                    <h3>Connected Peers (<span id="peer-count">0</span>)</h3>
                     <div id="peers-list" class="peers-list">
                         <p class="empty-state">No peers connected</p>
                     </div>
+                    <div class="peer-actions">
+                        <input type="text" id="manual-peer-id" placeholder="Enter peer ID to connect">
+                        <button id="connect-peer-btn" class="btn tertiary">Connect to Peer</button>
+                        <button id="force-connect-all-btn" class="btn tertiary">Force Connect All</button>
+                    </div>
                 </div>
-            </div>
+            </section>
 
-            <div class="media" aria-expanded="false">
-                <div class="section-header">
-                    <h2>
-                        <button id="media-toggle" class="toggle-btn" aria-expanded="false">
-                            ▶ Video/Audio
-                        </button>
-                    </h2>
-                </div>
-                <div id="media-content" class="collapsible-content" style="display: none;">
-                    <div class="media-controls">
+            <!-- Messaging Tab -->
+            <section id="messaging-tab" class="tab-content">
+                <h2>💬 Messaging & Communication</h2>
+                
+                <div class="card">
+                    <h3>📢 Broadcast Messages</h3>
+                    <p class="description">Send messages to all connected peers in the mesh</p>
+                    <div class="message-input">
                         <div class="input-group">
-                            <label>Media Types:</label>
-                            <div class="checkbox-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="enable-video">
-                                    <span class="checkmark"></span>
-                                    Enable Video
-                                </label>
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="enable-audio">
-                                    <span class="checkmark"></span>
-                                    Enable Audio
-                                </label>
-                            </div>
+                            <label for="broadcast-message">Broadcast Message:</label>
+                            <textarea id="broadcast-message" placeholder="Enter your broadcast message..." rows="3"></textarea>
                         </div>
-
-                        <div class="input-group">
-                            <label for="camera-select">Camera:</label>
-                            <select id="camera-select" disabled>
-                                <option value="">Select camera...</option>
-                            </select>
+                        <div class="message-options">
+                            <label><input type="checkbox" id="encrypt-broadcast" checked> Encrypt Message</label>
+                            <label><input type="checkbox" id="high-priority-broadcast"> High Priority</label>
                         </div>
-
-                        <div class="input-group">
-                            <label for="microphone-select">Microphone:</label>
-                            <select id="microphone-select" disabled>
-                                <option value="">Select microphone...</option>
-                            </select>
-                        </div>
-
                         <div class="button-group">
-                            <button id="start-media-btn" class="btn primary" disabled>Start Media</button>
-                            <button id="stop-media-btn" class="btn secondary" disabled>Stop Media</button>
-                            <button id="toggle-video-btn" class="btn tertiary" disabled>Toggle Video</button>
-                            <button id="toggle-audio-btn" class="btn tertiary" disabled>Toggle Audio</button>
-                            <button id="test-audio-btn" class="btn warning">🔊 Test Audio</button>
-                        </div>
-
-                        <div class="local-video">
-                            <h4>Your Video</h4>
-                            <div id="local-video-container" class="video-container">
-                                <p class="video-placeholder">No video stream</p>
-                            </div>
-                        </div>
-
-                        <div class="remote-videos">
-                            <h4>Peer Videos</h4>
-                            <div id="remote-videos-container" class="videos-grid">
-                                <p class="video-placeholder">No remote video streams</p>
-                            </div>
+                            <button id="send-broadcast-btn" class="btn primary">📢 Send Broadcast</button>
+                            <button id="send-anonymous-btn" class="btn secondary">🎭 Send Anonymous</button>
                         </div>
                     </div>
                 </div>
-            </div>
 
-            <div class="discovered-peers" aria-expanded="false">
-                <div class="section-header">
-                    <h2>
-                        <button id="discovered-peers-toggle" class="toggle-btn" aria-expanded="false">
-                            ▶ Discovered Peers
-                        </button>
-                        <span id="discovered-peers-count" class="count-badge">0</span>
-                    </h2>
+                <div class="card">
+                    <h3>📧 Direct Messages</h3>
+                    <p class="description">Send private messages to specific peers</p>
+                    <div class="message-input">
+                        <div class="input-group">
+                            <label for="target-peer">Target Peer:</label>
+                            <select id="target-peer-select">
+                                <option value="">Select a connected peer...</option>
+                            </select>
+                            <input type="text" id="target-peer" placeholder="Or enter peer ID manually">
+                        </div>
+                        <div class="input-group">
+                            <label for="direct-message">Private Message:</label>
+                            <textarea id="direct-message" placeholder="Enter your direct message..." rows="3"></textarea>
+                        </div>
+                        <div class="message-options">
+                            <label><input type="checkbox" id="encrypt-direct" checked> Encrypt Message</label>
+                            <label><input type="checkbox" id="request-receipt"> Request Read Receipt</label>
+                            <label><input type="checkbox" id="ephemeral-message"> Ephemeral (Auto-delete)</label>
+                        </div>
+                        <div class="button-group">
+                            <button id="send-direct-btn" class="btn primary">📧 Send Direct Message</button>
+                            <button id="send-file-btn" class="btn secondary">📎 Send File</button>
+                        </div>
+                    </div>
                 </div>
-                <div id="discovered-peers-content" class="collapsible-content" style="display: none;">
-                    <div id="discovered-peers-list" class="discovered-peers-list">
+
+                <div class="card">
+                    <h3>💬 Group Chat</h3>
+                    <p class="description">Create and manage group conversations</p>
+                    <div class="group-controls">
+                        <div class="input-group">
+                            <label for="group-name">Group Name:</label>
+                            <input type="text" id="group-name" placeholder="Enter group name">
+                        </div>
+                        <div class="input-group">
+                            <label for="group-members">Members (comma-separated peer IDs):</label>
+                            <textarea id="group-members" placeholder="peer1,peer2,peer3..." rows="2"></textarea>
+                        </div>
+                        <div class="button-group">
+                            <button id="create-group-btn" class="btn primary">Create Group</button>
+                            <button id="join-group-btn" class="btn secondary">Join Group</button>
+                            <button id="leave-group-btn" class="btn tertiary">Leave Group</button>
+                        </div>
+                        <div class="input-group">
+                            <label for="group-message">Group Message:</label>
+                            <textarea id="group-message" placeholder="Enter group message..." rows="3"></textarea>
+                            <button id="send-group-btn" class="btn primary">Send to Group</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Media Tab -->
+            <section id="media-tab" class="tab-content">
+                <h2>🎥 Media Management</h2>
+                
+                <div class="card">
+                    <h3>Local Media</h3>
+                    <div class="media-controls">
+                        <div class="checkbox-group">
+                            <label><input type="checkbox" id="enable-video"> Enable Video</label>
+                            <label><input type="checkbox" id="enable-audio"> Enable Audio</label>
+                        </div>
+                        <div class="device-selectors">
+                            <div class="input-group">
+                                <label for="camera-select">Camera:</label>
+                                <select id="camera-select">
+                                    <option value="">Select camera...</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label for="microphone-select">Microphone:</label>
+                                <select id="microphone-select">
+                                    <option value="">Select microphone...</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="button-group">
+                            <button id="start-media-btn" class="btn primary">Start Media</button>
+                            <button id="stop-media-btn" class="btn secondary" disabled>Stop Media</button>
+                            <button id="enumerate-devices-btn" class="btn tertiary">Refresh Devices</button>
+                        </div>
+                        <div class="media-toggle">
+                            <button id="toggle-video-btn" class="btn tertiary" disabled>Toggle Video</button>
+                            <button id="toggle-audio-btn" class="btn tertiary" disabled>Toggle Audio</button>
+                        </div>
+                    </div>
+                    <div class="media-preview">
+                        <video id="local-video" autoplay muted playsinline style="display: none;"></video>
+                        <div id="media-status" class="media-status">No active media stream</div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Remote Streams</h3>
+                    <div id="remote-streams" class="remote-streams">
+                        <p class="empty-state">No remote streams</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Media Information</h3>
+                    <div id="media-info" class="info-display">
+                        <div>Local Stream: <span id="local-stream-status">None</span></div>
+                        <div>Video Enabled: <span id="video-enabled-status">No</span></div>
+                        <div>Audio Enabled: <span id="audio-enabled-status">No</span></div>
+                        <div>Active Camera: <span id="active-camera">None</span></div>
+                        <div>Active Microphone: <span id="active-microphone">None</span></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- WebDHT & Storage Tab -->
+            <section id="dht-tab" class="tab-content">
+                <h2>🗄️ WebDHT (Low-Level DHT)</h2>
+                <p class="description">Low-level distributed hash table for raw key-value storage without encryption or access control</p>
+                
+                <div class="card">
+                    <h3>Store Raw Data</h3>
+                    <div class="dht-form">
+                        <div class="input-group">
+                            <label for="dht-key">Key:</label>
+                            <input type="text" id="dht-key" placeholder="Enter raw storage key">
+                        </div>
+                        <div class="input-group">
+                            <label for="dht-value">Value (JSON):</label>
+                            <textarea id="dht-value" placeholder='{"example": "data"}' rows="3"></textarea>
+                        </div>
+                        <div class="input-group">
+                            <label for="dht-ttl">TTL (ms, optional):</label>
+                            <input type="number" id="dht-ttl" placeholder="Time to live in milliseconds">
+                        </div>
+                        <div class="button-group">
+                            <button id="dht-put-btn" class="btn primary">Store Data</button>
+                            <button id="dht-update-btn" class="btn secondary">Update Data</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Retrieve Data</h3>
+                    <div class="input-group">
+                        <label for="dht-get-key">Key:</label>
+                        <input type="text" id="dht-get-key" placeholder="Enter key to retrieve">
+                    </div>
+                    <div class="button-group">
+                        <button id="dht-get-btn" class="btn primary">Get Data</button>
+                        <button id="dht-delete-btn" class="btn danger">Delete Key</button>
+                    </div>
+                    <div id="dht-result" class="result-display"></div>
+                </div>
+
+                <div class="card">
+                    <h3>Subscriptions</h3>
+                    <div class="input-group">
+                        <label for="dht-subscribe-key">Key to Subscribe:</label>
+                        <input type="text" id="dht-subscribe-key" placeholder="Enter key to monitor">
+                    </div>
+                    <div class="button-group">
+                        <button id="dht-subscribe-btn" class="btn primary">Subscribe</button>
+                        <button id="dht-unsubscribe-btn" class="btn secondary">Unsubscribe</button>
+                    </div>
+                    <div id="dht-subscriptions" class="subscriptions-list">
+                        <p class="empty-state">No active subscriptions</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>DHT Activity Log</h3>
+                    <div id="dht-log" class="activity-log">
+                        <p class="empty-state">No DHT activity yet</p>
+                    </div>
+                    <button id="clear-dht-log-btn" class="btn tertiary">Clear Log</button>
+                </div>
+
+                <div class="card">
+                    <h3>🗃️ Distributed Storage (High-Level)</h3>
+                    <p class="description">High-level storage with encryption, access control, and storage spaces - built on top of WebDHT</p>
+                    
+                    <div class="storage-controls">
+                        <div class="button-group">
+                            <button id="storage-enable-btn" class="btn primary">Enable Storage</button>
+                            <button id="storage-disable-btn" class="btn secondary">Disable Storage</button>
+                            <button id="storage-status-btn" class="btn tertiary">Get Status</button>
+                        </div>
+                        
+                        <div class="storage-form">
+                            <div class="input-group">
+                                <label for="storage-key">Storage Key:</label>
+                                <input type="text" id="storage-key" placeholder="Enter unique storage key">
+                            </div>
+                            <div class="input-group">
+                                <label for="storage-data">Data (JSON):</label>
+                                <textarea id="storage-data" placeholder='{"persistent": "data"}' rows="3"></textarea>
+                            </div>
+                            <div class="input-group">
+                                <label for="storage-space">Storage Space:</label>
+                                <select id="storage-space">
+                                    <option value="private">Private (encrypted, owner-only)</option>
+                                    <option value="public">Public (unencrypted, readable by all)</option>
+                                    <option value="frozen">Frozen (immutable, readable by all)</option>
+                                </select>
+                            </div>
+                            <div class="button-group">
+                                <button id="storage-put-btn" class="btn primary">Store Data</button>
+                                <button id="storage-get-btn" class="btn secondary">Retrieve Data</button>
+                                <button id="storage-delete-btn" class="btn danger">Delete Data</button>
+                            </div>
+                        </div>
+                        
+                        <div class="storage-management">
+                            <div class="button-group">
+                                <button id="storage-list-btn" class="btn tertiary">List All Keys</button>
+                                <button id="storage-stats-btn" class="btn tertiary">Storage Stats</button>
+                                <button id="storage-clear-btn" class="btn danger">Clear All Storage</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div id="storage-result" class="result-display"></div>
+                    
+                    <div class="card">
+                        <h4>Storage Activity Log</h4>
+                        <div id="storage-log" class="activity-log">
+                            <p class="empty-state">No storage activity yet</p>
+                        </div>
+                        <button id="clear-storage-log-btn" class="btn tertiary">Clear Storage Log</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Encryption Tab -->
+            <section id="crypto-tab" class="tab-content">
+                <h2>🔐 Encryption & Security</h2>
+                
+                <div class="card">
+                    <h3>Crypto Status</h3>
+                    <div id="crypto-status" class="info-display">
+                        <div>Crypto Enabled: <span id="crypto-enabled-status">Unknown</span></div>
+                        <div>Public Key: <span id="public-key-display">Not available</span></div>
+                        <div>Key Exchanges: <span id="key-exchanges-count">0</span></div>
+                    </div>
+                    <div class="button-group">
+                        <button id="refresh-crypto-status-btn" class="btn tertiary">Refresh Status</button>
+                        <button id="force-crypto-init-btn" class="btn secondary">Force Crypto Init</button>
+                        <button id="exchange-keys-btn" class="btn primary">Exchange Keys</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Encrypted Messaging</h3>
+                    <div class="input-group">
+                        <label for="encrypted-message">Message:</label>
+                        <textarea id="encrypted-message" placeholder="Enter message to encrypt and broadcast..." rows="3"></textarea>
+                    </div>
+                    <div class="input-group">
+                        <label for="group-id">Group ID (optional):</label>
+                        <input type="text" id="group-id" placeholder="Enter group encryption key ID">
+                    </div>
+                    <button id="send-encrypted-btn" class="btn primary">Send Encrypted Broadcast</button>
+                </div>
+
+                <div class="card">
+                    <h3>Key Exchange</h3>
+                    <div class="input-group">
+                        <label for="key-exchange-peer">Peer ID:</label>
+                        <input type="text" id="key-exchange-peer" placeholder="Enter peer ID for key exchange">
+                    </div>
+                    <button id="exchange-keys-btn" class="btn primary">Exchange Keys</button>
+                </div>
+
+                <div class="card">
+                    <h3>Manual Key Management</h3>
+                    <div class="input-group">
+                        <label for="manual-peer-id">Peer ID:</label>
+                        <input type="text" id="manual-peer-id" placeholder="Enter peer ID">
+                    </div>
+                    <div class="input-group">
+                        <label for="manual-public-key">Public Key:</label>
+                        <textarea id="manual-public-key" placeholder="Enter peer's public key..." rows="3"></textarea>
+                    </div>
+                    <button id="add-peer-key-btn" class="btn primary">Add Peer Key</button>
+                </div>
+
+                <div class="card">
+                    <h3>Encryption Activity Log</h3>
+                    <div id="crypto-log" class="activity-log">
+                        <p class="empty-state">No encryption activity yet</p>
+                    </div>
+                    <button id="clear-crypto-log-btn" class="btn tertiary">Clear Log</button>
+                </div>
+            </section>
+
+            <!-- Network Information Tab -->
+            <section id="network-tab" class="tab-content">
+                <h2>📊 Network Information & Monitoring</h2>
+                
+                <div class="card">
+                    <h3>Network Status</h3>
+                    <div id="network-status" class="status-grid">
+                        <div class="status-item">
+                            <label>Connected:</label>
+                            <span id="network-connected">No</span>
+                        </div>
+                        <div class="status-item">
+                            <label>Connected Peers:</label>
+                            <span id="network-peer-count">0</span>
+                        </div>
+                        <div class="status-item">
+                            <label>Discovered Peers:</label>
+                            <span id="network-discovered-count">0</span>
+                        </div>
+                        <div class="status-item">
+                            <label>Signaling URL:</label>
+                            <span id="network-signaling-url">None</span>
+                        </div>
+                        <div class="status-item">
+                            <label>Uptime:</label>
+                            <span id="network-uptime">0s</span>
+                        </div>
+                        <div class="status-item">
+                            <label>Can Accept More:</label>
+                            <span id="network-can-accept">Unknown</span>
+                        </div>
+                    </div>
+                    <button id="refresh-status-btn" class="btn tertiary">Refresh Status</button>
+                </div>
+
+                <div class="card">
+                    <h3>Peer State Summary</h3>
+                    <div id="peer-state-summary" class="peer-states">
+                        <p class="empty-state">No peer state information available</p>
+                    </div>
+                    <button id="get-peer-states-btn" class="btn tertiary">Get Peer States</button>
+                </div>
+
+                <div class="card">
+                    <h3>Connection Monitoring</h3>
+                    <div class="button-group">
+                        <button id="start-monitoring-btn" class="btn primary">Start Monitoring</button>
+                        <button id="stop-monitoring-btn" class="btn secondary" disabled>Stop Monitoring</button>
+                        <button id="debug-connectivity-btn" class="btn tertiary">Debug Connectivity</button>
+                    </div>
+                    <div id="connection-stats" class="stats-display">
+                        <p class="empty-state">No monitoring data available</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Discovered Peers</h3>
+                    <div id="discovered-peers" class="discovered-peers-list">
                         <p class="empty-state">No peers discovered</p>
                     </div>
                 </div>
-            </div>
+            </section>
 
-            <div class="manual-connection" aria-expanded="false">
-                <div class="section-header">
-                    <h2>
-                        <button id="manual-connection-toggle" class="toggle-btn" aria-expanded="false">
-                            ▶ Manual Connection
-                        </button>
-                    </h2>
-                </div>
-                <div id="manual-connection-content" class="collapsible-content" style="display: none;">
+            <!-- API Testing Tab -->
+            <section id="testing-tab" class="tab-content">
+                <h2>🧪 API Testing & Utilities</h2>
+                
+                <div class="card">
+                    <h3>Utility Functions</h3>
+                    <div class="button-group">
+                        <button id="validate-peer-id-btn" class="btn primary">Validate Peer ID</button>
+                        <button id="force-connect-all-api-btn" class="btn secondary">Force Connect All Peers</button>
+                        <button id="cleanup-stale-btn" class="btn tertiary">Cleanup Stale Data</button>
+                    </div>
                     <div class="input-group">
-                        <label for="target-peer">Target Peer ID (40-character SHA-1 hash):</label>
-                        <div class="input-group horizontal">
-                            <input type="text" id="target-peer" 
-                                   placeholder="Enter 40-character SHA-1 hash"
-                                   maxlength="40"
-                                   pattern="[a-fA-F0-9]{40}">
-                            <button id="connect-peer-btn" class="btn secondary">Connect to Peer</button>
-                        </div>
-                        <small class="input-help">
-                            Manually connect to a specific peer ID
-                        </small>
+                        <label for="test-peer-id">Peer ID to Validate:</label>
+                        <input type="text" id="test-peer-id" placeholder="Enter 40-character hex peer ID">
+                    </div>
+                    <div id="utility-results" class="result-display"></div>
+                </div>
+
+                <div class="card">
+                    <h3>Performance Testing</h3>
+                    <div class="input-group">
+                        <label for="test-message-count">Number of Messages:</label>
+                        <input type="number" id="test-message-count" value="10" min="1" max="100">
+                    </div>
+                    <div class="input-group">
+                        <label for="test-message-size">Message Size (chars):</label>
+                        <input type="number" id="test-message-size" value="100" min="1" max="10000">
+                    </div>
+                    <div class="button-group">
+                        <button id="performance-test-btn" class="btn primary">Run Performance Test</button>
+                        <button id="stress-test-btn" class="btn danger">Run Stress Test</button>
+                    </div>
+                    <div id="performance-results" class="result-display"></div>
+                </div>
+
+                <div class="card">
+                    <h3>Test Results & Logs</h3>
+                    <div id="test-log" class="test-log">
+                        <p class="empty-state">No test results yet</p>
+                    </div>
+                    <div class="button-group">
+                        <button id="export-logs-btn" class="btn tertiary">Export Logs</button>
+                        <button id="clear-test-log-btn" class="btn tertiary">Clear Test Log</button>
                     </div>
                 </div>
+
+                <div class="card">
+                    <h3>Error Testing</h3>
+                    <div class="button-group">
+                        <button id="test-invalid-peer-btn" class="btn danger">Test Invalid Peer Connection</button>
+                        <button id="test-malformed-message-btn" class="btn danger">Test Malformed Message</button>
+                        <button id="test-dht-limits-btn" class="btn danger">Test DHT Limits</button>
+                    </div>
+                    <div id="error-test-results" class="result-display"></div>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <div class="system-log">
+                <h3>System Log</h3>
+                <div id="system-log" class="log-display">
+                    <p class="empty-state">System log will appear here...</p>
+                </div>
+                <button id="clear-log-btn" class="btn tertiary">Clear Log</button>
             </div>
-
-            <div class="settings" aria-expanded="false">
-                <div class="section-header">
-                    <h2>
-                        <button id="settings-toggle" class="toggle-btn" aria-expanded="false">
-                            ▶ Settings
-                        </button>
-                    </h2>
-                </div>
-                <div id="settings-content" class="collapsible-content" style="display: none;">
-                <div class="input-group">
-                    <label for="signaling-url">Signaling Server URL:</label>
-                    <input type="url" id="signaling-url" 
-                           placeholder="ws://localhost:3000">
-                    <small class="input-help">
-                        Auto-populated from ?api, ?url, or ?signaling query parameters. Enter base API Gateway URL (without /signaling path).
-                    </small>
-                </div>
-                <div class="input-group">
-                    <label for="min-peers">Minimum Peers:</label>
-                    <input type="number" id="min-peers" 
-                           min="0" max="49" value="2" 
-                           placeholder="Minimum peer connections to maintain">
-                    <small class="input-help">
-                        Minimum peer connections to maintain (0-49, default: 2)
-                    </small>
-                </div>
-                <div class="input-group">
-                    <label for="max-peers">Maximum Peers:</label>
-                    <input type="number" id="max-peers" 
-                           min="1" max="50" value="10" 
-                           placeholder="Maximum number of peer connections">
-                    <small class="input-help">
-                        Limit concurrent peer connections (1-50, default: 10)
-                    </small>
-                </div>
-                <div class="auto-discovery-control">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="xor-routing-toggle" checked>
-                        <span class="checkmark"></span>
-                        Enable XOR-based routing
-                    </label>
-                    <small class="input-help">
-                        Use XOR distance for peer selection and routing optimization
-                    </small>
-                </div>
-                <div class="auto-discovery-control">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="auto-discovery-toggle" checked>
-                        <span class="checkmark"></span>
-                        Enable automatic peer discovery
-                    </label>
-                    <small class="input-help">
-                        Automatically discover and connect to nearby peers
-                    </small>
-                </div>
-                <div class="auto-discovery-control">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="eviction-strategy-toggle" checked>
-                        <span class="checkmark"></span>
-                        Enable smart eviction strategy
-                    </label>
-                    <small class="input-help">
-                        Automatically manage peer connections when at capacity
-                    </small>
-                </div>
-                <div class="auto-discovery-control">
-                    <label class="checkbox-label">
-                        <input type="checkbox" id="webdht-toggle" checked disabled>
-                        <span class="checkmark"></span>
-                        Enable WebDHT (Distributed Hash Table)
-                    </label>
-                    <small class="input-help">
-                        WebDHT status (configured at startup, restart required to change)
-                    </small>
-                </div>
-                </div>
-            </div>
-
-            <div class="dht" aria-expanded="false">
-                <div class="section-header">
-                    <h2>
-                        <button id="dht-toggle" class="toggle-btn" aria-expanded="false">
-                            ▶ WebDHT - Distributed Hash Table
-                        </button>
-                    </h2>
-                </div>
-                <div id="dht-content" class="collapsible-content" style="display: none;">
-                    <div class="dht-actions">
-                        <h3>Store Data</h3>
-                        <div class="input-group">
-                            <label for="dht-key">Key:</label>
-                            <input type="text" id="dht-key" placeholder="Enter key (e.g., 'user:123', 'config:theme')">
-                        </div>
-                        <div class="input-group">
-                            <label for="dht-value">Value:</label>
-                            <textarea id="dht-value" placeholder="Enter value (JSON, text, etc.)" rows="3"></textarea>
-                        </div>
-                        <div class="input-group">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="dht-enable-ttl">
-                                <span class="checkmark"></span>
-                                Enable expiration (TTL)
-                            </label>
-                            <small class="input-help">
-                                Check to set an expiration time, unchecked = records persist forever
-                            </small>
-                        </div>
-                        <div class="input-group" id="dht-ttl-group" style="display: none;">
-                            <label for="dht-ttl">TTL (seconds):</label>
-                            <input type="number" id="dht-ttl" placeholder="Time to live" min="1" max="2592000" value="3600">
-                            <small class="input-help">
-                                Time until record expires (e.g., 3600 = 1 hour, 86400 = 1 day)
-                            </small>
-                        </div>
-                        <div class="button-group">
-                            <button id="dht-put-btn" class="btn primary">Store in DHT</button>
-                            <button id="dht-update-btn" class="btn secondary">Update in DHT</button>
-                        </div>
-                    </div>
-
-                    <div class="dht-actions">
-                        <h3>Retrieve Data</h3>
-                        <div class="input-group horizontal">
-                            <input type="text" id="dht-get-key" placeholder="Enter key to retrieve">
-                            <button id="dht-get-btn" class="btn secondary">Get from DHT</button>
-                        </div>
-                    </div>
-
-                    <div class="dht-actions">
-                        <h3>Subscribe to Changes</h3>
-                        <div class="input-group horizontal">
-                            <input type="text" id="dht-subscribe-key" placeholder="Key to watch for changes">
-                            <div class="button-group">
-                                <button id="dht-subscribe-btn" class="btn tertiary">Subscribe</button>
-                                <button id="dht-clear-subscriptions-btn" class="btn quaternary">Clear All</button>
-                            </div>
-                        </div>
-                        <div id="dht-subscriptions" class="dht-subscriptions">
-                            <h4>Active Subscriptions:</h4>
-                            <div id="dht-subscriptions-list" class="subscriptions-list">
-                                <p class="empty-state">No active subscriptions</p>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="dht-results">
-                        <h3>DHT Operations Log</h3>
-                        <div id="dht-log" class="dht-log"></div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="crypto" aria-expanded="false">
-                <div class="section-header">
-                    <h2>
-                        <button id="crypto-toggle" class="toggle-btn" aria-expanded="false">
-                            ▶ Crypto - End-to-End Encryption
-                        </button>
-                    </h2>
-                </div>
-                <div id="crypto-content" class="collapsible-content" style="display: none;">
-                    <!-- Crypto Status -->
-                    <div class="crypto-status">
-                        <h3>Crypto Status</h3>
-                        <div class="info-group">
-                            <label>Encryption:</label>
-                            <span id="crypto-status" class="status">Disabled</span>
-                        </div>
-                        <div class="info-group">
-                            <label>Public Key:</label>
-                            <code id="crypto-public-key">None</code>
-                        </div>
-                        <div class="info-group">
-                            <label>Peer Keys:</label>
-                            <span id="crypto-peer-count">0</span>
-                        </div>
-                    </div>
-
-                    <!-- Key Management -->
-                    <div class="crypto-keys">
-                        <h3>Key Management</h3>
-                        <div class="button-group">
-                            <button id="crypto-generate-btn" class="btn primary">Generate New Keypair</button>
-                            <button id="crypto-reset-btn" class="btn warning">Reset Crypto</button>
-                            <button id="crypto-self-test-btn" class="btn tertiary">Run Self Test</button>
-                        </div>
-                        
-                        <div class="crypto-user-auth">
-                            <h4>User Authentication (Optional)</h4>
-                            <div class="input-group">
-                                <label for="crypto-alias">Alias:</label>
-                                <input type="text" id="crypto-alias" placeholder="Your username/alias">
-                            </div>
-                            <div class="input-group">
-                                <label for="crypto-password">Password:</label>
-                                <input type="password" id="crypto-password" placeholder="Your password">
-                            </div>
-                            <div class="button-group">
-                                <button id="crypto-login-btn" class="btn secondary">Login/Create Account</button>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Message Encryption -->
-                    <div class="crypto-messaging">
-                        <h3>Encrypted Messaging</h3>
-                        <div class="input-group">
-                            <label class="checkbox-label">
-                                <input type="checkbox" id="crypto-auto-encrypt">
-                                <span class="checkmark"></span>
-                                Auto-encrypt outgoing messages
-                            </label>
-                        </div>
-                        
-                        <div class="crypto-test-messaging">
-                            <h4>Test Encrypted Messages</h4>
-                            <div class="input-group horizontal">
-                                <input type="text" id="crypto-test-message" placeholder="Test message to encrypt">
-                                <input type="text" id="crypto-test-peer" placeholder="Target peer ID" maxlength="40">
-                                <button id="crypto-send-encrypted-btn" class="btn primary">Send Encrypted</button>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Group Encryption -->
-                    <div class="crypto-groups">
-                        <h3>Group Encryption</h3>
-                        <div class="input-group horizontal">
-                            <input type="text" id="crypto-group-id" placeholder="Group ID (e.g., 'chat-room-1')">
-                            <button id="crypto-create-group-btn" class="btn secondary">Create Group Key</button>
-                        </div>
-                        
-                        <div class="crypto-group-messaging">
-                            <div class="input-group horizontal">
-                                <input type="text" id="crypto-group-message" placeholder="Group message">
-                                <select id="crypto-group-select">
-                                    <option value="">Select group...</option>
-                                </select>
-                                <button id="crypto-send-group-btn" class="btn primary">Send to Group</button>
-                            </div>
-                        </div>
-                        
-                        <div id="crypto-groups-list" class="crypto-groups-list">
-                            <h4>Active Groups:</h4>
-                            <div class="empty-state">No groups created</div>
-                        </div>
-                    </div>
-
-                    <!-- Performance Stats -->
-                    <div class="crypto-stats">
-                        <h3>Performance Statistics</h3>
-                        <div class="stats-grid">
-                            <div class="stat-item">
-                                <label>Messages Encrypted:</label>
-                                <span id="crypto-stats-encrypted">0</span>
-                            </div>
-                            <div class="stat-item">
-                                <label>Messages Decrypted:</label>
-                                <span id="crypto-stats-decrypted">0</span>
-                            </div>
-                            <div class="stat-item">
-                                <label>Encryption Time (avg):</label>
-                                <span id="crypto-stats-encrypt-time">0ms</span>
-                            </div>
-                            <div class="stat-item">
-                                <label>Decryption Time (avg):</label>
-                                <span id="crypto-stats-decrypt-time">0ms</span>
-                            </div>
-                            <div class="stat-item">
-                                <label>Key Exchanges:</label>
-                                <span id="crypto-stats-key-exchanges">0</span>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Test Results -->
-                    <div class="crypto-test-results">
-                        <h3>Test Results</h3>
-                        <div id="crypto-test-log" class="test-log">
-                            <p class="empty-state">No tests run yet</p>
-                        </div>
-                    </div>
-
-                    <!-- Advanced Operations -->
-                    <div class="crypto-advanced">
-                        <h3>Advanced Operations</h3>
-                        <div class="button-group">
-                            <button id="crypto-export-key-btn" class="btn quaternary">Export Public Key</button>
-                            <button id="crypto-import-peer-key-btn" class="btn quaternary">Import Peer Key</button>
-                            <button id="crypto-benchmark-btn" class="btn tertiary">Run Benchmark</button>
-                        </div>
-                        
-                        <!-- Import peer key form -->
-                        <div id="crypto-import-form" class="crypto-import-form" style="display: none;">
-                            <div class="input-group">
-                                <label for="crypto-import-peer-id">Peer ID:</label>
-                                <input type="text" id="crypto-import-peer-id" placeholder="40-character peer ID" maxlength="40">
-                            </div>
-                            <div class="input-group">
-                                <label for="crypto-import-public-key">Public Key:</label>
-                                <textarea id="crypto-import-public-key" placeholder="Paste public key here" rows="3"></textarea>
-                            </div>
-                            <div class="button-group">
-                                <button id="crypto-import-confirm-btn" class="btn primary">Import Key</button>
-                                <button id="crypto-import-cancel-btn" class="btn secondary">Cancel</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="storage" aria-expanded="false">
-                <div class="section-header">
-                    <h2>
-                        <button id="storage-toggle" class="toggle-btn" aria-expanded="false">
-                            ▶ Distributed Storage - Encrypted P2P Storage Layer
-                        </button>
-                    </h2>
-                </div>
-                <div id="storage-content" class="collapsible-content" style="display: none;">
-                    <!-- Storage Status -->
-                    <div class="storage-status">
-                        <h3>Storage Status</h3>
-                        <div class="info-group">
-                            <label>Storage Layer:</label>
-                            <span id="storage-status">Disabled</span>
-                        </div>
-                        <div class="info-group">
-                            <label>Stored Items:</label>
-                            <span id="storage-item-count">0</span>
-                        </div>
-                        <div class="info-group">
-                            <label>Total Size:</label>
-                            <span id="storage-total-size">0 bytes</span>
-                        </div>
-                    </div>
-
-                    <!-- Storage Controls -->
-                    <div class="storage-controls">
-                        <h3>Storage Controls</h3>
-                        <div class="button-group">
-                            <button id="storage-enable-btn" class="btn primary">Enable Storage</button>
-                            <button id="storage-disable-btn" class="btn warning">Disable Storage</button>
-                            <button id="storage-clear-btn" class="btn quaternary">Clear All</button>
-                        </div>
-                    </div>
-
-                    <!-- Store Data -->
-                    <div class="storage-operations">
-                        <h3>Store Data</h3>
-                        <div class="input-group">
-                            <label for="storage-key">Key:</label>
-                            <input type="text" id="storage-key" placeholder="Storage key">
-                        </div>
-                        <div class="input-group">
-                            <label for="storage-value">Value:</label>
-                            <textarea id="storage-value" placeholder="Data to store (JSON or text)" rows="3"></textarea>
-                        </div>
-                        
-                        <!-- Storage Options -->
-                        <div class="storage-options">
-                            <h4>Storage Options</h4>
-                            <div class="input-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="storage-encrypt" checked>
-                                    <span class="checkmark"></span>
-                                    Encrypt data
-                                </label>
-                            </div>
-                            <div class="input-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="storage-public">
-                                    <span class="checkmark"></span>
-                                    Public access (readable by anyone)
-                                </label>
-                            </div>
-                            <div class="input-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="storage-immutable">
-                                    <span class="checkmark"></span>
-                                    Immutable (cannot be updated)
-                                </label>
-                            </div>
-                            <div class="input-group">
-                                <label class="checkbox-label">
-                                    <input type="checkbox" id="storage-crdt">
-                                    <span class="checkmark"></span>
-                                    Enable CRDT (conflict-free updates)
-                                </label>
-                            </div>
-                            <div class="input-group">
-                                <label for="storage-ttl">TTL (seconds, 0 = no expiration):</label>
-                                <input type="number" id="storage-ttl" value="0" min="0">
-                            </div>
-                        </div>
-                        
-                        <div class="button-group">
-                            <button id="storage-store-btn" class="btn primary">Store Data</button>
-                            <button id="storage-update-btn" class="btn secondary">Update Data</button>
-                        </div>
-                    </div>
-
-                    <!-- Retrieve Data -->
-                    <div class="storage-retrieve">
-                        <h3>Retrieve Data</h3>
-                        <div class="input-group horizontal">
-                            <input type="text" id="storage-get-key" placeholder="Key to retrieve">
-                            <button id="storage-get-btn" class="btn secondary">Get Data</button>
-                            <button id="storage-delete-btn" class="btn warning">Delete</button>
-                        </div>
-                    </div>
-
-                    <!-- Access Control -->
-                    <div class="storage-access">
-                        <h3>Access Control</h3>
-                        <div class="input-group horizontal">
-                            <input type="text" id="storage-access-key" placeholder="Key for access control">
-                            <input type="text" id="storage-access-peer" placeholder="Peer ID to grant access">
-                            <select id="storage-access-level">
-                                <option value="read">Read</option>
-                                <option value="write">Write</option>
-                                <option value="admin">Admin</option>
-                            </select>
-                            <button id="storage-grant-access-btn" class="btn tertiary">Grant Access</button>
-                        </div>
-                        <div class="input-group horizontal">
-                            <input type="text" id="storage-revoke-key" placeholder="Key for access revocation">
-                            <input type="text" id="storage-revoke-peer" placeholder="Peer ID to revoke access">
-                            <button id="storage-revoke-access-btn" class="btn quaternary">Revoke Access</button>
-                        </div>
-                    </div>
-
-                    <!-- Bulk Operations -->
-                    <div class="storage-bulk">
-                        <h3>Bulk Operations</h3>
-                        <div class="input-group horizontal">
-                            <input type="text" id="storage-prefix" placeholder="Key prefix for bulk operations">
-                            <button id="storage-list-btn" class="btn tertiary">List Keys</button>
-                            <button id="storage-bulk-delete-btn" class="btn warning">Bulk Delete</button>
-                        </div>
-                    </div>
-
-                    <!-- Search -->
-                    <div class="storage-search">
-                        <h3>Search</h3>
-                        <div class="input-group horizontal">
-                            <input type="text" id="storage-search-query" placeholder="Search query">
-                            <select id="storage-search-type">
-                                <option value="key">Search Keys</option>
-                                <option value="value">Search Values</option>
-                                <option value="metadata">Search Metadata</option>
-                            </select>
-                            <button id="storage-search-btn" class="btn tertiary">Search</button>
-                        </div>
-                    </div>
-
-                    <!-- Backup/Restore -->
-                    <div class="storage-backup">
-                        <h3>Backup & Restore</h3>
-                        <div class="button-group">
-                            <button id="storage-backup-btn" class="btn tertiary">Create Backup</button>
-                            <button id="storage-restore-btn" class="btn tertiary">Restore from Backup</button>
-                        </div>
-                        <input type="file" id="storage-restore-file" accept=".json" style="display: none;">
-                    </div>
-
-                    <!-- Storage Log -->
-                    <div class="storage-results">
-                        <h3>Storage Operations Log</h3>
-                        <div id="storage-log" class="storage-log"></div>
-                    </div>
-
-                    <!-- Lexical Storage Interface -->
-                    <div class="lexical-storage">
-                        <h3>🔗 Lexical Storage Interface (GUN-like API)</h3>
-                        <p class="feature-description">Chain operations like: <code>storage.get('users').get('alice').put({name: 'Alice'})</code></p>
-                        
-                        <!-- Lexical Operations -->
-                        <div class="lexical-operations">
-                            <h4>Chain Operations</h4>
-                            <div class="input-group">
-                                <label for="lexical-path">Path (dot notation):</label>
-                                <input type="text" id="lexical-path" placeholder="users.alice" value="demo.user1">
-                            </div>
-                            <div class="input-group">
-                                <label for="lexical-data">Data (JSON):</label>
-                                <textarea id="lexical-data" rows="3" placeholder='{"name": "Alice", "age": 30}'></textarea>
-                            </div>
-                            <div class="input-group">
-                                <label for="lexical-property">Property to get:</label>
-                                <input type="text" id="lexical-property" placeholder="name" value="name">
-                            </div>
-                            
-                            <div class="button-group">
-                                <button id="lexical-put-btn" class="btn primary">Put Data</button>
-                                <button id="lexical-get-btn" class="btn secondary">Get Property</button>
-                                <button id="lexical-val-btn" class="btn secondary">Get Full Object</button>
-                                <button id="lexical-update-btn" class="btn tertiary">Update</button>
-                                <button id="lexical-delete-btn" class="btn warning">Delete</button>
-                            </div>
-                        </div>
-
-                        <!-- Set Operations -->
-                        <div class="lexical-sets">
-                            <h4>Set Operations</h4>
-                            <div class="input-group">
-                                <label for="lexical-set-path">Set Path:</label>
-                                <input type="text" id="lexical-set-path" placeholder="users.alice.friends" value="demo.friends">
-                            </div>
-                            <div class="input-group">
-                                <label for="lexical-set-data">Set Data (JSON object):</label>
-                                <textarea id="lexical-set-data" rows="2" placeholder='{"bob": {"name": "Bob"}, "charlie": {"name": "Charlie"}}'></textarea>
-                            </div>
-                            
-                            <div class="button-group">
-                                <button id="lexical-set-btn" class="btn primary">Set Data</button>
-                                <button id="lexical-map-btn" class="btn secondary">Map & Log</button>
-                            </div>
-                        </div>
-
-                        <!-- Property Access Demo -->
-                        <div class="lexical-proxy">
-                            <h4>Property Access (Proxy)</h4>
-                            <div class="input-group">
-                                <label for="lexical-proxy-path">Property Path:</label>
-                                <input type="text" id="lexical-proxy-path" placeholder="users.alice.settings.theme" value="demo.settings.theme">
-                            </div>
-                            <div class="input-group">
-                                <label for="lexical-proxy-value">Value:</label>
-                                <input type="text" id="lexical-proxy-value" placeholder="dark" value="dark">
-                            </div>
-                            
-                            <div class="button-group">
-                                <button id="lexical-proxy-set-btn" class="btn primary">Set via Proxy</button>
-                                <button id="lexical-proxy-get-btn" class="btn secondary">Get via Proxy</button>
-                            </div>
-                        </div>
-
-                        <!-- Utility Operations -->
-                        <div class="lexical-utils">
-                            <h4>Utility Methods</h4>
-                            <div class="input-group">
-                                <label for="lexical-util-path">Path:</label>
-                                <input type="text" id="lexical-util-path" placeholder="demo.user1" value="demo.user1">
-                            </div>
-                            
-                            <div class="button-group">
-                                <button id="lexical-exists-btn" class="btn tertiary">Check Exists</button>
-                                <button id="lexical-keys-btn" class="btn tertiary">Get Keys</button>
-                                <button id="lexical-path-btn" class="btn tertiary">Get Path</button>
-                            </div>
-                        </div>
-
-                        <!-- Lexical Results -->
-                        <div class="lexical-results">
-                            <h4>Lexical Operations Results</h4>
-                            <div id="lexical-log" class="storage-log"></div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-            <div class="messages">
-                <h2>Messages</h2>
-                <div class="input-group horizontal">
-                    <input type="text" id="message-input" placeholder="Enter message">
-                    <input type="text" id="dm-target-input" placeholder="Peer ID for DM (leave blank to broadcast)" maxlength="40" pattern="[a-fA-F0-9]{40}">
-                    <button id="send-message-btn" class="btn primary">Send</button>
-                </div>
-                <small class="input-help">To send a direct message, enter a 40-character peer ID. Leave blank to broadcast.</small>
-                <div id="messages-log" class="messages-log"></div>
-            </div>
+        </footer>
     </div>
 
-    <script type="module" src="app.js?v=20250704"></script>
+    <!-- Load PeerPigeon library -->
+    <script src="../../dist/peerpigeon-browser.js"></script>
+    <!-- Load our application -->
+    <script src="app.js"></script>
 </body>
 </html>

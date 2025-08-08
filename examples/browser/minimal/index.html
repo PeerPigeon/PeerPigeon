@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PeerPigeon Minimal Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            margin: 20px;
+            background: #1a1a1a;
+            color: #00ff00;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #333;
+            background: #222;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            background: #333;
+            color: #00ff00;
+            border: 1px solid #555;
+            padding: 10px 20px;
+            margin: 5px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #444;
+        }
+        .log {
+            height: 300px;
+            overflow-y: auto;
+            background: #000;
+            padding: 10px;
+            border: 1px solid #333;
+            font-size: 12px;
+        }
+        .error { color: #ff4444; }
+        .success { color: #44ff44; }
+        .warning { color: #ffaa44; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>PeerPigeon Minimal Browser Test</h1>
+        
+        <div class="status">
+            <div><strong>Peer ID:</strong> <span id="peer-id">Generating...</span></div>
+            <div><strong>Status:</strong> <span id="status">Initializing...</span></div>
+            <div><strong>Connected Peers:</strong> <span id="peer-count">0</span></div>
+        </div>
+
+        <div class="controls">
+            <button onclick="connect()">Connect to Signaling</button>
+            <button onclick="sendMessage()">Send Test Message</button>
+            <button onclick="clearLog()">Clear Log</button>
+        </div>
+
+        <div class="log" id="log"></div>
+    </div>
+
+    <!-- Load PeerPigeon bundle first -->
+    <script src="/dist/peerpigeon-browser.js"></script>
+    <!-- Then load our minimal implementation -->
+    <script type="module" src="minimal.js"></script>
+</body>
+</html>

@@ -200,12 +200,5 @@ class DebugLogger {
   }
 }
 
-// Export for Node.js and browser environments
-if (typeof module !== 'undefined' && module.exports) {
-  module.exports = DebugLogger;
-} else if (typeof window !== 'undefined') {
-  window.DebugLogger = DebugLogger;
-}
-
 // ES6 export
 export default DebugLogger;

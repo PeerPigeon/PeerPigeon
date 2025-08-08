@@ -17,19 +17,26 @@ async function initializeUnsea() {
       unsea = await import('unsea');
       console.log('✅ Loaded unsea from npm package (Node.js)');
     } else if (isBrowser) {
-      // For browser environments, try CDN sources
-      try {
-        unsea = await import('https://cdn.jsdelivr.net/npm/unsea@latest/+esm');
-        console.log('✅ Loaded unsea from jsDelivr CDN');
-      } catch (jsDelivrError) {
-        console.warn('Failed to load from jsDelivr, trying unpkg:', jsDelivrError);
+      // Check if we have the bundled version first (from browser bundle)
+      if ((typeof globalThis !== 'undefined' && globalThis.__PEERPIGEON_UNSEA__) ||
+          (typeof window !== 'undefined' && window.__PEERPIGEON_UNSEA__)) {
+        unsea = globalThis.__PEERPIGEON_UNSEA__ || window.__PEERPIGEON_UNSEA__;
+        console.log('✅ Using bundled unsea (self-contained)');
+      } else {
+        // Fallback to CDN sources for backwards compatibility
         try {
-          unsea = await import('https://unpkg.com/unsea@latest/dist/unsea.esm.js');
-          console.log('✅ Loaded unsea from unpkg CDN');
-        } catch (unpkgError) {
-          console.warn('Failed to load from unpkg, trying Skypack:', unpkgError);
-          unsea = await import('https://cdn.skypack.dev/unsea');
-          console.log('✅ Loaded unsea from Skypack CDN');
+          unsea = await import('https://cdn.jsdelivr.net/npm/unsea@latest/+esm');
+          console.log('✅ Loaded unsea from jsDelivr CDN');
+        } catch (jsDelivrError) {
+          console.warn('Failed to load from jsDelivr, trying unpkg:', jsDelivrError);
+          try {
+            unsea = await import('https://unpkg.com/unsea@latest/dist/unsea.esm.js');
+            console.log('✅ Loaded unsea from unpkg CDN');
+          } catch (unpkgError) {
+            console.warn('Failed to load from unpkg, trying Skypack:', unpkgError);
+            unsea = await import('https://cdn.skypack.dev/unsea');
+            console.log('✅ Loaded unsea from Skypack CDN');
+          }
         }
       }
     } else {
@@ -59,6 +66,7 @@ export class CryptoManager extends EventEmitter {
     this.groupKeys = new Map(); // Store group encryption keys
     this.messageNonces = new Set(); // Prevent replay attacks
     this.maxNonceAge = 300000; // 5 minutes
+    this.nonceCleanupInterval = null; // Track the cleanup interval
 
     // Performance metrics
     this.stats = {
@@ -76,6 +84,7 @@ export class CryptoManager extends EventEmitter {
      * @param {string} options.alias - Optional user alias for persistent identity
      * @param {string} options.password - Optional password for user account
      * @param {boolean} options.generateKeypair - Whether to generate a new keypair if no credentials
+     * @param {string} options.peerId - Peer ID to use for automatic key storage
      * @returns {Promise<Object>} The generated or loaded keypair
      */
   async init(options = {}) {
@@ -85,6 +94,9 @@ export class CryptoManager extends EventEmitter {
       if (options.alias && options.password) {
         // Try to create or authenticate with persistent identity
         await this.createOrAuthenticateUser(options.alias, options.password);
+      } else if (options.peerId) {
+        // Use peer ID for automatic persistent key storage
+        await this.initWithPeerId(options.peerId);
       } else if (options.generateKeypair !== false) {
         // Generate ephemeral keypair
         this.keypair = await this.unsea.generateRandomPair();
@@ -126,7 +138,14 @@ export class CryptoManager extends EventEmitter {
           } else {
             // Generate new keys and save them
             this.keypair = await this.unsea.generateRandomPair();
-            await this.unsea.saveKeys(alias, this.keypair, password);
+            // PERFORMANCE: Defer key saving to prevent blocking WebRTC connection establishment
+            setTimeout(async () => {
+              try {
+                await this.unsea.saveKeys(alias, this.keypair, password);
+              } catch (saveError) {
+                this.debug.warn('Failed to save persistent keys:', saveError);
+              }
+            }, 0);
           }
         } catch (error) {
           // Fallback to generating ephemeral keys
@@ -143,6 +162,92 @@ export class CryptoManager extends EventEmitter {
       this.debug.error('User authentication failed:', error);
       throw error;
     }
+  }
+
+  /**
+     * Initialize with automatic key persistence using peer ID
+     * @param {string} peerId - The peer ID to use as storage alias
+     */
+  async initWithPeerId(peerId) {
+    try {
+      // Initialize unsea if not already done
+      if (!this.unsea) {
+        this.unsea = await initializeUnsea();
+      }
+
+      const keyAlias = `peerpigeon-${peerId}`;
+      this.debug.log(`🔐 Initializing crypto with automatic key persistence for peer ${peerId.substring(0, 8)}...`);
+
+      // Try to load existing keys first with timeout
+      try {
+        const loadKeysPromise = this.unsea.loadKeys(keyAlias);
+        const timeoutPromise = new Promise((resolve, reject) => {
+          setTimeout(() => reject(new Error('LoadKeys timeout')), 5000);
+        });
+        
+        const existingKeys = await Promise.race([loadKeysPromise, timeoutPromise]);
+        if (existingKeys && existingKeys.pub && existingKeys.priv) {
+          this.keypair = existingKeys;
+          this.debug.log(`🔐 Loaded existing keypair for peer ${peerId.substring(0, 8)}...`);
+          
+          // Mark as initialized and emit ready event
+          this.initialized = true;
+          this.encryptionEnabled = true;
+          this.emit('cryptoReady', {
+            hasKeypair: !!this.keypair,
+            publicKey: this.getPublicKey()
+          });
+          return;
+        }
+      } catch (error) {
+        this.debug.log(`🔐 No existing keys found for peer ${peerId.substring(0, 8)}..., will generate new ones`);
+      }
+
+      // Generate new keys and save them with timeout
+      const generateKeysPromise = this.unsea.generateRandomPair();
+      const generateTimeoutPromise = new Promise((resolve, reject) => {
+        setTimeout(() => reject(new Error('GenerateKeys timeout')), 5000);
+      });
+      
+      this.keypair = await Promise.race([generateKeysPromise, generateTimeoutPromise]);
+      
+      // PERFORMANCE: Defer key saving to prevent blocking WebRTC connection establishment
+      setTimeout(async () => {
+        try {
+          await this.unsea.saveKeys(keyAlias, this.keypair);
+          this.debug.log(`🔐 Generated and saved new keypair for peer ${peerId.substring(0, 8)}...`);
+        } catch (saveError) {
+          this.debug.warn(`🔐 Failed to save keypair for peer ${peerId.substring(0, 8)}..., using ephemeral keys:`, saveError.message);
+          // Continue with ephemeral keys if storage fails
+        }
+      }, 0);
+
+      // Mark as initialized and emit ready event
+      this.initialized = true;
+      this.encryptionEnabled = true;
+      this.emit('cryptoReady', {
+        hasKeypair: !!this.keypair,
+        publicKey: this.getPublicKey()
+      });
+
+    } catch (error) {
+      this.debug.error('Failed to initialize crypto with peer ID:', error);
+      // Fallback to ephemeral keypair
+      if (this.unsea) {
+        this.keypair = await this.unsea.generateRandomPair();
+        this.debug.log('🔐 Using ephemeral keypair as fallback');
+      } else {
+        throw error;
+      }
+    }
+
+    // Mark as initialized and emit ready event
+    this.initialized = true;
+    this.encryptionEnabled = true;
+    this.emit('cryptoReady', {
+      hasKeypair: !!this.keypair,
+      publicKey: this.getPublicKey()
+    });
   }
 
   /**
@@ -196,6 +301,19 @@ export class CryptoManager extends EventEmitter {
       keyData = publicKey;
     } else {
       return false;
+    }
+
+    // Check if we already have the same key for this peer to prevent duplicate key exchange events
+    const existingKey = this.peerKeys.get(peerId);
+    if (existingKey) {
+      // Compare both pub and epub keys to determine if this is actually a new key
+      const pubMatches = existingKey.pub === keyData.pub;
+      const epubMatches = existingKey.epub === keyData.epub;
+      
+      if (pubMatches && epubMatches) {
+        // This is a duplicate key exchange - don't emit event or increment stats
+        return false;
+      }
     }
 
     this.peerKeys.set(peerId, keyData);
@@ -485,11 +603,16 @@ export class CryptoManager extends EventEmitter {
      * Start periodic cleanup of old nonces
      */
   startNonceCleanup() {
-    setInterval(() => {
-      // Remove old nonces (this is a simplified approach)
-      // In a real implementation, you'd store nonces with timestamps
-      if (this.messageNonces.size > 1000) {
-        this.messageNonces.clear();
+    // Store the interval ID for cleanup
+    this.nonceCleanupInterval = setInterval(() => {
+      try {
+        // Remove old nonces (this is a simplified approach)
+        // In a real implementation, you'd store nonces with timestamps
+        if (this.messageNonces.size > 1000) {
+          this.messageNonces.clear();
+        }
+      } catch (error) {
+        console.error('Error during nonce cleanup:', error);
       }
     }, 60000); // Clean up every minute
   }
@@ -513,6 +636,12 @@ export class CryptoManager extends EventEmitter {
      * Clear all stored keys and reset state
      */
   reset() {
+    // Clear the nonce cleanup interval
+    if (this.nonceCleanupInterval) {
+      clearInterval(this.nonceCleanupInterval);
+      this.nonceCleanupInterval = null;
+    }
+
     this.keypair = null;
     this.peerKeys.clear();
     this.groupKeys.clear();

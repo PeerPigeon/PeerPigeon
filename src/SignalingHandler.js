@@ -54,11 +54,6 @@ export class SignalingHandler extends EventEmitter {
       return;
     }
 
-    // Ignore ping messages - they are for keepalive, not peer signaling
-    if (type === 'ping' || type === 'pong') {
-      return;
-    }
-
     this.debug.log('Processing signaling message:', { type, fromPeerId, targetPeerId });
 
     switch (type) {
@@ -146,6 +141,30 @@ export class SignalingHandler extends EventEmitter {
       return;
     }
 
+    // INITIATOR LOGIC: Use deterministic peer ID comparison to prevent race conditions
+    // Only accept offers if we should NOT be the initiator (i.e., the other peer should initiate)
+    const shouldWeInitiate = this.mesh.peerId > fromPeerId;
+    if (shouldWeInitiate) {
+      this.debug.log(`🔄 INITIATOR LOGIC: Rejecting offer from ${fromPeerId.substring(0, 8)}... because we should be the initiator (our ID: ${this.mesh.peerId.substring(0, 8)}... > their ID)`);
+      
+      // Send a polite rejection so they know we expect to be the initiator
+      try {
+        await this.mesh.sendSignalingMessage({
+          type: 'connection-rejected',
+          data: {
+            reason: 'initiator_role_conflict',
+            details: 'Peer should wait for us to initiate based on peer ID comparison',
+            shouldInitiate: false
+          }
+        }, fromPeerId);
+      } catch (error) {
+        this.debug.warn('Failed to send initiator rejection:', error);
+      }
+      return;
+    }
+
+    this.debug.log(`🔄 INITIATOR LOGIC: Accepting offer from ${fromPeerId.substring(0, 8)}... because they should be the initiator (their ID: ${fromPeerId.substring(0, 8)}... > our ID: ${this.mesh.peerId.substring(0, 8)}...)`);
+
     // If we already have a connection or are connecting, handle gracefully
     if (this.connectionManager.hasPeer(fromPeerId)) {
       const existingPeer = this.connectionManager.getPeer(fromPeerId);
@@ -160,6 +179,8 @@ export class SignalingHandler extends EventEmitter {
       // IMPROVED RACE CONDITION HANDLING:
       // Instead of ignoring offers based on initiator flags, resolve race conditions intelligently
       const weShouldInitiate = this.mesh.peerId > fromPeerId;
+      this.debug.log(`🔄 INITIATOR LOGIC: ${this.mesh.peerId.substring(0, 8)}... vs ${fromPeerId.substring(0, 8)}... → weShouldInitiate: ${weShouldInitiate}`);
+      this.debug.log(`🔄 EXISTING PEER: isInitiator: ${existingPeer.isInitiator}, status: ${existingStatus}`);
 
       // If both peers are trying to initiate (mutual initiation race condition)
       if (weShouldInitiate && existingPeer.isInitiator) {
@@ -263,18 +284,18 @@ export class SignalingHandler extends EventEmitter {
       await this.mesh.evictionManager.evictPeer(evictPeerId, 'incoming closer peer');
     }
     try {
-      // Get current media stream if available
-      const localStream = this.mesh.mediaManager.localStream;
-      const hasMedia = localStream !== null;
+      // SECURITY: NO automatic media sharing - all media must be manually invoked
       const options = {
-        localStream,
+        localStream: null, // Always null - media must be manually added later
         // ALWAYS enable both audio and video transceivers for maximum compatibility
         // This allows peers to receive media even if they don't have media when connecting
         enableAudio: true,
         enableVideo: true
+        // allowRemoteStreams defaults to false - streams only invoked when user explicitly enables them
       };
 
-      this.debug.log(`Creating answer connection for ${fromPeerId.substring(0, 8)}... (with media: ${hasMedia})`);
+      this.debug.log(`Creating answer connection for ${fromPeerId.substring(0, 8)}... (no automatic media sharing)`);
+      this.debug.log(`🔄 RECEIVER SETUP: Creating PeerConnection(${fromPeerId.substring(0, 8)}..., isInitiator=false)`);
 
       const peerConnection = new PeerConnection(fromPeerId, false, options);
 

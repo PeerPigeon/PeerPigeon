@@ -14,10 +14,8 @@ export class PeerConnection extends EventEmitter {
     this.dataChannelReady = false;
     this.connectionStartTime = Date.now();
     this.pendingIceCandidates = [];
-    this.iceCheckingTimeout = null; // Timeout for ICE checking state
-    this.connectingTimeout = null; // Timeout for stuck connecting state
-    this.dataChannelHealthMonitor = null; // Health monitoring for data channel when signaling is unavailable
     this.isClosing = false; // Flag to prevent disconnection events during intentional close
+    this.iceTimeoutId = null; // Timeout ID for ICE negotiation
     this._forcedStatus = null; // Track forced status (e.g., failed)
 
     // Media stream support
@@ -27,6 +25,10 @@ export class PeerConnection extends EventEmitter {
     this.enableAudio = options.enableAudio || false;
     this.audioTransceiver = null;
     this.videoTransceiver = null;
+    
+    // SECURITY: Never automatically invoke remote streams - only when user explicitly requests
+    this.allowRemoteStreams = options.allowRemoteStreams === true; // Default to false - streams must be explicitly invoked
+    this.pendingRemoteStreams = []; // Buffer remote streams until user invokes them
   }
 
   /**
@@ -62,34 +64,26 @@ export class PeerConnection extends EventEmitter {
 
     this.setupConnectionHandlers();
 
-    // ALWAYS pre-allocate transceivers for audio and video to enable future media streaming
-    // This ensures connections can handle media even if no media stream is available initially
-    this.debug.log('🔄 Pre-allocating audio and video transceivers for future media capability');
+    // CRITICAL FIX: Use addTrack() instead of pre-allocated transceivers to trigger ontrack events
+    // This ensures that ontrack events are properly fired on the receiving side
+    this.debug.log('🔄 Using addTrack() approach for proper ontrack event firing');
 
-    // Always add audio transceiver
-    this.audioTransceiver = this.connection.addTransceiver('audio', {
-      direction: 'sendrecv'
-    });
-
-    // Always add video transceiver
-    this.videoTransceiver = this.connection.addTransceiver('video', {
-      direction: 'sendrecv'
-    });
-
-    // Add local media stream if provided
+    // Add local media stream if provided using addTrack()
     if (this.localStream) {
-      this.debug.log('Adding local stream tracks to existing transceivers');
-      await this.setLocalStreamToTransceivers(this.localStream);
+      this.debug.log('Adding local stream tracks using addTrack() method');
+      await this.addLocalStreamWithAddTrack(this.localStream);
     }
 
     if (this.isInitiator) {
+      this.debug.log(`🚀 INITIATOR: Creating data channel for ${this.peerId.substring(0, 8)}... (WE are initiator)`);
       this.dataChannel = this.connection.createDataChannel('messages', {
         ordered: true
       });
       this.setupDataChannel();
     } else {
+      this.debug.log(`👥 RECEIVER: Waiting for data channel from ${this.peerId.substring(0, 8)}... (THEY are initiator)`);
       this.connection.ondatachannel = (event) => {
-        this.debug.log('Received data channel from', this.peerId);
+        this.debug.log(`📨 RECEIVED: Data channel received from ${this.peerId.substring(0, 8)}...`);
         this.dataChannel = event.channel;
         this.setupDataChannel();
       };
@@ -145,8 +139,16 @@ export class PeerConnection extends EventEmitter {
         });
 
         this.debug.log('🚨 ONTRACK DEBUG: About to emit remoteStream event');
-        this.emit('remoteStream', { peerId: this.peerId, stream: this.remoteStream });
-        this.debug.log('✅ ONTRACK DEBUG: remoteStream event emitted successfully');
+        
+        // Check if remote streams are allowed (crypto gating)
+        if (this.allowRemoteStreams) {
+          this.emit('remoteStream', { peerId: this.peerId, stream: this.remoteStream });
+          this.debug.log('✅ ONTRACK DEBUG: remoteStream event emitted successfully');
+        } else {
+          // Buffer the stream until crypto allows it
+          this.debug.log('🔒 ONTRACK DEBUG: Buffering remote stream until crypto verification');
+          this.pendingRemoteStreams.push({ peerId: this.peerId, stream: this.remoteStream });
+        }
       } else {
         this.debug.error('❌ ONTRACK DEBUG: No stream in ontrack event - this should not happen');
       }
@@ -167,25 +169,10 @@ export class PeerConnection extends EventEmitter {
       }
 
       if (this.connection.connectionState === 'connected') {
-        // Clear any pending timeouts
-        if (this.connectingTimeout) {
-          clearTimeout(this.connectingTimeout);
-          this.connectingTimeout = null;
-        }
         this.debug.log(`✅ Connection established with ${this.peerId}`);
         this.emit('connected', { peerId: this.peerId });
       } else if (this.connection.connectionState === 'connecting') {
         this.debug.log(`🔄 Connection to ${this.peerId} is connecting...`);
-        // Add timeout for stuck connecting state
-        if (this.connectingTimeout) {
-          clearTimeout(this.connectingTimeout);
-        }
-        this.connectingTimeout = setTimeout(() => {
-          if (this.connection && this.connection.connectionState === 'connecting' && !this.isClosing) {
-            this.debug.log(`⏰ Connection stuck in connecting state for ${this.peerId}, treating as failed`);
-            this.emit('disconnected', { peerId: this.peerId, reason: 'connection timeout' });
-          }
-        }, 5000); // Faster timeout - 5 seconds for connecting state
       } else if (this.connection.connectionState === 'disconnected') {
         // Give WebRTC more time to recover - it's common for connections to briefly disconnect during renegotiation
         this.debug.log(`⚠️ WebRTC connection disconnected for ${this.peerId}, waiting for potential recovery...`);
@@ -196,7 +183,7 @@ export class PeerConnection extends EventEmitter {
             this.debug.log(`❌ WebRTC connection remained disconnected for ${this.peerId}, treating as failed`);
             this.emit('disconnected', { peerId: this.peerId, reason: 'connection disconnected' });
           }
-        }, 3000); // Faster recovery - 3 seconds for disconnected state
+        }, 8000); // Increased recovery time - 8 seconds for disconnected state to allow for network fluctuations
       } else if (this.connection.connectionState === 'failed') {
         if (!this.isClosing) {
           this.debug.log(`❌ Connection failed for ${this.peerId}`);
@@ -214,41 +201,25 @@ export class PeerConnection extends EventEmitter {
       this.debug.log(`🧊 ICE connection state with ${this.peerId}: ${this.connection.iceConnectionState}`);
 
       if (this.connection.iceConnectionState === 'connected') {
-        // Clear any pending timeout
-        if (this.iceCheckingTimeout) {
-          clearTimeout(this.iceCheckingTimeout);
-          this.iceCheckingTimeout = null;
-        }
         this.debug.log(`✅ ICE connection established with ${this.peerId}`);
+        // Clear any existing ICE timeout
+        if (this.iceTimeoutId) {
+          clearTimeout(this.iceTimeoutId);
+          this.iceTimeoutId = null;
+        }
       } else if (this.connection.iceConnectionState === 'checking') {
         this.debug.log(`🔄 ICE checking for ${this.peerId}...`);
-        // Set a timeout for ICE checking state - if it takes too long, only restart if signaling is available
-        if (this.iceCheckingTimeout) {
-          clearTimeout(this.iceCheckingTimeout);
+        
+        // Set a timeout for ICE negotiation to prevent hanging
+        if (this.iceTimeoutId) {
+          clearTimeout(this.iceTimeoutId);
         }
-        this.iceCheckingTimeout = setTimeout(() => {
-          if (this.connection && this.connection.iceConnectionState === 'checking') {
-            // Check if signaling is available before attempting ICE restart
-            const hasSignaling = this.mesh && this.mesh.signalingClient && this.mesh.signalingClient.isConnected();
-            const hasMeshConnectivity = this.mesh && this.mesh.connected && this.mesh.connectionManager.getConnectedPeerCount() > 0;
-
-            if (hasSignaling || hasMeshConnectivity) {
-              this.debug.log(`⏰ ICE checking timeout for ${this.peerId}, attempting restart (signaling: ${hasSignaling}, mesh: ${hasMeshConnectivity})`);
-              try {
-                this.restartIceViaSignaling().catch(error => {
-                  this.debug.error('Failed to restart ICE:', error);
-                  this.emit('disconnected', { peerId: this.peerId, reason: 'ICE restart failed' });
-                });
-              } catch (error) {
-                this.debug.error('Failed to restart ICE:', error);
-                this.emit('disconnected', { peerId: this.peerId, reason: 'ICE restart failed' });
-              }
-            } else {
-              this.debug.log(`⏰ ICE checking timeout for ${this.peerId}, but no signaling available - keeping connection alive`);
-              // Don't disconnect - peer connection may still work without signaling server
-            }
+        this.iceTimeoutId = setTimeout(() => {
+          if (this.connection && this.connection.iceConnectionState === 'checking' && !this.isClosing) {
+            this.debug.error(`❌ ICE negotiation timeout for ${this.peerId} - connection stuck in checking state`);
+            this.emit('disconnected', { peerId: this.peerId, reason: 'ICE negotiation timeout' });
           }
-        }, 10000); // Faster ICE checking timeout - 10 seconds
+        }, 30000); // 30 second timeout for ICE negotiation
       } else if (this.connection.iceConnectionState === 'failed') {
         // Check if signaling is available before attempting ICE restart
         const hasSignaling = this.mesh && this.mesh.signalingClient && this.mesh.signalingClient.isConnected();
@@ -267,9 +238,8 @@ export class PeerConnection extends EventEmitter {
             this.emit('disconnected', { peerId: this.peerId, reason: 'ICE failed' });
           }
         } else {
-          this.debug.log(`❌ ICE connection failed for ${this.peerId}, but no signaling available - monitoring data channel`);
-          // Don't immediately disconnect - monitor data channel health instead
-          this.monitorDataChannelHealth();
+          this.debug.log(`❌ ICE connection failed for ${this.peerId}, disconnecting`);
+          this.emit('disconnected', { peerId: this.peerId, reason: 'ICE failed' });
         }
       } else if (this.connection.iceConnectionState === 'disconnected') {
         // Give more time for ICE reconnection - this is common during renegotiation
@@ -294,9 +264,8 @@ export class PeerConnection extends EventEmitter {
                 this.emit('disconnected', { peerId: this.peerId, reason: 'ICE disconnected' });
               }
             } else {
-              this.debug.log(`❌ ICE remained disconnected for ${this.peerId}, but no signaling available - monitoring data channel`);
-              // Monitor data channel health instead of immediately disconnecting
-              this.monitorDataChannelHealth();
+              this.debug.log(`❌ ICE remained disconnected for ${this.peerId}, disconnecting`);
+              this.emit('disconnected', { peerId: this.peerId, reason: 'ICE disconnected' });
             }
           }
         }, 5000); // Faster ICE reconnection - 5 seconds
@@ -361,30 +330,6 @@ export class PeerConnection extends EventEmitter {
     this.dataChannel.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
-
-        // Handle internal ping messages for health monitoring
-        if (message.type === 'ping') {
-          this.debug.log(`📡 Received health ping from ${this.peerId}, responding with pong`);
-          try {
-            const pongMessage = {
-              type: 'pong',
-              timestamp: Date.now(),
-              originalTimestamp: message.timestamp,
-              from: this.mesh?.peerId || 'unknown'
-            };
-            this.dataChannel.send(JSON.stringify(pongMessage));
-          } catch (error) {
-            this.debug.error('Failed to send pong response:', error);
-          }
-          return; // Don't emit this as a regular message
-        }
-
-        // Handle pong responses (optional logging)
-        if (message.type === 'pong') {
-          this.debug.log(`📡 Received health pong from ${this.peerId}`);
-          return; // Don't emit this as a regular message
-        }
-
         this.emit('message', { peerId: this.peerId, message });
       } catch (error) {
         this.debug.error('Failed to parse message:', error);
@@ -403,15 +348,59 @@ export class PeerConnection extends EventEmitter {
     };
   }
 
+  // CRITICAL: Check and force data channel state after answer processing
+  checkDataChannelState() {
+    if (this.dataChannel) {
+      this.debug.log(`🔍 DATA CHANNEL CHECK: State for ${this.peerId.substring(0, 8)}... is ${this.dataChannel.readyState}`);
+      
+      // If data channel is open but we haven't triggered the open event yet
+      if (this.dataChannel.readyState === 'open' && !this.dataChannelReady) {
+        this.debug.log(`🚀 FORCE OPEN: Triggering data channel open for ${this.peerId.substring(0, 8)}...`);
+        this.dataChannelReady = true;
+        this.emit('dataChannelOpen', { peerId: this.peerId });
+      }
+      // If data channel is connecting, set up a check in case the event doesn't fire
+      else if (this.dataChannel.readyState === 'connecting') {
+        this.debug.log(`⏳ CONNECTING: Data channel connecting for ${this.peerId.substring(0, 8)}..., setting up backup check`);
+        setTimeout(() => {
+          if (this.dataChannel && this.dataChannel.readyState === 'open' && !this.dataChannelReady) {
+            this.debug.log(`🚀 BACKUP OPEN: Backup trigger for data channel open for ${this.peerId.substring(0, 8)}...`);
+            this.dataChannelReady = true;
+            this.emit('dataChannelOpen', { peerId: this.peerId });
+          }
+        }, 100); // Short delay to allow normal event to fire first
+      } else {
+        this.debug.log(`❌ DATA CHANNEL CHECK: No data channel found for ${this.peerId.substring(0, 8)}...`);
+      }
+    }
+  }
+
   async createOffer() {
-    // Create offer with optimized settings for faster connection
-    const offer = await this.connection.createOffer({
-      offerToReceiveAudio: true,
-      offerToReceiveVideo: true,
-      iceRestart: false // Don't restart ICE unless necessary
-    });
-    await this.connection.setLocalDescription(offer);
-    return offer;
+    // Create offer with optimized settings for faster connection and timeout protection
+    try {
+      const offer = await Promise.race([
+        this.connection.createOffer({
+          offerToReceiveAudio: true,
+          offerToReceiveVideo: true,
+          iceRestart: false // Don't restart ICE unless necessary
+        }),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('createOffer timeout')), 10000)
+        )
+      ]);
+      
+      await Promise.race([
+        this.connection.setLocalDescription(offer),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('setLocalDescription timeout')), 10000)
+        )
+      ]);
+      
+      return offer;
+    } catch (error) {
+      this.debug.error(`❌ Failed to create offer for ${this.peerId}:`, error);
+      throw error;
+    }
   }
 
   async handleOffer(offer) {
@@ -453,16 +442,38 @@ export class PeerConnection extends EventEmitter {
     this.debug.log(`🔄 OFFER DEBUG: State validation passed, processing offer from ${this.peerId.substring(0, 8)}... SDP length: ${offer.sdp.length}`);
 
     try {
-      await this.connection.setRemoteDescription(offer);
+      await Promise.race([
+        this.connection.setRemoteDescription(offer),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('setRemoteDescription timeout')), 10000)
+        )
+      ]);
+      
       this.remoteDescriptionSet = true;
       this.debug.log(`✅ OFFER DEBUG: Offer processed successfully from ${this.peerId.substring(0, 8)}...`);
       this.debug.log(`✅ OFFER DEBUG: New signaling state after offer: ${this.connection.signalingState}`);
       await this.processPendingIceCandidates();
 
-      const answer = await this.connection.createAnswer();
-      await this.connection.setLocalDescription(answer);
+      const answer = await Promise.race([
+        this.connection.createAnswer(),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('createAnswer timeout')), 10000)
+        )
+      ]);
+      
+      await Promise.race([
+        this.connection.setLocalDescription(answer),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('setLocalDescription timeout')), 10000)
+        )
+      ]);
+      
       this.debug.log(`✅ OFFER DEBUG: Answer created for offer from ${this.peerId.substring(0, 8)}...`);
       this.debug.log(`✅ OFFER DEBUG: Final signaling state after answer: ${this.connection.signalingState}`);
+      
+      // CRITICAL: Force check data channel state after offer/answer processing
+      this.checkDataChannelState();
+      
       return answer;
     } catch (error) {
       this.debug.error(`❌ OFFER DEBUG: Failed to process offer from ${this.peerId}:`, error);
@@ -519,12 +530,21 @@ export class PeerConnection extends EventEmitter {
     this.debug.log(`🔄 ANSWER DEBUG: State validation passed, processing answer from ${this.peerId.substring(0, 8)}... SDP length: ${answer.sdp.length}`);
 
     try {
-      await this.connection.setRemoteDescription(answer);
+      await Promise.race([
+        this.connection.setRemoteDescription(answer),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('setRemoteDescription timeout')), 10000)
+        )
+      ]);
+      
       this.remoteDescriptionSet = true;
       this.debug.log(`✅ ANSWER DEBUG: Answer processed successfully from ${this.peerId.substring(0, 8)}...`);
       this.debug.log(`✅ ANSWER DEBUG: New signaling state: ${this.connection.signalingState}`);
       this.debug.log(`✅ ANSWER DEBUG: New connection state: ${this.connection.connectionState}`);
       await this.processPendingIceCandidates();
+      
+      // CRITICAL: Force check data channel state after answer processing
+      this.checkDataChannelState();
     } catch (error) {
       this.debug.error(`❌ ANSWER DEBUG: Failed to set remote description for answer from ${this.peerId}:`, error);
       this.debug.error('ANSWER DEBUG: Answer SDP that failed:', answer.sdp);
@@ -560,7 +580,12 @@ export class PeerConnection extends EventEmitter {
     }
 
     try {
-      await this.connection.addIceCandidate(candidate);
+      await Promise.race([
+        this.connection.addIceCandidate(candidate),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('addIceCandidate timeout')), 5000)
+        )
+      ]);
       this.debug.log(`🧊 Successfully added ICE candidate for ${this.peerId.substring(0, 8)}...`);
     } catch (error) {
       this.debug.error(`🧊 Failed to add ICE candidate for ${this.peerId.substring(0, 8)}...:`, error);
@@ -577,7 +602,12 @@ export class PeerConnection extends EventEmitter {
 
       for (const candidate of this.pendingIceCandidates) {
         try {
-          await this.connection.addIceCandidate(candidate);
+          await Promise.race([
+            this.connection.addIceCandidate(candidate),
+            new Promise((resolve, reject) => 
+              setTimeout(() => reject(new Error('addIceCandidate timeout')), 5000)
+            )
+          ]);
           this.debug.log(`🧊 Successfully added buffered ICE candidate (${candidate.type}) for ${this.peerId.substring(0, 8)}...`);
         } catch (error) {
           this.debug.error(`🧊 Failed to add buffered ICE candidate for ${this.peerId.substring(0, 8)}...:`, error);
@@ -637,7 +667,16 @@ export class PeerConnection extends EventEmitter {
               this.processedTrackIds.add(track.id);
 
               this.debug.log('🚨 TRACK CHECK: Emitting remoteStream event for new track');
-              this.emit('remoteStream', { peerId: this.peerId, stream: this.remoteStream });
+              
+              // Check if remote streams are allowed (crypto gating)
+              if (this.allowRemoteStreams) {
+                this.emit('remoteStream', { peerId: this.peerId, stream: this.remoteStream });
+              } else {
+                // Buffer the stream until crypto allows it
+                this.debug.log('🔒 TRACK CHECK: Buffering remote stream until crypto verification');
+                this.pendingRemoteStreams.push({ peerId: this.peerId, stream: this.remoteStream });
+              }
+              
               foundNewTracks = true;
             }
           }
@@ -765,6 +804,61 @@ export class PeerConnection extends EventEmitter {
   }
 
   /**
+   * Add local stream using addTrack() method to trigger ontrack events
+   */
+  async addLocalStreamWithAddTrack(stream) {
+    if (!stream || !this.connection) return;
+
+    this.debug.log('🎥 Adding local stream using addTrack() for proper ontrack events');
+
+    const audioTracks = stream.getAudioTracks();
+    const videoTracks = stream.getVideoTracks();
+
+    // Mark stream as local origin to prevent loopback
+    this.markStreamAsLocal(stream);
+
+    // Add audio tracks using addTrack()
+    audioTracks.forEach((audioTrack, index) => {
+      this.debug.log(`🎤 Adding audio track ${index} using addTrack()`);
+      try {
+        const audioSender = this.connection.addTrack(audioTrack, stream);
+        this.audioTransceiver = this.connection.getTransceivers().find(t => t.sender === audioSender);
+        
+        // Setup audio sending monitoring
+        this.setupAudioSendingMonitoring(audioTrack);
+        this.debug.log(`🎤 SENDING AUDIO to peer ${this.peerId.substring(0, 8)} - track enabled: ${audioTrack.enabled}`);
+      } catch (error) {
+        this.debug.error(`❌ Failed to add audio track ${index}:`, error);
+      }
+    });
+
+    // Add video tracks using addTrack()
+    videoTracks.forEach((videoTrack, index) => {
+      this.debug.log(`🎥 Adding video track ${index} using addTrack()`);
+      try {
+        const videoSender = this.connection.addTrack(videoTrack, stream);
+        this.videoTransceiver = this.connection.getTransceivers().find(t => t.sender === videoSender);
+        this.debug.log(`🎥 SENDING VIDEO to peer ${this.peerId.substring(0, 8)} - track enabled: ${videoTrack.enabled}`);
+      } catch (error) {
+        this.debug.error(`❌ Failed to add video track ${index}:`, error);
+      }
+    });
+
+    this.localStream = stream;
+    this.debug.log('✅ Local stream added using addTrack() method');
+    
+    // DEBUG: Log transceivers after adding tracks
+    const transceivers = this.connection.getTransceivers();
+    this.debug.log('🔍 Transceivers after addTrack():', transceivers.map(t => ({
+      kind: t.receiver?.track?.kind || 'unknown',
+      direction: t.direction,
+      hasTrack: !!t.sender?.track,
+      trackId: t.sender?.track?.id?.substring(0, 8) || 'none',
+      mid: t.mid
+    })));
+  }
+
+  /**
      * Add or replace local media stream
      */
   async setLocalStream(stream) {
@@ -774,120 +868,39 @@ export class PeerConnection extends EventEmitter {
 
     this.debug.log(`Setting local stream for ${this.peerId}, current state: ${this.connection.connectionState}, signaling: ${this.connection.signalingState}`);
 
-    // DEBUG: Log current transceivers before any changes
-    const transceivers = this.connection.getTransceivers();
-    this.debug.log('🔍 Current transceivers before stream change:', transceivers.map(t => ({
-      kind: t.receiver.track?.kind || 'unknown',
-      direction: t.direction,
-      hasTrack: !!t.sender.track,
-      mid: t.mid
-    })));
+    // First, remove any existing local tracks
+    const senders = this.connection.getSenders();
+    for (const sender of senders) {
+      if (sender.track) {
+        this.debug.log('�️ Removing existing track:', sender.track.kind);
+        this.connection.removeTrack(sender);
+      }
+    }
 
-    // Use stored transceiver references for reliable access
-    this.debug.log('🔄 Using stored transceiver references for media');
+    // Clear transceiver references
+    this.audioTransceiver = null;
+    this.videoTransceiver = null;
 
     if (stream) {
-      const audioTracks = stream.getAudioTracks();
-      const videoTracks = stream.getVideoTracks();
-
-      // Mark stream as local origin to prevent loopback
-      this.markStreamAsLocal(stream);
-
-      // Handle audio track using stored reference
-      if (this.audioTransceiver) {
-        if (audioTracks.length > 0) {
-          this.debug.log('🔄 Replacing audio track in stored transceiver');
-          await this.audioTransceiver.sender.replaceTrack(audioTracks[0]);
-          this.audioTransceiver.direction = 'sendrecv';
-
-          // Setup audio sending monitoring
-          this.setupAudioSendingMonitoring(audioTracks[0]);
-          this.debug.log(`🎤 SENDING AUDIO to peer ${this.peerId.substring(0, 8)} - track enabled: ${audioTracks[0].enabled}`);
-        } else {
-          this.debug.log('🔄 Removing audio track from stored transceiver');
-          await this.audioTransceiver.sender.replaceTrack(null);
-          this.audioTransceiver.direction = 'recvonly';
-          this.debug.log(`🎤 STOPPED SENDING AUDIO to peer ${this.peerId.substring(0, 8)}`);
-        }
-      }
-
-      // Handle video track using stored reference
-      if (this.videoTransceiver) {
-        if (videoTracks.length > 0) {
-          this.debug.log('🔄 Replacing video track in stored transceiver');
-          await this.videoTransceiver.sender.replaceTrack(videoTracks[0]);
-          this.videoTransceiver.direction = 'sendrecv';
-        } else {
-          this.debug.log('🔄 Removing video track from stored transceiver');
-          await this.videoTransceiver.sender.replaceTrack(null);
-          this.videoTransceiver.direction = 'recvonly';
-        }
-      }
-
-      this.localStream = stream;
-      this.debug.log('✅ Stream set successfully using stored transceivers');
+      this.debug.log('🎥 Adding new stream using addTrack() method');
+      await this.addLocalStreamWithAddTrack(stream);
     } else {
-      // Remove all tracks using stored references
-      if (this.audioTransceiver) {
-        this.debug.log('🔄 Removing audio track from stored transceiver');
-        await this.audioTransceiver.sender.replaceTrack(null);
-        this.audioTransceiver.direction = 'recvonly';
-      }
-
-      if (this.videoTransceiver) {
-        this.debug.log('🔄 Removing video track from stored transceiver');
-        await this.videoTransceiver.sender.replaceTrack(null);
-        this.videoTransceiver.direction = 'recvonly';
-      }
-
       this.localStream = null;
-      this.debug.log('✅ All tracks removed using stored transceivers');
+      this.debug.log('✅ All tracks removed');
     }
 
     this.debug.log('Updated local media stream for', this.peerId);
-
-    // DEBUG: Log final transceivers after changes
-    const finalTransceivers = this.connection.getTransceivers();
-    this.debug.log('🔍 Final transceivers after stream change:', finalTransceivers.map(t => ({
-      kind: t.receiver?.track?.kind || 'unknown',
-      direction: t.direction,
-      hasTrack: !!t.sender?.track,
-      trackId: t.sender?.track?.id?.substring(0, 8) || 'none',
-      mid: t.mid
-    })));
-
-    // AGGRESSIVE FIX: Force immediate renegotiation if connection is stuck
-    if (this.connection.signalingState === 'have-local-offer') {
-      this.debug.log('🆘 FORCE RENEGOTIATION: Connection stuck in \'have-local-offer\' - forcing immediate renegotiation');
-
-      // Force renegotiation event
-      this.emit('renegotiationNeeded', { peerId: this.peerId });
-
-      // Also try direct renegotiation as backup
-      setTimeout(() => {
-        if (this.connection.signalingState === 'have-local-offer') {
-          this.debug.log('🆘 EMERGENCY: Still stuck after forced renegotiation - attempting direct recovery');
-          this.forceConnectionRecovery().catch(err => {
-            this.debug.error('❌ EMERGENCY: Direct recovery failed', err);
-          });
-        }
-      }, 5000);
-    } else {
-      // Normal renegotiation for stable connections
-      this.debug.log('✅ RENEGOTIATION: Triggering normal renegotiation for media changes');
-      this.emit('renegotiationNeeded', { peerId: this.peerId });
-    }
 
     // CRITICAL: Force renegotiation when media changes
     this.debug.log('✅ Stream updated - forcing renegotiation for media changes');
     this.debug.log(`   Current state: connectionState=${this.connection.connectionState}, signalingState=${this.connection.signalingState}`);
 
-    // Always trigger renegotiation when stream changes, regardless of connection state
+    // Always trigger renegotiation when stream changes
     if (stream) {
       setTimeout(() => {
         this.debug.log('🔄 Forcing renegotiation for media stream changes');
         this.emit('renegotiationNeeded', { peerId: this.peerId });
-      }, 200); // Increased delay to ensure replaceTrack completes
+      }, 200);
     }
   }
 
@@ -899,8 +912,19 @@ export class PeerConnection extends EventEmitter {
 
     try {
       // Create a new offer to break the stuck state
-      const offer = await this.connection.createOffer({ iceRestart: true });
-      await this.connection.setLocalDescription(offer);
+      const offer = await Promise.race([
+        this.connection.createOffer({ iceRestart: true }),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('forceConnectionRecovery createOffer timeout')), 10000)
+        )
+      ]);
+      
+      await Promise.race([
+        this.connection.setLocalDescription(offer),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('forceConnectionRecovery setLocalDescription timeout')), 10000)
+        )
+      ]);
 
       // Emit recovery offer via mesh signaling
       if (this.mesh && this.mesh.sendSignalingMessage) {
@@ -917,34 +941,6 @@ export class PeerConnection extends EventEmitter {
     } catch (error) {
       this.debug.error(`❌ RECOVERY: Emergency recovery failed for ${this.peerId.substring(0, 8)}...`, error);
       throw error;
-    }
-  }
-
-  /**
-     * Helper method to set local stream tracks to existing transceivers
-     */
-  async setLocalStreamToTransceivers(stream) {
-    if (stream) {
-      const audioTracks = stream.getAudioTracks();
-      const videoTracks = stream.getVideoTracks();
-
-      // Set audio track to stored audio transceiver
-      if (this.audioTransceiver && audioTracks.length > 0) {
-        this.debug.log('🔄 Setting audio track to stored audio transceiver');
-        await this.audioTransceiver.sender.replaceTrack(audioTracks[0]);
-        this.audioTransceiver.direction = 'sendrecv';
-
-        // Setup audio sending monitoring
-        this.setupAudioSendingMonitoring(audioTracks[0]);
-        this.debug.log(`🎤 SENDING AUDIO to peer ${this.peerId.substring(0, 8)} via transceiver - track enabled: ${audioTracks[0].enabled}`);
-      }
-
-      // Set video track to stored video transceiver
-      if (this.videoTransceiver && videoTracks.length > 0) {
-        this.debug.log('🔄 Setting video track to stored video transceiver');
-        await this.videoTransceiver.sender.replaceTrack(videoTracks[0]);
-        this.videoTransceiver.direction = 'sendrecv';
-      }
     }
   }
 
@@ -1157,6 +1153,35 @@ export class PeerConnection extends EventEmitter {
   }
 
   /**
+   * Allow remote streams to be emitted (called after crypto verification)
+   */
+  allowRemoteStreamEmission() {
+    this.debug.log(`🔓 CRYPTO: Allowing remote stream emission for ${this.peerId.substring(0, 8)}...`);
+    this.allowRemoteStreams = true;
+    
+    // Emit any buffered remote streams
+    while (this.pendingRemoteStreams.length > 0) {
+      const streamEvent = this.pendingRemoteStreams.shift();
+      this.debug.log(`🔓 CRYPTO: Emitting buffered remote stream from ${streamEvent.peerId.substring(0, 8)}...`);
+      this.emit('remoteStream', streamEvent);
+    }
+  }
+
+  /**
+   * Block remote streams (called when crypto is required but not verified)
+   */
+  blockRemoteStreamEmission() {
+    // Check if crypto blocking is globally disabled (for video tests)
+    if (typeof window !== 'undefined' && window.DISABLE_CRYPTO_BLOCKING) {
+      this.debug.log(`🔓 CRYPTO: Video test mode - NOT blocking remote stream emission for ${this.peerId.substring(0, 8)}...`);
+      return; // Don't block streams in video test mode
+    }
+    
+    this.debug.log(`🔒 CRYPTO: Blocking remote stream emission for ${this.peerId.substring(0, 8)}...`);
+    this.allowRemoteStreams = false;
+  }
+
+  /**
      * Check if connection has video/audio capabilities
      */
   getMediaCapabilities() {
@@ -1258,48 +1283,6 @@ export class PeerConnection extends EventEmitter {
   }
 
   /**
-   * Monitor data channel health when ICE connection is problematic but signaling is unavailable
-   * This allows peer connections to survive signaling server outages
-   */
-  monitorDataChannelHealth() {
-    if (this.dataChannelHealthMonitor) {
-      clearTimeout(this.dataChannelHealthMonitor);
-    }
-
-    this.debug.log(`📡 Monitoring data channel health for ${this.peerId} (signaling unavailable)`);
-
-    // Test data channel by sending a ping message
-    const testDataChannel = () => {
-      if (!this.dataChannel || this.dataChannel.readyState !== 'open' || this.isClosing) {
-        this.debug.log(`❌ Data channel not available for ${this.peerId}, disconnecting`);
-        this.emit('disconnected', { peerId: this.peerId, reason: 'data channel unavailable' });
-        return;
-      }
-
-      try {
-        // Send a small ping message to test connectivity
-        const pingMessage = {
-          type: 'ping',
-          timestamp: Date.now(),
-          from: this.mesh?.peerId || 'unknown'
-        };
-
-        this.dataChannel.send(JSON.stringify(pingMessage));
-        this.debug.log(`✅ Data channel ping sent to ${this.peerId} - connection appears healthy`);
-
-        // Schedule next health check in 30 seconds
-        this.dataChannelHealthMonitor = setTimeout(testDataChannel, 30000);
-      } catch (error) {
-        this.debug.error(`❌ Data channel ping failed for ${this.peerId}:`, error);
-        this.emit('disconnected', { peerId: this.peerId, reason: 'data channel ping failed' });
-      }
-    };
-
-    // Start monitoring after a short delay
-    this.dataChannelHealthMonitor = setTimeout(testDataChannel, 5000);
-  }
-
-  /**
    * Restart ICE using signaling coordination (WebSocket or mesh)
    * This allows ICE restart to work even when the signaling server is down
    * by using the mesh for coordination
@@ -1316,8 +1299,19 @@ export class PeerConnection extends EventEmitter {
       this.connection.restartIce();
 
       // Create a new offer with the restarted ICE
-      const offer = await this.connection.createOffer({ iceRestart: true });
-      await this.connection.setLocalDescription(offer);
+      const offer = await Promise.race([
+        this.connection.createOffer({ iceRestart: true }),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('ICE restart createOffer timeout')), 10000)
+        )
+      ]);
+      
+      await Promise.race([
+        this.connection.setLocalDescription(offer),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('ICE restart setLocalDescription timeout')), 10000)
+        )
+      ]);
 
       // Send the new offer via our mesh signaling system
       if (this.mesh && this.mesh.sendSignalingMessage) {
@@ -1348,9 +1342,26 @@ export class PeerConnection extends EventEmitter {
     this.debug.log(`🔄 Handling ICE restart offer from ${this.peerId}`);
 
     try {
-      await this.connection.setRemoteDescription(offer);
-      const answer = await this.connection.createAnswer();
-      await this.connection.setLocalDescription(answer);
+      await Promise.race([
+        this.connection.setRemoteDescription(offer),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('ICE restart setRemoteDescription timeout')), 10000)
+        )
+      ]);
+      
+      const answer = await Promise.race([
+        this.connection.createAnswer(),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('ICE restart createAnswer timeout')), 10000)
+        )
+      ]);
+      
+      await Promise.race([
+        this.connection.setLocalDescription(answer),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('ICE restart setLocalDescription timeout')), 10000)
+        )
+      ]);
 
       // Send the answer back
       if (this.mesh && this.mesh.sendSignalingMessage) {
@@ -1379,7 +1390,12 @@ export class PeerConnection extends EventEmitter {
     this.debug.log(`🔄 Handling ICE restart answer from ${this.peerId}`);
 
     try {
-      await this.connection.setRemoteDescription(answer);
+      await Promise.race([
+        this.connection.setRemoteDescription(answer),
+        new Promise((resolve, reject) => 
+          setTimeout(() => reject(new Error('ICE restart setRemoteDescription timeout')), 10000)
+        )
+      ]);
       this.debug.log(`✅ ICE restart completed for ${this.peerId}`);
     } catch (error) {
       this.debug.error(`Failed to handle ICE restart answer from ${this.peerId}:`, error);
@@ -1387,34 +1403,15 @@ export class PeerConnection extends EventEmitter {
     }
   }
 
-  /**
-   * Stop data channel health monitoring
-   */
-  stopDataChannelHealthMonitoring() {
-    if (this.dataChannelHealthMonitor) {
-      clearTimeout(this.dataChannelHealthMonitor);
-      this.dataChannelHealthMonitor = null;
-      this.debug.log(`📡 Stopped data channel health monitoring for ${this.peerId}`);
-    }
-  }
-
   close() {
     // Set flag to prevent disconnection events during intentional close
     this.isClosing = true;
 
-    // Clear any pending timeouts
-    if (this.iceCheckingTimeout) {
-      clearTimeout(this.iceCheckingTimeout);
-      this.iceCheckingTimeout = null;
+    // Clear any existing ICE timeout
+    if (this.iceTimeoutId) {
+      clearTimeout(this.iceTimeoutId);
+      this.iceTimeoutId = null;
     }
-
-    if (this.connectingTimeout) {
-      clearTimeout(this.connectingTimeout);
-      this.connectingTimeout = null;
-    }
-
-    // Stop data channel health monitoring
-    this.stopDataChannelHealthMonitoring();
 
     if (this.connection) {
       this.connection.close();

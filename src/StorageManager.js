@@ -74,45 +74,6 @@ export class StorageManager extends EventEmitter {
     return this.loadSignalingUrlFromStorage();
   }
 
-  async generatePeerId() {
-    const array = new Uint8Array(20);
-
-    // Environment-aware random value generation
-    if (environmentDetector.hasRandomValues) {
-      if (environmentDetector.isBrowser || environmentDetector.isWorker || environmentDetector.isNativeScript) {
-        crypto.getRandomValues(array);
-      } else if (environmentDetector.isNodeJS) {
-        // In Node.js, use crypto module (handle both CommonJS and ES modules)
-        try {
-          if (typeof require !== 'undefined') {
-            const crypto = require('crypto');
-            const randomBytes = crypto.randomBytes(20);
-            array.set(randomBytes);
-          } else {
-            // ES module approach - import crypto dynamically
-            const crypto = await import('crypto');
-            const randomBytes = crypto.randomBytes(20);
-            array.set(randomBytes);
-          }
-        } catch (e) {
-          this.debug.warn('Could not use Node.js crypto, falling back to Math.random');
-          // Fallback to Math.random
-          for (let i = 0; i < array.length; i++) {
-            array[i] = Math.floor(Math.random() * 256);
-          }
-        }
-      }
-    } else {
-      // Fallback to less secure random generation
-      this.debug.warn('Secure random values not available, using fallback method');
-      for (let i = 0; i < array.length; i++) {
-        array[i] = Math.floor(Math.random() * 256);
-      }
-    }
-
-    return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
-  }
-
   validatePeerId(peerId) {
     return typeof peerId === 'string' && /^[a-fA-F0-9]{40}$/.test(peerId);
   }

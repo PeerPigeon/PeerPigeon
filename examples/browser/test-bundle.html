@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PeerPigeon Bundle Test</title>
+</head>
+<body>
+    <h1>PeerPigeon Bundle Test</h1>
+    <div id="test-results"></div>
+    
+    <script src="../../dist/peerpigeon-browser.js"></script>
+    <script>
+        function runTests() {
+            const results = document.getElementById('test-results');
+            let html = '';
+            
+            // Test 1: PeerPigeon global object
+            html += `<p>PeerPigeon object available: ${typeof PeerPigeon !== 'undefined' ? '✅ YES' : '❌ NO'}</p>`;
+            
+            // Test 2: PeerPigeonMesh class
+            if (typeof PeerPigeon !== 'undefined') {
+                html += `<p>PeerPigeonMesh class: ${typeof PeerPigeon.PeerPigeonMesh === 'function' ? '✅ YES' : '❌ NO'}</p>`;
+                html += `<p>Available exports: ${Object.keys(PeerPigeon).join(', ')}</p>`;
+            }
+            
+            // Test 3: UnSEA crypto
+            html += `<p>UnSEA crypto available: ${typeof window.__PEERPIGEON_UNSEA__ !== 'undefined' ? '✅ YES' : '❌ NO'}</p>`;
+            
+            results.innerHTML = html;
+        }
+        
+        // Run tests when page loads
+        window.addEventListener('load', runTests);
+    </script>
+</body>
+</html>

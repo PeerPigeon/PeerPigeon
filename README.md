@@ -16,8 +16,8 @@
 - **🧠 Smart Eviction Strategy**: Automatically replaces distant peers with closer ones to optimize mesh topology
 - **🔍 Auto-Discovery**: Seamlessly connects to peers as they join the network
 - **⚡ WebSocket Signaling**: Real-time bidirectional communication for optimal performance
-- **🗄️ Distributed Hash Table (WebDHT)**: Store and retrieve data across the mesh with automatic replication
-- **📦 Distributed Storage Layer**: Encrypted, access-controlled storage with CRDT support for collaborative editing
+- **🗄️ WebDHT (Low-Level DHT)**: Simple distributed hash table for raw key-value storage across the mesh
+- **📦 DistributedStorageManager (High-Level)**: Encrypted, access-controlled storage with CRDT support for collaborative editing
 - **🎥 Media Streaming**: Built-in support for audio/video streaming between peers
 - **💬 Messaging System**: Direct messages and broadcast gossip protocol messaging
 - **🔧 Modular Architecture**: Clean separation of concerns with event-driven components
@@ -82,7 +82,8 @@ import { PeerPigeonMesh } from 'peerpigeon';
 
 // Create mesh instance
 const mesh = new PeerPigeonMesh({
-    enableWebDHT: true, // Enable distributed hash table (default: true)
+    enableWebDHT: true, // Enable low-level distributed hash table (default: true)
+    enableCrypto: true, // Enable encryption features (default: true)
     peerId: 'custom-peer-id' // Optional: provide custom peer ID
 });
 
@@ -186,6 +187,26 @@ const mesh = new PeerPigeonMesh(options);
 
 See [docs/DEBUG.md](docs/DEBUG.md) for complete documentation.
 
+## 📚 Storage Architecture: WebDHT vs DistributedStorageManager
+
+PeerPigeon provides **two separate storage systems** for different use cases:
+
+### 🔧 WebDHT (Low-Level)
+**Raw distributed hash table for simple key-value storage**
+- Direct DHT operations across the mesh
+- No encryption or access control
+- Basic Kademlia-style routing and replication
+- Use for simple data sharing or building custom storage
+
+### 🛡️ DistributedStorageManager (High-Level)  
+**Encrypted storage with access control and advanced features**
+- Built on top of WebDHT as storage backend
+- Encryption, access control, storage spaces
+- CRDT support for collaborative editing
+- Use for application data and user content
+
+**Important**: These are separate systems. DistributedStorageManager uses WebDHT as its backend, but you can use either independently depending on your needs.
+
 ### WebDHT (Distributed Hash Table) Examples
 
 ```javascript
@@ -208,9 +229,9 @@ await mesh.dhtUpdate('shared-counter', 42);
 ### Distributed Storage Layer Examples
 
 ```javascript
-// Enable crypto for encryption support
+// Crypto is enabled by default, but can be explicitly set
 const mesh = new PeerPigeonMesh({
-    enableCrypto: true,
+    enableCrypto: true, // Default: true, set to false to disable
     enableWebDHT: true
 });
 
@@ -689,6 +710,10 @@ mesh.setMaxPeers(10);
 // Default: 2, Min: 0, Max: 49
 mesh.setMinPeers(2);
 
+// Enable or disable automatic connection behavior when joining the mesh.
+// Default: true
+mesh.setAutoConnect(true);
+
 // Enable or disable automatic connection to newly discovered peers.
 // Default: true
 mesh.setAutoDiscovery(true);
@@ -706,6 +731,11 @@ mesh.setXorRouting(true);
 // Default: true (enabled)
 // Can only be set during initialization in constructor options
 const mesh = new PeerPigeonMesh({ enableWebDHT: false }); // Disable DHT
+
+// Enable or disable encryption features (CryptoManager).
+// Default: true (enabled)
+// Can only be set during initialization in constructor options
+const mesh2 = new PeerPigeonMesh({ enableCrypto: false }); // Disable crypto
 
 // Set the signaling connection type. Currently only 'websocket' is supported.
 // Default: 'websocket'
