@@ -63,6 +63,30 @@ export interface StatusChangedEvent {
     message: string;
 }
 
+export interface StreamingStatus {
+    sendingStream: boolean;
+    receivingStreams: boolean;
+    streamType: 'broadcast' | 'selective' | 'none';
+}
+
+export interface SelectiveStreamStartedEvent {
+    targetPeerIds: string[];
+    stream: MediaStream;
+    streamType: '1:1' | '1:many';
+}
+
+export interface SelectiveStreamStoppedEvent {
+    returnToBroadcast: boolean;
+}
+
+export interface StreamingBlockedEvent {
+    blockedPeerIds: string[];
+}
+
+export interface StreamingAllowedEvent {
+    allowedPeerIds: string[];
+}
+
 export declare class PeerPigeonMesh {
     constructor(options?: PeerPigeonOptions);
     
@@ -102,6 +126,17 @@ export declare class PeerPigeonMesh {
         microphones: MediaDeviceInfo[];
     }>;
     
+    // === SELECTIVE STREAMING METHODS ===
+    startSelectiveStream(peerIds: string | string[], options?: MediaStreamConstraints): Promise<MediaStream>;
+    stopSelectiveStream(returnToBroadcast?: boolean): Promise<void>;
+    enableStreamingForAllPeers(): Promise<void>;
+    blockStreamingToPeers(peerIds: string | string[]): Promise<void>;
+    allowStreamingToPeers(peerIds: string | string[]): Promise<void>;
+    getStreamingStatus(): Map<string, StreamingStatus>;
+    isStreamingToAll(): boolean;
+    getStreamingPeers(): string[];
+    getBlockedStreamingPeers(): string[];
+    
     // WebDHT
     dhtPut(key: string, value: any): Promise<void>;
     dhtGet(key: string): Promise<any>;
@@ -121,6 +156,13 @@ export declare class PeerPigeonMesh {
     addEventListener(event: 'dhtValueChanged', listener: (data: DHTValueChangedEvent) => void): void;
     addEventListener(event: 'statusChanged', listener: (data: StatusChangedEvent) => void): void;
     addEventListener(event: 'peersUpdated', listener: () => void): void;
+    
+    // === NEW SELECTIVE STREAMING EVENTS ===
+    addEventListener(event: 'selectiveStreamStarted', listener: (data: SelectiveStreamStartedEvent) => void): void;
+    addEventListener(event: 'selectiveStreamStopped', listener: (data: SelectiveStreamStoppedEvent) => void): void;
+    addEventListener(event: 'broadcastStreamEnabled', listener: () => void): void;
+    addEventListener(event: 'streamingBlockedToPeers', listener: (data: StreamingBlockedEvent) => void): void;
+    addEventListener(event: 'streamingAllowedToPeers', listener: (data: StreamingAllowedEvent) => void): void;
     
     removeEventListener(event: string, listener: Function): void;
 }

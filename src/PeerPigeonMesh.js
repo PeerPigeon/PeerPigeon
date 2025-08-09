@@ -768,6 +768,218 @@ export class PeerPigeonMesh extends EventEmitter {
     return streams;
   }
 
+  // === SELECTIVE STREAMING CONTROL METHODS ===
+
+  /**
+   * Enable streaming to specific peers only (1:1 or 1:many patterns)
+   * @param {string|string[]} peerIds - Single peer ID or array of peer IDs to stream to
+   * @param {Object} options - Stream options (video, audio, deviceIds)
+   * @returns {Promise<MediaStream>} The local stream
+   */
+  async startSelectiveStream(peerIds, options = {}) {
+    // Normalize to array
+    const targetPeerIds = Array.isArray(peerIds) ? peerIds : [peerIds];
+    
+    this.debug.log(`🎯 SELECTIVE STREAM: Starting stream to ${targetPeerIds.length} specific peer(s)`);
+    
+    // Start local media stream
+    const stream = await this.mediaManager.startLocalStream(options);
+    
+    // Get all connections
+    const connections = this.connectionManager.getAllConnections();
+    
+    // Apply stream only to target peers
+    for (const connection of connections) {
+      if (targetPeerIds.includes(connection.peerId)) {
+        this.debug.log(`📡 SELECTIVE STREAM: Enabling stream for target peer ${connection.peerId.substring(0, 8)}...`);
+        
+        // Enable remote stream reception on target peer
+        if (connection.allowRemoteStreamEmission) {
+          connection.allowRemoteStreamEmission();
+        }
+        
+        // Set local stream for this connection
+        await connection.setLocalStream(stream);
+      } else {
+        this.debug.log(`🚫 SELECTIVE STREAM: Blocking stream for non-target peer ${connection.peerId.substring(0, 8)}...`);
+        
+        // Ensure no stream is set for non-target peers
+        await connection.setLocalStream(null);
+        
+        // Block remote stream reception from non-target peers if desired
+        if (connection.blockRemoteStreamEmission) {
+          connection.blockRemoteStreamEmission();
+        }
+      }
+    }
+    
+    // Emit event for UI updates
+    this.emit('selectiveStreamStarted', {
+      targetPeerIds,
+      stream,
+      streamType: targetPeerIds.length === 1 ? '1:1' : '1:many'
+    });
+    
+    return stream;
+  }
+
+  /**
+   * Stop selective streaming and return to broadcast mode or stop entirely
+   * @param {boolean} returnToBroadcast - If true, switch to broadcast mode; if false, stop streaming entirely
+   */
+  async stopSelectiveStream(returnToBroadcast = false) {
+    this.debug.log(`🛑 SELECTIVE STREAM: Stopping selective streaming (broadcast mode: ${returnToBroadcast})`);
+    
+    if (returnToBroadcast) {
+      // Switch to broadcast mode - enable streams for all connected peers
+      await this.enableStreamingForAllPeers();
+    } else {
+      // Stop streaming entirely
+      await this.stopMedia();
+    }
+    
+    this.emit('selectiveStreamStopped', { returnToBroadcast });
+  }
+
+  /**
+   * Enable streaming for all connected peers (broadcast mode)
+   */
+  async enableStreamingForAllPeers() {
+    this.debug.log('📡 BROADCAST STREAM: Enabling streaming for ALL connected peers');
+    
+    const connections = this.connectionManager.getAllConnections();
+    const currentStream = this.mediaManager.localStream;
+    
+    for (const connection of connections) {
+      this.debug.log(`📡 BROADCAST STREAM: Enabling stream for peer ${connection.peerId.substring(0, 8)}...`);
+      
+      // Enable remote stream reception
+      if (connection.allowRemoteStreamEmission) {
+        connection.allowRemoteStreamEmission();
+      }
+      
+      // Set local stream if we have one
+      if (currentStream) {
+        await connection.setLocalStream(currentStream);
+      }
+    }
+    
+    this.emit('broadcastStreamEnabled');
+  }
+
+  /**
+   * Block streaming to specific peers while maintaining streams to others
+   * @param {string|string[]} peerIds - Peer ID(s) to block streaming to
+   */
+  async blockStreamingToPeers(peerIds) {
+    const targetPeerIds = Array.isArray(peerIds) ? peerIds : [peerIds];
+    
+    this.debug.log(`🚫 BLOCK STREAM: Blocking streaming to ${targetPeerIds.length} peer(s)`);
+    
+    for (const peerId of targetPeerIds) {
+      const connection = this.connectionManager.getPeer(peerId);
+      if (connection) {
+        this.debug.log(`🚫 BLOCK STREAM: Blocking stream to peer ${peerId.substring(0, 8)}...`);
+        
+        // Remove local stream from this connection
+        await connection.setLocalStream(null);
+        
+        // Block remote stream reception
+        if (connection.blockRemoteStreamEmission) {
+          connection.blockRemoteStreamEmission();
+        }
+      }
+    }
+    
+    this.emit('streamingBlockedToPeers', { blockedPeerIds: targetPeerIds });
+  }
+
+  /**
+   * Allow streaming to specific peers (unblock them)
+   * @param {string|string[]} peerIds - Peer ID(s) to allow streaming to
+   */
+  async allowStreamingToPeers(peerIds) {
+    const targetPeerIds = Array.isArray(peerIds) ? peerIds : [peerIds];
+    
+    this.debug.log(`✅ ALLOW STREAM: Allowing streaming to ${targetPeerIds.length} peer(s)`);
+    
+    const currentStream = this.mediaManager.localStream;
+    
+    for (const peerId of targetPeerIds) {
+      const connection = this.connectionManager.getPeer(peerId);
+      if (connection) {
+        this.debug.log(`✅ ALLOW STREAM: Allowing stream to peer ${peerId.substring(0, 8)}...`);
+        
+        // Enable remote stream reception
+        if (connection.allowRemoteStreamEmission) {
+          connection.allowRemoteStreamEmission();
+        }
+        
+        // Set local stream if we have one
+        if (currentStream) {
+          await connection.setLocalStream(currentStream);
+        }
+      }
+    }
+    
+    this.emit('streamingAllowedToPeers', { allowedPeerIds: targetPeerIds });
+  }
+
+  /**
+   * Get current streaming status for all connected peers
+   * @returns {Map} Map of peer IDs to streaming status
+   */
+  getStreamingStatus() {
+    const status = new Map();
+    const connections = this.connectionManager.getAllConnections();
+    
+    for (const connection of connections) {
+      const hasLocalStream = connection.getLocalStream() !== null;
+      const allowsRemoteStreams = connection.allowRemoteStreams;
+      
+      status.set(connection.peerId, {
+        sendingStream: hasLocalStream,
+        receivingStreams: allowsRemoteStreams,
+        streamType: hasLocalStream ? (this.isStreamingToAll() ? 'broadcast' : 'selective') : 'none'
+      });
+    }
+    
+    return status;
+  }
+
+  /**
+   * Check if currently streaming to all connected peers
+   * @returns {boolean} True if streaming to all peers
+   */
+  isStreamingToAll() {
+    const connections = this.connectionManager.getAllConnections();
+    if (connections.length === 0) return false;
+    
+    return connections.every(connection => connection.getLocalStream() !== null);
+  }
+
+  /**
+   * Get list of peers currently receiving streams
+   * @returns {string[]} Array of peer IDs receiving streams
+   */
+  getStreamingPeers() {
+    const connections = this.connectionManager.getAllConnections();
+    return connections
+      .filter(connection => connection.getLocalStream() !== null)
+      .map(connection => connection.peerId);
+  }
+
+  /**
+   * Get list of peers currently blocked from streaming
+   * @returns {string[]} Array of peer IDs blocked from streaming
+   */
+  getBlockedStreamingPeers() {
+    const connections = this.connectionManager.getAllConnections();
+    return connections
+      .filter(connection => connection.getLocalStream() === null && this.mediaManager.localStream !== null)
+      .map(connection => connection.peerId);
+  }
+
   // Static utility methods
   static validatePeerId(peerId) {
     return typeof peerId === 'string' && /^[a-fA-F0-9]{40}$/.test(peerId);
