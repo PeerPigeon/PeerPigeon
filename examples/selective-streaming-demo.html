@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PeerPigeon Selective Streaming Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        
+        .section {
+            margin-bottom: 30px;
+        }
+        
+        .section h2 {
+            color: #333;
+            border-bottom: 2px solid #007bff;
+            padding-bottom: 10px;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 15px;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            background: #007bff;
+            color: white;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        .btn:hover {
+            background: #0056b3;
+        }
+        
+        .btn.secondary {
+            background: #6c757d;
+        }
+        
+        .btn.secondary:hover {
+            background: #545b62;
+        }
+        
+        .btn.danger {
+            background: #dc3545;
+        }
+        
+        .btn.danger:hover {
+            background: #c82333;
+        }
+        
+        .btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        select, input {
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            margin-right: 10px;
+        }
+        
+        select[multiple] {
+            min-height: 100px;
+        }
+        
+        .status-display {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 15px;
+            margin: 15px 0;
+            font-family: monospace;
+        }
+        
+        .log {
+            background: #000;
+            color: #00ff00;
+            padding: 15px;
+            border-radius: 4px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+        
+        .video-container {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+        
+        .video-item {
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            overflow: hidden;
+            background: #000;
+        }
+        
+        .video-item video {
+            width: 300px;
+            height: 200px;
+            object-fit: cover;
+        }
+        
+        .video-label {
+            background: #333;
+            color: white;
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+        
+        .pattern-examples {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .pattern-card {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 15px;
+            background: #f9f9f9;
+        }
+        
+        .pattern-card h3 {
+            margin-top: 0;
+            color: #007bff;
+        }
+        
+        .code-block {
+            background: #f4f4f4;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 12px;
+            margin: 10px 0;
+        }
+        
+        .info-text {
+            color: #666;
+            font-style: italic;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 PeerPigeon Selective Streaming Demo</h1>
+        <p>This demo showcases the new selective streaming capabilities that allow you to control streaming patterns: 1:1, 1:many, many:many with individual peer control.</p>
+    </div>
+
+    <div class="container">
+        <div class="section">
+            <h2>🔗 Connection</h2>
+            <div class="controls">
+                <input type="text" id="signaling-url" placeholder="ws://localhost:3001" value="ws://localhost:3001">
+                <button class="btn" id="connect-btn">Connect</button>
+                <button class="btn secondary" id="disconnect-btn">Disconnect</button>
+            </div>
+            <div class="status-display">
+                <div><strong>Status:</strong> <span id="connection-status">Disconnected</span></div>
+                <div><strong>Peer ID:</strong> <span id="peer-id">Generating...</span></div>
+                <div><strong>Connected Peers:</strong> <span id="peer-count">0</span></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="section">
+            <h2>👥 Peer Selection</h2>
+            <div class="controls">
+                <select id="peer-selector" multiple size="5" style="min-width: 300px;">
+                    <option value="" disabled>Connect to peers first...</option>
+                </select>
+            </div>
+            <p class="info-text">💡 Hold Ctrl/Cmd to select multiple peers for streaming control</p>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="section">
+            <h2>🎥 Media Controls</h2>
+            <div class="controls">
+                <label><input type="checkbox" id="enable-video" checked> Video</label>
+                <label><input type="checkbox" id="enable-audio" checked> Audio</label>
+            </div>
+            
+            <h3>📡 Broadcasting (Traditional Mode)</h3>
+            <div class="controls">
+                <button class="btn" id="start-broadcast-btn">Start Broadcast Stream</button>
+                <button class="btn secondary" id="stop-broadcast-btn">Stop Broadcast</button>
+            </div>
+            
+            <h3>🎯 Selective Streaming (New Feature)</h3>
+            <div class="controls">
+                <button class="btn" id="start-selective-btn">Start Selective Stream</button>
+                <button class="btn secondary" id="stop-selective-btn">Stop Selective</button>
+                <button class="btn secondary" id="switch-broadcast-btn">Switch to Broadcast</button>
+            </div>
+            
+            <h3>🔧 Fine-Grained Control</h3>
+            <div class="controls">
+                <button class="btn danger" id="block-peers-btn">Block Selected Peers</button>
+                <button class="btn" id="allow-peers-btn">Allow Selected Peers</button>
+                <button class="btn secondary" id="show-status-btn">Show Streaming Status</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="section">
+            <h2>📊 Streaming Status</h2>
+            <div id="streaming-status" class="status-display">
+                <div>No streaming active</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="section">
+            <h2>🎬 Video Streams</h2>
+            <h3>📹 Local Stream</h3>
+            <div class="video-container">
+                <div class="video-item">
+                    <video id="local-video" autoplay muted playsinline style="display: none;"></video>
+                    <div class="video-label">Local (You)</div>
+                </div>
+            </div>
+            
+            <h3>📺 Remote Streams</h3>
+            <div id="remote-streams" class="video-container">
+                <div class="info-text">No remote streams</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="section">
+            <h2>📖 Streaming Patterns Examples</h2>
+            <div class="pattern-examples">
+                <div class="pattern-card">
+                    <h3>🎯 1:1 Streaming</h3>
+                    <p>Stream to only one specific peer (private call)</p>
+                    <div class="code-block">
+// Select one peer and click "Start Selective Stream"
+mesh.startSelectiveStream('peer-id-123', {
+    video: true, audio: true
+});
+                    </div>
+                </div>
+                
+                <div class="pattern-card">
+                    <h3>📡 1:Many Streaming</h3>
+                    <p>Stream to multiple selected peers (group presentation)</p>
+                    <div class="code-block">
+// Select multiple peers and click "Start Selective Stream"
+mesh.startSelectiveStream([
+    'peer-id-123', 'peer-id-456', 'peer-id-789'
+], { video: true, audio: true });
+                    </div>
+                </div>
+                
+                <div class="pattern-card">
+                    <h3>🌐 Many:Many Streaming</h3>
+                    <p>Multiple peers streaming to each other (conference)</p>
+                    <div class="code-block">
+// Each peer calls startSelectiveStream with their
+// desired targets, creating a many:many topology
+peer1.startSelectiveStream(['peer2', 'peer3']);
+peer2.startSelectiveStream(['peer1', 'peer3']);
+peer3.startSelectiveStream(['peer1', 'peer2']);
+                    </div>
+                </div>
+                
+                <div class="pattern-card">
+                    <h3>🚫 Dynamic Control</h3>
+                    <p>Block/allow peers dynamically during streaming</p>
+                    <div class="code-block">
+// Block specific peers while keeping others
+mesh.blockStreamingToPeers(['peer-id-456']);
+
+// Re-allow blocked peers
+mesh.allowStreamingToPeers(['peer-id-456']);
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="section">
+            <h2>📝 Event Log</h2>
+            <div id="log" class="log">PeerPigeon Selective Streaming Demo loaded...\n</div>
+            <button class="btn secondary" onclick="document.getElementById('log').textContent = ''">Clear Log</button>
+        </div>
+    </div>
+
+    <script type="module">
+        import { PeerPigeonMesh } from '../src/browser-entry.js';
+
+        class SelectiveStreamingDemo {
+            constructor() {
+                this.mesh = null;
+                this.init();
+            }
+
+            async init() {
+                this.log('🚀 Initializing PeerPigeon with selective streaming...');
+                
+                try {
+                    this.mesh = new PeerPigeonMesh({
+                        enableWebDHT: true,
+                        enableCrypto: true,
+                        enableDistributedStorage: true,
+                        maxPeers: 5,
+                        minPeers: 1,
+                        autoConnect: true,
+                        autoDiscovery: true
+                    });
+
+                    await this.mesh.init();
+                    this.setupEventListeners();
+                    this.setupUI();
+                    this.updateStatus();
+                    
+                    this.log('✅ PeerPigeon initialized with selective streaming support');
+                } catch (error) {
+                    this.log(`❌ Initialization failed: ${error.message}`, 'error');
+                }
+            }
+
+            setupEventListeners() {
+                // Connection events
+                this.mesh.addEventListener('statusChanged', (data) => {
+                    this.log(`📡 ${data.type}: ${data.message}`);
+                    this.updateStatus();
+                });
+
+                this.mesh.addEventListener('peerConnected', (data) => {
+                    this.log(`🤝 Peer connected: ${data.peerId.substring(0, 8)}...`);
+                    this.updatePeersList();
+                });
+
+                this.mesh.addEventListener('peerDisconnected', (data) => {
+                    this.log(`👋 Peer disconnected: ${data.peerId.substring(0, 8)}...`);
+                    this.updatePeersList();
+                });
+
+                // Media events
+                this.mesh.addEventListener('localStreamStarted', (data) => {
+                    this.log('🎥 Local stream started');
+                    this.handleLocalStream(data.stream);
+                });
+
+                this.mesh.addEventListener('localStreamStopped', () => {
+                    this.log('🛑 Local stream stopped');
+                    this.hideLocalStream();
+                });
+
+                this.mesh.addEventListener('remoteStream', (data) => {
+                    this.log(`📺 Remote stream received from ${data.peerId.substring(0, 8)}...`);
+                    this.handleRemoteStream(data.peerId, data.stream);
+                });
+
+                // === NEW SELECTIVE STREAMING EVENTS ===
+                this.mesh.addEventListener('selectiveStreamStarted', (data) => {
+                    this.log(`🎯 Selective ${data.streamType} streaming started to ${data.targetPeerIds.length} peer(s)`);
+                    this.updateStreamingStatus();
+                });
+
+                this.mesh.addEventListener('selectiveStreamStopped', (data) => {
+                    this.log(`🛑 Selective streaming stopped${data.returnToBroadcast ? ' (switched to broadcast)' : ''}`);
+                    this.updateStreamingStatus();
+                });
+
+                this.mesh.addEventListener('broadcastStreamEnabled', () => {
+                    this.log('📡 Broadcast streaming enabled for all peers');
+                    this.updateStreamingStatus();
+                });
+
+                this.mesh.addEventListener('streamingBlockedToPeers', (data) => {
+                    this.log(`🚫 Streaming blocked to ${data.blockedPeerIds.length} peer(s)`);
+                    this.updateStreamingStatus();
+                });
+
+                this.mesh.addEventListener('streamingAllowedToPeers', (data) => {
+                    this.log(`✅ Streaming allowed to ${data.allowedPeerIds.length} peer(s)`);
+                    this.updateStreamingStatus();
+                });
+            }
+
+            setupUI() {
+                // Connection controls
+                document.getElementById('connect-btn').addEventListener('click', () => {
+                    this.connect();
+                });
+
+                document.getElementById('disconnect-btn').addEventListener('click', () => {
+                    this.disconnect();
+                });
+
+                // Media controls
+                document.getElementById('start-broadcast-btn').addEventListener('click', () => {
+                    this.startBroadcastStream();
+                });
+
+                document.getElementById('stop-broadcast-btn').addEventListener('click', () => {
+                    this.stopBroadcastStream();
+                });
+
+                document.getElementById('start-selective-btn').addEventListener('click', () => {
+                    this.startSelectiveStream();
+                });
+
+                document.getElementById('stop-selective-btn').addEventListener('click', () => {
+                    this.stopSelectiveStream();
+                });
+
+                document.getElementById('switch-broadcast-btn').addEventListener('click', () => {
+                    this.switchToBroadcast();
+                });
+
+                document.getElementById('block-peers-btn').addEventListener('click', () => {
+                    this.blockSelectedPeers();
+                });
+
+                document.getElementById('allow-peers-btn').addEventListener('click', () => {
+                    this.allowSelectedPeers();
+                });
+
+                document.getElementById('show-status-btn').addEventListener('click', () => {
+                    this.updateStreamingStatus();
+                });
+            }
+
+            async connect() {
+                const url = document.getElementById('signaling-url').value.trim();
+                if (!url) {
+                    this.log('❌ Please enter a signaling server URL', 'error');
+                    return;
+                }
+
+                try {
+                    this.log(`🔌 Connecting to ${url}...`);
+                    await this.mesh.connect(url);
+                } catch (error) {
+                    this.log(`❌ Connection failed: ${error.message}`, 'error');
+                }
+            }
+
+            disconnect() {
+                this.mesh.disconnect();
+                this.log('🔌 Disconnected from signaling server');
+                this.updateStatus();
+                this.updatePeersList();
+            }
+
+            async startBroadcastStream() {
+                const options = this.getMediaOptions();
+                
+                try {
+                    await this.mesh.initializeMedia();
+                    await this.mesh.startMedia(options);
+                    this.log('📡 Broadcast streaming started to ALL connected peers');
+                } catch (error) {
+                    this.log(`❌ Broadcast streaming error: ${error.message}`, 'error');
+                }
+            }
+
+            async stopBroadcastStream() {
+                try {
+                    await this.mesh.stopMedia();
+                    this.log('🛑 Broadcast streaming stopped');
+                } catch (error) {
+                    this.log(`❌ Stop broadcast error: ${error.message}`, 'error');
+                }
+            }
+
+            async startSelectiveStream() {
+                const selectedPeers = this.getSelectedPeers();
+                if (selectedPeers.length === 0) {
+                    this.log('❌ Please select at least one peer for selective streaming', 'error');
+                    return;
+                }
+
+                const options = this.getMediaOptions();
+
+                try {
+                    await this.mesh.initializeMedia();
+                    await this.mesh.startSelectiveStream(selectedPeers, options);
+                    
+                    const streamType = selectedPeers.length === 1 ? '1:1' : '1:many';
+                    this.log(`🎯 Selective ${streamType} streaming started to: ${selectedPeers.map(id => id.substring(0, 8) + '...').join(', ')}`);
+                } catch (error) {
+                    this.log(`❌ Selective streaming error: ${error.message}`, 'error');
+                }
+            }
+
+            async stopSelectiveStream() {
+                try {
+                    await this.mesh.stopSelectiveStream(false);
+                    this.log('🛑 Selective streaming stopped');
+                } catch (error) {
+                    this.log(`❌ Stop selective streaming error: ${error.message}`, 'error');
+                }
+            }
+
+            async switchToBroadcast() {
+                try {
+                    await this.mesh.stopSelectiveStream(true);
+                    this.log('📡 Switched to broadcast mode - streaming to all peers');
+                } catch (error) {
+                    this.log(`❌ Switch to broadcast error: ${error.message}`, 'error');
+                }
+            }
+
+            async blockSelectedPeers() {
+                const selectedPeers = this.getSelectedPeers();
+                if (selectedPeers.length === 0) {
+                    this.log('❌ Please select peers to block', 'error');
+                    return;
+                }
+
+                try {
+                    await this.mesh.blockStreamingToPeers(selectedPeers);
+                    this.log(`🚫 Blocked streaming to: ${selectedPeers.map(id => id.substring(0, 8) + '...').join(', ')}`);
+                } catch (error) {
+                    this.log(`❌ Block peers error: ${error.message}`, 'error');
+                }
+            }
+
+            async allowSelectedPeers() {
+                const selectedPeers = this.getSelectedPeers();
+                if (selectedPeers.length === 0) {
+                    this.log('❌ Please select peers to allow', 'error');
+                    return;
+                }
+
+                try {
+                    await this.mesh.allowStreamingToPeers(selectedPeers);
+                    this.log(`✅ Allowed streaming to: ${selectedPeers.map(id => id.substring(0, 8) + '...').join(', ')}`);
+                } catch (error) {
+                    this.log(`❌ Allow peers error: ${error.message}`, 'error');
+                }
+            }
+
+            getSelectedPeers() {
+                const selector = document.getElementById('peer-selector');
+                return Array.from(selector.selectedOptions).map(option => option.value);
+            }
+
+            getMediaOptions() {
+                return {
+                    video: document.getElementById('enable-video').checked,
+                    audio: document.getElementById('enable-audio').checked
+                };
+            }
+
+            updateStatus() {
+                const status = this.mesh?.getStatus() || { connected: false };
+                document.getElementById('connection-status').textContent = status.connected ? 'Connected' : 'Disconnected';
+                document.getElementById('peer-id').textContent = this.mesh?.peerId || 'Generating...';
+                document.getElementById('peer-count').textContent = this.mesh?.getConnectedPeerCount() || 0;
+            }
+
+            updatePeersList() {
+                const selector = document.getElementById('peer-selector');
+                const currentSelections = Array.from(selector.selectedOptions).map(option => option.value);
+                
+                selector.innerHTML = '';
+                
+                if (!this.mesh) return;
+                
+                const connectedPeers = this.mesh.getConnectedPeerCount();
+                if (connectedPeers === 0) {
+                    const option = document.createElement('option');
+                    option.value = '';
+                    option.disabled = true;
+                    option.textContent = 'No peers connected...';
+                    selector.appendChild(option);
+                    return;
+                }
+
+                // Get connected peer IDs (this might need to be implemented)
+                const peers = this.mesh.getPeers?.() || [];
+                peers.forEach(peerId => {
+                    const option = document.createElement('option');
+                    option.value = peerId;
+                    option.textContent = `${peerId.substring(0, 8)}...${peerId.substring(-8)}`;
+                    
+                    if (currentSelections.includes(peerId)) {
+                        option.selected = true;
+                    }
+                    
+                    selector.appendChild(option);
+                });
+            }
+
+            updateStreamingStatus() {
+                if (!this.mesh || !this.mesh.getStreamingStatus) {
+                    document.getElementById('streaming-status').innerHTML = '<div>Streaming methods not available</div>';
+                    return;
+                }
+
+                try {
+                    const streamingPeers = this.mesh.getStreamingPeers();
+                    const blockedPeers = this.mesh.getBlockedStreamingPeers();
+                    const isStreamingToAll = this.mesh.isStreamingToAll();
+
+                    const statusDiv = document.getElementById('streaming-status');
+                    statusDiv.innerHTML = `
+                        <div><strong>Mode:</strong> ${isStreamingToAll ? 'Broadcast (All Peers)' : 'Selective'}</div>
+                        <div><strong>Streaming to:</strong> ${streamingPeers.length} peer(s)</div>
+                        <div><strong>Blocked:</strong> ${blockedPeers.length} peer(s)</div>
+                        <div><strong>Active Peers:</strong> ${streamingPeers.map(id => id.substring(0, 8) + '...').join(', ') || 'None'}</div>
+                        ${blockedPeers.length > 0 ? `<div><strong>Blocked Peers:</strong> ${blockedPeers.map(id => id.substring(0, 8) + '...').join(', ')}</div>` : ''}
+                    `;
+                } catch (error) {
+                    document.getElementById('streaming-status').innerHTML = `<div>Error getting streaming status: ${error.message}</div>`;
+                }
+            }
+
+            handleLocalStream(stream) {
+                const video = document.getElementById('local-video');
+                video.srcObject = stream;
+                video.style.display = 'block';
+            }
+
+            hideLocalStream() {
+                const video = document.getElementById('local-video');
+                video.srcObject = null;
+                video.style.display = 'none';
+            }
+
+            handleRemoteStream(peerId, stream) {
+                const container = document.getElementById('remote-streams');
+                
+                // Remove "no streams" message
+                if (container.querySelector('.info-text')) {
+                    container.innerHTML = '';
+                }
+
+                // Remove existing stream from this peer
+                const existing = document.getElementById(`remote-${peerId}`);
+                if (existing) {
+                    existing.remove();
+                }
+
+                // Add new stream
+                const videoItem = document.createElement('div');
+                videoItem.className = 'video-item';
+                videoItem.id = `remote-${peerId}`;
+                videoItem.innerHTML = `
+                    <video autoplay playsinline></video>
+                    <div class="video-label">${peerId.substring(0, 8)}...</div>
+                `;
+
+                const video = videoItem.querySelector('video');
+                video.srcObject = stream;
+
+                container.appendChild(videoItem);
+            }
+
+            log(message, type = 'info') {
+                const logDiv = document.getElementById('log');
+                const timestamp = new Date().toLocaleTimeString();
+                logDiv.textContent += `[${timestamp}] ${message}\n`;
+                logDiv.scrollTop = logDiv.scrollHeight;
+            }
+        }
+
+        // Initialize the demo
+        new SelectiveStreamingDemo();
+    </script>
+</body>
+</html>
