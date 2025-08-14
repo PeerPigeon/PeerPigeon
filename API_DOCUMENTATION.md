@@ -1426,6 +1426,207 @@ Emit an event (internal use).
 
 **Returns:** `void`
 
+### Standard Node.js EventEmitter Compatible Methods
+
+#### `on(event, callback)`
+Add event listener (alias for `addEventListener`).
+
+**Parameters:**
+- `event` (string) - Event name
+- `callback` (Function) - Event handler
+
+**Returns:** `EventEmitter` - Returns this for method chaining
+
+**Example:**
+```javascript
+mesh.on('peerConnected', (data) => {
+    console.log('Peer connected:', data.peerId);
+}).on('messageReceived', (data) => {
+    console.log('Message:', data.content);
+});
+```
+
+#### `off(event, callback)`
+Remove event listener (alias for `removeEventListener`).
+
+**Parameters:**
+- `event` (string) - Event name
+- `callback` (Function) - Event handler to remove
+
+**Returns:** `EventEmitter` - Returns this for method chaining
+
+#### `once(event, callback)`
+Add one-time event listener that automatically removes itself after being called once.
+
+**Parameters:**
+- `event` (string) - Event name
+- `callback` (Function) - Event handler
+
+**Returns:** `EventEmitter` - Returns this for method chaining
+
+**Example:**
+```javascript
+mesh.once('connected', () => {
+    console.log('Connected to mesh!');
+    // This listener will be automatically removed after first execution
+});
+```
+
+#### `removeAllListeners([event])`
+Remove all listeners for an event, or all listeners if no event is specified.
+
+**Parameters:**
+- `event` (string, optional) - Event name. If omitted, removes all listeners for all events
+
+**Returns:** `EventEmitter` - Returns this for method chaining
+
+**Example:**
+```javascript
+// Remove all listeners for 'peerConnected' event
+mesh.removeAllListeners('peerConnected');
+
+// Remove all listeners for all events
+mesh.removeAllListeners();
+```
+
+#### `listeners(event)`
+Get array of listeners for an event.
+
+**Parameters:**
+- `event` (string) - Event name
+
+**Returns:** `Function[]` - Array of listener functions
+
+**Example:**
+```javascript
+const peerConnectedListeners = mesh.listeners('peerConnected');
+console.log(`${peerConnectedListeners.length} listeners for peerConnected`);
+```
+
+#### `listenerCount(event)`
+Get the number of listeners for an event.
+
+**Parameters:**
+- `event` (string) - Event name
+
+**Returns:** `number` - Number of listeners
+
+**Example:**
+```javascript
+const count = mesh.listenerCount('messageReceived');
+console.log(`${count} message listeners`);
+```
+
+#### `eventNames()`
+Get array of event names that have listeners.
+
+**Returns:** `string[]` - Array of event names
+
+**Example:**
+```javascript
+const events = mesh.eventNames();
+console.log('Events with listeners:', events);
+```
+
+### Usage Examples
+
+#### Basic Event Handling with Standard Methods
+
+```javascript
+import { PeerPigeonMesh } from 'peerpigeon';
+
+const mesh = new PeerPigeonMesh({
+  peerId: 'unique-peer-id',
+  maxPeers: 5
+});
+
+// Using standard .on() method with chaining
+mesh
+  .on('connected', () => {
+    console.log('🔗 Connected to mesh network');
+  })
+  .on('peerConnected', (data) => {
+    console.log(`👋 Peer joined: ${data.peerId}`);
+  })
+  .on('messageReceived', (data) => {
+    console.log(`💬 Message from ${data.from}: ${data.content}`);
+  });
+
+// One-time listener for initialization
+mesh.once('initialized', () => {
+  console.log('🎉 Mesh is ready!');
+  // This listener will automatically be removed after first call
+});
+
+await mesh.init();
+await mesh.connect('ws://localhost:3000');
+```
+
+#### Advanced Event Management
+
+```javascript
+// Store reference to listeners for later removal
+const messageHandler = (data) => {
+  console.log('Message:', data.content);
+};
+
+const peerHandler = (data) => {
+  console.log('Peer event:', data.peerId);
+};
+
+// Add multiple listeners
+mesh
+  .on('messageReceived', messageHandler)
+  .on('peerConnected', peerHandler)
+  .on('peerDisconnected', peerHandler);
+
+// Check listener counts
+console.log(`Message listeners: ${mesh.listenerCount('messageReceived')}`);
+console.log(`Active events: ${mesh.eventNames()}`);
+
+// Remove specific listener
+mesh.off('messageReceived', messageHandler);
+
+// Remove all listeners for an event
+mesh.removeAllListeners('peerConnected');
+
+// Remove all listeners for all events
+mesh.removeAllListeners();
+```
+
+#### Error Handling and Cleanup
+
+```javascript
+// Set up error handling
+mesh.on('error', (error) => {
+  console.error('Mesh error:', error);
+});
+
+// Clean up on shutdown
+process.on('SIGINT', () => {
+  console.log('Shutting down...');
+  
+  // Remove all event listeners to prevent memory leaks
+  mesh.removeAllListeners();
+  
+  // Disconnect from mesh
+  mesh.disconnect();
+  process.exit(0);
+});
+```
+
+#### Compatibility with Both Styles
+
+```javascript
+// You can mix and match both styles as needed
+mesh.addEventListener('connected', legacyHandler); // Traditional style
+mesh.on('disconnected', modernHandler);           // Standard style
+
+// Both work the same way
+mesh.removeEventListener('connected', legacyHandler);
+mesh.off('disconnected', modernHandler);
+```
+
 ### Main Events by Class
 
 #### PeerPigeonMesh Events
