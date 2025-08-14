@@ -232,7 +232,78 @@ export class GossipManager extends EventEmitter {
     } else if (subtype === 'dm') {
       // Direct message logic
       if (typeof to === 'string' && typeof this.mesh.peerId === 'string' && to.trim().toLowerCase() === this.mesh.peerId.trim().toLowerCase()) {
-        // This peer is the target, emit to UI
+        // This peer is the target - check if this message type should be filtered
+        
+        this.debug.log(`🔍 DM DEBUG: Received DM from ${originPeerId?.substring(0, 8)}, content type: ${typeof processedContent}`);
+        if (typeof processedContent === 'object' && processedContent) {
+          this.debug.log(`🔍 DM DEBUG: Content object has type: ${processedContent.type}`);
+        }
+        
+        // Define message types that should be filtered from peer-readable messages
+        // These messages are processed but not emitted as regular messages to UI/applications
+        const filteredMessageTypes = new Set([
+          'signaling-relay',
+          'peer-announce-relay', 
+          'bootstrap-keepalive'
+        ]);
+
+        // Parse the content to check message type
+        let messageType = null;
+        let shouldFilter = false;
+        
+        // Check if content is already an object with type property
+        if (typeof processedContent === 'object' && processedContent && processedContent.type) {
+          messageType = processedContent.type;
+          shouldFilter = filteredMessageTypes.has(messageType);
+        } else if (typeof processedContent === 'string') {
+          // Try to parse as JSON if it's a string
+          try {
+            const parsedContent = JSON.parse(processedContent);
+            messageType = parsedContent.type;
+            shouldFilter = filteredMessageTypes.has(messageType);
+          } catch (e) {
+            // Not JSON or doesn't have type - treat as regular message
+          }
+        }
+
+        this.debug.log(`🔍 DM DEBUG: messageType=${messageType}, shouldFilter=${shouldFilter}`);
+
+        if (shouldFilter) {
+          this.debug.log(`🔇 FILTER: Processing filtered DM type '${messageType}' from ${originPeerId?.substring(0, 8)} (not emitted to UI)`);
+          
+          // Process the filtered message internally but don't emit to UI
+          if (messageType === 'signaling-relay' && typeof processedContent === 'object') {
+            // Handle signaling relay
+            if (processedContent.signalingMessage && this.mesh.signalingHandler) {
+              this.mesh.signalingHandler.handleSignalingMessage({
+                type: processedContent.signalingMessage.type,
+                data: processedContent.signalingMessage.data,
+                fromPeerId: processedContent.signalingMessage.fromPeerId || originPeerId,
+                targetPeerId: processedContent.targetPeerId,
+                timestamp: processedContent.timestamp
+              });
+            }
+          } else if (messageType === 'peer-announce-relay' && typeof processedContent === 'object') {
+            // Handle peer announce relay
+            if (processedContent.data && this.mesh.signalingHandler) {
+              this.mesh.signalingHandler.handlePeerAnnouncement(processedContent.data, originPeerId);
+            }
+          } else if (messageType === 'bootstrap-keepalive') {
+            // Handle bootstrap keepalive - content can be object or string
+            if (this.mesh.peerDiscovery) {
+              // For bootstrap keepalive from a specific source, use the 'from' field as the peer ID
+              const keepalivePeerId = (typeof processedContent === 'object' && processedContent.from)
+                ? processedContent.from
+                : originPeerId;
+              this.mesh.peerDiscovery.updateDiscoveryTimestamp(keepalivePeerId);
+            }
+          }
+          
+          // Do NOT emit to UI and do NOT relay further
+          return;
+        }
+
+        // This is a regular (non-filtered) direct message - emit to UI
         this.emit('messageReceived', {
           from: originPeerId,
           content: processedContent,
