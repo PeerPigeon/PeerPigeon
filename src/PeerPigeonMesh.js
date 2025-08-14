@@ -113,6 +113,21 @@ export class PeerPigeonMesh extends EventEmitter {
         return; // Don't emit as regular message
       }
 
+      // Additional safety filter for message types that should not be emitted to UI
+      // These should already be filtered at the GossipManager level, but this provides defense in depth
+      if (data.content && typeof data.content === 'string') {
+        try {
+          const parsedContent = JSON.parse(data.content);
+          const filteredTypes = ['signaling-relay', 'peer-announce-relay', 'bootstrap-keepalive'];
+          if (filteredTypes.includes(parsedContent.type)) {
+            console.debug(`🔇 MESH FILTER: Blocked filtered message type '${parsedContent.type}' from UI emission`);
+            return; // Don't emit to UI
+          }
+        } catch (e) {
+          // Not JSON, continue normally
+        }
+      }
+
       this.emit('messageReceived', data);
     });
 
