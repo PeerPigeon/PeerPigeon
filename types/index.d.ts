@@ -165,6 +165,52 @@ export declare class PeerPigeonMesh {
     addEventListener(event: 'streamingAllowedToPeers', listener: (data: StreamingAllowedEvent) => void): void;
     
     removeEventListener(event: string, listener: Function): void;
+    
+    // Standard Node.js EventEmitter compatible methods
+    on(event: 'connected', listener: () => void): this;
+    on(event: 'disconnected', listener: () => void): this;
+    on(event: 'peerConnected', listener: (data: PeerConnectionEvent) => void): this;
+    on(event: 'peerDisconnected', listener: (data: PeerDisconnectionEvent) => void): this;
+    on(event: 'peerDiscovered', listener: (data: PeerConnectionEvent) => void): this;
+    on(event: 'peerEvicted', listener: (data: PeerDisconnectionEvent) => void): this;
+    on(event: 'messageReceived', listener: (data: MessageData) => void): this;
+    on(event: 'remoteStream', listener: (data: RemoteStreamEvent) => void): this;
+    on(event: 'dhtValueChanged', listener: (data: DHTValueChangedEvent) => void): this;
+    on(event: 'statusChanged', listener: (data: StatusChangedEvent) => void): this;
+    on(event: 'peersUpdated', listener: () => void): this;
+    on(event: 'selectiveStreamStarted', listener: (data: SelectiveStreamStartedEvent) => void): this;
+    on(event: 'selectiveStreamStopped', listener: (data: SelectiveStreamStoppedEvent) => void): this;
+    on(event: 'broadcastStreamEnabled', listener: () => void): this;
+    on(event: 'streamingBlockedToPeers', listener: (data: StreamingBlockedEvent) => void): this;
+    on(event: 'streamingAllowedToPeers', listener: (data: StreamingAllowedEvent) => void): this;
+    on(event: string, listener: Function): this;
+    
+    off(event: string, listener: Function): this;
+    
+    once(event: 'connected', listener: () => void): this;
+    once(event: 'disconnected', listener: () => void): this;
+    once(event: 'peerConnected', listener: (data: PeerConnectionEvent) => void): this;
+    once(event: 'peerDisconnected', listener: (data: PeerDisconnectionEvent) => void): this;
+    once(event: 'peerDiscovered', listener: (data: PeerConnectionEvent) => void): this;
+    once(event: 'peerEvicted', listener: (data: PeerDisconnectionEvent) => void): this;
+    once(event: 'messageReceived', listener: (data: MessageData) => void): this;
+    once(event: 'remoteStream', listener: (data: RemoteStreamEvent) => void): this;
+    once(event: 'dhtValueChanged', listener: (data: DHTValueChangedEvent) => void): this;
+    once(event: 'statusChanged', listener: (data: StatusChangedEvent) => void): this;
+    once(event: 'peersUpdated', listener: () => void): this;
+    once(event: 'selectiveStreamStarted', listener: (data: SelectiveStreamStartedEvent) => void): this;
+    once(event: 'selectiveStreamStopped', listener: (data: SelectiveStreamStoppedEvent) => void): this;
+    once(event: 'broadcastStreamEnabled', listener: () => void): this;
+    once(event: 'streamingBlockedToPeers', listener: (data: StreamingBlockedEvent) => void): this;
+    once(event: 'streamingAllowedToPeers', listener: (data: StreamingAllowedEvent) => void): this;
+    once(event: string, listener: Function): this;
+    
+    removeAllListeners(event?: string): this;
+    listeners(event: string): Function[];
+    listenerCount(event: string): number;
+    eventNames(): string[];
+    
+    emit(event: string, data?: any): void;
 }
 
 export interface PeerConnectionOptions {

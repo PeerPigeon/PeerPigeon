@@ -153,6 +153,35 @@ mesh.addEventListener('messageReceived', (data) => {
 });
 ```
 
+### Standard Event Methods
+
+PeerPigeon supports both traditional event methods and standard Node.js EventEmitter compatible methods:
+
+```javascript
+// Standard Node.js EventEmitter style (with method chaining)
+mesh
+    .on('connected', () => console.log('🔗 Connected!'))
+    .on('peerConnected', (data) => console.log(`👋 Peer: ${data.peerId}`))
+    .on('messageReceived', (data) => console.log(`💬 ${data.content}`));
+
+// One-time listeners (auto-removed after first call)
+mesh.once('initialized', () => {
+    console.log('🎉 Mesh is ready!');
+});
+
+// Remove specific listeners
+const messageHandler = (data) => console.log(data.content);
+mesh.on('messageReceived', messageHandler);
+mesh.off('messageReceived', messageHandler);
+
+// Remove all listeners for an event
+mesh.removeAllListeners('peerConnected');
+
+// Get listener information
+console.log(`Active events: ${mesh.eventNames()}`);
+console.log(`Message listeners: ${mesh.listenerCount('messageReceived')}`);
+```
+
 ### 🐛 Debug Configuration
 
 PeerPigeon includes a comprehensive debug system that allows you to control console output at a granular level. **By default, all console logging is disabled** to prevent noise in production.
