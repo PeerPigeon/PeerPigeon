@@ -493,10 +493,7 @@ export class PeerPigeonMesh extends EventEmitter {
     this.connectionManager.disconnectAllPeers();
     this.connectionManager.cleanup();
 
-    // Cleanup WebDHT
-    if (this.webDHT) {
-      this.webDHT.cleanup();
-    }
+    // WebDHT persists in the mesh - no cleanup needed on disconnect
     this.evictionManager.cleanup();
     this.cleanupManager.cleanup();
     this.gossipManager.cleanup();
