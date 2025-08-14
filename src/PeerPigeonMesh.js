@@ -198,7 +198,7 @@ export class PeerPigeonMesh extends EventEmitter {
       if (report.runtime.isBrowser) {
         errors.push('WebRTC is not supported in this browser. PeerPigeon requires WebRTC for peer-to-peer connections.');
       } else if (report.runtime.isNodeJS) {
-        warnings.push('WebRTC support not detected in Node.js environment. Consider using a WebRTC library like node-webrtc.');
+        warnings.push('WebRTC support not detected in Node.js environment. PeerPigeon includes @koush/wrtc for automatic WebRTC support - ensure it is properly installed.');
       } else if (report.runtime.isNativeScript) {
         warnings.push('WebRTC support not detected in NativeScript environment. Consider using a native WebRTC plugin.');
       }
@@ -281,6 +281,18 @@ export class PeerPigeonMesh extends EventEmitter {
 
   async init() {
     try {
+      // Initialize WebRTC polyfill for Node.js if needed
+      if (this.runtimeInfo?.isNodeJS) {
+        try {
+          const webrtcInitialized = await environmentDetector.initWebRTCAsync();
+          if (webrtcInitialized) {
+            this.debug.log('🌐 WebRTC polyfill initialized successfully for Node.js environment');
+          }
+        } catch (error) {
+          this.debug.warn('WebRTC polyfill initialization failed:', error.message);
+        }
+      }
+
       // Use provided peer ID if valid, otherwise generate one
       if (this.providedPeerId) {
         if (PeerPigeonMesh.validatePeerId(this.providedPeerId)) {
@@ -687,28 +699,11 @@ export class PeerPigeonMesh extends EventEmitter {
         
         if (shouldShareMedia) {
           this.debug.log(`📡 MEDIA START: Setting stream for peer ${connection.peerId.substring(0, 8)}...`);
-          this.debug.log('🎥 MESH: About to call setLocalStream on peer connection');
           await connection.setLocalStream(stream);
-          this.debug.log('🎥 MESH: setLocalStream completed for peer ' + connection.peerId.substring(0, 8) + '...');
+          this.debug.log(`✅ MEDIA START: Stream applied to ${connection.peerId.substring(0, 8)}...`);
 
-          // FORCE IMMEDIATE RENEGOTIATION: Don't wait for the automatic trigger
-          this.debug.log(`📡 MEDIA START: Forcing immediate renegotiation for peer ${connection.peerId.substring(0, 8)}...`);
-          // Force immediate renegotiation without delay for faster connection
-          try {
-            if (connection.connection && connection.connection.signalingState === 'stable') {
-              // Create and send a renegotiation offer immediately
-              const offer = await connection.createOffer();
-              await this.sendSignalingMessage({
-                type: 'renegotiation-offer',
-                data: offer,
-                timestamp: Date.now(),
-                forced: true // Mark as forced renegotiation
-              }, connection.peerId);
-              this.debug.log(`✅ MEDIA START: Forced renegotiation offer sent to ${connection.peerId.substring(0, 8)}...`);
-            }
-          } catch (error) {
-            this.debug.error(`❌ MEDIA START: Failed to force renegotiation for ${connection.peerId.substring(0, 8)}...`, error);
-          }
+          // REMOVED: No forced immediate renegotiation - let natural renegotiation handle it
+          // This prevents cascade renegotiation conflicts when multiple peers join
         } // End of shouldShareMedia block
       } // End of connections loop
 

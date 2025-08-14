@@ -176,14 +176,19 @@ export class PeerConnection extends EventEmitter {
       } else if (this.connection.connectionState === 'disconnected') {
         // Give WebRTC more time to recover - it's common for connections to briefly disconnect during renegotiation
         this.debug.log(`⚠️ WebRTC connection disconnected for ${this.peerId}, waiting for potential recovery...`);
+        
+        // Longer recovery time for disconnected state when there are multiple peers (3+)
+        // This helps prevent cascade failures when multiple renegotiations happen
+        const recoveryTime = 12000; // 12 seconds for disconnected state recovery
+        
         setTimeout(() => {
           if (this.connection &&
                         this.connection.connectionState === 'disconnected' &&
                         !this.isClosing) {
-            this.debug.log(`❌ WebRTC connection remained disconnected for ${this.peerId}, treating as failed`);
+            this.debug.log(`❌ WebRTC connection remained disconnected for ${this.peerId} after ${recoveryTime}ms, treating as failed`);
             this.emit('disconnected', { peerId: this.peerId, reason: 'connection disconnected' });
           }
-        }, 8000); // Increased recovery time - 8 seconds for disconnected state to allow for network fluctuations
+        }, recoveryTime);
       } else if (this.connection.connectionState === 'failed') {
         if (!this.isClosing) {
           this.debug.log(`❌ Connection failed for ${this.peerId}`);
