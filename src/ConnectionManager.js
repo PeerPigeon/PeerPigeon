@@ -18,6 +18,11 @@ export class ConnectionManager extends EventEmitter {
     this.cleanupInProgress = new Set();
     this.lastConnectionAttempt = new Map(); // Track last attempt time per peer
 
+    // Renegotiation management to prevent conflicts
+    this.activeRenegotiations = new Set();
+    this.renegotiationQueue = new Map();
+    this.maxConcurrentRenegotiations = 1; // Only allow 1 renegotiation at a time
+
     // Configuration
     this.maxConnectionAttempts = 3;
     this.retryDelay = 500; // Faster retry - 500ms between attempts to same peer
@@ -285,116 +290,23 @@ export class ConnectionManager extends EventEmitter {
       this.debug.log(`[EVENT] Remote stream received from ${event.peerId.substring(0, 8)}...`);
       this.emit('remoteStream', event);
 
-      // CRITICAL: Forward the stream to other connected peers (media forwarding)
-      this._forwardStreamToOtherPeers(event.stream, event.peerId);
+      // DISABLED: Media forwarding causes cascade renegotiation issues with 3+ peers
+      // Each peer should manage their own direct streams to avoid conflicts
+      // this._forwardStreamToOtherPeers(event.stream, event.peerId);
+      this.debug.log('🔄 MEDIA FORWARDING: Disabled to prevent renegotiation conflicts with 3+ peers');
     });
 
     peerConnection.addEventListener('renegotiationNeeded', async (event) => {
       this.debug.log(`🔄 Renegotiation needed for ${event.peerId.substring(0, 8)}...`);
 
-      try {
-        // Check connection state - allow renegotiation for stable connections or those stuck in "have-local-offer"
-        // The latter case indicates an incomplete initial handshake that needs to be completed
-        const signalingState = peerConnection.connection.signalingState;
-        if (signalingState !== 'stable' && signalingState !== 'have-local-offer') {
-          this.debug.log(`Skipping renegotiation for ${event.peerId.substring(0, 8)}... - connection in unsupported state (${signalingState})`);
-          return;
-        }
-
-        // CRITICAL FIX: Check for stuck "have-local-offer" connections and force recovery
-        if (signalingState === 'have-local-offer') {
-          this.debug.log(`� STUCK CONNECTION RECOVERY: Connection with ${event.peerId.substring(0, 8)}... stuck in "have-local-offer" - forcing complete recovery`);
-
-          try {
-            // DIRECT FIX: Force the connection back to working state by bypassing the stuck offer
-            this.debug.log(`🔄 RECOVERY: Creating bypass connection for stuck peer ${event.peerId.substring(0, 8)}...`);
-
-            // Get the current local stream to preserve media state
-            const currentLocalStream = peerConnection.getLocalStream();
-
-            // Close and recreate the connection completely
-            peerConnection.close();
-
-            // Remove the old connection
-            this.peers.delete(event.peerId);
-
-            // Create a fresh connection with media
-            const freshConnection = await this.connectToPeer(event.peerId, false, {
-              localStream: currentLocalStream
-            });
-
-            if (freshConnection) {
-              this.debug.log(`✅ RECOVERY: Successfully created fresh connection for ${event.peerId.substring(0, 8)}... - media should work now`);
-
-              // Apply media stream to the fresh connection
-              if (currentLocalStream) {
-                await freshConnection.setLocalStream(currentLocalStream);
-                this.debug.log(`✅ RECOVERY: Applied media stream to fresh connection for ${event.peerId.substring(0, 8)}...`);
-              }
-            } else {
-              this.debug.error(`❌ RECOVERY: Failed to create fresh connection for ${event.peerId.substring(0, 8)}...`);
-            }
-
-            return; // Exit early - fresh connection will handle renegotiation naturally
-          } catch (error) {
-            this.debug.error(`❌ RECOVERY: Complete recovery failed for ${event.peerId.substring(0, 8)}...`, error);
-            // Continue with existing fallback logic
-          }
-        }
-
-        // Additional check for connection state
-        if (peerConnection.connection.connectionState !== 'connected') {
-          this.debug.log(`Skipping renegotiation for ${event.peerId.substring(0, 8)}... - not connected (${peerConnection.connection.connectionState})`);
-          return;
-        }
-
-        this.debug.log(`🔄 Creating renegotiation offer for ${event.peerId.substring(0, 8)}... (signaling state: ${signalingState})`);
-
-        // Create new offer for renegotiation - no need for special options since we have pre-allocated transceivers
-        const offer = await peerConnection.connection.createOffer();
-
-        // CRITICAL DEBUG: Check if offer SDP contains media information
-        this.debug.log('🔍 RENEGOTIATION OFFER SDP DEBUG:');
-        this.debug.log(`   SDP length: ${offer.sdp.length}`);
-        this.debug.log(`   Contains video: ${offer.sdp.includes('m=video')}`);
-        this.debug.log(`   Contains audio: ${offer.sdp.includes('m=audio')}`);
-        this.debug.log(`   Send recv: ${offer.sdp.includes('sendrecv')}`);
-        const videoLines = offer.sdp.split('\n').filter(line => line.includes('video')).length;
-        const audioLines = offer.sdp.split('\n').filter(line => line.includes('audio')).length;
-        this.debug.log(`   Video lines: ${videoLines}, Audio lines: ${audioLines}`);
-
-        await peerConnection.connection.setLocalDescription(offer);
-
-        // Send the renegotiation offer via regular signaling (NOT as a new offer, but as renegotiation)
-        await this.mesh.sendSignalingMessage({
-          type: 'renegotiation-offer',
-          data: offer
-        }, event.peerId);
-
-        // Faster watchdog timer for stuck connections
-        setTimeout(() => {
-          if (peerConnection.connection.signalingState === 'have-local-offer') {
-            this.debug.log(`⚠️ WATCHDOG: Connection with ${event.peerId.substring(0, 8)}... still stuck after 3 seconds - forcing emergency recovery`);
-
-            // Emergency recovery: Create immediate bypass
-            this.connectToPeer(event.peerId, false, {
-              localStream: peerConnection.getLocalStream(),
-              emergency: true
-            }).catch(err => {
-              this.debug.error(`❌ EMERGENCY: Failed emergency recovery for ${event.peerId.substring(0, 8)}...`, err);
-            });
-          }
-        }, 3000); // 3 second watchdog - much faster
-
-        this.debug.log(`🔄 Sent renegotiation offer to ${event.peerId.substring(0, 8)}... (signaling state: ${signalingState})`);
-      } catch (error) {
-        this.debug.error(`Failed to renegotiate with ${event.peerId}:`, error);
-
-        // If renegotiation fails due to m-line order, log but don't crash
-        if (error.name === 'InvalidAccessError' && error.message.includes('m-line')) {
-          this.debug.log(`🔄 M-line order error detected for ${event.peerId.substring(0, 8)}... - this is expected with replaceTrack approach`);
-        }
+      // SMART RENEGOTIATION: Queue renegotiations to prevent conflicts
+      if (this.activeRenegotiations.size >= this.maxConcurrentRenegotiations) {
+        this.debug.log(`🔄 QUEUE: Renegotiation for ${event.peerId.substring(0, 8)}... queued (${this.activeRenegotiations.size} active)`);
+        this.renegotiationQueue.set(event.peerId, event);
+        return;
       }
+
+      await this._performRenegotiation(peerConnection, event);
     });
 
     // ...existing code...
@@ -832,6 +744,20 @@ export class ConnectionManager extends EventEmitter {
       return;
     }
 
+    // Define message types that should be filtered from peer-readable messages
+    // These messages are processed but not emitted as regular messages to UI/applications
+    const filteredMessageTypes = new Set([
+      'signaling-relay',
+      'peer-announce-relay', 
+      'bootstrap-keepalive'
+    ]);
+
+    // Check if this message type should be filtered from peer-readable messages
+    const isFilteredMessage = filteredMessageTypes.has(message.type);
+    if (isFilteredMessage) {
+      this.debug.log(`🔇 FILTER: Processing filtered message type '${message.type}' from ${fromPeerId?.substring(0, 8)} (not emitted to UI)`);
+    }
+
     // Route based on message type
     switch (message.type) {
       case 'gossip':
@@ -881,12 +807,51 @@ export class ConnectionManager extends EventEmitter {
         }
         break;
 
+      case 'signaling-relay':
+        // Process signaling relay messages but don't emit as peer-readable
+        this.debug.log(`🔇 FILTER: Processing signaling-relay from ${fromPeerId?.substring(0, 8)} (filtered from UI)`);
+        // Handle the signaling relay internally - extract and process the actual signaling message
+        if (message.data && message.targetPeerId === this.mesh.peerId) {
+          this.mesh.signalingHandler.handleSignalingMessage({
+            type: message.data.type,
+            data: message.data.data,
+            fromPeerId: message.fromPeerId || fromPeerId,
+            targetPeerId: message.targetPeerId,
+            timestamp: message.timestamp
+          });
+        }
+        return; // Early return to prevent fallback to gossip handler
+
+      case 'peer-announce-relay':
+        // Process peer announce relay messages but don't emit as peer-readable
+        this.debug.log(`🔇 FILTER: Processing peer-announce-relay from ${fromPeerId?.substring(0, 8)} (filtered from UI)`);
+        // Handle the peer announcement internally
+        if (message.data && this.mesh.signalingHandler) {
+          this.mesh.signalingHandler.handlePeerAnnouncement(message.data, fromPeerId);
+        }
+        return; // Early return to prevent fallback to gossip handler
+
+      case 'bootstrap-keepalive':
+        // Process bootstrap keepalive messages but don't emit as peer-readable
+        this.debug.log(`🔇 FILTER: Processing bootstrap-keepalive from ${fromPeerId?.substring(0, 8)} (filtered from UI)`);
+        // Handle keepalive internally - update peer discovery timestamps
+        if (this.mesh.peerDiscovery) {
+          this.mesh.peerDiscovery.updateDiscoveryTimestamp(fromPeerId);
+        }
+        return; // Early return to prevent fallback to gossip handler
+
       default:
-        // Unknown message type - try gossip as fallback for backward compatibility
-        this.debug.warn(`Unknown message type '${message.type}' from ${fromPeerId?.substring(0, 8)}, trying gossip handler`);
-        this.mesh.gossipManager.handleGossipMessage(message, fromPeerId).catch(error => {
-          this.debug.error('Error handling unknown message as gossip:', error);
-        });
+        // For non-filtered message types, check if they should be emitted
+        if (!isFilteredMessage) {
+          // Unknown message type - try gossip as fallback for backward compatibility
+          this.debug.warn(`Unknown message type '${message.type}' from ${fromPeerId?.substring(0, 8)}, trying gossip handler`);
+          this.mesh.gossipManager.handleGossipMessage(message, fromPeerId).catch(error => {
+            this.debug.error('Error handling unknown message as gossip:', error);
+          });
+        } else {
+          // This is a filtered message type that doesn't have a specific handler
+          this.debug.log(`🔇 FILTER: Filtered message type '${message.type}' processed but not emitted`);
+        }
         break;
     }
   }
@@ -909,6 +874,83 @@ export class ConnectionManager extends EventEmitter {
     if (peerConnection) {
       peerConnection.close();
       this.peers.delete(fromPeerId);
+    }
+  }
+
+  /**
+   * Perform a single renegotiation with conflict prevention
+   * @private
+   */
+  async _performRenegotiation(peerConnection, event) {
+    const peerId = event.peerId;
+    
+    // Mark this renegotiation as active
+    this.activeRenegotiations.add(peerId);
+    
+    try {
+      this.debug.log(`🔄 ACTIVE: Starting renegotiation for ${peerId.substring(0, 8)}... (${this.activeRenegotiations.size} active)`);
+
+      // Check connection state - allow renegotiation for stable connections or those stuck in "have-local-offer"
+      const signalingState = peerConnection.connection.signalingState;
+      if (signalingState !== 'stable' && signalingState !== 'have-local-offer') {
+        this.debug.log(`Skipping renegotiation for ${peerId.substring(0, 8)}... - connection in unsupported state (${signalingState})`);
+        return;
+      }
+
+      // Additional check for connection state
+      if (peerConnection.connection.connectionState !== 'connected') {
+        this.debug.log(`Skipping renegotiation for ${peerId.substring(0, 8)}... - not connected (${peerConnection.connection.connectionState})`);
+        return;
+      }
+
+      this.debug.log(`🔄 Creating renegotiation offer for ${peerId.substring(0, 8)}... (signaling state: ${signalingState})`);
+
+      // Create new offer for renegotiation
+      const offer = await peerConnection.connection.createOffer();
+
+      this.debug.log('🔍 RENEGOTIATION OFFER SDP DEBUG:');
+      this.debug.log(`   SDP length: ${offer.sdp.length}`);
+      this.debug.log(`   Contains video: ${offer.sdp.includes('m=video')}`);
+      this.debug.log(`   Contains audio: ${offer.sdp.includes('m=audio')}`);
+
+      await peerConnection.connection.setLocalDescription(offer);
+
+      // Send the renegotiation offer
+      await this.mesh.sendSignalingMessage({
+        type: 'renegotiation-offer',
+        data: offer
+      }, peerId);
+
+      this.debug.log(`✅ ACTIVE: Sent renegotiation offer to ${peerId.substring(0, 8)}...`);
+    } catch (error) {
+      this.debug.error(`❌ ACTIVE: Failed to renegotiate with ${peerId.substring(0, 8)}...`, error);
+    } finally {
+      // Always clean up and process queue
+      this.activeRenegotiations.delete(peerId);
+      this.debug.log(`🔄 ACTIVE: Completed renegotiation for ${peerId.substring(0, 8)}... (${this.activeRenegotiations.size} active)`);
+      
+      // Process next queued renegotiation
+      this._processRenegotiationQueue();
+    }
+  }
+
+  /**
+   * Process the next renegotiation in the queue
+   * @private
+   */
+  _processRenegotiationQueue() {
+    if (this.activeRenegotiations.size >= this.maxConcurrentRenegotiations || this.renegotiationQueue.size === 0) {
+      return;
+    }
+
+    // Get next queued renegotiation
+    const [nextPeerId, nextEvent] = this.renegotiationQueue.entries().next().value;
+    this.renegotiationQueue.delete(nextPeerId);
+
+    const peerConnection = this.peers.get(nextPeerId);
+    if (peerConnection) {
+      this.debug.log(`🔄 QUEUE: Processing queued renegotiation for ${nextPeerId.substring(0, 8)}...`);
+      this._performRenegotiation(peerConnection, nextEvent);
     }
   }
 

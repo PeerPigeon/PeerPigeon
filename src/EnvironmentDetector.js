@@ -2,7 +2,6 @@
  * EnvironmentDetector - Utility for detecting runtime environment and capabilities
  * Provides comprehensive environment detection for browser, Node.js, Worker contexts
  */
-import DebugLogger from './DebugLogger.js';
 
 export class EnvironmentDetector {
   constructor() {
@@ -21,6 +20,62 @@ export class EnvironmentDetector {
     this._cache.set('isDeno', this._detectDeno());
     this._cache.set('isBun', this._detectBun());
     this._cache.set('isNativeScript', this._detectNativeScript());
+
+    // Initialize WebRTC polyfill for Node.js if available
+    if (this._cache.get('isNodeJS')) {
+      this._initNodeWebRTC();
+    }
+  }
+
+  /**
+   * Initialize WebRTC polyfill for Node.js environment
+   * Attempts to load @koush/wrtc and set up WebRTC globals
+   * @private
+   */
+  _initNodeWebRTC() {
+    try {
+      // Check if WebRTC is already available globally
+      if (typeof global !== 'undefined' && typeof global.RTCPeerConnection !== 'undefined') {
+        return; // WebRTC already available
+      }
+
+      // Try to import @koush/wrtc package
+      let wrtc;
+      if (typeof require !== 'undefined') {
+        // CommonJS require
+        try {
+          wrtc = require('@koush/wrtc');
+        } catch (e) {
+          // @koush/wrtc not available, try node-webrtc as fallback
+          try {
+            wrtc = require('node-webrtc');
+          } catch (e2) {
+            // No WebRTC package available
+            return;
+          }
+        }
+      } else {
+        // ES modules - dynamic import would be needed
+        // Since we can't do synchronous dynamic imports, we'll skip this
+        // The async method initWebRTCAsync() should be used instead
+        return;
+      }
+
+      // Set up WebRTC globals if we successfully loaded a package
+      if (wrtc && typeof global !== 'undefined') {
+        global.RTCPeerConnection = wrtc.RTCPeerConnection;
+        global.RTCSessionDescription = wrtc.RTCSessionDescription;
+        global.RTCIceCandidate = wrtc.RTCIceCandidate;
+        global.MediaStream = wrtc.MediaStream || global.MediaStream;
+        global.MediaStreamTrack = wrtc.MediaStreamTrack || global.MediaStreamTrack;
+
+        // Update cache to reflect that WebRTC is now available
+        this._webrtcPolyfilled = true;
+      }
+    } catch (error) {
+      // Silently fail - WebRTC polyfill is optional
+      // The application will handle missing WebRTC through normal capability detection
+    }
   }
 
   // Primary environment detection
@@ -132,9 +187,11 @@ export class EnvironmentDetector {
     }
     if (this.isNodeJS) {
       // Check for Node.js WebRTC implementations or globally injected WebRTC
+      // This includes polyfills loaded by _initNodeWebRTC()
       return (typeof global !== 'undefined' &&
                    typeof global.RTCPeerConnection !== 'undefined') ||
-                   typeof RTCPeerConnection !== 'undefined';
+                   typeof RTCPeerConnection !== 'undefined' ||
+                   this._webrtcPolyfilled === true;
     }
     if (this.isNativeScript) {
       // NativeScript can access native WebRTC implementations through native modules
@@ -491,6 +548,55 @@ export class EnvironmentDetector {
     };
   }
 
+  /**
+   * Asynchronously initialize WebRTC polyfill for Node.js environment
+   * This method is useful for ES module environments where dynamic imports are preferred
+   * @returns {Promise<boolean>} True if WebRTC was successfully initialized
+   */
+  async initWebRTCAsync() {
+    if (!this.isNodeJS) {
+      return false; // Only works in Node.js
+    }
+
+    try {
+      // Check if WebRTC is already available globally
+      if (typeof global !== 'undefined' && typeof global.RTCPeerConnection !== 'undefined') {
+        return true; // WebRTC already available
+      }
+
+      let wrtc;
+      try {
+        // Try to import @koush/wrtc first
+        wrtc = await import('@koush/wrtc');
+      } catch (e) {
+        try {
+          // Fallback to node-webrtc
+          wrtc = await import('node-webrtc');
+        } catch (e2) {
+          // No WebRTC package available
+          return false;
+        }
+      }
+
+      // Set up WebRTC globals if we successfully loaded a package
+      if (wrtc && typeof global !== 'undefined') {
+        global.RTCPeerConnection = wrtc.RTCPeerConnection || wrtc.default?.RTCPeerConnection;
+        global.RTCSessionDescription = wrtc.RTCSessionDescription || wrtc.default?.RTCSessionDescription;
+        global.RTCIceCandidate = wrtc.RTCIceCandidate || wrtc.default?.RTCIceCandidate;
+        global.MediaStream = wrtc.MediaStream || wrtc.default?.MediaStream || global.MediaStream;
+        global.MediaStreamTrack = wrtc.MediaStreamTrack || wrtc.default?.MediaStreamTrack || global.MediaStreamTrack;
+
+        // Update cache to reflect that WebRTC is now available
+        this._webrtcPolyfilled = true;
+        return true;
+      }
+    } catch (error) {
+      // Silently fail - WebRTC polyfill is optional
+    }
+
+    return false;
+  }
+
   // Static method for quick environment check
   static detect() {
     return new EnvironmentDetector();
@@ -514,3 +620,4 @@ export const isNativeScript = () => environmentDetector.isNativeScript;
 export const hasWebRTC = () => environmentDetector.hasWebRTC;
 export const hasWebSocket = () => environmentDetector.hasWebSocket;
 export const getEnvironmentReport = () => environmentDetector.getEnvironmentReport();
+export const initWebRTCAsync = () => environmentDetector.initWebRTCAsync();
