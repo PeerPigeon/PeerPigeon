@@ -24,6 +24,16 @@
 - **💰 Cost-Optimized**: XOR-based routing reduces signaling server costs by ~95%
 - **🛡️ Memory Safe**: Comprehensive cleanup prevents memory leaks in long-running applications
 
+**Quick Links:**
+- [Live Demo](http://localhost:8080/examples/browser/) (after starting local server)
+- [Browser Examples](examples/browser/) - Complete web-based examples
+- [Node.js Examples](examples/node/) - Server-side examples  
+- [NativeScript Examples](examples/nativescript/) - Mobile app examples
+- [API Documentation](API_DOCUMENTATION.md)
+- [Selective Streaming Guide](SELECTIVE_STREAMING_GUIDE.md) - Media streaming optimization guide
+- [CLI Documentation](CLI_README.md) - Command line interface guide
+- [GitHub Issues](https://github.com/draeder/peerpigeon/issues)
+
 ## 🏗️ Architecture Overview
 
 ```mermaid
@@ -1502,15 +1512,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **WebRTC Community**: For providing the foundation of peer-to-peer communication
 - **Gossip Protocols**: Epidemic algorithms research for reliable message propagation
 - **Open Source Community**: For feedback, testing, and continuous improvement
-
----
-
-**Quick Links:**
-- [Live Demo](http://localhost:8080/examples/browser/) (after starting local server)
-- [Browser Examples](examples/browser/) - Complete web-based examples
-- [Node.js Examples](examples/node/) - Server-side examples  
-- [NativeScript Examples](examples/nativescript/) - Mobile app examples
-- [API Documentation](docs/API.md)
-- [Deployment Guide](docs/DEPLOYMENT.md)
-- [GitHub Issues](https://github.com/danrayadev/pigon/issues)
-- [Contributing Guidelines](CONTRIBUTING.md)

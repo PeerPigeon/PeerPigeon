@@ -118,7 +118,7 @@ export class PeerPigeonMesh extends EventEmitter {
       if (data.content && typeof data.content === 'string') {
         try {
           const parsedContent = JSON.parse(data.content);
-          const filteredTypes = ['signaling-relay', 'peer-announce-relay', 'bootstrap-keepalive'];
+          const filteredTypes = ['signaling-relay', 'peer-announce-relay', 'bootstrap-keepalive', 'client-peer-announcement', 'cross-bootstrap-signaling'];
           if (filteredTypes.includes(parsedContent.type)) {
             console.debug(`🔇 MESH FILTER: Blocked filtered message type '${parsedContent.type}' from UI emission`);
             return; // Don't emit to UI
