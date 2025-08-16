@@ -749,7 +749,9 @@ export class ConnectionManager extends EventEmitter {
     const filteredMessageTypes = new Set([
       'signaling-relay',
       'peer-announce-relay', 
-      'bootstrap-keepalive'
+      'bootstrap-keepalive',
+      'client-peer-announcement',
+      'cross-bootstrap-signaling'
     ]);
 
     // Check if this message type should be filtered from peer-readable messages
@@ -837,6 +839,31 @@ export class ConnectionManager extends EventEmitter {
         // Handle keepalive internally - update peer discovery timestamps
         if (this.mesh.peerDiscovery) {
           this.mesh.peerDiscovery.updateDiscoveryTimestamp(fromPeerId);
+        }
+        return; // Early return to prevent fallback to gossip handler
+
+      case 'client-peer-announcement':
+        // Process client peer announcement messages but don't emit as peer-readable
+        this.debug.log(`🔇 FILTER: Processing client-peer-announcement from ${fromPeerId?.substring(0, 8)} (filtered from UI)`);
+        // Handle client peer announcement internally
+        if (message.clientPeerId && this.mesh.signalingHandler) {
+          this.mesh.signalingHandler.handlePeerAnnouncement(message.clientPeerId);
+        }
+        return; // Early return to prevent fallback to gossip handler
+
+      case 'cross-bootstrap-signaling':
+        // Process cross-bootstrap signaling messages but don't emit as peer-readable
+        this.debug.log(`🔇 FILTER: Processing cross-bootstrap-signaling from ${fromPeerId?.substring(0, 8)} (filtered from UI)`);
+        // Handle cross-bootstrap signaling internally
+        if (message.originalMessage && message.targetPeerId === this.mesh.peerId && this.mesh.signalingHandler) {
+          // Extract and process the wrapped signaling message
+          this.mesh.signalingHandler.handleSignalingMessage({
+            type: message.originalMessage.type,
+            data: message.originalMessage.data,
+            fromPeerId: message.originalMessage.fromPeerId || fromPeerId,
+            targetPeerId: message.targetPeerId,
+            timestamp: message.originalMessage.timestamp || message.timestamp
+          });
         }
         return; // Early return to prevent fallback to gossip handler
 
