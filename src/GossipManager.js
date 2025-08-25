@@ -32,7 +32,7 @@ export class GossipManager extends EventEmitter {
   /**
      * Broadcast a message to all peers in the network using gossip protocol
      */
-  broadcastMessage(content, messageType = 'chat') {
+  async broadcastMessage(content, messageType = 'chat') {
     // Validate content
     if (content === undefined || content === null) {
       this.debug.error('Cannot broadcast message with undefined/null content');
@@ -49,7 +49,7 @@ export class GossipManager extends EventEmitter {
       return null;
     }
 
-    const messageId = this.generateMessageId();
+    const messageId = await this.generateMessageId();
     const message = {
       id: messageId,
       type: 'gossip',
@@ -94,7 +94,7 @@ export class GossipManager extends EventEmitter {
      * @param {string} subtype - Message subtype (default: 'dm')
      * @returns {string|null} The message ID if sent, or null on error
      */
-  sendDirectMessage(targetPeerId, content, subtype = 'dm') {
+  async sendDirectMessage(targetPeerId, content, subtype = 'dm') {
     if (!targetPeerId || typeof targetPeerId !== 'string') {
       this.debug.error('Invalid targetPeerId for direct message');
       return null;
@@ -106,7 +106,7 @@ export class GossipManager extends EventEmitter {
       return null;
     }
 
-    const messageId = this.generateMessageId();
+    const messageId = await this.generateMessageId();
     const message = {
       id: messageId,
       type: 'gossip',
@@ -398,14 +398,14 @@ export class GossipManager extends EventEmitter {
   /**
      * Broadcast peer announcement via gossip when we connect
      */
-  announcePeer(peerId = this.mesh.peerId) {
+  async announcePeer(peerId = this.mesh.peerId) {
     const announcementData = {
       peerId,
       timestamp: Date.now()
     };
 
     this.debug.log(`Gossiping peer announcement for: ${peerId.substring(0, 8)}...`);
-    this.broadcastMessage(announcementData, 'peer-announcement');
+    await this.broadcastMessage(announcementData, 'peer-announcement');
   }
 
   /**
@@ -528,9 +528,33 @@ export class GossipManager extends EventEmitter {
   /**
      * Generate unique message ID
      */
-  generateMessageId() {
+  async generateMessageId() {
     const array = new Uint8Array(16);
-    crypto.getRandomValues(array);
+    
+    // Environment-aware random value generation
+    if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+      // Browser environment
+      crypto.getRandomValues(array);
+    } else if (typeof process !== 'undefined' && process.versions && process.versions.node) {
+      // Node.js environment
+      try {
+        const crypto = await import('crypto');
+        const randomBytes = crypto.randomBytes(16);
+        array.set(randomBytes);
+      } catch (e) {
+        console.warn('Could not use Node.js crypto, falling back to Math.random');
+        // Fallback to Math.random
+        for (let i = 0; i < array.length; i++) {
+          array[i] = Math.floor(Math.random() * 256);
+        }
+      }
+    } else {
+      // Fallback to Math.random for other environments
+      for (let i = 0; i < array.length; i++) {
+        array[i] = Math.floor(Math.random() * 256);
+      }
+    }
+    
     return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
   }
 
