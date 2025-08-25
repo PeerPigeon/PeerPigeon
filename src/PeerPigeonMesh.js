@@ -103,7 +103,9 @@ export class PeerPigeonMesh extends EventEmitter {
 
       // Handle crypto key exchange messages
       if (data.message && (data.message.type === 'key_exchange' || data.message.type === 'key_exchange_response')) {
-        this._handleKeyExchange(data.message, data.from);
+        this._handleKeyExchange(data.message, data.from).catch(err => {
+          this.debug.error('Key exchange handling failed:', err);
+        });
         return; // Don't emit as regular message
       }
 
@@ -148,7 +150,9 @@ export class PeerPigeonMesh extends EventEmitter {
         hasVideo: data.hasVideo,
         hasAudio: data.hasAudio,
         timestamp: Date.now()
-      }, 'mediaEvent');
+      }, 'mediaEvent').catch(err => {
+        this.debug.error('Failed to broadcast stream started event:', err);
+      });
     });
 
     this.mediaManager.addEventListener('localStreamStopped', () => {
@@ -158,7 +162,9 @@ export class PeerPigeonMesh extends EventEmitter {
         event: 'streamStopped',
         peerId: this.peerId,
         timestamp: Date.now()
-      }, 'mediaEvent');
+      }, 'mediaEvent').catch(err => {
+        this.debug.error('Failed to broadcast stream stopped event:', err);
+      });
     });
 
     this.mediaManager.addEventListener('error', (data) => {
@@ -607,12 +613,12 @@ export class PeerPigeonMesh extends EventEmitter {
      * @param {string|object} content - The message content
      * @returns {string|null} The message ID if sent, or null on error
      */
-  sendDirectMessage(targetPeerId, content) {
+  async sendDirectMessage(targetPeerId, content) {
     if (!targetPeerId || typeof targetPeerId !== 'string') {
       this.debug.error('Invalid targetPeerId for direct message');
       return null;
     }
-    return this.gossipManager.sendDirectMessage(targetPeerId, content);
+    return await this.gossipManager.sendDirectMessage(targetPeerId, content);
   }
 
   /**
@@ -620,9 +626,9 @@ export class PeerPigeonMesh extends EventEmitter {
      * @param {string|object} content - The message content
      * @returns {string|null} The message ID if sent, or null on error
      */
-  sendMessage(content) {
+  async sendMessage(content) {
     // For clarity, this is a broadcast/gossip message
-    return this.gossipManager.broadcastMessage(content, 'chat');
+    return await this.gossipManager.broadcastMessage(content, 'chat');
   }
 
   // Helper methods for backward compatibility
@@ -1401,7 +1407,7 @@ export class PeerPigeonMesh extends EventEmitter {
     try {
       if (targetPeerId) {
         // Send directly to target peer
-        return this.sendDirectMessage(targetPeerId, signalingMessage);
+        return await this.sendDirectMessage(targetPeerId, signalingMessage);
       } else {
         // Broadcast to all connected peers
         return this.broadcast(signalingMessage);
@@ -1516,7 +1522,7 @@ export class PeerPigeonMesh extends EventEmitter {
 
     try {
       const encryptedContent = await this.cryptoManager.encryptForPeer(content, peerId);
-      return this.sendDirectMessage(peerId, encryptedContent);
+      return await this.sendDirectMessage(peerId, encryptedContent);
     } catch (error) {
       this.debug.error('Failed to send encrypted message:', error);
       throw error;
@@ -1550,7 +1556,7 @@ export class PeerPigeonMesh extends EventEmitter {
         };
       }
       // Use 'encrypted' message type instead of 'chat' for encrypted broadcasts
-      return this.gossipManager.broadcastMessage(encryptedContent, 'encrypted');
+      return await this.gossipManager.broadcastMessage(encryptedContent, 'encrypted');
     } catch (error) {
       this.debug.error('Failed to send encrypted broadcast:', error);
       throw error;
@@ -1746,7 +1752,7 @@ export class PeerPigeonMesh extends EventEmitter {
      * @param {string} from - Sender's peer ID
      * @private
      */
-  _handleKeyExchange(data, from) {
+  async _handleKeyExchange(data, from) {
     if ((data.type === 'key_exchange' || data.type === 'key_exchange_response') && data.publicKey && this.cryptoManager) {
       // Try to add the peer key - will return false if it's a duplicate
       const keyAdded = this.cryptoManager.addPeerKey(from, data.publicKey);
@@ -1763,7 +1769,7 @@ export class PeerPigeonMesh extends EventEmitter {
       if (data.type === 'key_exchange' && keyAdded) {
         const keypair = this.cryptoManager.keypair;
         if (keypair && keypair.pub && keypair.epub) {
-          this.gossipManager.sendDirectMessage(from, {
+          await this.gossipManager.sendDirectMessage(from, {
             type: 'key_exchange_response',
             publicKey: {
               pub: keypair.pub,
