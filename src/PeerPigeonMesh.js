@@ -28,6 +28,12 @@ export class PeerPigeonMesh extends EventEmitter {
     this.signalingClient = null;
     this.peerDiscovery = null;
 
+    // Network namespace configuration
+    this.networkName = options.networkName || 'global';
+    this.allowGlobalFallback = options.allowGlobalFallback !== false; // Default to true
+    this.isInFallbackMode = false;
+    this.originalNetworkName = this.networkName;
+
     // Configuration - Optional features enabled by default (opt-out)
     this.maxPeers = options.maxPeers !== undefined ? options.maxPeers : 3;
     this.minPeers = options.minPeers !== undefined ? options.minPeers : 2;
@@ -423,6 +429,11 @@ export class PeerPigeonMesh extends EventEmitter {
   setupDiscoveryHandlers() {
     this.peerDiscovery.addEventListener('peerDiscovered', (data) => {
       this.emit('peerDiscovered', data);
+      
+      // Check if we should return from global fallback to original network
+      if (this.isInFallbackMode && this.originalNetworkName !== 'global') {
+        this._tryReturnToOriginalNetwork();
+      }
     });
 
     this.peerDiscovery.addEventListener('connectToPeer', (data) => {
@@ -440,6 +451,11 @@ export class PeerPigeonMesh extends EventEmitter {
 
     this.peerDiscovery.addEventListener('optimizeConnections', (data) => {
       this.meshOptimizer.handleOptimizeConnections(data.unconnectedPeers);
+    });
+
+    // Monitor network health and activate fallback if needed
+    this.addEventListener('peersUpdated', () => {
+      this._checkNetworkHealth();
     });
 
     this.peerDiscovery.addEventListener('peersUpdated', (data) => {
@@ -554,6 +570,139 @@ export class PeerPigeonMesh extends EventEmitter {
     this.emit('statusChanged', { type: 'setting', setting: 'evictionStrategy', value: enabled });
   }
 
+  // Network namespace management methods
+  setNetworkName(networkName) {
+    if (this.connected) {
+      throw new Error('Cannot change network name while connected. Disconnect first.');
+    }
+    
+    this.networkName = networkName || 'global';
+    this.originalNetworkName = this.networkName;
+    this.isInFallbackMode = false;
+    
+    this.emit('statusChanged', { 
+      type: 'setting', 
+      setting: 'networkName', 
+      value: this.networkName 
+    });
+    
+    return this.networkName;
+  }
+
+  getNetworkName() {
+    return this.networkName;
+  }
+
+  getOriginalNetworkName() {
+    return this.originalNetworkName;
+  }
+
+  isUsingGlobalFallback() {
+    return this.isInFallbackMode;
+  }
+
+  setAllowGlobalFallback(allow) {
+    this.allowGlobalFallback = allow;
+    this.emit('statusChanged', { 
+      type: 'setting', 
+      setting: 'allowGlobalFallback', 
+      value: allow 
+    });
+    
+    // If we're currently in fallback mode and fallback is disabled, try to return to original network
+    if (!allow && this.isInFallbackMode) {
+      this._tryReturnToOriginalNetwork();
+    }
+    
+    return this.allowGlobalFallback;
+  }
+
+  async _tryReturnToOriginalNetwork() {
+    if (!this.isInFallbackMode || this.originalNetworkName === 'global') {
+      return;
+    }
+
+    // Check if there are now peers in the original network
+    const originalNetworkPeerCount = await this._getNetworkPeerCount(this.originalNetworkName);
+    
+    if (originalNetworkPeerCount > 0) {
+      this.debug.log(`Returning from global fallback to original network: ${this.originalNetworkName}`);
+      this.networkName = this.originalNetworkName;
+      this.isInFallbackMode = false;
+      
+      this.emit('statusChanged', { 
+        type: 'network', 
+        message: `Returned to network: ${this.networkName}`,
+        networkName: this.networkName,
+        fallbackMode: false
+      });
+      
+      // Trigger reconnection to rebuild mesh in correct network
+      if (this.connected) {
+        this.disconnect();
+        setTimeout(() => {
+          if (this.signalingUrl) {
+            this.connect(this.signalingUrl);
+          }
+        }, 1000);
+      }
+    }
+  }
+
+  async _activateGlobalFallback() {
+    if (this.originalNetworkName === 'global' || this.isInFallbackMode || !this.allowGlobalFallback) {
+      return false;
+    }
+
+    this.debug.log(`Activating global fallback from network: ${this.originalNetworkName}`);
+    this.networkName = 'global';
+    this.isInFallbackMode = true;
+    
+    this.emit('statusChanged', { 
+      type: 'network', 
+      message: `Fallback to global network from: ${this.originalNetworkName}`,
+      networkName: this.networkName,
+      originalNetwork: this.originalNetworkName,
+      fallbackMode: true
+    });
+    
+    return true;
+  }
+
+  async _getNetworkPeerCount(networkName) {
+    // This would need to be implemented with signaling server support
+    // For now, return 0 to indicate we can't determine peer count
+    return 0;
+  }
+
+  _checkNetworkHealth() {
+    // TEMPORARILY DISABLED - aggressive fallback for debugging
+    return;
+    
+    if (this.originalNetworkName === 'global' || !this.allowGlobalFallback) {
+      return;
+    }
+
+    const connectedCount = this.connectionManager.getConnectedPeerCount();
+    const discoveredCount = this.discoveredPeers.size;
+
+    // If we're in the original network but have insufficient peers, activate fallback
+    if (!this.isInFallbackMode && this.networkName === this.originalNetworkName) {
+      if (connectedCount === 0 && discoveredCount === 0) {
+        this.debug.log(`Network ${this.originalNetworkName} appears empty, activating global fallback`);
+        this._activateGlobalFallback().then(activated => {
+          if (activated && this.connected && this.signalingUrl) {
+            // Reconnect to signaling server with global network
+            this.disconnect();
+            setTimeout(() => {
+              this.connect(this.signalingUrl);
+            }, 1000);
+          }
+        });
+      }
+    }
+  }
+
   // Status and information methods
   getStatus() {
     const connectedCount = this.connectionManager.getConnectedPeerCount();
@@ -563,6 +712,10 @@ export class PeerPigeonMesh extends EventEmitter {
       connected: this.connected,
       polling: false, // Only WebSocket is supported
       signalingUrl: this.signalingUrl,
+      networkName: this.networkName,
+      originalNetworkName: this.originalNetworkName,
+      isInFallbackMode: this.isInFallbackMode,
+      allowGlobalFallback: this.allowGlobalFallback,
       connectedCount,
       totalPeerCount: totalCount, // Include total count for debugging
       minPeers: this.minPeers,

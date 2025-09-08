@@ -14,6 +14,11 @@
               <span class="status-dot"></span>
               {{ isConnected ? 'Connected' : 'Disconnected' }}
             </div>
+            <div class="status-item" v-if="networkName">
+              <strong>Network:</strong> 
+              <span class="network-display">{{ networkName }}</span>
+              <span v-if="store.isInFallbackMode" class="fallback-indicator">Fallback</span>
+            </div>
             <div class="status-item" v-if="peerId">
               <strong>ID:</strong> {{ peerId.substring(0, 8) }}...
             </div>
@@ -23,12 +28,27 @@
           </div>
           
           <div class="connection-controls">
-            <input 
-              v-model="signalingUrl" 
-              placeholder="ws://localhost:3000"
-              class="url-input"
-              :disabled="isConnected"
-            >
+            <div class="input-group">
+              <label for="network-input">Network:</label>
+              <input 
+                id="network-input"
+                v-model="networkName" 
+                placeholder="global"
+                class="network-input"
+                :disabled="isConnected"
+                title="Network name (e.g., 'gaming', 'work', 'family')"
+              >
+            </div>
+            <div class="input-group">
+              <label for="url-input">Signaling Server:</label>
+              <input 
+                id="url-input"
+                v-model="signalingUrl" 
+                placeholder="ws://localhost:3000"
+                class="url-input"
+                :disabled="isConnected"
+              >
+            </div>
             <button 
               v-if="!isConnected" 
               @click="handleConnect"
@@ -109,12 +129,20 @@ const signalingUrl = computed({
   get: () => store.signalingUrl,
   set: (value) => store.signalingUrl = value
 });
+const networkName = computed({
+  get: () => store.networkName,
+  set: (value) => store.setNetworkName(value)
+});
 const peerId = computed(() => store.peerId);
 const networkStatus = computed(() => store.networkStatus);
 
 // Methods
 const handleConnect = async () => {
   try {
+    // Set network name before connecting
+    if (networkName.value && networkName.value.trim()) {
+      store.setNetworkName(networkName.value.trim());
+    }
     await store.connectToSignaling(signalingUrl.value);
   } catch (error) {
     console.error('Connection failed:', error);
@@ -129,7 +157,12 @@ const handleDisconnect = () => {
 // Initialize on mount
 onMounted(async () => {
   try {
-    await store.initMesh();
+    // Initialize with initial network name if provided
+    const initialOptions = {};
+    if (networkName.value && networkName.value.trim()) {
+      initialOptions.networkName = networkName.value.trim();
+    }
+    await store.initMesh(initialOptions);
   } catch (error) {
     console.error('Failed to initialize mesh:', error);
     alert(`Failed to initialize mesh: ${error.message}`);
@@ -212,22 +245,60 @@ onMounted(async () => {
 
 .connection-controls {
   display: flex;
-  gap: 10px;
-  align-items: center;
+  gap: 15px;
+  align-items: end;
   flex-wrap: wrap;
 }
 
+.input-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.input-group label {
+  font-size: 12px;
+  font-weight: 500;
+  color: #666;
+  margin: 0;
+}
+
+.network-input,
 .url-input {
   padding: 8px 12px;
   border: 1px solid #ddd;
   border-radius: 6px;
   font-size: 14px;
+  min-width: 150px;
+}
+
+.network-input {
+  min-width: 120px;
+}
+
+.url-input {
   min-width: 200px;
 }
 
+.network-input:disabled,
 .url-input:disabled {
   background: #f5f5f5;
   color: #999;
+}
+
+.network-display {
+  color: #3b82f6;
+  font-weight: 600;
+}
+
+.fallback-indicator {
+  background: #f59e0b;
+  color: white;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 6px;
 }
 
 .btn {
@@ -326,10 +397,20 @@ onMounted(async () => {
   
   .connection-controls {
     justify-content: center;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
   }
   
+  .input-group {
+    width: 100%;
+    max-width: 250px;
+  }
+  
+  .network-input,
   .url-input {
-    min-width: 150px;
+    width: 100%;
+    min-width: auto;
   }
   
   .tabs {

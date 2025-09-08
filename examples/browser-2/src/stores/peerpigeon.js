@@ -9,6 +9,12 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
   const signalingUrl = ref('ws://localhost:3000');
   const peerId = ref('');
   
+  // Network namespace state
+  const networkName = ref('global');
+  const originalNetworkName = ref('global');
+  const isInFallbackMode = ref(false);
+  const allowGlobalFallback = ref(true);
+  
   // Network state
   const peers = reactive(new Map());
   const discoveredPeers = reactive(new Map());
@@ -68,119 +74,185 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
   // Core methods
   const initMesh = async (options = {}) => {
     try {
-      // For development, use a mock implementation
-      const MockPeerPigeonMesh = class {
-        constructor(meshOptions) {
-          this.options = meshOptions;
-          this.peerId = 'mock-peer-' + Math.random().toString(36).substr(2, 9);
-          this.eventListeners = new Map();
-        }
-        
-        async init() { 
-          addDebugLog('Mock mesh initialized', 'success');
-          return true; 
-        }
-        
-        async connect(url) { 
-          addDebugLog(`Mock connected to ${url}`, 'success');
-          return true; 
-        }
-        
-        disconnect() {
-          addDebugLog('Mock disconnected', 'info');
-        }
-        
-        addEventListener(event, handler) {
-          if (!this.eventListeners.has(event)) {
-            this.eventListeners.set(event, []);
+      // Use real PeerPigeonMesh if available, otherwise mock
+      const PeerPigeonMeshClass = window.PeerPigeon?.PeerPigeonMesh;
+      
+      if (!PeerPigeonMeshClass) {
+        // Fallback to mock implementation for development
+        const MockPeerPigeonMesh = class {
+          constructor(meshOptions) {
+            this.options = meshOptions;
+            this.peerId = 'mock-peer-' + Math.random().toString(36).substr(2, 9);
+            this.eventListeners = new Map();
+            this.networkName = meshOptions.networkName || 'global';
+            this.originalNetworkName = this.networkName;
+            this.isInFallbackMode = false;
+            this.allowGlobalFallback = meshOptions.allowGlobalFallback !== false;
           }
-          this.eventListeners.get(event).push(handler);
-        }
+          
+          async init() { 
+            addDebugLog('Mock mesh initialized', 'success');
+            return true; 
+          }
+          
+          async connect(url) { 
+            addDebugLog(`Mock connected to ${url}`, 'success');
+            return true; 
+          }
+          
+          disconnect() {
+            addDebugLog('Mock disconnected', 'info');
+          }
+          
+          addEventListener(event, handler) {
+            if (!this.eventListeners.has(event)) {
+              this.eventListeners.set(event, []);
+            }
+            this.eventListeners.get(event).push(handler);
+          }
+          
+          sendMessage(content) { 
+            addDebugLog(`Mock broadcast: ${JSON.stringify(content)}`, 'info');
+            return 'mock-message-id-' + Date.now(); 
+          }
+          
+          sendDirectMessage(peerId, content) { 
+            addDebugLog(`Mock direct to ${peerId}: ${JSON.stringify(content)}`, 'info');
+            return 'mock-message-id-' + Date.now(); 
+          }
+          
+          getStatus() { 
+            return { 
+              connectedCount: 0, 
+              maxPeers: networkStatus.maxPeers, 
+              minPeers: networkStatus.minPeers,
+              autoDiscovery: networkStatus.autoDiscovery,
+              evictionStrategy: networkStatus.evictionStrategy,
+              xorRouting: networkStatus.xorRouting,
+              networkName: this.networkName,
+              originalNetworkName: this.originalNetworkName,
+              isInFallbackMode: this.isInFallbackMode,
+              allowGlobalFallback: this.allowGlobalFallback
+            }; 
+          }
+          
+          setNetworkName(name) {
+            this.networkName = name || 'global';
+            this.originalNetworkName = this.networkName;
+            this.isInFallbackMode = false;
+            addDebugLog(`Mock network changed to: ${this.networkName}`, 'info');
+            return this.networkName;
+          }
+          
+          getNetworkName() {
+            return this.networkName;
+          }
+          
+          getOriginalNetworkName() {
+            return this.originalNetworkName;
+          }
+          
+          isUsingGlobalFallback() {
+            return this.isInFallbackMode;
+          }
+          
+          setAllowGlobalFallback(allow) {
+            this.allowGlobalFallback = allow;
+            addDebugLog(`Mock global fallback ${allow ? 'enabled' : 'disabled'}`, 'info');
+            return this.allowGlobalFallback;
+          }
+          
+          async startMedia(options) {
+            addDebugLog(`Mock media started: ${JSON.stringify(options)}`, 'info');
+            return null; // Mock stream
+          }
+          
+          async stopMedia() {
+            addDebugLog('Mock media stopped', 'info');
+          }
+          
+          async dhtPut(key, _value, _options) {
+            addDebugLog(`Mock DHT PUT: ${key}`, 'info');
+            return true;
+          }
+          
+          async dhtGet(key, _options) {
+            addDebugLog(`Mock DHT GET: ${key}`, 'info');
+            return null;
+          }
+          
+          getDHTStats() {
+            return { entries: 0, peers: 0 };
+          }
+          
+          get distributedStorage() {
+            return {
+              store: async (key, _value, _options) => {
+                addDebugLog(`Mock storage STORE: ${key}`, 'info');
+                return true;
+              },
+              retrieve: async (key, _options) => {
+                addDebugLog(`Mock storage RETRIEVE: ${key}`, 'info');
+                return null;
+              },
+              getStats: async () => ({ items: 0, size: 0 })
+            };
+          }
+          
+          get cryptoManager() {
+            return {
+              init: async () => true,
+              getPublicKey: () => 'mock-public-key'
+            };
+          }
+        };
         
-        sendMessage(content) { 
-          addDebugLog(`Mock broadcast: ${JSON.stringify(content)}`, 'info');
-          return 'mock-message-id-' + Date.now(); 
-        }
+        const meshOptions = {
+          enableWebDHT: true,
+          enableCrypto: true,
+          enableDistributedStorage: true,
+          networkName: networkName.value,
+          allowGlobalFallback: allowGlobalFallback.value,
+          maxPeers: networkStatus.maxPeers,
+          minPeers: networkStatus.minPeers,
+          autoDiscovery: networkStatus.autoDiscovery,
+          evictionStrategy: networkStatus.evictionStrategy,
+          xorRouting: networkStatus.xorRouting,
+          ...options
+        };
         
-        sendDirectMessage(peerId, content) { 
-          addDebugLog(`Mock direct to ${peerId}: ${JSON.stringify(content)}`, 'info');
-          return 'mock-message-id-' + Date.now(); 
-        }
+        mesh.value = new MockPeerPigeonMesh(meshOptions);
+      } else {
+        // Use real PeerPigeonMesh
+        const meshOptions = {
+          enableWebDHT: true,
+          enableCrypto: true,
+          enableDistributedStorage: true,
+          networkName: networkName.value,
+          allowGlobalFallback: allowGlobalFallback.value,
+          maxPeers: networkStatus.maxPeers,
+          minPeers: networkStatus.minPeers,
+          autoDiscovery: networkStatus.autoDiscovery,
+          evictionStrategy: networkStatus.evictionStrategy,
+          xorRouting: networkStatus.xorRouting,
+          ...options
+        };
         
-        getStatus() { 
-          return { 
-            connectedCount: 0, 
-            maxPeers: networkStatus.maxPeers, 
-            minPeers: networkStatus.minPeers,
-            autoDiscovery: networkStatus.autoDiscovery,
-            evictionStrategy: networkStatus.evictionStrategy,
-            xorRouting: networkStatus.xorRouting
-          }; 
-        }
-        
-        async startMedia(options) {
-          addDebugLog(`Mock media started: ${JSON.stringify(options)}`, 'info');
-          return null; // Mock stream
-        }
-        
-        async stopMedia() {
-          addDebugLog('Mock media stopped', 'info');
-        }
-        
-        async dhtPut(key, _value, _options) {
-          addDebugLog(`Mock DHT PUT: ${key}`, 'info');
-          return true;
-        }
-        
-        async dhtGet(key, _options) {
-          addDebugLog(`Mock DHT GET: ${key}`, 'info');
-          return null;
-        }
-        
-        getDHTStats() {
-          return { entries: 0, peers: 0 };
-        }
-        
-        get distributedStorage() {
-          return {
-            store: async (key, _value, _options) => {
-              addDebugLog(`Mock storage STORE: ${key}`, 'info');
-              return true;
-            },
-            retrieve: async (key, _options) => {
-              addDebugLog(`Mock storage RETRIEVE: ${key}`, 'info');
-              return null;
-            },
-            getStats: async () => ({ items: 0, size: 0 })
-          };
-        }
-        
-        get cryptoManager() {
-          return {
-            init: async () => true,
-            getPublicKey: () => 'mock-public-key'
-          };
-        }
-      };
+        mesh.value = new PeerPigeonMeshClass(meshOptions);
+      }
       
-      const meshOptions = {
-        enableWebDHT: true,
-        enableCrypto: true,
-        enableDistributedStorage: true,
-        maxPeers: networkStatus.maxPeers,
-        minPeers: networkStatus.minPeers,
-        autoDiscovery: networkStatus.autoDiscovery,
-        evictionStrategy: networkStatus.evictionStrategy,
-        xorRouting: networkStatus.xorRouting,
-        ...options
-      };
-      
-      mesh.value = new MockPeerPigeonMesh(meshOptions);
       setupEventHandlers();
       
       await mesh.value.init();
       isInitialized.value = true;
       peerId.value = mesh.value.peerId;
+      
+      // Update network state from mesh
+      if (mesh.value.getNetworkName) {
+        networkName.value = mesh.value.getNetworkName();
+        originalNetworkName.value = mesh.value.getOriginalNetworkName();
+        isInFallbackMode.value = mesh.value.isUsingGlobalFallback();
+      }
       
       // Initialize crypto if enabled
       if (mesh.value.cryptoManager) {
@@ -190,7 +262,7 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
         cryptoState.publicKey = mesh.value.cryptoManager.getPublicKey();
       }
       
-      addDebugLog('Mesh initialized successfully', 'success');
+      addDebugLog(`Mesh initialized successfully in network: ${networkName.value}`, 'success');
       return true;
     } catch (error) {
       addDebugLog(`Failed to initialize mesh: ${error.message}`, 'error');
@@ -233,6 +305,23 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     // Connection events
     mesh.value.addEventListener('statusChanged', (event) => {
       addDebugLog(`Status: ${event.type} - ${event.message || ''}`, 'info');
+      
+      // Handle network-specific status changes
+      if (event.type === 'network') {
+        networkName.value = event.networkName || networkName.value;
+        isInFallbackMode.value = event.fallbackMode || false;
+        addDebugLog(`Network status: ${event.message}`, event.fallbackMode ? 'warning' : 'info');
+      }
+      
+      // Handle settings changes
+      if (event.type === 'setting') {
+        if (event.setting === 'networkName') {
+          networkName.value = event.value;
+        } else if (event.setting === 'allowGlobalFallback') {
+          allowGlobalFallback.value = event.value;
+        }
+      }
+      
       updateNetworkStatus();
     });
     
@@ -681,6 +770,57 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     }
     return false;
   };
+
+  // Network management methods
+  const setNetworkName = (name) => {
+    if (mesh.value && mesh.value.setNetworkName) {
+      const newName = mesh.value.setNetworkName(name);
+      networkName.value = newName;
+      originalNetworkName.value = mesh.value.getOriginalNetworkName();
+      isInFallbackMode.value = mesh.value.isUsingGlobalFallback();
+      addDebugLog(`Network changed to: ${newName}`, 'success');
+      return newName;
+    } else {
+      networkName.value = name || 'global';
+      originalNetworkName.value = networkName.value;
+      isInFallbackMode.value = false;
+      addDebugLog(`Network name set: ${networkName.value}`, 'info');
+      return networkName.value;
+    }
+  };
+
+  const getNetworkInfo = () => {
+    return {
+      currentNetwork: networkName.value,
+      originalNetwork: originalNetworkName.value,
+      isInFallbackMode: isInFallbackMode.value,
+      allowGlobalFallback: allowGlobalFallback.value
+    };
+  };
+
+  const setAllowGlobalFallback = (allow) => {
+    if (mesh.value && mesh.value.setAllowGlobalFallback) {
+      const result = mesh.value.setAllowGlobalFallback(allow);
+      allowGlobalFallback.value = result;
+      addDebugLog(`Global fallback ${allow ? 'enabled' : 'disabled'}`, 'success');
+      return result;
+    } else {
+      allowGlobalFallback.value = allow;
+      addDebugLog(`Global fallback setting: ${allow}`, 'info');
+      return allowGlobalFallback.value;
+    }
+  };
+
+  const forceReturnToOriginalNetwork = async () => {
+    if (mesh.value && mesh.value._tryReturnToOriginalNetwork) {
+      await mesh.value._tryReturnToOriginalNetwork();
+      networkName.value = mesh.value.getNetworkName();
+      isInFallbackMode.value = mesh.value.isUsingGlobalFallback();
+      addDebugLog('Attempted to return to original network', 'info');
+    } else {
+      addDebugLog('Force return to original network not available', 'warning');
+    }
+  };
   
   return {
     // State
@@ -689,6 +829,10 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     isConnected,
     signalingUrl,
     peerId,
+    networkName,
+    originalNetworkName,
+    isInFallbackMode,
+    allowGlobalFallback,
     peers,
     discoveredPeers,
     networkStatus,
@@ -728,6 +872,12 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     disableDebugModule,
     clearDebugLogs,
     addDebugLog,
+    
+    // Network management methods
+    setNetworkName,
+    getNetworkInfo,
+    setAllowGlobalFallback,
+    forceReturnToOriginalNetwork,
     
     // Crypto methods
     initializeCrypto,

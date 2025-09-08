@@ -5,6 +5,64 @@
       <p>Monitor mesh network topology, peer connections, and network health</p>
     </div>
 
+    <!-- Network Namespace Section -->
+    <div class="namespace-section">
+      <h3>Network Namespace</h3>
+      <div class="namespace-info">
+        <div class="current-network">
+          <div class="network-badge">
+            <span class="network-name">{{ store.networkName }}</span>
+            <span v-if="store.isInFallbackMode" class="fallback-indicator">Fallback Mode</span>
+          </div>
+          <div v-if="store.isInFallbackMode" class="original-network">
+            Original: {{ store.originalNetworkName }}
+          </div>
+        </div>
+        
+        <div class="namespace-controls">
+          <div class="network-switch">
+            <input 
+              v-model="newNetworkName" 
+              type="text" 
+              placeholder="Enter network name (e.g., 'gaming', 'work')"
+              class="network-input"
+              :disabled="isConnected"
+            />
+            <button 
+              @click="switchNetwork" 
+              :disabled="!newNetworkName.trim() || isConnected"
+              class="btn btn-primary btn-sm"
+            >
+              Switch
+            </button>
+          </div>
+          
+          <div class="quick-networks">
+            <button 
+              v-for="network in quickNetworks" 
+              :key="network"
+              @click="setQuickNetwork(network)"
+              :disabled="isConnected || store.networkName === network"
+              :class="['btn', 'btn-outline', 'btn-xs', { active: store.networkName === network }]"
+            >
+              {{ network }}
+            </button>
+          </div>
+          
+          <div class="fallback-setting">
+            <label class="checkbox-label">
+              <input 
+                type="checkbox" 
+                v-model="store.allowGlobalFallback"
+                @change="updateFallbackSetting"
+              />
+              Allow global fallback
+            </label>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Network Status Cards -->
     <div class="status-grid">
       <div class="status-card">
@@ -229,6 +287,10 @@ const connectionStartTime = ref(null);
 const uptimeInterval = ref(null);
 const connectionUptime = ref('00:00:00');
 
+// Network namespace state
+const newNetworkName = ref('');
+const quickNetworks = ['global', 'gaming', 'work', 'family', 'test'];
+
 // Computed properties
 const networkStatus = computed(() => store.networkStatus);
 const peers = computed(() => store.peers);
@@ -237,6 +299,24 @@ const connectedPeersList = computed(() => store.connectedPeersList);
 const canAcceptMorePeers = computed(() => store.canAcceptMorePeers);
 const peerId = computed(() => store.peerId);
 const isConnected = computed(() => store.isConnected);
+
+// Network namespace methods
+const switchNetwork = () => {
+  if (newNetworkName.value.trim()) {
+    store.setNetworkName(newNetworkName.value.trim());
+    store.addDebugLog(`Network set to: ${newNetworkName.value.trim()}`, 'success');
+    newNetworkName.value = '';
+  }
+};
+
+const setQuickNetwork = (network) => {
+  store.setNetworkName(network);
+  store.addDebugLog(`Quick switch to network: ${network}`, 'success');
+};
+
+const updateFallbackSetting = () => {
+  store.setAllowGlobalFallback(store.allowGlobalFallback);
+};
 
 // Methods
 const updateMaxPeers = () => {
@@ -702,5 +782,149 @@ onUnmounted(() => {
 .health-excellent {
   color: #22c55e;
   font-weight: 600;
+}
+
+/* Network Namespace Styles */
+.namespace-section {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 20px;
+  margin-bottom: 24px;
+}
+
+.namespace-section h3 {
+  margin: 0 0 16px 0;
+  color: #1e293b;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.namespace-info {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 20px;
+  align-items: start;
+}
+
+.current-network {
+  min-width: 200px;
+}
+
+.network-badge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.network-name {
+  background: #3b82f6;
+  color: white;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.fallback-indicator {
+  background: #f59e0b;
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.original-network {
+  color: #64748b;
+  font-size: 13px;
+}
+
+.namespace-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.network-switch {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.network-input {
+  flex: 1;
+  max-width: 300px;
+  padding: 8px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 14px;
+}
+
+.network-input:disabled {
+  background-color: #f3f4f6;
+  opacity: 0.6;
+}
+
+.quick-networks {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.fallback-setting {
+  display: flex;
+  align-items: center;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  color: #374151;
+}
+
+.checkbox-label input[type="checkbox"] {
+  margin: 0;
+}
+
+.btn-xs {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.btn-outline {
+  background: transparent;
+  border: 1px solid #d1d5db;
+  color: #374151;
+}
+
+.btn-outline:hover:not(:disabled) {
+  background: #f3f4f6;
+}
+
+.btn-outline.active {
+  background: #3b82f6;
+  border-color: #3b82f6;
+  color: white;
+}
+
+@media (max-width: 768px) {
+  .namespace-info {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  
+  .network-switch {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .network-input {
+    max-width: none;
+  }
 }
 </style>

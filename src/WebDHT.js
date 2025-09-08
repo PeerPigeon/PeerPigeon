@@ -103,21 +103,25 @@ export class WebDHT extends EventEmitter {
   }
 
   /**
-   * Store key-value pair
+   * Store key-value pair with network namespace support
    */
   async put(key, value) {
-    const keyHash = await this.hash(key);
+    // Add network namespace to the key to ensure network isolation
+    const namespacedKey = `${this.mesh.networkName}:${key}`;
+    const keyHash = await this.hash(namespacedKey);
     
     const storeData = {
-      key,
+      key: namespacedKey,
+      originalKey: key, // Store original key for retrieval
       value,
+      networkName: this.mesh.networkName,
       timestamp: Date.now(),
       publisher: this.peerId
     };
 
     // Always store locally first
-    this.storage.set(key, storeData);
-    this.debug.log(`PUT: Stored ${key} locally`);
+    this.storage.set(namespacedKey, storeData);
+    this.debug.log(`PUT: Stored ${key} locally in network ${this.mesh.networkName}`);
 
     // Find closest peers for replication
     const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
@@ -143,29 +147,30 @@ export class WebDHT extends EventEmitter {
     // Wait for all sends to complete
     await Promise.allSettled(replicationPromises);
     
-    this.debug.log(`PUT: ${key} replicated to ${targetPeers.length} peers`);
+    this.debug.log(`PUT: ${key} replicated to ${targetPeers.length} peers in network ${this.mesh.networkName}`);
     
     return true;
   }
 
   /**
-   * Retrieve value by key
+   * Retrieve value by key with network namespace support
    */
   async get(key, options = {}) {
     const forceRefresh = options.forceRefresh || false;
+    const namespacedKey = `${this.mesh.networkName}:${key}`;
     
     // Check local storage first (unless force refresh)
-    if (!forceRefresh && this.storage.has(key)) {
-      const data = this.storage.get(key);
-      this.debug.log(`GET: Found ${key} locally`);
+    if (!forceRefresh && this.storage.has(namespacedKey)) {
+      const data = this.storage.get(namespacedKey);
+      this.debug.log(`GET: Found ${key} locally in network ${this.mesh.networkName}`);
       return data.value;
     }
 
     // If not found locally or force refresh, query the network
-    const keyHash = await this.hash(key);
+    const keyHash = await this.hash(namespacedKey);
     const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
     
-    this.debug.log(`GET: Querying ${targetPeers.length} peers for ${key}: ${targetPeers.map(p => p.substring(0, 8)).join(', ')}`);
+    this.debug.log(`GET: Querying ${targetPeers.length} peers for ${key} in network ${this.mesh.networkName}`);
 
     // Query peers in parallel
     const queryPromises = targetPeers.map(async (peerId) => {
@@ -173,7 +178,7 @@ export class WebDHT extends EventEmitter {
       
       try {
         this.debug.log(`GET: Querying peer ${peerId.substring(0, 8)} for ${key}`);
-        const result = await this.queryPeer(peerId, key);
+        const result = await this.queryPeer(peerId, namespacedKey);
         this.debug.log(`GET: Peer ${peerId.substring(0, 8)} response for ${key}:`, result ? 'found' : 'not found');
         return result;
       } catch (error) {
@@ -190,9 +195,9 @@ export class WebDHT extends EventEmitter {
         const data = result.value;
         
         // Cache locally for future use
-        this.storage.set(key, data);
+        this.storage.set(namespacedKey, data);
         
-        this.debug.log(`GET: Found ${key} from network`);
+        this.debug.log(`GET: Found ${key} from network ${this.mesh.networkName}`);
         return data.value;
       }
     }
@@ -283,10 +288,17 @@ export class WebDHT extends EventEmitter {
   }
 
   /**
-   * Handle store request from peer
+   * Handle store request from peer with network filtering
    */
   handleStore(data, fromPeerId) {
-    const { key, value, timestamp, publisher } = data;
+    const { key, value, timestamp, publisher, networkName } = data;
+    
+    // Filter by network namespace
+    const messageNetwork = networkName || 'global';
+    if (messageNetwork !== this.mesh.networkName) {
+      this.debug.log(`Filtering DHT store from different network: ${messageNetwork} (current: ${this.mesh.networkName})`);
+      return;
+    }
     
     try {
       // Simple conflict resolution: latest timestamp wins

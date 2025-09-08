@@ -41,6 +41,8 @@ class PeerPigeonTestSuite {
                 enableWebDHT: true,
                 enableCrypto: true,
                 enableDistributedStorage: true, // Enable distributed storage
+                networkName: 'global', // Default network
+                allowGlobalFallback: true, // Allow fallback to global network
                 maxPeers: 3,
                 minPeers: 2,
                 autoConnect: true,
@@ -236,6 +238,23 @@ class PeerPigeonTestSuite {
 
         document.getElementById('force-connect-all-btn').addEventListener('click', () => {
             this.forceConnectAll();
+        });
+
+        // Network name controls
+        document.getElementById('network-name').addEventListener('change', (e) => {
+            this.setNetworkName(e.target.value);
+        });
+
+        document.getElementById('allow-global-fallback').addEventListener('change', (e) => {
+            this.setAllowGlobalFallback(e.checked);
+        });
+
+        // Quick network buttons
+        document.querySelectorAll('.network-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const networkName = e.target.dataset.network;
+                this.setNetworkName(networkName);
+            });
         });
     }
 
@@ -533,10 +552,26 @@ class PeerPigeonTestSuite {
             return;
         }
 
+        // Set network name before connecting
+        const networkName = document.getElementById('network-name').value.trim() || 'global';
+        const allowFallback = document.getElementById('allow-global-fallback').checked;
+        
         try {
-            this.log(`🔌 Connecting to ${url}...`);
+            // Apply network settings before connecting
+            if (this.mesh.setNetworkName) {
+                this.mesh.setNetworkName(networkName);
+                this.log(`🌐 Network set to: ${networkName}`);
+            }
+            
+            if (this.mesh.setAllowGlobalFallback) {
+                this.mesh.setAllowGlobalFallback(allowFallback);
+                this.log(`🔄 Global fallback ${allowFallback ? 'enabled' : 'disabled'}`);
+            }
+            
+            this.log(`🔌 Connecting to ${url} on network "${networkName}"...`);
             await this.mesh.connect(url);
             this.updateConnectionButtons(true);
+            this.updateNetworkStatus();
         } catch (error) {
             this.log(`❌ Connection failed: ${error.message}`, 'error');
         }
@@ -546,9 +581,74 @@ class PeerPigeonTestSuite {
         try {
             this.mesh.disconnect();
             this.updateConnectionButtons(false);
+            this.updateNetworkStatus();
             this.log('🔌 Disconnected from signaling server');
         } catch (error) {
             this.log(`❌ Disconnect error: ${error.message}`, 'error');
+        }
+    }
+
+    // Network Management
+    setNetworkName(networkName) {
+        if (!networkName || networkName.trim() === '') {
+            networkName = 'global';
+        }
+        
+        const trimmedName = networkName.trim();
+        
+        // Update the input field
+        document.getElementById('network-name').value = trimmedName;
+        
+        // Update network buttons active state
+        document.querySelectorAll('.network-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.network === trimmedName);
+        });
+        
+        // If disconnected, can change network name immediately
+        if (!this.mesh.connected) {
+            if (this.mesh.setNetworkName) {
+                this.mesh.setNetworkName(trimmedName);
+                this.log(`🌐 Network name set to: ${trimmedName}`);
+            }
+            this.updateNetworkStatus();
+        } else {
+            this.log(`⚠️ Disconnect first to change network from current network`, 'warning');
+        }
+    }
+
+    setAllowGlobalFallback(allow) {
+        if (this.mesh.setAllowGlobalFallback) {
+            this.mesh.setAllowGlobalFallback(allow);
+            this.log(`🔄 Global fallback ${allow ? 'enabled' : 'disabled'}`);
+        }
+        document.getElementById('allow-global-fallback').checked = allow;
+    }
+
+    updateNetworkStatus() {
+        const networkStatus = document.getElementById('network-status');
+        const currentNetworkEl = document.getElementById('current-network');
+        const fallbackIndicator = document.getElementById('fallback-indicator');
+        const originalNetworkInfo = document.getElementById('original-network-info');
+        const originalNetworkEl = document.getElementById('original-network');
+
+        if (this.mesh && this.mesh.getNetworkName) {
+            const currentNetwork = this.mesh.getNetworkName();
+            const originalNetwork = this.mesh.getOriginalNetworkName ? this.mesh.getOriginalNetworkName() : currentNetwork;
+            const isInFallback = this.mesh.isUsingGlobalFallback ? this.mesh.isUsingGlobalFallback() : false;
+
+            currentNetworkEl.textContent = currentNetwork;
+            fallbackIndicator.style.display = isInFallback ? 'inline' : 'none';
+            
+            if (isInFallback && originalNetwork !== currentNetwork) {
+                originalNetworkEl.textContent = originalNetwork;
+                originalNetworkInfo.style.display = 'block';
+            } else {
+                originalNetworkInfo.style.display = 'none';
+            }
+            
+            networkStatus.style.display = this.mesh.connected ? 'block' : 'none';
+        } else {
+            networkStatus.style.display = 'none';
         }
     }
 
@@ -1498,6 +1598,7 @@ class PeerPigeonTestSuite {
     handleStatusChange(data) {
         this.updatePeerInfo();
         this.updateNetworkInfo();
+        this.updateNetworkStatus();
         
         switch (data.type) {
             case 'connected':
@@ -1513,6 +1614,17 @@ class PeerPigeonTestSuite {
                 break;
             case 'error':
                 this.log(`❌ ${data.message}`, 'error');
+                break;
+            case 'network':
+                this.log(`🌐 Network: ${data.message}`, data.fallbackMode ? 'warning' : 'info');
+                if (data.fallbackMode) {
+                    this.log(`⚠️ Switched to global fallback from ${data.originalNetwork}`, 'warning');
+                }
+                break;
+            case 'setting':
+                if (data.setting === 'networkName') {
+                    this.log(`🌐 Network name changed to: ${data.value}`, 'info');
+                }
                 break;
         }
     }
