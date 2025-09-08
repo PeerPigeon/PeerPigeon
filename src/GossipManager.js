@@ -56,6 +56,7 @@ export class GossipManager extends EventEmitter {
       subtype: messageType,
       content,
       from: this.mesh.peerId,
+      networkName: this.mesh.networkName, // Include network namespace
       timestamp: Date.now(),
       ttl: this.maxTTL,
       path: [this.mesh.peerId] // Track propagation path
@@ -114,6 +115,7 @@ export class GossipManager extends EventEmitter {
       content,
       from: this.mesh.peerId,
       to: targetPeerId,
+      networkName: this.mesh.networkName, // Include network namespace
       timestamp: Date.now(),
       ttl: this.maxTTL,
       path: [this.mesh.peerId]
@@ -136,11 +138,20 @@ export class GossipManager extends EventEmitter {
     this.debug.log(`🔥🔥🔥 GOSSIP MESSAGE RECEIVED! From: ${fromPeerId?.substring(0, 8)}...`);
     this.debug.log('🔥🔥🔥 Message:', message);
 
-    const { id: messageId, ttl, from: originPeerId, subtype, content, timestamp, path, to } = message;
+    const { id: messageId, ttl, from: originPeerId, subtype, content, timestamp, path, to, networkName } = message;
 
     // Validate message structure
     if (!messageId || !originPeerId || !subtype || content === undefined) {
       this.debug.error('Invalid gossip message structure:', message);
+      return;
+    }
+
+    // Filter messages by network namespace
+    const messageNetwork = networkName || 'global';
+    const currentNetwork = this.mesh.networkName;
+    
+    if (messageNetwork !== currentNetwork) {
+      this.debug.log(`Filtering gossip message from different network: ${messageNetwork} (current: ${currentNetwork})`);
       return;
     }
 

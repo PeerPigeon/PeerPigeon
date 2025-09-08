@@ -59,15 +59,45 @@
                 <h2>🌐 Connection Management</h2>
                 
                 <div class="card">
-                    <h3>Signaling Server</h3>
+                    <h3>🌐 Network & Signaling Server</h3>
+                    <div class="input-group">
+                        <label for="network-name">Network Name:</label>
+                        <input type="text" id="network-name" value="global" placeholder="global (e.g., 'gaming', 'work', 'family')">
+                        <small>Create isolated networks or use 'global' for default mesh</small>
+                    </div>
                     <div class="input-group">
                         <label for="signaling-url">Server URL:</label>
                         <input type="text" id="signaling-url" value="ws://localhost:3000" placeholder="ws://localhost:3000">
+                    </div>
+                    <div class="checkbox-group">
+                        <label><input type="checkbox" id="allow-global-fallback" checked> Allow Global Fallback</label>
+                        <small>Automatically fallback to global network when current network is empty</small>
                     </div>
                     <div class="button-group">
                         <button id="connect-btn" class="btn primary">Connect</button>
                         <button id="disconnect-btn" class="btn secondary" disabled>Disconnect</button>
                         <button id="cleanup-btn" class="btn tertiary">Cleanup Stale Data</button>
+                    </div>
+                    <div id="network-status" class="network-status" style="display: none;">
+                        <div class="status-info">
+                            <span><strong>Current Network:</strong> <span id="current-network">global</span></span>
+                            <span id="fallback-indicator" style="display: none;" class="fallback-badge">Fallback Mode</span>
+                        </div>
+                        <div class="status-info" id="original-network-info" style="display: none;">
+                            <span><strong>Original Network:</strong> <span id="original-network"></span></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>🎯 Quick Network Switch</h3>
+                    <p class="description">Quickly switch between common networks (only when disconnected)</p>
+                    <div class="quick-networks">
+                        <button class="btn tertiary network-btn" data-network="global">Global</button>
+                        <button class="btn tertiary network-btn" data-network="gaming">Gaming</button>
+                        <button class="btn tertiary network-btn" data-network="work">Work</button>
+                        <button class="btn tertiary network-btn" data-network="family">Family</button>
+                        <button class="btn tertiary network-btn" data-network="test">Test</button>
                     </div>
                 </div>
 

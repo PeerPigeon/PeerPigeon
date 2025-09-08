@@ -73,12 +73,13 @@ export class SignalingClient extends EventEmitter {
       type: message.type,
       data: message.data,
       maxPeers: this.maxPeers,
+      networkName: this.mesh ? this.mesh.networkName : 'global', // Include network namespace
       ...(message.targetPeerId && { targetPeerId: message.targetPeerId })
     };
 
     try {
       this.websocket.send(JSON.stringify(payload));
-      this.debug.log('Sent WebSocket message:', payload.type);
+      this.debug.log(`Sent WebSocket message: ${payload.type} (network: ${payload.networkName})`);
       return { success: true };
     } catch (error) {
       this.debug.error('Failed to send WebSocket message:', error);
@@ -170,14 +171,22 @@ export class SignalingClient extends EventEmitter {
         this.websocket.onmessage = (event) => {
           try {
             const message = JSON.parse(event.data);
-            this.debug.log('Received WebSocket message:', message.type);
+            this.debug.log(`Received WebSocket message: ${message.type} (network: ${message.networkName || 'unknown'})`);
 
             if (message.type === 'connected') {
               // Connection confirmation from server
               this.debug.log('WebSocket connection confirmed by server');
             } else {
-              // Forward signaling message to mesh
-              this.emit('signalingMessage', message);
+              // Filter messages by network namespace
+              const currentNetwork = this.mesh ? this.mesh.networkName : 'global';
+              const messageNetwork = message.networkName || 'global';
+              
+              if (messageNetwork === currentNetwork) {
+                // Forward signaling message to mesh
+                this.emit('signalingMessage', message);
+              } else {
+                this.debug.log(`Filtered message from different network: ${messageNetwork} (current: ${currentNetwork})`);
+              }
             }
           } catch (error) {
             this.debug.error('Failed to parse WebSocket message:', error);

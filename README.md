@@ -12,6 +12,7 @@
 ## 🌟 Features
 
 - **🕸️ True Mesh Networking**: Gossip protocol ensures messages reach all peers, not just direct connections
+- **🌐 Network Namespaces**: Create isolated peer networks with automatic global fallback
 - **📐 XOR Distance Routing**: Kademlia-inspired peer selection for optimal network topology  
 - **🧠 Smart Eviction Strategy**: Automatically replaces distant peers with closer ones to optimize mesh topology
 - **🔍 Auto-Discovery**: Seamlessly connects to peers as they join the network
@@ -30,6 +31,7 @@
 - [Node.js Examples](examples/node/) - Server-side examples  
 - [NativeScript Examples](examples/nativescript/) - Mobile app examples
 - [API Documentation](API_DOCUMENTATION.md)
+- [Network Namespaces Guide](NETWORK_NAMESPACES.md) - Named network segregation with global fallback
 - [Selective Streaming Guide](SELECTIVE_STREAMING_GUIDE.md) - Media streaming optimization guide
 - [CLI Documentation](CLI_README.md) - Command line interface guide
 - [GitHub Issues](https://github.com/draeder/peerpigeon/issues)

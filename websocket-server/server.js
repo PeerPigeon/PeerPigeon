@@ -14,7 +14,8 @@ const HOST = process.env.HOST || 'localhost';
 
 // In-memory storage for connections and peer data
 const connections = new Map(); // peerId -> WebSocket connection
-const peerData = new Map(); // peerId -> { peerId, timestamp, data }
+const peerData = new Map(); // peerId -> { peerId, networkName, timestamp, data }
+const networkPeers = new Map(); // networkName -> Set of peerIds
 
 // Utility functions
 function validatePeerId(peerId) {
@@ -44,13 +45,20 @@ function findClosestPeers(targetPeerId, allPeerIds, maxPeers = 3) {
   return distances.slice(0, maxPeers).map(item => item.peerId);
 }
 
-function getActivePeers(excludePeerId = null) {
+function getActivePeers(excludePeerId = null, networkName = 'global') {
   const peers = [];
   const stalePeers = [];
 
-  for (const [peerId, connection] of connections) {
+  // Get peers for the specific network
+  const networkPeerSet = networkPeers.get(networkName);
+  if (!networkPeerSet) {
+    return peers; // No peers in this network
+  }
+
+  for (const peerId of networkPeerSet) {
     if (peerId !== excludePeerId) {
-      if (connection.readyState === WebSocket.OPEN && isConnectionAlive(connection)) {
+      const connection = connections.get(peerId);
+      if (connection && connection.readyState === WebSocket.OPEN && isConnectionAlive(connection)) {
         peers.push(peerId);
       } else {
         // Mark stale connections for cleanup
@@ -62,8 +70,7 @@ function getActivePeers(excludePeerId = null) {
   // Clean up stale connections
   stalePeers.forEach(peerId => {
     console.log(`🧹 Cleaning up stale connection: ${peerId.substring(0, 8)}...`);
-    connections.delete(peerId);
-    peerData.delete(peerId);
+    cleanupPeer(peerId);
   });
 
   return peers;
@@ -100,31 +107,50 @@ function sendToConnection(peerId, data) {
 
 function cleanupPeer(peerId) {
   const wasConnected = connections.has(peerId);
+  const peerInfo = peerData.get(peerId);
+  
   connections.delete(peerId);
   peerData.delete(peerId);
+  
+  // Remove from network tracking
+  if (peerInfo && peerInfo.networkName) {
+    const networkPeerSet = networkPeers.get(peerInfo.networkName);
+    if (networkPeerSet) {
+      networkPeerSet.delete(peerId);
+      // Clean up empty network sets
+      if (networkPeerSet.size === 0) {
+        networkPeers.delete(peerInfo.networkName);
+      }
+    }
+  }
 
   if (wasConnected) {
-    console.log(`🧹 Cleaned up peer: ${peerId.substring(0, 8)}...`);
+    console.log(`🧹 Cleaned up peer: ${peerId.substring(0, 8)}... from network: ${peerInfo?.networkName || 'unknown'}`);
 
-    // Notify other peers about disconnection
-    const activePeers = getActivePeers();
-    activePeers.forEach(otherPeerId => {
-      sendToConnection(otherPeerId, {
-        type: 'peer-disconnected',
-        data: { peerId },
-        fromPeerId: 'system',
-        targetPeerId: otherPeerId,
-        timestamp: Date.now()
+    // Notify other peers in the same network about disconnection
+    if (peerInfo && peerInfo.networkName) {
+      const activePeers = getActivePeers(null, peerInfo.networkName);
+      activePeers.forEach(otherPeerId => {
+        sendToConnection(otherPeerId, {
+          type: 'peer-disconnected',
+          data: { peerId },
+          networkName: peerInfo.networkName,
+          fromPeerId: 'system',
+          targetPeerId: otherPeerId,
+          timestamp: Date.now()
+        });
       });
-    });
+    }
   }
 }
 
 function broadcastToClosestPeers(fromPeerId, message, maxPeers = 5) {
-  const activePeers = getActivePeers(fromPeerId);
+  const peerInfo = peerData.get(fromPeerId);
+  const networkName = peerInfo?.networkName || 'global';
+  const activePeers = getActivePeers(fromPeerId, networkName);
   const closestPeers = findClosestPeers(fromPeerId, activePeers, maxPeers);
 
-  console.log(`Broadcasting from ${fromPeerId} to ${closestPeers.length} closest peers`);
+  console.log(`Broadcasting from ${fromPeerId.substring(0, 8)}... to ${closestPeers.length} closest peers in network: ${networkName}`);
 
   closestPeers.forEach(peerId => {
     sendToConnection(peerId, message);
@@ -146,11 +172,16 @@ console.log('🚀 Starting PeerPigeon WebSocket server...');
 // Periodic cleanup of stale connections
 setInterval(() => {
   const totalConnections = connections.size;
-  getActivePeers(); // This will clean up stale connections
+  
+  // Clean up all networks
+  for (const [networkName] of networkPeers) {
+    getActivePeers(null, networkName); // This will clean up stale connections
+  }
+  
   const cleanedUp = totalConnections - connections.size;
 
   if (cleanedUp > 0) {
-    console.log(`🧹 Periodic cleanup: removed ${cleanedUp} stale connections, ${connections.size} active`);
+    console.log(`🧹 Periodic cleanup: removed ${cleanedUp} stale connections, ${connections.size} active across ${networkPeers.size} networks`);
   }
 }, 30000); // Clean up every 30 seconds
 
@@ -210,31 +241,42 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data) => {
     try {
       const message = JSON.parse(data);
-      const { type, data: messageData, targetPeerId } = message;
+      const { type, data: messageData, targetPeerId, networkName } = message;
 
-      console.log(`📨 Received ${type} from ${peerId.substring(0, 8)}...`);
+      console.log(`📨 Received ${type} from ${peerId.substring(0, 8)}... in network: ${networkName || 'global'}`);
 
       const responseMessage = {
         type,
         data: messageData,
         fromPeerId: peerId,
         targetPeerId,
+        networkName: networkName || 'global', // Include network name in forwarded messages
         timestamp: Date.now()
       };
 
       // Handle different message types - SIGNALING ONLY
       switch (type) {
         case 'announce': {
+          // Extract network name from the message
+          const peerNetworkName = networkName || 'global';
+          
           // Handle peer announcement
           peerData.set(peerId, {
             peerId,
+            networkName: peerNetworkName,
             timestamp: Date.now(),
             data: messageData,
             connected: true
           });
 
-          // Get active peers with immediate validation
-          const activePeers = getActivePeers(peerId);
+          // Add peer to network tracking
+          if (!networkPeers.has(peerNetworkName)) {
+            networkPeers.set(peerNetworkName, new Set());
+          }
+          networkPeers.get(peerNetworkName).add(peerId);
+
+          // Get active peers in the same network
+          const activePeers = getActivePeers(peerId, peerNetworkName);
 
           // Double-check each active peer with a quick ping test
           const validatedPeers = [];
@@ -248,13 +290,14 @@ wss.on('connection', (ws, req) => {
             }
           }
 
-          console.log(`📢 Announcing ${peerId.substring(0, 8)}... to ${validatedPeers.length} validated peers`);
+          console.log(`📢 Announcing ${peerId.substring(0, 8)}... to ${validatedPeers.length} validated peers in network: ${peerNetworkName}`);
 
           // Send peer-discovered messages to validated peers only
           validatedPeers.forEach(otherPeerId => {
             sendToConnection(otherPeerId, {
               type: 'peer-discovered',
               data: { peerId, ...messageData },
+              networkName: peerNetworkName,
               fromPeerId: 'system',
               targetPeerId: otherPeerId,
               timestamp: Date.now()
@@ -267,6 +310,7 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({
               type: 'peer-discovered',
               data: { peerId: existingPeerId, ...existingPeerData?.data },
+              networkName: peerNetworkName,
               fromPeerId: 'system',
               targetPeerId: peerId,
               timestamp: Date.now()
@@ -276,9 +320,9 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'goodbye': {
-          // Handle peer disconnect
-          peerData.delete(peerId);
+          // Handle peer disconnect - broadcast before deleting peer data
           broadcastToClosestPeers(peerId, responseMessage);
+          peerData.delete(peerId);
           break;
         }
 
@@ -292,17 +336,28 @@ wss.on('connection', (ws, req) => {
               fromPeerId: peerId?.substring(0, 8) + '...',
               targetPeerId: targetPeerId?.substring(0, 8) + '...',
               hasTargetPeerId: !!targetPeerId,
-              hasData: !!messageData
+              hasData: !!messageData,
+              networkName: networkName || 'global'
             });
           }
 
           // Handle WebRTC signaling - this is the server's primary purpose
           if (targetPeerId) {
+            // CRITICAL: Validate that both peers are in the same network
+            const senderNetwork = networkName || 'global';
+            const targetPeerData = peerData.get(targetPeerId);
+            const targetNetwork = targetPeerData?.networkName || 'global';
+            
+            if (senderNetwork !== targetNetwork) {
+              console.log(`🚫 Blocking ${type} from ${peerId.substring(0, 8)}... (network: ${senderNetwork}) to ${targetPeerId.substring(0, 8)}... (network: ${targetNetwork}) - different networks`);
+              break;
+            }
+            
             const success = sendToSpecificPeer(targetPeerId, responseMessage);
             if (!success) {
               console.log(`⚠️  Failed to send ${type} to ${targetPeerId.substring(0, 8)}... (peer not found)`);
             } else if (type === 'answer') {
-              console.log(`✅ WEBSOCKET DEBUG: Answer successfully routed to ${targetPeerId.substring(0, 8)}...`);
+              console.log(`✅ WEBSOCKET DEBUG: Answer successfully routed to ${targetPeerId.substring(0, 8)}... (same network: ${senderNetwork})`);
             }
           } else {
             console.log(`⚠️  ${type} message missing targetPeerId`);
@@ -357,6 +412,7 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, HOST, () => {
   console.log(`🌐 PeerPigeon WebSocket server running on ws://${HOST}:${PORT}`);
   console.log('📝 Usage: Connect with ?peerId=<40-char-hex-id>');
+  console.log('🌐 Supporting network namespaces for isolated peer groups');
   console.log('📊 Ready to handle peer connections...');
 });
 

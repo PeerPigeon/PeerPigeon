@@ -911,3 +911,88 @@ footer {
     font-family: monospace;
     font-size: 0.9rem;
 }
+
+/* Network Management Styles */
+.network-status {
+    background: var(--success-color);
+    color: white;
+    padding: 12px 16px;
+    border-radius: var(--radius);
+    margin: 15px 0;
+    font-weight: 500;
+}
+
+.network-status .status-info {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    flex-wrap: wrap;
+}
+
+.network-status #fallback-indicator {
+    background: var(--warning-color);
+    color: white;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-left: 8px;
+}
+
+.quick-networks {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+}
+
+.network-btn {
+    min-width: 80px;
+    position: relative;
+    transition: all 0.2s ease;
+}
+
+.network-btn.active {
+    background: var(--primary-color) !important;
+    color: white !important;
+    border-color: var(--primary-color) !important;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(37, 99, 235, 0.3);
+}
+
+.network-btn.active::after {
+    content: '✓';
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    background: var(--success-color);
+    color: white;
+    border-radius: 50%;
+    width: 18px;
+    height: 18px;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+}
+
+.network-btn:hover:not(.active) {
+    background: var(--border-color);
+    transform: translateY(-1px);
+}
+
+.network-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+}
+
+#original-network-info {
+    background: var(--warning-color);
+    color: white;
+    padding: 8px 12px;
+    border-radius: 4px;
+    margin-top: 8px;
+    font-size: 0.9rem;
+}

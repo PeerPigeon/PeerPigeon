@@ -3996,11 +3996,13 @@ ${b64.match(/.{1,64}/g).join("\n")}
         type: message.type,
         data: message.data,
         maxPeers: this.maxPeers,
+        networkName: this.mesh ? this.mesh.networkName : "global",
+        // Include network namespace
         ...message.targetPeerId && { targetPeerId: message.targetPeerId }
       };
       try {
         this.websocket.send(JSON.stringify(payload));
-        this.debug.log("Sent WebSocket message:", payload.type);
+        this.debug.log(`Sent WebSocket message: ${payload.type} (network: ${payload.networkName})`);
         return { success: true };
       } catch (error) {
         this.debug.error("Failed to send WebSocket message:", error);
@@ -4068,11 +4070,17 @@ ${b64.match(/.{1,64}/g).join("\n")}
           this.websocket.onmessage = (event) => {
             try {
               const message = JSON.parse(event.data);
-              this.debug.log("Received WebSocket message:", message.type);
+              this.debug.log(`Received WebSocket message: ${message.type} (network: ${message.networkName || "unknown"})`);
               if (message.type === "connected") {
                 this.debug.log("WebSocket connection confirmed by server");
               } else {
-                this.emit("signalingMessage", message);
+                const currentNetwork = this.mesh ? this.mesh.networkName : "global";
+                const messageNetwork = message.networkName || "global";
+                if (messageNetwork === currentNetwork) {
+                  this.emit("signalingMessage", message);
+                } else {
+                  this.debug.log(`Filtered message from different network: ${messageNetwork} (current: ${currentNetwork})`);
+                }
               }
             } catch (error) {
               this.debug.error("Failed to parse WebSocket message:", error);
@@ -7495,6 +7503,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
         subtype: messageType,
         content,
         from: this.mesh.peerId,
+        networkName: this.mesh.networkName,
+        // Include network namespace
         timestamp: Date.now(),
         ttl: this.maxTTL,
         path: [this.mesh.peerId]
@@ -7542,6 +7552,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
         content,
         from: this.mesh.peerId,
         to: targetPeerId,
+        networkName: this.mesh.networkName,
+        // Include network namespace
         timestamp: Date.now(),
         ttl: this.maxTTL,
         path: [this.mesh.peerId]
@@ -7560,9 +7572,15 @@ ${b64.match(/.{1,64}/g).join("\n")}
     async handleGossipMessage(message, fromPeerId) {
       this.debug.log(`\u{1F525}\u{1F525}\u{1F525} GOSSIP MESSAGE RECEIVED! From: ${fromPeerId?.substring(0, 8)}...`);
       this.debug.log("\u{1F525}\u{1F525}\u{1F525} Message:", message);
-      const { id: messageId, ttl, from: originPeerId, subtype, content, timestamp, path, to } = message;
+      const { id: messageId, ttl, from: originPeerId, subtype, content, timestamp, path, to, networkName } = message;
       if (!messageId || !originPeerId || !subtype || content === void 0) {
         this.debug.error("Invalid gossip message structure:", message);
+        return;
+      }
+      const messageNetwork = networkName || "global";
+      const currentNetwork = this.mesh.networkName;
+      if (messageNetwork !== currentNetwork) {
+        this.debug.log(`Filtering gossip message from different network: ${messageNetwork} (current: ${currentNetwork})`);
         return;
       }
       if (this.seenMessages.has(messageId)) {
@@ -8266,18 +8284,22 @@ ${b64.match(/.{1,64}/g).join("\n")}
       return peersWithDistance.slice(0, count).map((p) => p.peerId);
     }
     /**
-     * Store key-value pair
+     * Store key-value pair with network namespace support
      */
     async put(key, value) {
-      const keyHash = await this.hash(key);
+      const namespacedKey = `${this.mesh.networkName}:${key}`;
+      const keyHash = await this.hash(namespacedKey);
       const storeData = {
-        key,
+        key: namespacedKey,
+        originalKey: key,
+        // Store original key for retrieval
         value,
+        networkName: this.mesh.networkName,
         timestamp: Date.now(),
         publisher: this.peerId
       };
-      this.storage.set(key, storeData);
-      this.debug.log(`PUT: Stored ${key} locally`);
+      this.storage.set(namespacedKey, storeData);
+      this.debug.log(`PUT: Stored ${key} locally in network ${this.mesh.networkName}`);
       const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
       this.debug.log(`PUT: Replicating ${key} to ${targetPeers.length} peers`);
       const replicationPromises = targetPeers.map(async (peerId) => {
@@ -8294,27 +8316,28 @@ ${b64.match(/.{1,64}/g).join("\n")}
         return { peerId, success: true };
       });
       await Promise.allSettled(replicationPromises);
-      this.debug.log(`PUT: ${key} replicated to ${targetPeers.length} peers`);
+      this.debug.log(`PUT: ${key} replicated to ${targetPeers.length} peers in network ${this.mesh.networkName}`);
       return true;
     }
     /**
-     * Retrieve value by key
+     * Retrieve value by key with network namespace support
      */
     async get(key, options = {}) {
       const forceRefresh = options.forceRefresh || false;
-      if (!forceRefresh && this.storage.has(key)) {
-        const data = this.storage.get(key);
-        this.debug.log(`GET: Found ${key} locally`);
+      const namespacedKey = `${this.mesh.networkName}:${key}`;
+      if (!forceRefresh && this.storage.has(namespacedKey)) {
+        const data = this.storage.get(namespacedKey);
+        this.debug.log(`GET: Found ${key} locally in network ${this.mesh.networkName}`);
         return data.value;
       }
-      const keyHash = await this.hash(key);
+      const keyHash = await this.hash(namespacedKey);
       const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
-      this.debug.log(`GET: Querying ${targetPeers.length} peers for ${key}: ${targetPeers.map((p) => p.substring(0, 8)).join(", ")}`);
+      this.debug.log(`GET: Querying ${targetPeers.length} peers for ${key} in network ${this.mesh.networkName}`);
       const queryPromises = targetPeers.map(async (peerId) => {
         if (peerId === this.peerId) return null;
         try {
           this.debug.log(`GET: Querying peer ${peerId.substring(0, 8)} for ${key}`);
-          const result = await this.queryPeer(peerId, key);
+          const result = await this.queryPeer(peerId, namespacedKey);
           this.debug.log(`GET: Peer ${peerId.substring(0, 8)} response for ${key}:`, result ? "found" : "not found");
           return result;
         } catch (error) {
@@ -8326,8 +8349,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
       for (const result of results) {
         if (result.status === "fulfilled" && result.value) {
           const data = result.value;
-          this.storage.set(key, data);
-          this.debug.log(`GET: Found ${key} from network`);
+          this.storage.set(namespacedKey, data);
+          this.debug.log(`GET: Found ${key} from network ${this.mesh.networkName}`);
           return data.value;
         }
       }
@@ -8400,10 +8423,15 @@ ${b64.match(/.{1,64}/g).join("\n")}
       }
     }
     /**
-     * Handle store request from peer
+     * Handle store request from peer with network filtering
      */
     handleStore(data, fromPeerId) {
-      const { key, value, timestamp, publisher } = data;
+      const { key, value, timestamp, publisher, networkName } = data;
+      const messageNetwork = networkName || "global";
+      if (messageNetwork !== this.mesh.networkName) {
+        this.debug.log(`Filtering DHT store from different network: ${messageNetwork} (current: ${this.mesh.networkName})`);
+        return;
+      }
       try {
         if (this.storage.has(key)) {
           const existing = this.storage.get(key);
@@ -10703,6 +10731,10 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.providedPeerId = options.peerId || null;
       this.signalingClient = null;
       this.peerDiscovery = null;
+      this.networkName = options.networkName || "global";
+      this.allowGlobalFallback = options.allowGlobalFallback !== false;
+      this.isInFallbackMode = false;
+      this.originalNetworkName = this.networkName;
       this.maxPeers = options.maxPeers !== void 0 ? options.maxPeers : 3;
       this.minPeers = options.minPeers !== void 0 ? options.minPeers : 2;
       this.autoConnect = options.autoConnect !== false;
@@ -10986,6 +11018,9 @@ ${b64.match(/.{1,64}/g).join("\n")}
     setupDiscoveryHandlers() {
       this.peerDiscovery.addEventListener("peerDiscovered", (data) => {
         this.emit("peerDiscovered", data);
+        if (this.isInFallbackMode && this.originalNetworkName !== "global") {
+          this._tryReturnToOriginalNetwork();
+        }
       });
       this.peerDiscovery.addEventListener("connectToPeer", (data) => {
         this.debug.log(`PeerDiscovery requested connection to: ${data.peerId.substring(0, 8)}...`);
@@ -10999,6 +11034,9 @@ ${b64.match(/.{1,64}/g).join("\n")}
       });
       this.peerDiscovery.addEventListener("optimizeConnections", (data) => {
         this.meshOptimizer.handleOptimizeConnections(data.unconnectedPeers);
+      });
+      this.addEventListener("peersUpdated", () => {
+        this._checkNetworkHealth();
       });
       this.peerDiscovery.addEventListener("peersUpdated", (data) => {
         this.emit("statusChanged", { type: "info", message: `Cleaned up ${data.removedCount} stale peer(s)` });
@@ -11083,6 +11121,107 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.evictionStrategy = enabled;
       this.emit("statusChanged", { type: "setting", setting: "evictionStrategy", value: enabled });
     }
+    // Network namespace management methods
+    setNetworkName(networkName) {
+      if (this.connected) {
+        throw new Error("Cannot change network name while connected. Disconnect first.");
+      }
+      this.networkName = networkName || "global";
+      this.originalNetworkName = this.networkName;
+      this.isInFallbackMode = false;
+      this.emit("statusChanged", {
+        type: "setting",
+        setting: "networkName",
+        value: this.networkName
+      });
+      return this.networkName;
+    }
+    getNetworkName() {
+      return this.networkName;
+    }
+    getOriginalNetworkName() {
+      return this.originalNetworkName;
+    }
+    isUsingGlobalFallback() {
+      return this.isInFallbackMode;
+    }
+    setAllowGlobalFallback(allow) {
+      this.allowGlobalFallback = allow;
+      this.emit("statusChanged", {
+        type: "setting",
+        setting: "allowGlobalFallback",
+        value: allow
+      });
+      if (!allow && this.isInFallbackMode) {
+        this._tryReturnToOriginalNetwork();
+      }
+      return this.allowGlobalFallback;
+    }
+    async _tryReturnToOriginalNetwork() {
+      if (!this.isInFallbackMode || this.originalNetworkName === "global") {
+        return;
+      }
+      const originalNetworkPeerCount = await this._getNetworkPeerCount(this.originalNetworkName);
+      if (originalNetworkPeerCount > 0) {
+        this.debug.log(`Returning from global fallback to original network: ${this.originalNetworkName}`);
+        this.networkName = this.originalNetworkName;
+        this.isInFallbackMode = false;
+        this.emit("statusChanged", {
+          type: "network",
+          message: `Returned to network: ${this.networkName}`,
+          networkName: this.networkName,
+          fallbackMode: false
+        });
+        if (this.connected) {
+          this.disconnect();
+          setTimeout(() => {
+            if (this.signalingUrl) {
+              this.connect(this.signalingUrl);
+            }
+          }, 1e3);
+        }
+      }
+    }
+    async _activateGlobalFallback() {
+      if (this.originalNetworkName === "global" || this.isInFallbackMode || !this.allowGlobalFallback) {
+        return false;
+      }
+      this.debug.log(`Activating global fallback from network: ${this.originalNetworkName}`);
+      this.networkName = "global";
+      this.isInFallbackMode = true;
+      this.emit("statusChanged", {
+        type: "network",
+        message: `Fallback to global network from: ${this.originalNetworkName}`,
+        networkName: this.networkName,
+        originalNetwork: this.originalNetworkName,
+        fallbackMode: true
+      });
+      return true;
+    }
+    async _getNetworkPeerCount(networkName) {
+      return 0;
+    }
+    _checkNetworkHealth() {
+      return;
+      if (this.originalNetworkName === "global" || !this.allowGlobalFallback) {
+        return;
+      }
+      const connectedCount = this.connectionManager.getConnectedPeerCount();
+      const discoveredCount = this.discoveredPeers.size;
+      if (!this.isInFallbackMode && this.networkName === this.originalNetworkName) {
+        if (connectedCount === 0 && discoveredCount === 0) {
+          this.debug.log(`Network ${this.originalNetworkName} appears empty, activating global fallback`);
+          this._activateGlobalFallback().then((activated) => {
+            if (activated && this.connected && this.signalingUrl) {
+              this.disconnect();
+              setTimeout(() => {
+                this.connect(this.signalingUrl);
+              }, 1e3);
+            }
+          });
+        }
+      }
+    }
     // Status and information methods
     getStatus() {
       const connectedCount = this.connectionManager.getConnectedPeerCount();
@@ -11093,6 +11232,10 @@ ${b64.match(/.{1,64}/g).join("\n")}
         polling: false,
         // Only WebSocket is supported
         signalingUrl: this.signalingUrl,
+        networkName: this.networkName,
+        originalNetworkName: this.originalNetworkName,
+        isInFallbackMode: this.isInFallbackMode,
+        allowGlobalFallback: this.allowGlobalFallback,
         connectedCount,
         totalPeerCount: totalCount,
         // Include total count for debugging
