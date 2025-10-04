@@ -23,6 +23,7 @@
     "dev:http": "node dev-server.js",
     "start": "node websocket-server/server.js",
     "server": "node websocket-server/server.js",
+    "hub": "node scripts/start-hub.js",
     "lint": "node -c src/*.js examples/**/*.js websocket-server/*.js",
     "lint:fix": "eslint --cache --cache-location .eslintcache src/ examples/ websocket-server/ --ext .js --fix",
     "test": "node test/browser-integration-test.js",

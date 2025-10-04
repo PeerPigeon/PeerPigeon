@@ -1,7 +1,8 @@
 // PeerPigeon WebSocket Server - Node.js module
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import { EventEmitter } from 'events';
+import { URL } from 'url';
 
 /**
  * PeerPigeon WebSocket signaling server
@@ -14,29 +15,167 @@ export class PeerPigeonServer extends EventEmitter {
         this.port = options.port || 3000;
         this.host = options.host || 'localhost';
         this.maxConnections = options.maxConnections || 1000;
-        this.cleanupInterval = options.cleanupInterval || 60000; // 1 minute
+        this.cleanupInterval = options.cleanupInterval || 30000; // 30 seconds
         this.peerTimeout = options.peerTimeout || 300000; // 5 minutes
         this.corsOrigin = options.corsOrigin || '*';
         this.maxMessageSize = options.maxMessageSize || 1048576; // 1MB
+        this.maxPortRetries = options.maxPortRetries || 10; // Try up to 10 ports
+        
+        // Hub configuration
+        this.isHub = options.isHub || false; // Whether this server is a hub
+        this.hubMeshNamespace = 'pigeonhub-mesh'; // Reserved namespace for hubs
+        this.bootstrapHubs = options.bootstrapHubs || []; // URIs of bootstrap hubs to connect to
+        this.autoConnect = options.autoConnect !== false; // Auto-connect to bootstrap hubs (default: true)
+        this.reconnectInterval = options.reconnectInterval || 5000; // Reconnect interval in ms
+        this.maxReconnectAttempts = options.maxReconnectAttempts || 10; // Max reconnection attempts
+        
+        // Generate hub peer ID if this is a hub
+        this.hubPeerId = options.hubPeerId || (this.isHub ? this.generatePeerId() : null);
 
         this.httpServer = null;
         this.wss = null;
         this.connections = new Map(); // peerId -> WebSocket
         this.peerData = new Map(); // peerId -> peer info
+        this.networkPeers = new Map(); // networkName -> Set of peerIds
+        this.hubs = new Map(); // peerId -> hub info (for peers identified as hubs)
+        this.bootstrapConnections = new Map(); // bootstrapUri -> connection info
         this.isRunning = false;
         this.cleanupTimer = null;
+        this.startTime = null;
     }
 
     /**
-     * Start the WebSocket server
+     * Validate peer ID format
      */
-    async start() {
-        if (this.isRunning) {
-            throw new Error('Server is already running');
+    validatePeerId(peerId) {
+        return typeof peerId === 'string' && /^[a-fA-F0-9]{40}$/.test(peerId);
+    }
+
+    /**
+     * Generate a random peer ID (40 hex characters)
+     */
+    generatePeerId() {
+        // Generate random hex string
+        const chars = '0123456789abcdef';
+        let peerId = '';
+        for (let i = 0; i < 40; i++) {
+            peerId += chars[Math.floor(Math.random() * 16)];
+        }
+        return peerId;
+    }
+
+    /**
+     * Check if a peer is registered as a hub
+     */
+    isPeerHub(peerId) {
+        return this.hubs.has(peerId);
+    }
+
+    /**
+     * Register a peer as a hub
+     */
+    registerHub(peerId, hubInfo = {}) {
+        this.hubs.set(peerId, {
+            peerId,
+            registeredAt: Date.now(),
+            lastActivity: Date.now(),
+            ...hubInfo
+        });
+        console.log(`🏢 Registered hub: ${peerId.substring(0, 8)}... (${this.hubs.size} total hubs)`);
+        this.emit('hubRegistered', { peerId, totalHubs: this.hubs.size });
+    }
+
+    /**
+     * Unregister a hub
+     */
+    unregisterHub(peerId) {
+        if (this.hubs.delete(peerId)) {
+            console.log(`🏢 Unregistered hub: ${peerId.substring(0, 8)}... (${this.hubs.size} remaining hubs)`);
+            this.emit('hubUnregistered', { peerId, totalHubs: this.hubs.size });
+        }
+    }
+
+    /**
+     * Get all connected hubs
+     */
+    getConnectedHubs(excludePeerId = null) {
+        const hubList = [];
+        for (const [peerId, hubInfo] of this.hubs) {
+            if (peerId !== excludePeerId && this.connections.has(peerId)) {
+                hubList.push({ peerId, ...hubInfo });
+            }
+        }
+        return hubList;
+    }
+
+    /**
+     * Find closest peers using XOR distance
+     */
+    findClosestPeers(targetPeerId, allPeerIds, maxPeers = 3) {
+        if (!targetPeerId || !allPeerIds || allPeerIds.length === 0) {
+            return [];
         }
 
+        // XOR distance calculation (simplified)
+        const distances = allPeerIds.map(peerId => {
+            let distance = 0;
+            const minLength = Math.min(targetPeerId.length, peerId.length);
+
+            for (let i = 0; i < minLength; i++) {
+                const xor = parseInt(targetPeerId[i], 16) ^ parseInt(peerId[i], 16);
+                distance += xor;
+            }
+
+            return { peerId, distance };
+        });
+
+        // Sort by distance and return closest peers
+        distances.sort((a, b) => a.distance - b.distance);
+        return distances.slice(0, maxPeers).map(item => item.peerId);
+    }
+
+    /**
+     * Get active peers in a network
+     */
+    getActivePeers(excludePeerId = null, networkName = 'global') {
+        const peers = [];
+        const stalePeers = [];
+
+        // Get peers for the specific network
+        const networkPeerSet = this.networkPeers.get(networkName);
+        if (!networkPeerSet) {
+            return peers; // No peers in this network
+        }
+
+        for (const peerId of networkPeerSet) {
+            if (peerId !== excludePeerId) {
+                const connection = this.connections.get(peerId);
+                if (connection && connection.readyState === connection.OPEN) {
+                    peers.push(peerId);
+                } else {
+                    // Mark stale connections for cleanup
+                    stalePeers.push(peerId);
+                }
+            }
+        }
+
+        // Clean up stale connections
+        stalePeers.forEach(peerId => {
+            console.log(`🧹 Cleaning up stale connection: ${peerId.substring(0, 8)}...`);
+            this.cleanupPeer(peerId);
+        });
+
+        return peers;
+    }
+
+    /**
+     * Try to start server on a specific port
+     */
+    async tryPort(port, maxRetries = null) {
+        maxRetries = maxRetries !== null ? maxRetries : this.maxPortRetries;
+        
         return new Promise((resolve, reject) => {
-            try {
+            const attemptPort = (currentPort, retriesLeft) => {
                 // Create HTTP server
                 this.httpServer = createServer((req, res) => {
                     // Handle CORS preflight
@@ -60,9 +199,26 @@ export class PeerPigeonServer extends EventEmitter {
                             status: 'healthy',
                             timestamp: new Date().toISOString(),
                             uptime: process.uptime(),
+                            isHub: this.isHub,
                             connections: this.connections.size,
                             peers: this.peerData.size,
+                            hubs: this.hubs.size,
+                            networks: this.networkPeers.size,
                             memory: process.memoryUsage()
+                        }));
+                        return;
+                    }
+
+                    // Hubs endpoint - list connected hubs
+                    if (req.url === '/hubs') {
+                        res.writeHead(200, {
+                            'Content-Type': 'application/json',
+                            'Access-Control-Allow-Origin': this.corsOrigin
+                        });
+                        res.end(JSON.stringify({
+                            timestamp: new Date().toISOString(),
+                            totalHubs: this.hubs.size,
+                            hubs: this.getConnectedHubs()
                         }));
                         return;
                     }
@@ -83,31 +239,95 @@ export class PeerPigeonServer extends EventEmitter {
 
                 this.setupWebSocketHandlers();
 
+                // Handle port in use error
+                const errorHandler = (error) => {
+                    if (error.code === 'EADDRINUSE') {
+                        console.log(`⚠️  Port ${currentPort} is already in use`);
+                        
+                        // Clean up failed server
+                        this.httpServer.removeAllListeners();
+                        if (this.wss) {
+                            this.wss.close();
+                        }
+                        this.httpServer = null;
+                        this.wss = null;
+
+                        if (retriesLeft > 0) {
+                            const nextPort = currentPort + 1;
+                            console.log(`🔄 Trying port ${nextPort}...`);
+                            attemptPort(nextPort, retriesLeft - 1);
+                        } else {
+                            reject(new Error(`Failed to find available port after ${maxRetries} attempts (tried ${port}-${currentPort})`));
+                        }
+                    } else {
+                        console.error('❌ HTTP server error:', error);
+                        this.emit('error', error);
+                        reject(error);
+                    }
+                };
+
+                this.httpServer.once('error', errorHandler);
+
                 // Start HTTP server
-                this.httpServer.listen(this.port, this.host, () => {
+                this.httpServer.listen(currentPort, this.host, () => {
+                    // Remove error handler after successful start
+                    this.httpServer.removeListener('error', errorHandler);
+                    
+                    // Update port to the actual port used
+                    this.port = currentPort;
                     this.isRunning = true;
+                    this.startTime = Date.now();
                     this.startCleanupTimer();
 
-                    console.log(`🚀 PeerPigeon WebSocket server started on ws://${this.host}:${this.port}`);
+                    if (currentPort !== port) {
+                        console.log(`✅ Port ${port} was in use, using port ${currentPort} instead`);
+                    }
+
+                    const serverType = this.isHub ? '🏢 PeerPigeon Hub Server' : '🚀 PeerPigeon WebSocket Server';
+                    console.log(`${serverType} started on ws://${this.host}:${this.port}`);
+                    if (this.isHub) {
+                        console.log(`🌐 Hub mesh namespace: ${this.hubMeshNamespace}`);
+                    }
                     console.log(`📊 Max connections: ${this.maxConnections}`);
                     console.log(`🧹 Cleanup interval: ${this.cleanupInterval}ms`);
                     console.log(`⏰ Peer timeout: ${this.peerTimeout}ms`);
 
                     this.emit('started', { host: this.host, port: this.port });
-                    resolve();
-                });
+                    resolve({ host: this.host, port: this.port });
 
-                this.httpServer.on('error', (error) => {
-                    console.error('❌ HTTP server error:', error);
-                    this.emit('error', error);
-                    reject(error);
+                    // Add persistent error handler after successful start
+                    this.httpServer.on('error', (error) => {
+                        console.error('❌ HTTP server error:', error);
+                        this.emit('error', error);
+                    });
                 });
+            };
 
-            } catch (error) {
-                console.error('❌ Failed to start server:', error);
-                reject(error);
-            }
+            attemptPort(port, maxRetries);
         });
+    }
+
+    /**
+     * Start the WebSocket server
+     */
+    async start() {
+        if (this.isRunning) {
+            throw new Error('Server is already running');
+        }
+
+        try {
+            const result = await this.tryPort(this.port);
+            
+            // If this is a hub, connect to bootstrap hubs
+            if (this.isHub && this.autoConnect) {
+                await this.connectToBootstrapHubs();
+            }
+            
+            return result;
+        } catch (error) {
+            console.error('❌ Failed to start server:', error);
+            throw error;
+        }
     }
 
     /**
@@ -120,6 +340,11 @@ export class PeerPigeonServer extends EventEmitter {
 
         return new Promise((resolve) => {
             console.log('🛑 Stopping PeerPigeon WebSocket server...');
+
+            // Disconnect from bootstrap hubs if this is a hub
+            if (this.isHub) {
+                this.disconnectFromBootstrapHubs();
+            }
 
             // Stop cleanup timer
             if (this.cleanupTimer) {
@@ -164,6 +389,249 @@ export class PeerPigeonServer extends EventEmitter {
     }
 
     /**
+     * Connect to bootstrap hubs
+     */
+    async connectToBootstrapHubs() {
+        if (!this.isHub) {
+            console.log('⚠️  Not a hub, skipping bootstrap connections');
+            return;
+        }
+
+        // If no bootstrap hubs specified, try default port 3000
+        let bootstrapUris = this.bootstrapHubs;
+        if (!bootstrapUris || bootstrapUris.length === 0) {
+            // Don't connect to ourselves
+            const defaultPort = 3000;
+            if (this.port !== defaultPort) {
+                bootstrapUris = [`ws://${this.host}:${defaultPort}`];
+                console.log(`🔗 No bootstrap hubs specified, trying default: ws://${this.host}:${defaultPort}`);
+            } else {
+                console.log('ℹ️  No bootstrap hubs to connect to (running on default port 3000)');
+                return;
+            }
+        }
+
+        console.log(`🔗 Connecting to ${bootstrapUris.length} bootstrap hub(s)...`);
+
+        for (const uri of bootstrapUris) {
+            try {
+                await this.connectToHub(uri);
+            } catch (error) {
+                console.error(`❌ Failed to connect to bootstrap hub ${uri}:`, error.message);
+            }
+        }
+    }
+
+    /**
+     * Connect to a specific hub
+     */
+    async connectToHub(uri, attemptNumber = 0) {
+        return new Promise((resolve, reject) => {
+            try {
+                // Parse URI to check if it's our own server
+                const url = new URL(uri);
+                const hubPort = parseInt(url.port) || 3000;
+                const hubHost = url.hostname;
+
+                // Don't connect to ourselves
+                if (hubHost === this.host && hubPort === this.port) {
+                    console.log(`⚠️  Skipping self-connection to ${uri}`);
+                    resolve();
+                    return;
+                }
+
+                const wsUrl = `${uri}?peerId=${this.hubPeerId}`;
+                console.log(`🔗 Connecting to hub: ${uri} (attempt ${attemptNumber + 1})`);
+
+                const ws = new WebSocket(wsUrl);
+                
+                const connectionInfo = {
+                    uri,
+                    ws,
+                    connected: false,
+                    attemptNumber,
+                    lastAttempt: Date.now(),
+                    reconnectTimer: null
+                };
+
+                this.bootstrapConnections.set(uri, connectionInfo);
+
+                ws.on('open', () => {
+                    console.log(`✅ Connected to bootstrap hub: ${uri}`);
+                    connectionInfo.connected = true;
+                    connectionInfo.attemptNumber = 0; // Reset attempt counter on success
+
+                    // Announce this hub on the hub mesh
+                    this.announceToHub(ws);
+                    
+                    this.emit('bootstrapConnected', { uri });
+                    resolve();
+                });
+
+                ws.on('message', (data) => {
+                    try {
+                        const message = JSON.parse(data.toString());
+                        this.handleBootstrapMessage(uri, message);
+                    } catch (error) {
+                        console.error(`❌ Error handling message from ${uri}:`, error);
+                    }
+                });
+
+                ws.on('close', (code, reason) => {
+                    console.log(`🔌 Disconnected from bootstrap hub ${uri} (${code}: ${reason})`)
+                    connectionInfo.connected = false;
+                    
+                    this.emit('bootstrapDisconnected', { uri, code, reason });
+                    
+                    // Attempt to reconnect
+                    if (this.isRunning && attemptNumber < this.maxReconnectAttempts) {
+                        connectionInfo.reconnectTimer = setTimeout(() => {
+                            console.log(`🔄 Reconnecting to ${uri}...`);
+                            this.connectToHub(uri, attemptNumber + 1);
+                        }, this.reconnectInterval);
+                    } else if (attemptNumber >= this.maxReconnectAttempts) {
+                        console.log(`❌ Max reconnection attempts reached for ${uri}`);
+                        this.bootstrapConnections.delete(uri);
+                    }
+                });
+
+                ws.on('error', (error) => {
+                    console.error(`❌ WebSocket error for ${uri}:`, error.message);
+                    
+                    // Only reject on first attempt, otherwise we'll retry
+                    if (attemptNumber === 0) {
+                        this.bootstrapConnections.delete(uri);
+                        reject(error);
+                    }
+                });
+
+            } catch (error) {
+                console.error(`❌ Failed to create connection to ${uri}:`, error);
+                reject(error);
+            }
+        });
+    }
+
+    /**
+     * Announce this hub to a bootstrap hub
+     */
+    announceToHub(ws) {
+        const announcement = {
+            type: 'announce',
+            networkName: this.hubMeshNamespace,
+            data: {
+                isHub: true,
+                port: this.port,
+                host: this.host,
+                capabilities: ['signaling', 'relay'],
+                timestamp: Date.now()
+            }
+        };
+
+        ws.send(JSON.stringify(announcement));
+        console.log(`📢 Announced to bootstrap hub on ${this.hubMeshNamespace}`);
+    }
+
+    /**
+     * Handle messages from bootstrap hubs
+     */
+    handleBootstrapMessage(uri, message) {
+        const { type, data, fromPeerId, targetPeerId, networkName } = message;
+
+        switch (type) {
+            case 'connected':
+                console.log(`✅ Bootstrap hub acknowledged connection: ${uri}`);
+                break;
+
+            case 'peer-discovered':
+                if (data?.isHub) {
+                    console.log(`🏢 Discovered hub via bootstrap: ${data.peerId?.substring(0, 8)}...`);
+                    this.emit('hubDiscovered', { peerId: data.peerId, via: uri, data });
+                } else if (data?.peerId) {
+                    // Regular peer discovered on another hub - notify our local peers in same network
+                    const discoveredPeerId = data.peerId;
+                    const discoveredNetwork = networkName || 'global';
+                    
+                    console.log(`📥 Peer ${discoveredPeerId.substring(0, 8)}... discovered on another hub (network: ${discoveredNetwork})`);
+                    
+                    // Forward to all our local peers in the same network
+                    const localPeers = this.getActivePeers(null, discoveredNetwork);
+                    localPeers.forEach(localPeerId => {
+                        const localConnection = this.connections.get(localPeerId);
+                        if (localConnection) {
+                            this.sendToConnection(localConnection, {
+                                type: 'peer-discovered',
+                                data,
+                                networkName: discoveredNetwork,
+                                fromPeerId: 'system',
+                                targetPeerId: localPeerId,
+                                timestamp: Date.now()
+                            });
+                        }
+                    });
+                }
+                break;
+
+            case 'peer-disconnected':
+                if (data?.isHub) {
+                    console.log(`🏢 Hub disconnected: ${data.peerId?.substring(0, 8)}...`);
+                }
+                break;
+
+            case 'offer':
+            case 'answer':
+            case 'ice-candidate':
+                // Check if target peer is on this hub
+                if (targetPeerId) {
+                    const targetConnection = this.connections.get(targetPeerId);
+                    if (targetConnection && targetConnection.readyState === WebSocket.OPEN) {
+                        // Forward to local peer
+                        console.log(`📥 Received ${type} from ${fromPeerId?.substring(0, 8)}... for local peer ${targetPeerId.substring(0, 8)}...`);
+                        this.sendToConnection(targetConnection, message);
+                    } else {
+                        // Not our peer, relay to other bootstrap hubs
+                        console.log(`🔄 Relaying ${type} from ${fromPeerId?.substring(0, 8)}... for ${targetPeerId.substring(0, 8)}... (not local)`);
+                        for (const [otherUri, connInfo] of this.bootstrapConnections) {
+                            if (otherUri !== uri && connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
+                                connInfo.ws.send(JSON.stringify(message));
+                            }
+                        }
+                    }
+                } else {
+                    console.log(`⚠️  Received ${type} without targetPeerId via ${uri}`);
+                }
+                this.emit('bootstrapSignaling', { type, data, fromPeerId, targetPeerId, uri });
+                break;
+
+            case 'pong':
+                // Heartbeat response
+                break;
+
+            default:
+                console.log(`📨 Received ${type} from bootstrap hub ${uri}`);
+        }
+    }
+
+    /**
+     * Disconnect from all bootstrap hubs
+     */
+    disconnectFromBootstrapHubs() {
+        console.log(`🔌 Disconnecting from ${this.bootstrapConnections.size} bootstrap hub(s)...`);
+        
+        for (const [uri, info] of this.bootstrapConnections) {
+            if (info.reconnectTimer) {
+                clearTimeout(info.reconnectTimer);
+            }
+            
+            if (info.ws && info.ws.readyState === WebSocket.OPEN) {
+                info.ws.close(1000, 'Hub shutting down');
+            }
+        }
+        
+        this.bootstrapConnections.clear();
+    }
+
+    /**
      * Setup WebSocket connection handlers
      */
     setupWebSocketHandlers() {
@@ -172,10 +640,24 @@ export class PeerPigeonServer extends EventEmitter {
             const peerId = url.searchParams.get('peerId');
 
             // Validate peer ID
-            if (!peerId || !/^[a-fA-F0-9]{40}$/.test(peerId)) {
+            if (!peerId || !this.validatePeerId(peerId)) {
                 console.log('❌ Invalid peer ID, closing connection');
                 ws.close(1008, 'Invalid peerId format');
                 return;
+            }
+
+            // Check if peerId is already connected
+            if (this.connections.has(peerId)) {
+                const existingConnection = this.connections.get(peerId);
+                if (existingConnection.readyState === existingConnection.OPEN) {
+                    console.log(`⚠️  Peer ${peerId.substring(0, 8)}... already connected, closing duplicate`);
+                    ws.close(1008, 'Peer already connected');
+                    return;
+                } else {
+                    // Clean up stale connection
+                    console.log(`🔄 Replacing stale connection for ${peerId.substring(0, 8)}...`);
+                    this.cleanupPeer(peerId);
+                }
             }
 
             // Check connection limit
@@ -191,8 +673,12 @@ export class PeerPigeonServer extends EventEmitter {
                 peerId,
                 connectedAt: Date.now(),
                 lastActivity: Date.now(),
-                remoteAddress: req.socket.remoteAddress
+                remoteAddress: req.socket.remoteAddress,
+                connected: true
             });
+
+            // Set up connection metadata
+            ws.connectedAt = Date.now();
 
             console.log(`✅ Peer connected: ${peerId.substring(0, 8)}... (${this.connections.size} total)`);
             this.emit('peerConnected', { peerId, totalConnections: this.connections.size });
@@ -250,20 +736,37 @@ export class PeerPigeonServer extends EventEmitter {
             return;
         }
 
-        // Log message type
-        console.log(`📨 Message from ${peerId.substring(0, 8)}...: ${message.type}`);
+        const { type, data: messageData, targetPeerId, networkName, fromPeerId: originalFromPeerId } = message;
 
-        switch (message.type) {
+        // Log message type
+        console.log(`📨 Received ${type} from ${peerId.substring(0, 8)}... in network: ${networkName || 'global'}`);
+
+        // Preserve the original fromPeerId if it exists (for relayed messages from other hubs)
+        // Otherwise use the peerId of the connection
+        const responseMessage = {
+            type,
+            data: messageData,
+            fromPeerId: originalFromPeerId || peerId,
+            targetPeerId,
+            networkName: networkName || 'global',
+            timestamp: Date.now()
+        };
+
+        switch (type) {
             case 'announce':
-                this.handleAnnounce(peerId, message);
+                this.handleAnnounce(peerId, message, responseMessage);
                 break;
             case 'goodbye':
-                this.handleGoodbye(peerId, message);
+                this.handleGoodbye(peerId, message, responseMessage);
                 break;
             case 'offer':
             case 'answer':
             case 'ice-candidate':
-                this.handleSignaling(peerId, message);
+                this.handleSignaling(peerId, message, responseMessage);
+                break;
+            case 'peer-discovered':
+                // Handle peer discovery from other hubs
+                this.handlePeerDiscovered(peerId, message);
                 break;
             case 'ping':
                 this.handlePing(peerId, message);
@@ -272,85 +775,220 @@ export class PeerPigeonServer extends EventEmitter {
                 this.handleCleanup(peerId, message);
                 break;
             default:
-                console.log(`❓ Unknown message type from ${peerId.substring(0, 8)}...: ${message.type}`);
+                console.log(`⚠️  Ignoring non-signaling message type '${type}' - peers should route their own messages`);
+                const connection = this.connections.get(peerId);
+                if (connection && connection.readyState === WebSocket.OPEN) {
+                    this.sendToConnection(connection, {
+                        type: 'error',
+                        error: `Signaling server does not route '${type}' messages. Use WebRTC data channels for peer-to-peer communication.`,
+                        timestamp: Date.now()
+                    });
+                }
+                break;
         }
     }
 
     /**
      * Handle peer announcement
      */
-    handleAnnounce(peerId, message) {
-        console.log(`📢 Peer announced: ${peerId.substring(0, 8)}...`);
+    handleAnnounce(peerId, message, responseMessage) {
+        // Extract network name from the message
+        const peerNetworkName = message.networkName || 'global';
+        
+        // Detect if this peer is a hub
+        const isHub = message.data?.isHub === true || peerNetworkName === this.hubMeshNamespace;
+        
+        if (isHub) {
+            console.log(`📢 Hub announced: ${peerId.substring(0, 8)}... in network: ${peerNetworkName}`);
+        } else {
+            console.log(`📢 Peer announced: ${peerId.substring(0, 8)}... in network: ${peerNetworkName}`);
+        }
 
-        // Update peer data
+        // Update peer data with network information
         const peerInfo = this.peerData.get(peerId);
         if (peerInfo) {
             peerInfo.announced = true;
             peerInfo.announcedAt = Date.now();
+            peerInfo.networkName = peerNetworkName;
+            peerInfo.data = message.data;
+            peerInfo.isHub = isHub;
         }
 
-        // Notify other peers about this peer
-        this.broadcastToOthers(peerId, {
-            type: 'peer-discovered',
-            data: {
-                peerId,
-                timestamp: Date.now(),
-                ...message.data
-            },
-            fromPeerId: 'system',
-            timestamp: Date.now()
+        // Register as hub if applicable
+        if (isHub) {
+            this.registerHub(peerId, {
+                networkName: peerNetworkName,
+                data: message.data,
+                connectedAt: peerInfo?.connectedAt || Date.now()
+            });
+        }
+
+        // Add peer to network tracking
+        if (!this.networkPeers.has(peerNetworkName)) {
+            this.networkPeers.set(peerNetworkName, new Set());
+        }
+        this.networkPeers.get(peerNetworkName).add(peerId);
+
+        // If this is a hub and we have bootstrap connections, broadcast this peer to other hubs
+        if (this.isHub && this.bootstrapConnections.size > 0 && !isHub) {
+            console.log(`📡 Broadcasting peer ${peerId.substring(0, 8)}... to other hubs via bootstrap`);
+            const peerAnnouncement = {
+                type: 'peer-discovered',
+                data: {
+                    peerId,
+                    isHub: false,
+                    ...message.data
+                },
+                networkName: peerNetworkName,
+                fromPeerId: 'system',
+                timestamp: Date.now()
+            };
+            
+            for (const [uri, connInfo] of this.bootstrapConnections) {
+                if (connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
+                    connInfo.ws.send(JSON.stringify(peerAnnouncement));
+                }
+            }
+        }
+
+        // Get active peers in the same network
+        const activePeers = this.getActivePeers(peerId, peerNetworkName);
+
+        // Validate peers
+        const validatedPeers = [];
+        for (const otherPeerId of activePeers) {
+            const connection = this.connections.get(otherPeerId);
+            if (connection && connection.readyState === connection.OPEN) {
+                validatedPeers.push(otherPeerId);
+            } else {
+                console.log(`🧹 Found dead connection during announce: ${otherPeerId.substring(0, 8)}...`);
+                this.cleanupPeer(otherPeerId);
+            }
+        }
+
+        const hubType = isHub ? 'hub' : 'peer';
+        console.log(`📢 Announcing ${hubType} ${peerId.substring(0, 8)}... to ${validatedPeers.length} validated peers in network: ${peerNetworkName}`);
+
+        // Send peer-discovered messages to validated peers only
+        validatedPeers.forEach(otherPeerId => {
+            const otherPeerData = this.peerData.get(otherPeerId);
+            this.sendToConnection(this.connections.get(otherPeerId), {
+                type: 'peer-discovered',
+                data: { 
+                    peerId, 
+                    isHub,
+                    ...message.data 
+                },
+                networkName: peerNetworkName,
+                fromPeerId: 'system',
+                targetPeerId: otherPeerId,
+                timestamp: Date.now()
+            });
         });
 
-        this.emit('peerAnnounced', { peerId });
+        // Send existing validated peers to the new peer (include their hub status)
+        const newPeerConnection = this.connections.get(peerId);
+        validatedPeers.forEach(existingPeerId => {
+            const existingPeerData = this.peerData.get(existingPeerId);
+            this.sendToConnection(newPeerConnection, {
+                type: 'peer-discovered',
+                data: { 
+                    peerId: existingPeerId,
+                    isHub: existingPeerData?.isHub || false,
+                    ...existingPeerData?.data 
+                },
+                networkName: peerNetworkName,
+                fromPeerId: 'system',
+                targetPeerId: peerId,
+                timestamp: Date.now()
+            });
+        });
+
+        this.emit('peerAnnounced', { peerId, networkName: peerNetworkName, isHub });
     }
 
     /**
      * Handle peer goodbye
      */
-    handleGoodbye(peerId, message) {
+    handleGoodbye(peerId, message, responseMessage) {
         console.log(`👋 Peer goodbye: ${peerId.substring(0, 8)}...`);
 
-        // Notify other peers about disconnection
-        this.broadcastToOthers(peerId, {
-            type: 'peer-disconnected',
-            data: {
-                peerId,
-                reason: message.data?.reason || 'goodbye',
-                timestamp: Date.now()
-            },
-            fromPeerId: 'system',
-            timestamp: Date.now()
-        });
-
+        // Broadcast to closest peers before removing peer data
+        this.broadcastToClosestPeers(peerId, responseMessage);
+        
         // Remove peer
-        this.removePeer(peerId);
+        this.cleanupPeer(peerId);
         this.emit('peerGoodbye', { peerId });
     }
 
     /**
      * Handle WebRTC signaling messages
      */
-    handleSignaling(peerId, message) {
+    handleSignaling(peerId, message, responseMessage) {
         const targetPeerId = message.targetPeerId;
+        const networkName = message.networkName || 'global';
+        
+        console.log(`🔍 SIGNALING DEBUG: Received ${message.type} from ${peerId.substring(0, 8)}... to ${targetPeerId?.substring(0, 8)}... in network '${networkName}'`);
+        
         if (!targetPeerId) {
             console.log(`❌ No target peer ID in signaling message from ${peerId.substring(0, 8)}...`);
             return;
         }
 
         const targetConnection = this.connections.get(targetPeerId);
-        if (!targetConnection) {
-            console.log(`❌ Target peer ${targetPeerId.substring(0, 8)}... not found for signaling`);
-            return;
+        
+        // Only validate network if target peer is local (we have their data)
+        if (targetConnection) {
+            const targetPeerData = this.peerData.get(targetPeerId);
+            const targetNetwork = targetPeerData?.networkName || 'global';
+            
+            if (networkName !== targetNetwork) {
+                console.log(`🚫 Blocking ${message.type} from ${peerId.substring(0, 8)}... (network: ${networkName}) to ${targetPeerId.substring(0, 8)}... (network: ${targetNetwork}) - different networks`);
+                return;
+            }
+            
+            // Target is local - forward directly
+            console.log(`✅ Forwarding ${message.type} to LOCAL peer ${targetPeerId.substring(0, 8)}...`);
+            this.sendToConnection(targetConnection, responseMessage);
+        } else {
+            // Target peer not on this hub - relay to other hubs
+            console.log(`🔄 Target peer ${targetPeerId.substring(0, 8)}... NOT LOCAL, relaying to other hubs (network: ${networkName})`);
+            
+            let relayed = false;
+            
+            // First try relaying through bootstrap hubs (if we're not the bootstrap)
+            if (this.bootstrapConnections.size > 0) {
+                console.log(`� Relaying ${message.type} through ${this.bootstrapConnections.size} bootstrap connection(s)`);
+                
+                for (const [uri, connInfo] of this.bootstrapConnections) {
+                    if (connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
+                        connInfo.ws.send(JSON.stringify(responseMessage));
+                        console.log(`✅ Relayed ${message.type} to bootstrap hub ${uri}`);
+                        relayed = true;
+                    }
+                }
+            }
+            
+            // If we're the bootstrap hub (or bootstrap relay failed), forward to all connected hubs
+            if (this.hubs.size > 0) {
+                console.log(`� Forwarding ${message.type} to ${this.hubs.size} connected hub(s)`);
+                
+                for (const [hubPeerId, hubInfo] of this.hubs) {
+                    const hubConnection = this.connections.get(hubPeerId);
+                    if (hubConnection && hubConnection.readyState === WebSocket.OPEN) {
+                        hubConnection.send(JSON.stringify(responseMessage));
+                        console.log(`✅ Forwarded ${message.type} to hub ${hubPeerId.substring(0, 8)}...`);
+                        relayed = true;
+                    }
+                }
+            }
+            
+            if (!relayed) {
+                console.log(`❌ FAILED TO RELAY: No hubs available for ${targetPeerId.substring(0, 8)}... (network: ${networkName})`);
+                console.log(`   - Bootstrap connections: ${this.bootstrapConnections.size}`);
+                console.log(`   - Connected hubs: ${this.hubs.size}`);
+            }
         }
-
-        // Forward signaling message to target peer
-        this.sendToConnection(targetConnection, {
-            ...message,
-            fromPeerId: peerId,
-            timestamp: Date.now()
-        });
-
-        console.log(`🔄 Forwarded ${message.type} from ${peerId.substring(0, 8)}... to ${targetPeerId.substring(0, 8)}...`);
     }
 
     /**
@@ -379,6 +1017,59 @@ export class PeerPigeonServer extends EventEmitter {
     }
 
     /**
+     * Handle peer discovery messages from other hubs
+     */
+    handlePeerDiscovered(fromHubPeerId, message) {
+        const { data: messageData, networkName } = message;
+        const discoveredPeerId = messageData?.peerId;
+        
+        if (!discoveredPeerId || !networkName) {
+            console.log(`⚠️ Invalid peer-discovered message from ${fromHubPeerId.substring(0, 8)}...`);
+            return;
+        }
+
+        // Check if sender is a hub
+        const senderPeerData = this.peerData.get(fromHubPeerId);
+        const isFromHub = senderPeerData?.isHub || senderPeerData?.networkName === this.hubMeshNamespace;
+
+        if (!isFromHub) {
+            console.log(`⚠️ Received peer-discovered from non-hub peer ${fromHubPeerId.substring(0, 8)}... - ignoring`);
+            return;
+        }
+
+        console.log(`🔍 Received peer discovery from hub ${fromHubPeerId.substring(0, 8)}... - Peer ${discoveredPeerId.substring(0, 8)}... in network '${networkName}'`);
+
+        // Forward to all local CLIENT peers in the same network (exclude hubs)
+        const localPeers = this.networkPeers.get(networkName);
+        if (localPeers && localPeers.size > 0) {
+            let forwardedCount = 0;
+            for (const localPeerId of localPeers) {
+                // Skip hubs - only forward to client peers
+                const localPeerData = this.peerData.get(localPeerId);
+                if (localPeerData?.isHub) {
+                    continue;
+                }
+
+                const ws = this.connections.get(localPeerId);
+                if (ws && ws.readyState === ws.OPEN) {
+                    ws.send(JSON.stringify({
+                        type: 'peer-discovered',
+                        data: messageData,
+                        networkName,
+                        fromPeerId: 'system',
+                        targetPeerId: localPeerId,
+                        timestamp: Date.now()
+                    }));
+                    forwardedCount++;
+                }
+            }
+            console.log(`✅ Forwarded peer-discovered to ${forwardedCount} local peer(s) in network '${networkName}'`);
+        } else {
+            console.log(`ℹ️ No local peers in network '${networkName}' to forward to`);
+        }
+    }
+
+    /**
      * Handle peer disconnection
      */
     handleDisconnection(peerId, code, reason) {
@@ -397,17 +1088,67 @@ export class PeerPigeonServer extends EventEmitter {
         });
 
         // Remove peer
-        this.removePeer(peerId);
+        this.cleanupPeer(peerId);
         this.emit('peerDisconnected', { peerId, code, reason, totalConnections: this.connections.size });
     }
 
     /**
-     * Remove peer from server
+     * Remove peer from server with network cleanup
      */
-    removePeer(peerId) {
+    cleanupPeer(peerId) {
+        const wasConnected = this.connections.has(peerId);
+        const peerInfo = this.peerData.get(peerId);
+        const isHub = peerInfo?.isHub || false;
+        
         this.connections.delete(peerId);
         this.peerData.delete(peerId);
-        console.log(`🗑️ Removed peer: ${peerId.substring(0, 8)}... (${this.connections.size} remaining)`);
+        
+        // Unregister hub if applicable
+        if (isHub) {
+            this.unregisterHub(peerId);
+        }
+        
+        // Remove from network tracking
+        if (peerInfo && peerInfo.networkName) {
+            const networkPeerSet = this.networkPeers.get(peerInfo.networkName);
+            if (networkPeerSet) {
+                networkPeerSet.delete(peerId);
+                // Clean up empty network sets
+                if (networkPeerSet.size === 0) {
+                    this.networkPeers.delete(peerInfo.networkName);
+                }
+            }
+        }
+
+        if (wasConnected) {
+            const peerType = isHub ? 'hub' : 'peer';
+            console.log(`🧹 Cleaned up ${peerType}: ${peerId.substring(0, 8)}... from network: ${peerInfo?.networkName || 'unknown'}`);
+
+            // Notify other peers in the same network about disconnection
+            if (peerInfo && peerInfo.networkName) {
+                const activePeers = this.getActivePeers(null, peerInfo.networkName);
+                activePeers.forEach(otherPeerId => {
+                    this.sendToConnection(this.connections.get(otherPeerId), {
+                        type: 'peer-disconnected',
+                        data: { 
+                            peerId,
+                            isHub
+                        },
+                        networkName: peerInfo.networkName,
+                        fromPeerId: 'system',
+                        targetPeerId: otherPeerId,
+                        timestamp: Date.now()
+                    });
+                });
+            }
+        }
+    }
+
+    /**
+     * Remove peer from server (backwards compatibility)
+     */
+    removePeer(peerId) {
+        this.cleanupPeer(peerId);
     }
 
     /**
@@ -446,6 +1187,22 @@ export class PeerPigeonServer extends EventEmitter {
     }
 
     /**
+     * Broadcast message to closest peers in same network
+     */
+    broadcastToClosestPeers(fromPeerId, message, maxPeers = 5) {
+        const peerInfo = this.peerData.get(fromPeerId);
+        const networkName = peerInfo?.networkName || 'global';
+        const activePeers = this.getActivePeers(fromPeerId, networkName);
+        const closestPeers = this.findClosestPeers(fromPeerId, activePeers, maxPeers);
+
+        console.log(`Broadcasting from ${fromPeerId.substring(0, 8)}... to ${closestPeers.length} closest peers in network: ${networkName}`);
+
+        closestPeers.forEach(peerId => {
+            this.sendToConnection(this.connections.get(peerId), message);
+        });
+    }
+
+    /**
      * Start cleanup timer
      */
     startCleanupTimer() {
@@ -458,33 +1215,17 @@ export class PeerPigeonServer extends EventEmitter {
      * Perform cleanup of inactive connections
      */
     performCleanup() {
-        const now = Date.now();
-        const disconnectedPeers = [];
-
-        for (const [peerId, peerInfo] of this.peerData) {
-            if (now - peerInfo.lastActivity > this.peerTimeout) {
-                console.log(`🧹 Cleaning up inactive peer: ${peerId.substring(0, 8)}...`);
-
-                const connection = this.connections.get(peerId);
-                if (connection) {
-                    try {
-                        connection.close(1000, 'Inactive timeout');
-                    } catch (error) {
-                        console.error(`Error closing inactive connection for ${peerId}:`, error);
-                    }
-                }
-
-                disconnectedPeers.push(peerId);
-            }
+        const totalConnections = this.connections.size;
+        
+        // Clean up all networks
+        for (const [networkName] of this.networkPeers) {
+            this.getActivePeers(null, networkName); // This will clean up stale connections
         }
+        
+        const cleanedUp = totalConnections - this.connections.size;
 
-        // Remove disconnected peers
-        disconnectedPeers.forEach(peerId => {
-            this.removePeer(peerId);
-        });
-
-        if (disconnectedPeers.length > 0) {
-            console.log(`🧹 Cleaned up ${disconnectedPeers.length} inactive peers`);
+        if (cleanedUp > 0) {
+            console.log(`🧹 Periodic cleanup: removed ${cleanedUp} stale connections, ${this.connections.size} active across ${this.networkPeers.size} networks`);
         }
     }
 
@@ -492,14 +1233,54 @@ export class PeerPigeonServer extends EventEmitter {
      * Get server statistics
      */
     getStats() {
+        const bootstrapStats = {
+            total: this.bootstrapConnections.size,
+            connected: 0
+        };
+        
+        for (const [, info] of this.bootstrapConnections) {
+            if (info.connected) {
+                bootstrapStats.connected++;
+            }
+        }
+        
         return {
             isRunning: this.isRunning,
+            isHub: this.isHub,
+            hubPeerId: this.hubPeerId,
             connections: this.connections.size,
             peers: this.peerData.size,
+            hubs: this.hubs.size,
+            networks: this.networkPeers.size,
+            bootstrapHubs: bootstrapStats,
             maxConnections: this.maxConnections,
-            uptime: this.isRunning ? Date.now() - this.startTime : 0,
+            uptime: this.isRunning && this.startTime ? Date.now() - this.startTime : 0,
             host: this.host,
             port: this.port
+        };
+    }
+
+    /**
+     * Get hub statistics
+     */
+    getHubStats() {
+        const connectedHubs = this.getConnectedHubs();
+        const bootstrapHubsInfo = [];
+        
+        for (const [uri, info] of this.bootstrapConnections) {
+            bootstrapHubsInfo.push({
+                uri,
+                connected: info.connected,
+                lastAttempt: info.lastAttempt,
+                attemptNumber: info.attemptNumber
+            });
+        }
+        
+        return {
+            totalHubs: this.hubs.size,
+            connectedHubs: connectedHubs.length,
+            hubs: connectedHubs,
+            bootstrapHubs: bootstrapHubsInfo
         };
     }
 
