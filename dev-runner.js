@@ -21,7 +21,7 @@ const colors = {
 };
 
 // Start signaling server
-const signalingServer = spawn('node', ['websocket-server/server.js'], {
+const signalingServer = spawn('node', ['server/start.js'], {
   cwd: __dirname,
   stdio: 'pipe'
 });

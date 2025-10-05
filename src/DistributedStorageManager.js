@@ -516,7 +516,8 @@ export class DistributedStorageManager extends EventEmitter {
 
       // Store directly with clean key - NO PREFIXES, type information is in metadata
       await this.webDHT.put(storageKey, storagePayload, {
-        ttl: metadata.ttl
+        ttl: metadata.ttl,
+        space: space // Pass space for space-aware replication
       });
 
       this.debug.log(`📦 Stored ${space} space data for key: ${storageKey}`);
@@ -572,7 +573,8 @@ export class DistributedStorageManager extends EventEmitter {
     try {
       // Get data from WebDHT using just the clean base key - NO PREFIXES
       const webDHTPayload = await this.webDHT.get(baseKey, {
-        forceRefresh: options.forceRefresh
+        forceRefresh: options.forceRefresh,
+        space: options.space // Pass space for space-aware replication
       });
 
       this.debug.log(`📦 Retrieved WebDHT payload for key ${baseKey}:`, {

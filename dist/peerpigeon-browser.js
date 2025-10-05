@@ -8237,6 +8237,26 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.startMaintenance();
     }
     /**
+     * Calculate replication factor based on storage space and network size
+     * @param {string} space - Storage space type (private, public, frozen)
+     * @param {number} totalPeers - Total number of connected peers
+     * @returns {number} Appropriate replication factor
+     */
+    getReplicationFactor(space, totalPeers = null) {
+      const peerCount = totalPeers || Array.from(this.mesh.connectionManager.peers.keys()).filter((peerId) => this.mesh.connectionManager.peers.get(peerId).getStatus() === "connected").length;
+      if (peerCount === 0) return 0;
+      switch (space) {
+        case "private":
+          return Math.min(3, peerCount);
+        case "public":
+          return Math.max(3, Math.min(Math.ceil(peerCount * 0.3), 7));
+        case "frozen":
+          return Math.max(5, Math.min(Math.ceil(peerCount * 0.5), 10));
+        default:
+          return Math.min(this.replicationFactor, peerCount);
+      }
+    }
+    /**
      * Simple hash function for consistent hashing
      */
     async hash(data) {
@@ -8285,8 +8305,12 @@ ${b64.match(/.{1,64}/g).join("\n")}
     }
     /**
      * Store key-value pair with network namespace support
+     * @param {string} key - Storage key
+     * @param {*} value - Value to store
+     * @param {Object} options - Storage options
+     * @param {string} options.space - Storage space (private, public, frozen) for replication strategy
      */
-    async put(key, value) {
+    async put(key, value, options = {}) {
       const namespacedKey = `${this.mesh.networkName}:${key}`;
       const keyHash = await this.hash(namespacedKey);
       const storeData = {
@@ -8296,11 +8320,14 @@ ${b64.match(/.{1,64}/g).join("\n")}
         value,
         networkName: this.mesh.networkName,
         timestamp: Date.now(),
-        publisher: this.peerId
+        publisher: this.peerId,
+        space: options.space
+        // Track space for replication info
       };
       this.storage.set(namespacedKey, storeData);
       this.debug.log(`PUT: Stored ${key} locally in network ${this.mesh.networkName}`);
-      const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
+      const replicationFactor = options.space ? this.getReplicationFactor(options.space) : this.replicationFactor;
+      const targetPeers = this.findClosestPeers(keyHash, replicationFactor);
       this.debug.log(`PUT: Replicating ${key} to ${targetPeers.length} peers`);
       const replicationPromises = targetPeers.map(async (peerId) => {
         if (peerId !== this.peerId) {
@@ -8316,11 +8343,16 @@ ${b64.match(/.{1,64}/g).join("\n")}
         return { peerId, success: true };
       });
       await Promise.allSettled(replicationPromises);
-      this.debug.log(`PUT: ${key} replicated to ${targetPeers.length} peers in network ${this.mesh.networkName}`);
+      const spaceInfo = options.space ? ` (${options.space} space, RF=${replicationFactor})` : "";
+      this.debug.log(`PUT: ${key} replicated to ${targetPeers.length} peers in network ${this.mesh.networkName}${spaceInfo}`);
       return true;
     }
     /**
      * Retrieve value by key with network namespace support
+     * @param {string} key - Storage key
+     * @param {Object} options - Retrieval options
+     * @param {boolean} options.forceRefresh - Force refresh from network
+     * @param {string} options.space - Storage space for space-aware replication
      */
     async get(key, options = {}) {
       const forceRefresh = options.forceRefresh || false;
@@ -8331,7 +8363,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
         return data.value;
       }
       const keyHash = await this.hash(namespacedKey);
-      const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
+      const replicationFactor = options.space ? this.getReplicationFactor(options.space) : this.replicationFactor;
+      const targetPeers = this.findClosestPeers(keyHash, replicationFactor);
       this.debug.log(`GET: Querying ${targetPeers.length} peers for ${key} in network ${this.mesh.networkName}`);
       const queryPromises = targetPeers.map(async (peerId) => {
         if (peerId === this.peerId) return null;
@@ -9751,7 +9784,9 @@ ${b64.match(/.{1,64}/g).join("\n")}
           space
         });
         await this.webDHT.put(storageKey, storagePayload, {
-          ttl: metadata.ttl
+          ttl: metadata.ttl,
+          space
+          // Pass space for space-aware replication
         });
         this.debug.log(`\u{1F4E6} Stored ${space} space data for key: ${storageKey}`);
         this.emit("dataStored", {
@@ -9794,7 +9829,9 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.debug.log(`\u{1F4E6} Retrieving data for base key: ${baseKey}`);
       try {
         const webDHTPayload = await this.webDHT.get(baseKey, {
-          forceRefresh: options.forceRefresh
+          forceRefresh: options.forceRefresh,
+          space: options.space
+          // Pass space for space-aware replication
         });
         this.debug.log(`\u{1F4E6} Retrieved WebDHT payload for key ${baseKey}:`, {
           payloadExists: !!webDHTPayload,

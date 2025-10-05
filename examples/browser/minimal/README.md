@@ -21,7 +21,7 @@ This is a stripped-down version of PeerPigeon designed for testing browser-to-br
 1. **Start the signaling server:**
    ```bash
    cd /Users/danraeder/Documents/GitHub/peerpigeon
-   node websocket-server/server.js
+   node server/start.js
    ```
 
 2. **Open two browser tabs:**

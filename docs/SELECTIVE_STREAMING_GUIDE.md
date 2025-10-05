@@ -368,8 +368,9 @@ Check out the complete demo at `examples/selective-streaming-demo.html` for a wo
 
 1. Start a signaling server:
 ```bash
-cd websocket-server
-node server.js
+npm run server
+# or directly:
+# node server/start.js
 ```
 
 2. Open the demo in multiple browser tabs:
