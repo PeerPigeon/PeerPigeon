@@ -350,7 +350,7 @@ export class WebDHT extends EventEmitter {
    * Handle store request from peer with network filtering
    */
   handleStore(data, fromPeerId) {
-    const { key, value, timestamp, publisher, networkName } = data;
+    const { key, value, timestamp, publisher, networkName, space } = data;
     
     // Filter by network namespace
     const messageNetwork = networkName || 'global';
@@ -368,8 +368,8 @@ export class WebDHT extends EventEmitter {
         }
       }
 
-      // Store the data
-      this.storage.set(key, { key, value, timestamp, publisher });
+      // Store the complete data with all fields including space
+      this.storage.set(key, { key, value, timestamp, publisher, space, networkName });
       this.debug.log(`STORE: Received ${key} from ${fromPeerId.substring(0, 8)}`);
     } catch (error) {
       this.debug.warn(`Store failed for ${key}:`, error.message);

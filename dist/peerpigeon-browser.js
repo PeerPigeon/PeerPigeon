@@ -8459,7 +8459,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
      * Handle store request from peer with network filtering
      */
     handleStore(data, fromPeerId) {
-      const { key, value, timestamp, publisher, networkName } = data;
+      const { key, value, timestamp, publisher, networkName, space } = data;
       const messageNetwork = networkName || "global";
       if (messageNetwork !== this.mesh.networkName) {
         this.debug.log(`Filtering DHT store from different network: ${messageNetwork} (current: ${this.mesh.networkName})`);
@@ -8472,7 +8472,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
             return;
           }
         }
-        this.storage.set(key, { key, value, timestamp, publisher });
+        this.storage.set(key, { key, value, timestamp, publisher, space, networkName });
         this.debug.log(`STORE: Received ${key} from ${fromPeerId.substring(0, 8)}`);
       } catch (error) {
         this.debug.warn(`Store failed for ${key}:`, error.message);
