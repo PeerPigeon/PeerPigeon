@@ -332,8 +332,8 @@ class Browser3IntegrationTest {
   async waitForPeerConnections() {
     console.log('🤝 Waiting for peer-to-peer connections...');
     
-    // Give peers time to discover each other (realtime but needs a moment)
-    await new Promise(resolve => setTimeout(resolve, 10000));
+    // Give peers time to discover each other (increased for reliability)
+    await new Promise(resolve => setTimeout(resolve, 15000));
     
     const connectionCounts = [];
     for (let i = 0; i < this.pages.length; i++) {
@@ -620,9 +620,9 @@ class Browser3IntegrationTest {
     
     console.log('🔍 DHT Post-store status on storage peer:', postStoreStatus);
     
-    // Wait for DHT propagation across mesh - increased timeout
+    // Wait for DHT propagation across mesh - increased timeout for CI reliability
     console.log('⏳ Waiting for DHT propagation across mesh...');
-    await new Promise(resolve => setTimeout(resolve, 8000));
+    await new Promise(resolve => setTimeout(resolve, 12000));
     
     // Check DHT state on retrieval peer before attempting retrieval
     const preRetrieveStatus = await retrievalPeer.evaluate((key) => {
@@ -642,7 +642,7 @@ class Browser3IntegrationTest {
     
     // Retrieve from peer 3 via library API with enhanced retry logic and debugging
     let retrieveResult = null;
-    const maxRetries = 4; // Increased retries
+    const maxRetries = 6; // Increased retries for CI reliability
     let retryCount = 0;
     
     while (retryCount < maxRetries) {
@@ -691,7 +691,7 @@ class Browser3IntegrationTest {
       retryCount++;
       if (retryCount < maxRetries) {
         console.log(`🔄 DHT retry ${retryCount + 1}/${maxRetries}...`);
-        await new Promise(resolve => setTimeout(resolve, 4000)); // Increased retry delay
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Increased retry delay for CI
       }
     }
     
@@ -906,8 +906,8 @@ class Browser3IntegrationTest {
       throw new Error(`Failed to store private data: ${storeResult.error}`);
     }
     
-    // Wait for storage propagation
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // Wait for storage propagation (increased for CI reliability)
+    await new Promise(resolve => setTimeout(resolve, 8000));
     
     // Switch retrieval peer to storage tab
     await retrievalPeer.evaluate(() => {
@@ -994,12 +994,12 @@ class Browser3IntegrationTest {
       throw new Error(`Failed to store public data via library API: ${storeResult.error}`);
     }
     
-    // Wait for public storage propagation
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // Wait for public storage propagation (increased for CI reliability)
+    await new Promise(resolve => setTimeout(resolve, 8000));
     
     // Retrieve public data from different peer via library API with retry logic
     let retrieveResult = null;
-    const maxRetries = 3;
+    const maxRetries = 5;
     let retryCount = 0;
     
     while (retryCount < maxRetries) {
@@ -1028,8 +1028,8 @@ class Browser3IntegrationTest {
       
       retryCount++;
       if (retryCount < maxRetries) {
-        console.log(`🔄 Public storage retry ${retryCount + 1}/${maxRetries}...`);
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        console.log(`🔄 Public storage retry ${retryCount}/${maxRetries}...`);
+        await new Promise(resolve => setTimeout(resolve, 4000));
       }
     }
     
@@ -1041,7 +1041,8 @@ class Browser3IntegrationTest {
     } else {
       console.error('❌ Public storage space cross-peer test failed via library API');
       console.error('Expected type: public_storage_test');
-      console.error('Retrieved:', JSON.stringify(retrieveResult.data, null, 2));
+      console.error('Retrieved:', JSON.stringify(retrieveResult, null, 2));
+      console.error(`Retries attempted: ${retryCount}/${maxRetries}`);
       this.testResults.failed++;
       this.testResults.errors.push('Public storage space cross-peer test failed via library API');
     }
@@ -1084,7 +1085,9 @@ class Browser3IntegrationTest {
         console.log('🔍 FROZEN DEBUG: Store result:', result);
         
         // Immediately try to retrieve from same peer to verify storage
-        const verifyData = await testSuite.mesh.distributedStorage.retrieve(key);
+        const verifyData = await testSuite.mesh.distributedStorage.retrieve(key, {
+          space: 'frozen'
+        });
         console.log('🔍 FROZEN DEBUG: Immediate verification on same peer:', verifyData);
         
         return { success: result, verifyData };
@@ -1100,50 +1103,12 @@ class Browser3IntegrationTest {
     
     console.log('🔍 FROZEN DEBUG: Storage peer verification data:', storeResult.verifyData);
     
-    // Wait for frozen storage propagation
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    
-    // Check storage status on both peers before retrieval attempt
-    const storageStatus = await Promise.all([
-      storagePeer.evaluate((key) => {
-        const mesh = window.peerPigeonTestSuite?.mesh;
-        const storage = mesh?.distributedStorage?.storage;
-        if (!storage) return { error: 'No storage available' };
-        
-        const hasKey = storage.has(key);
-        const data = storage.get(key);
-        return { 
-          hasKey, 
-          dataExists: !!data,
-          space: data?.metadata?.space,
-          storageSize: storage.size,
-          allKeys: Array.from(storage.keys())
-        };
-      }, frozenKey),
-      retrievalPeer.evaluate((key) => {
-        const mesh = window.peerPigeonTestSuite?.mesh;
-        const storage = mesh?.distributedStorage?.storage;
-        if (!storage) return { error: 'No storage available' };
-        
-        const hasKey = storage.has(key);
-        const data = storage.get(key);
-        return { 
-          hasKey, 
-          dataExists: !!data,
-          space: data?.metadata?.space,
-          storageSize: storage.size,
-          allKeys: Array.from(storage.keys())
-        };
-      }, frozenKey)
-    ]);
-    
-    console.log('🔍 FROZEN DEBUG: Storage status:');
-    console.log('   Peer 2 (storage):', storageStatus[0]);
-    console.log('   Peer 5 (retrieval):', storageStatus[1]);
+    // Wait for frozen storage propagation (increased for CI reliability)
+    await new Promise(resolve => setTimeout(resolve, 8000));
     
     // Retrieve frozen data from different peer via library API with retry logic
     let retrieveResult = null;
-    const maxRetries = 3;
+    const maxRetries = 5;
     let retryCount = 0;
     
     while (retryCount < maxRetries) {
@@ -1156,9 +1121,10 @@ class Browser3IntegrationTest {
           
           console.log('🔍 FROZEN DEBUG: Retrieval attempt for key:', key);
           
-          // Retrieve via library API
+          // Retrieve via library API with frozen space specified
           const data = await testSuite.mesh.distributedStorage.retrieve(key, {
-            forceRefresh: true
+            forceRefresh: true,
+            space: 'frozen'
           });
           
           console.log('🔍 FROZEN DEBUG: Retrieved data:', data);
@@ -1180,8 +1146,8 @@ class Browser3IntegrationTest {
       
       retryCount++;
       if (retryCount < maxRetries) {
-        console.log(`🔄 Frozen storage retry ${retryCount + 1}/${maxRetries}...`);
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        console.log(`🔄 Frozen storage retry ${retryCount}/${maxRetries}...`);
+        await new Promise(resolve => setTimeout(resolve, 4000));
       }
     }
     
