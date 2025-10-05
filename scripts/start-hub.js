@@ -7,6 +7,8 @@
  *   npm run hub
  *   PORT=3001 npm run hub
  *   PORT=8080 npm run hub
+ *   BOOTSTRAP_HUBS=ws://localhost:3000 PORT=3001 npm run hub
+ *   BOOTSTRAP_HUBS=ws://hub1:3000,ws://hub2:3001 PORT=3002 npm run hub
  */
 
 import { PeerPigeonServer } from '../server/index.js';
@@ -15,6 +17,13 @@ import { PeerPigeonServer } from '../server/index.js';
 const PORT = parseInt(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 
+// Get bootstrap hubs from environment variable
+let bootstrapHubs = [];
+if (process.env.BOOTSTRAP_HUBS) {
+    bootstrapHubs = process.env.BOOTSTRAP_HUBS.split(',').map(uri => uri.trim()).filter(uri => uri);
+    console.log(`🔗 Bootstrap hubs configured: ${bootstrapHubs.join(', ')}\n`);
+}
+
 console.log('🚀 Starting PeerPigeon Hub...\n');
 
 // Create hub server
@@ -22,7 +31,8 @@ const hub = new PeerPigeonServer({
     port: PORT,
     host: HOST,
     isHub: true,
-    autoConnect: true // Auto-connect to bootstrap on port 3000
+    autoConnect: true, // Auto-connect to bootstrap on port 3000
+    bootstrapHubs: bootstrapHubs.length > 0 ? bootstrapHubs : undefined
 });
 
 // Event listeners
