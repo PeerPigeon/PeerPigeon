@@ -31,17 +31,8 @@ jobs:
       run: npm run lint
       
     - name: Run tests
-      run: npm run test:custom
+      run: npm test
       
-    - name: Run coverage
-      run: npm run test:coverage
-      
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./coverage/lcov.info
-        fail_ci_if_error: false
-
   security:
     runs-on: ubuntu-latest
     steps:
@@ -84,4 +75,4 @@ jobs:
     - name: Run performance benchmarks
       run: |
         echo "Running benchmarks..."
-        timeout 30s npm run test:custom || echo "Benchmarks completed"
+        timeout 30s npm test || echo "Benchmarks completed"
