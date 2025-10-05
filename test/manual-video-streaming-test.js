@@ -65,7 +65,7 @@ class ManualVideoStreamingTest {
     console.log('🚀 Starting servers...');
     
     // Start signaling server
-    this.signalingServer = spawn('node', ['websocket-server/server.js'], {
+    this.signalingServer = spawn('node', ['server/start.js'], {
       stdio: 'pipe',
       env: { ...process.env, PORT: SIGNALING_PORT }
     });

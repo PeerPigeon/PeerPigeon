@@ -47,12 +47,15 @@ new PeerPigeonMesh(options = {})
 
 **Parameters:**
 - `options.peerId` (string, optional) - Custom peer ID (40-character hex string)
+- `options.networkName` (string, default: 'global') - Network namespace for isolation
+- `options.allowGlobalFallback` (boolean, default: true) - Allow fallback to global network
 - `options.enableWebDHT` (boolean, default: true) - Enable low-level distributed hash table
-- `options.enableCrypto` (boolean, default: true) - Enable encryption features
+- `options.enableCrypto` (boolean, default: true) - Enable encryption and key management
 - `options.maxPeers` (number, default: 3) - Maximum number of peer connections
 - `options.minPeers` (number, default: 2) - Minimum number of peer connections
+- `options.autoConnect` (boolean, default: true) - Auto-connect when joining network
 - `options.autoDiscovery` (boolean, default: true) - Automatic peer discovery
-- `options.evictionStrategy` (boolean, default: true) - Peer eviction for optimization
+- `options.evictionStrategy` (boolean, default: true) - Smart peer eviction for optimization
 - `options.xorRouting` (boolean, default: true) - XOR distance-based routing
 
 ### Core Methods
@@ -1711,7 +1714,7 @@ mesh.off('disconnected', modernHandler);
 
 ### PeerPigeonServer
 
-WebSocket signaling server for hosting mesh networks.
+WebSocket signaling server for hosting mesh networks with optional hub capabilities.
 
 #### Constructor
 
@@ -1722,41 +1725,75 @@ new PeerPigeonServer(options = {})
 **Parameters:**
 - `options.port` (number, default: 3000) - Server port
 - `options.host` (string, default: 'localhost') - Server host
-- `options.maxPeers` (number, default: 100) - Maximum peers
-- `options.cleanupInterval` (number, default: 300000) - Cleanup interval in ms
+- `options.maxConnections` (number, default: 1000) - Maximum concurrent connections
+- `options.cleanupInterval` (number, default: 30000) - Cleanup interval in ms (30 seconds)
+- `options.peerTimeout` (number, default: 300000) - Peer timeout in ms (5 minutes)
+- `options.corsOrigin` (string, default: '*') - CORS origin
+- `options.maxMessageSize` (number, default: 1048576) - Max message size in bytes (1MB)
+- `options.maxPortRetries` (number, default: 10) - Port retry attempts if port in use
+- `options.isHub` (boolean, default: false) - Run as a hub server
+- `options.hubPeerId` (string, optional) - Custom hub peer ID (auto-generated if hub)
+- `options.bootstrapHubs` (Array<string>, default: []) - URIs of bootstrap hubs to connect to
+- `options.autoConnect` (boolean, default: true) - Auto-connect to bootstrap hubs
+- `options.reconnectInterval` (number, default: 5000) - Hub reconnect interval in ms
+- `options.maxReconnectAttempts` (number, default: 10) - Max hub reconnection attempts
 
 #### Methods
 
-#### `start()`
-Start the signaling server.
+#### `async start()`
+Start the signaling server. Automatically tries next port if specified port is in use.
 
-**Returns:** `Promise<void>`
+**Returns:** `Promise<{host: string, port: number}>`  
+**Throws:** Error if server fails to start  
+**Events:** Emits `started` with `{host, port}`
 
-#### `stop()`
-Stop the signaling server.
+#### `async stop()`
+Stop the signaling server and disconnect from any bootstrap hubs.
 
-**Returns:** `Promise<void>`
+**Returns:** `Promise<void>`  
+**Events:** Emits `stopped`
 
 #### `getStats()`
-Get server statistics.
+Get comprehensive server statistics.
 
 **Returns:** `Object`
 ```javascript
 {
-  connectedPeers: number,
-  totalConnections: number,
-  messagesProcessed: number,
-  uptime: number
+  isRunning: boolean,
+  isHub: boolean,
+  hubPeerId: string | null,
+  connections: number,
+  peers: number,
+  hubs: number,
+  networks: number,
+  bootstrapHubs: {
+    total: number,
+    connected: number
+  },
+  maxConnections: number,
+  uptime: number,
+  host: string,
+  port: number
 }
 ```
 
-#### `broadcastToAll(message)`
-Broadcast message to all connected peers.
+#### `getHubStats()`
+Get hub-specific statistics (only relevant if `isHub: true`).
 
-**Parameters:**
-- `message` (Object) - Message to broadcast
+**Returns:** `Object`
+```javascript
+{
+  totalHubs: number,
+  connectedHubs: number,
+  hubs: Array<{peerId, registeredAt, lastActivity}>,
+  bootstrapHubs: Array<{uri, connected, lastAttempt, attemptNumber}>
+}
+```
 
-**Returns:** `number` - Number of peers reached
+#### `getPeers()`
+Get list of all connected peers.
+
+**Returns:** `Array<Object>` - Array of peer information objects
 
 #### `broadcastToOthers(senderPeerId, message)`
 Broadcast to all peers except sender.
@@ -1769,9 +1806,18 @@ Broadcast to all peers except sender.
 
 #### Events
 
-- `peerConnected` - Peer connected to server
-- `peerDisconnected` - Peer disconnected from server
-- `messageReceived` - Message received from peer
+- `started` - Server started `{host, port}`
+- `stopped` - Server stopped
+- `peerConnected` - Peer connected `{peerId, totalConnections}`
+- `peerDisconnected` - Peer disconnected `{peerId, code, reason, totalConnections}`
+- `peerAnnounced` - Peer announced `{peerId, networkName, isHub}`
+- `peerGoodbye` - Peer said goodbye `{peerId}`
+- `hubRegistered` - Hub registered `{peerId, totalHubs}` (if this is a hub)
+- `hubUnregistered` - Hub unregistered `{peerId, totalHubs}` (if this is a hub)
+- `bootstrapConnected` - Connected to bootstrap hub `{uri}` (if this is a hub)
+- `bootstrapDisconnected` - Disconnected from bootstrap `{uri, code, reason}` (if this is a hub)
+- `hubDiscovered` - Discovered another hub `{peerId, via, data}` (if this is a hub)
+- `bootstrapSignaling` - Signaling relayed through bootstrap `{type, data, fromPeerId, targetPeerId, uri}`
 - `error` - Server error
 
 ---

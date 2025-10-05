@@ -88,7 +88,7 @@ class Browser3IntegrationTest {
     console.log('🚀 Starting servers...');
     
     // Start the signaling server
-    this.signalingServer = spawn('node', ['websocket-server/server.js'], {
+    this.signalingServer = spawn('node', ['server/start.js'], {
       env: { ...process.env, PORT: SIGNALING_PORT },
       stdio: ['ignore', 'pipe', 'pipe']
     });
@@ -1261,7 +1261,8 @@ class Browser3IntegrationTest {
           
           console.log('🔍 Retrieving from peer 1 via library API:', key);
           const data = await testSuite.mesh.distributedStorage.retrieve(key, {
-            forceRefresh: true
+            forceRefresh: true,
+            space: 'public' // Specify space for space-aware replication
           });
           
           console.log('📥 Peer 1 retrieved via library:', data);
@@ -1325,7 +1326,8 @@ class Browser3IntegrationTest {
             
             // Retrieve data DIRECTLY via library API - this is an async operation
             const data = await testSuite.mesh.distributedStorage.retrieve(key, {
-              forceRefresh: true
+              forceRefresh: true,
+              space: 'public' // Specify space for space-aware replication
             });
             
             console.log('📥 Peer 2 retrieved via library:', data);

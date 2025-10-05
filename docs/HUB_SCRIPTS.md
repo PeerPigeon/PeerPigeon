@@ -326,6 +326,6 @@ See the `examples/` directory for more detailed examples:
 ## Support
 
 For more information, see:
-- [HUB_SYSTEM.md](../HUB_SYSTEM.md) - Complete hub system documentation
-- [API_DOCUMENTATION.md](../API_DOCUMENTATION.md) - API reference
+- [HUB_SYSTEM.md](HUB_SYSTEM.md) - Complete hub system documentation
+- [API_DOCUMENTATION.md](API_DOCUMENTATION.md) - API reference
 - [README.md](../README.md) - Main project documentation

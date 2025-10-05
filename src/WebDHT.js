@@ -2,7 +2,12 @@ import { EventEmitter } from './EventEmitter.js';
 import DebugLogger from './DebugLogger.js';
 
 /**
- * SimpleWebDHT - Efficient Distributed Hash Table for millions of WebRTC peers
+ * SimpleWebDHT - Efficient Distributed Hash Table for millions of WebR    const targetPeers = this.findClosestPeers(keyHash, replicationFactor);
+    
+    const spaceInfo = options.space ? ` (${options.space} space, RF=${replicationFactor})` : '';
+    this.debug.log(`GET: Querying ${targetPeers.length} peers for ${key} in network ${this.mesh.networkName}${spaceInfo}`);
+
+    // Query peers in parallelers
  * 
  * Design principles:
  * 1. SIMPLE: Minimal complexity, maximum reliability
@@ -40,6 +45,39 @@ export class WebDHT extends EventEmitter {
     
     this.setupMessageHandling();
     this.startMaintenance();
+  }
+
+  /**
+   * Calculate replication factor based on storage space and network size
+   * @param {string} space - Storage space type (private, public, frozen)
+   * @param {number} totalPeers - Total number of connected peers
+   * @returns {number} Appropriate replication factor
+   */
+  getReplicationFactor(space, totalPeers = null) {
+    const peerCount = totalPeers || Array.from(this.mesh.connectionManager.peers.keys())
+      .filter(peerId => this.mesh.connectionManager.peers.get(peerId).getStatus() === 'connected').length;
+    
+    if (peerCount === 0) return 0;
+    
+    switch(space) {
+      case 'private':
+        // Private data: minimal replication (only owner can decrypt)
+        return Math.min(3, peerCount);
+      
+      case 'public':
+        // Public data: moderate replication for good availability
+        // 30% of peers, minimum 3, maximum 7
+        return Math.max(3, Math.min(Math.ceil(peerCount * 0.3), 7));
+      
+      case 'frozen':
+        // Frozen data: high replication for immutability and permanence
+        // 50% of peers, minimum 5, maximum 10
+        return Math.max(5, Math.min(Math.ceil(peerCount * 0.5), 10));
+      
+      default:
+        // Default: use base replication factor
+        return Math.min(this.replicationFactor, peerCount);
+    }
   }
 
   /**
@@ -104,8 +142,12 @@ export class WebDHT extends EventEmitter {
 
   /**
    * Store key-value pair with network namespace support
+   * @param {string} key - Storage key
+   * @param {*} value - Value to store
+   * @param {Object} options - Storage options
+   * @param {string} options.space - Storage space (private, public, frozen) for replication strategy
    */
-  async put(key, value) {
+  async put(key, value, options = {}) {
     // Add network namespace to the key to ensure network isolation
     const namespacedKey = `${this.mesh.networkName}:${key}`;
     const keyHash = await this.hash(namespacedKey);
@@ -116,15 +158,21 @@ export class WebDHT extends EventEmitter {
       value,
       networkName: this.mesh.networkName,
       timestamp: Date.now(),
-      publisher: this.peerId
+      publisher: this.peerId,
+      space: options.space // Track space for replication info
     };
 
     // Always store locally first
     this.storage.set(namespacedKey, storeData);
     this.debug.log(`PUT: Stored ${key} locally in network ${this.mesh.networkName}`);
 
+    // Determine replication factor based on storage space
+    const replicationFactor = options.space 
+      ? this.getReplicationFactor(options.space)
+      : this.replicationFactor;
+    
     // Find closest peers for replication
-    const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
+    const targetPeers = this.findClosestPeers(keyHash, replicationFactor);
     
     this.debug.log(`PUT: Replicating ${key} to ${targetPeers.length} peers`);
     
@@ -147,13 +195,18 @@ export class WebDHT extends EventEmitter {
     // Wait for all sends to complete
     await Promise.allSettled(replicationPromises);
     
-    this.debug.log(`PUT: ${key} replicated to ${targetPeers.length} peers in network ${this.mesh.networkName}`);
+    const spaceInfo = options.space ? ` (${options.space} space, RF=${replicationFactor})` : '';
+    this.debug.log(`PUT: ${key} replicated to ${targetPeers.length} peers in network ${this.mesh.networkName}${spaceInfo}`);
     
     return true;
   }
 
   /**
    * Retrieve value by key with network namespace support
+   * @param {string} key - Storage key
+   * @param {Object} options - Retrieval options
+   * @param {boolean} options.forceRefresh - Force refresh from network
+   * @param {string} options.space - Storage space for space-aware replication
    */
   async get(key, options = {}) {
     const forceRefresh = options.forceRefresh || false;
@@ -168,7 +221,13 @@ export class WebDHT extends EventEmitter {
 
     // If not found locally or force refresh, query the network
     const keyHash = await this.hash(namespacedKey);
-    const targetPeers = this.findClosestPeers(keyHash, this.replicationFactor);
+    
+    // Use space-aware replication factor for querying
+    const replicationFactor = options.space 
+      ? this.getReplicationFactor(options.space)
+      : this.replicationFactor;
+    
+    const targetPeers = this.findClosestPeers(keyHash, replicationFactor);
     
     this.debug.log(`GET: Querying ${targetPeers.length} peers for ${key} in network ${this.mesh.networkName}`);
 

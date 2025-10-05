@@ -155,9 +155,6 @@ build/
 *.zip
 *.tar.gz
 
-# Generated documentation (JSDoc output)
-docs/
-
 # Temporary debugging files
 *MemoryLeakDetector*
 *memory-leak-test*
