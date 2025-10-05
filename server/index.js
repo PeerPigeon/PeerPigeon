@@ -530,6 +530,124 @@ export class PeerPigeonServer extends EventEmitter {
 
         ws.send(JSON.stringify(announcement));
         console.log(`📢 Announced to bootstrap hub on ${this.hubMeshNamespace}`);
+        
+        // Announce all existing local peers to the bootstrap hub
+        this.announceLocalPeersToHub(ws);
+    }
+    
+    /**
+     * Announce all local (non-hub) peers to a bootstrap hub
+     */
+    announceLocalPeersToHub(ws) {
+        let totalAnnounced = 0;
+        
+        // Iterate through all networks and announce their peers
+        for (const [networkName, peerSet] of this.networkPeers) {
+            // Skip the hub mesh namespace
+            if (networkName === this.hubMeshNamespace) {
+                continue;
+            }
+            
+            for (const peerId of peerSet) {
+                const peerData = this.peerData.get(peerId);
+                
+                // Skip hubs, only announce regular peers
+                if (peerData?.isHub) {
+                    continue;
+                }
+                
+                // Skip if not connected or not announced
+                const connection = this.connections.get(peerId);
+                if (!connection || connection.readyState !== WebSocket.OPEN || !peerData?.announced) {
+                    continue;
+                }
+                
+                // Send peer-discovered message to bootstrap hub
+                const peerAnnouncement = {
+                    type: 'peer-discovered',
+                    data: {
+                        peerId,
+                        isHub: false,
+                        ...peerData.data
+                    },
+                    networkName: networkName,
+                    fromPeerId: 'system',
+                    timestamp: Date.now()
+                };
+                
+                try {
+                    ws.send(JSON.stringify(peerAnnouncement));
+                    totalAnnounced++;
+                } catch (error) {
+                    console.error(`❌ Error announcing peer ${peerId.substring(0, 8)}... to bootstrap:`, error.message);
+                }
+            }
+        }
+        
+        if (totalAnnounced > 0) {
+            console.log(`📡 Announced ${totalAnnounced} local peer(s) to bootstrap hub`);
+        }
+    }
+    
+    /**
+     * Send all local peers to a connected hub (via peerId)
+     */
+    sendLocalPeersToHub(hubPeerId) {
+        const hubConnection = this.connections.get(hubPeerId);
+        if (!hubConnection || hubConnection.readyState !== WebSocket.OPEN) {
+            console.log(`⚠️  Cannot send peers to hub ${hubPeerId.substring(0, 8)}... - not connected`);
+            return;
+        }
+        
+        let totalSent = 0;
+        
+        // Iterate through all networks and send their peers
+        for (const [networkName, peerSet] of this.networkPeers) {
+            // Skip the hub mesh namespace
+            if (networkName === this.hubMeshNamespace) {
+                continue;
+            }
+            
+            for (const peerId of peerSet) {
+                const peerData = this.peerData.get(peerId);
+                
+                // Skip hubs, only send regular peers
+                if (peerData?.isHub) {
+                    continue;
+                }
+                
+                // Skip if not connected or not announced
+                const connection = this.connections.get(peerId);
+                if (!connection || connection.readyState !== WebSocket.OPEN || !peerData?.announced) {
+                    continue;
+                }
+                
+                // Send peer-discovered message to the hub
+                const peerAnnouncement = {
+                    type: 'peer-discovered',
+                    data: {
+                        peerId,
+                        isHub: false,
+                        ...peerData.data
+                    },
+                    networkName: networkName,
+                    fromPeerId: 'system',
+                    targetPeerId: hubPeerId,
+                    timestamp: Date.now()
+                };
+                
+                try {
+                    this.sendToConnection(hubConnection, peerAnnouncement);
+                    totalSent++;
+                } catch (error) {
+                    console.error(`❌ Error sending peer ${peerId.substring(0, 8)}... to hub:`, error.message);
+                }
+            }
+        }
+        
+        if (totalSent > 0) {
+            console.log(`📡 Sent ${totalSent} local peer(s) to hub ${hubPeerId.substring(0, 8)}...`);
+        }
     }
 
     /**
@@ -821,6 +939,12 @@ export class PeerPigeonServer extends EventEmitter {
                 data: message.data,
                 connectedAt: peerInfo?.connectedAt || Date.now()
             });
+            
+            // When a new hub announces itself, send it all our local peers
+            if (this.isHub) {
+                console.log(`📡 New hub connected, sending our local peers to ${peerId.substring(0, 8)}...`);
+                this.sendLocalPeersToHub(peerId);
+            }
         }
 
         // Add peer to network tracking
@@ -829,24 +953,53 @@ export class PeerPigeonServer extends EventEmitter {
         }
         this.networkPeers.get(peerNetworkName).add(peerId);
 
-        // If this is a hub and we have bootstrap connections, broadcast this peer to other hubs
-        if (this.isHub && this.bootstrapConnections.size > 0 && !isHub) {
-            console.log(`📡 Broadcasting peer ${peerId.substring(0, 8)}... to other hubs via bootstrap`);
-            const peerAnnouncement = {
-                type: 'peer-discovered',
-                data: {
-                    peerId,
-                    isHub: false,
-                    ...message.data
-                },
-                networkName: peerNetworkName,
-                fromPeerId: 'system',
-                timestamp: Date.now()
-            };
+        // If this is a hub, broadcast this peer to ALL other connected hubs (both bootstrap and incoming)
+        if (this.isHub && !isHub) {
+            const connectedHubs = [];
             
+            // 1. Add outgoing bootstrap connections
             for (const [uri, connInfo] of this.bootstrapConnections) {
                 if (connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
-                    connInfo.ws.send(JSON.stringify(peerAnnouncement));
+                    connectedHubs.push({ type: 'bootstrap', ws: connInfo.ws, id: uri });
+                }
+            }
+            
+            // 2. Add incoming hub connections (hubs that connected to us)
+            for (const [hubPeerId, hubInfo] of this.hubs) {
+                // Skip self and the announcing hub
+                if (hubPeerId === this.hubPeerId || hubPeerId === peerId) {
+                    continue;
+                }
+                const hubConnection = this.connections.get(hubPeerId);
+                if (hubConnection && hubConnection.readyState === WebSocket.OPEN) {
+                    connectedHubs.push({ type: 'incoming', ws: hubConnection, id: hubPeerId });
+                }
+            }
+            
+            if (connectedHubs.length > 0) {
+                console.log(`📡 Broadcasting peer ${peerId.substring(0, 8)}... to ${connectedHubs.length} connected hub(s)`);
+                const peerAnnouncement = {
+                    type: 'peer-discovered',
+                    data: {
+                        peerId,
+                        isHub: false,
+                        ...message.data
+                    },
+                    networkName: peerNetworkName,
+                    fromPeerId: 'system',
+                    timestamp: Date.now()
+                };
+                
+                for (const hub of connectedHubs) {
+                    try {
+                        if (hub.type === 'bootstrap') {
+                            hub.ws.send(JSON.stringify(peerAnnouncement));
+                        } else {
+                            this.sendToConnection(hub.ws, peerAnnouncement);
+                        }
+                    } catch (error) {
+                        console.error(`❌ Error broadcasting to hub ${hub.id}:`, error.message);
+                    }
                 }
             }
         }
