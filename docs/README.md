@@ -45,6 +45,7 @@ Complete documentation for PeerPigeon - a WebRTC-based peer-to-peer mesh network
 - **Signaling Server** - WebSocket server setup (see API_DOCUMENTATION.md)
 - **Hub System** - Multi-server federation (see HUB_SYSTEM.md)
 - **Bootstrap Hubs** - Hub discovery (see BOOTSTRAP_HUBS.md)
+- **[Custom Hub Namespaces](CUSTOM_HUB_NAMESPACES.md)** - Isolate hub networks with custom namespaces
 - **CLI Tools** - Command-line utilities (see CLI_README.md)
 
 ## 🔧 Reference Documents

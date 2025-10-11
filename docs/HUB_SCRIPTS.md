@@ -58,6 +58,14 @@ BOOTSTRAP=ws://hub1.example.com:3000,ws://hub2.example.com:3000 npm run hub
 HUB_ID=a1b2c3d4e5f6789012345678901234567890abcd npm run hub
 ```
 
+### Custom Hub Mesh Namespace
+
+```bash
+HUB_MESH_NAMESPACE=my-custom-mesh npm run hub
+```
+
+**Note:** All hubs in the same deployment must use the same namespace to discover each other.
+
 ### Disable Auto-Connect
 
 ```bash
@@ -82,6 +90,7 @@ PORT=3002 node scripts/start-hub.js          # Custom port
 - `HOST` - Host address (default: localhost)
 - `BOOTSTRAP` - Comma-separated bootstrap hub URIs
 - `HUB_ID` - Custom 40-character hex peer ID
+- `HUB_MESH_NAMESPACE` - Custom hub mesh namespace (default: pigeonhub-mesh)
 - `AUTO_CONNECT` - Auto-connect to bootstrap (default: true)
 
 **Command Line Flags:**
@@ -101,6 +110,7 @@ HUB_COUNT=6 node scripts/start-hub-network.js  # Start 6 hubs (ports 3000-3005)
 - `HUB_COUNT` - Number of hubs to start (default: 4)
 - `START_PORT` - Starting port number (default: 3000)
 - `HOST` - Host address (default: localhost)
+- `HUB_MESH_NAMESPACE` - Custom hub mesh namespace (default: pigeonhub-mesh)
 
 **Features:**
 - Starts bootstrap hub first
