@@ -104,4 +104,5 @@ pm2 startup
 - Host: localhost
 - Reconnect Interval: 5 seconds
 - Max Reconnect Attempts: 10
-- Hub Mesh Namespace: pigeonhub-mesh
+- Hub Mesh Namespace: pigeonhub-mesh (configurable via `HUB_MESH_NAMESPACE`)
+

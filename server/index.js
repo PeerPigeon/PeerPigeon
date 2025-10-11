@@ -21,9 +21,10 @@ export class PeerPigeonServer extends EventEmitter {
         this.maxMessageSize = options.maxMessageSize || 1048576; // 1MB
         this.maxPortRetries = options.maxPortRetries || 10; // Try up to 10 ports
         
+                
         // Hub configuration
         this.isHub = options.isHub || false; // Whether this server is a hub
-        this.hubMeshNamespace = 'pigeonhub-mesh'; // Reserved namespace for hubs
+        this.hubMeshNamespace = options.hubMeshNamespace || 'pigeonhub-mesh'; // Reserved namespace for hubs (default: 'pigeonhub-mesh')
         this.bootstrapHubs = options.bootstrapHubs || []; // URIs of bootstrap hubs to connect to
         this.autoConnect = options.autoConnect !== false; // Auto-connect to bootstrap hubs (default: true)
         this.reconnectInterval = options.reconnectInterval || 5000; // Reconnect interval in ms
@@ -1401,6 +1402,7 @@ export class PeerPigeonServer extends EventEmitter {
             isRunning: this.isRunning,
             isHub: this.isHub,
             hubPeerId: this.hubPeerId,
+            hubMeshNamespace: this.hubMeshNamespace,
             connections: this.connections.size,
             peers: this.peerData.size,
             hubs: this.hubs.size,
@@ -1442,6 +1444,30 @@ export class PeerPigeonServer extends EventEmitter {
      */
     getPeers() {
         return Array.from(this.peerData.values());
+    }
+
+    /**
+     * Get the current hub mesh namespace
+     */
+    getHubMeshNamespace() {
+        return this.hubMeshNamespace;
+    }
+
+    /**
+     * Set the hub mesh namespace (only when server is not running)
+     */
+    setHubMeshNamespace(namespace) {
+        if (this.isRunning) {
+            throw new Error('Cannot change hub mesh namespace while server is running. Stop the server first.');
+        }
+        
+        if (typeof namespace !== 'string' || namespace.trim().length === 0) {
+            throw new Error('Hub mesh namespace must be a non-empty string');
+        }
+        
+        this.hubMeshNamespace = namespace.trim();
+        console.log(`🌐 Hub mesh namespace set to: ${this.hubMeshNamespace}`);
+        return this.hubMeshNamespace;
     }
 }
 

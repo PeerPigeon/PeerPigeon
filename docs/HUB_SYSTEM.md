@@ -39,15 +39,17 @@ PeerPigeon supports a hub system where certain nodes can act as **hubs** - long-
    (app-net)           (app-net)          (app-net)
 ```
 
-## Hub Namespace: `pigeonhub-mesh`
+## Hub Namespace: `pigeonhub-mesh` (Configurable)
 
-The `pigeonhub-mesh` namespace is reserved for hub-to-hub connections. When a hub announces on this namespace:
+By default, the `pigeonhub-mesh` namespace is reserved for hub-to-hub connections. However, you can configure a custom hub mesh namespace for your deployment. When a hub announces on this namespace:
 
 1. The signaling server identifies it as a hub
 2. It's registered in the hub registry
 3. It receives a list of all other connected hubs
 4. Other hubs are notified about this new hub
 5. Hubs can then establish WebRTC connections to each other
+
+**Note:** All hubs in the same network must use the same namespace to discover and connect to each other.
 
 ## Server Configuration
 
@@ -60,6 +62,7 @@ const hubServer = new PeerPigeonServer({
     port: 3000,
     host: 'localhost',
     isHub: true, // Mark this server as a hub
+    hubMeshNamespace: 'pigeonhub-mesh', // Optional: defaults to 'pigeonhub-mesh'
     maxConnections: 1000,
     cleanupInterval: 30000
 });
@@ -75,6 +78,50 @@ hubServer.on('hubUnregistered', ({ peerId, totalHubs }) => {
 
 await hubServer.start();
 ```
+
+### Using a Custom Hub Namespace
+
+You can use a custom namespace for your hub network to isolate different hub deployments:
+
+```javascript
+const hubServer = new PeerPigeonServer({
+    port: 3000,
+    host: 'localhost',
+    isHub: true,
+    hubMeshNamespace: 'my-custom-hub-mesh', // Custom namespace
+    maxConnections: 1000
+});
+```
+
+All hubs in the same deployment should use the same `hubMeshNamespace` to form a unified hub mesh.
+
+### Programmatic API for Hub Namespace
+
+You can also get and set the hub mesh namespace programmatically:
+
+```javascript
+// Create hub with default namespace
+const hubServer = new PeerPigeonServer({
+    port: 3000,
+    isHub: true
+});
+
+// Get current namespace
+const namespace = hubServer.getHubMeshNamespace();
+console.log('Current namespace:', namespace); // 'pigeonhub-mesh'
+
+// Set custom namespace (only when server is not running)
+hubServer.setHubMeshNamespace('production-mesh');
+
+// Start the server
+await hubServer.start();
+
+// Get server stats including namespace
+const stats = hubServer.getStats();
+console.log('Hub mesh namespace:', stats.hubMeshNamespace);
+```
+
+**Important:** You can only change the namespace when the server is stopped. Attempting to change it while running will throw an error.
 
 ### Creating a Regular Server
 

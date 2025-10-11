@@ -1732,11 +1732,14 @@ new PeerPigeonServer(options = {})
 - `options.maxMessageSize` (number, default: 1048576) - Max message size in bytes (1MB)
 - `options.maxPortRetries` (number, default: 10) - Port retry attempts if port in use
 - `options.isHub` (boolean, default: false) - Run as a hub server
+- `options.hubMeshNamespace` (string, default: 'pigeonhub-mesh') - Network namespace for hub-to-hub connections
 - `options.hubPeerId` (string, optional) - Custom hub peer ID (auto-generated if hub)
 - `options.bootstrapHubs` (Array<string>, default: []) - URIs of bootstrap hubs to connect to
 - `options.autoConnect` (boolean, default: true) - Auto-connect to bootstrap hubs
 - `options.reconnectInterval` (number, default: 5000) - Hub reconnect interval in ms
 - `options.maxReconnectAttempts` (number, default: 10) - Max hub reconnection attempts
+
+**Note:** All hubs in the same network must use the same `hubMeshNamespace` to discover and connect to each other. The default `'pigeonhub-mesh'` namespace works for most deployments, but you can specify a custom namespace to isolate different hub networks.
 
 #### Methods
 
@@ -1762,6 +1765,7 @@ Get comprehensive server statistics.
   isRunning: boolean,
   isHub: boolean,
   hubPeerId: string | null,
+  hubMeshNamespace: string,  // Current hub mesh namespace
   connections: number,
   peers: number,
   hubs: number,
@@ -1794,6 +1798,33 @@ Get hub-specific statistics (only relevant if `isHub: true`).
 Get list of all connected peers.
 
 **Returns:** `Array<Object>` - Array of peer information objects
+
+#### `getHubMeshNamespace()`
+Get the current hub mesh namespace.
+
+**Returns:** `string` - Current hub mesh namespace
+
+```javascript
+const namespace = server.getHubMeshNamespace();
+console.log('Hub namespace:', namespace); // 'pigeonhub-mesh'
+```
+
+#### `setHubMeshNamespace(namespace)`
+Set the hub mesh namespace. Can only be called when server is stopped.
+
+**Parameters:**
+- `namespace` (string) - New hub mesh namespace (non-empty string)
+
+**Returns:** `string` - The set namespace  
+**Throws:** Error if server is running or namespace is invalid
+
+```javascript
+// Must be called before starting the server
+server.setHubMeshNamespace('production-mesh');
+await server.start();
+```
+
+**Important:** All hubs in the same network must use the same namespace to discover each other.
 
 #### `broadcastToOthers(senderPeerId, message)`
 Broadcast to all peers except sender.

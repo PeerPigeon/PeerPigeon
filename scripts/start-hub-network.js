@@ -10,6 +10,7 @@
  * Usage:
  *   node scripts/start-hub-network.js
  *   HUB_COUNT=5 node scripts/start-hub-network.js
+ *   HUB_MESH_NAMESPACE=custom-mesh node scripts/start-hub-network.js
  */
 
 import { PeerPigeonServer } from '../server/index.js';
@@ -18,6 +19,7 @@ import { PeerPigeonServer } from '../server/index.js';
 const HUB_COUNT = parseInt(process.env.HUB_COUNT) || 4; // Bootstrap + 3 secondary
 const START_PORT = parseInt(process.env.START_PORT) || 3000;
 const HOST = process.env.HOST || 'localhost';
+const HUB_MESH_NAMESPACE = process.env.HUB_MESH_NAMESPACE || 'pigeonhub-mesh';
 
 console.log('╔════════════════════════════════════════════╗');
 console.log('║    PeerPigeon Hub Network Startup          ║');
@@ -27,6 +29,7 @@ console.log(`📋 Configuration:`);
 console.log(`  Total Hubs: ${HUB_COUNT}`);
 console.log(`  Start Port: ${START_PORT}`);
 console.log(`  Host: ${HOST}`);
+console.log(`  Hub Mesh Namespace: ${HUB_MESH_NAMESPACE}`);
 console.log('');
 
 const hubs = [];
@@ -39,6 +42,7 @@ async function createBootstrapHub() {
         port: START_PORT,
         host: HOST,
         isHub: true,
+        hubMeshNamespace: HUB_MESH_NAMESPACE,
         autoConnect: false
     });
 
@@ -57,6 +61,7 @@ async function createSecondaryHub(port) {
         port,
         host: HOST,
         isHub: true,
+        hubMeshNamespace: HUB_MESH_NAMESPACE,
         autoConnect: true,
         bootstrapHubs: [`ws://${HOST}:${START_PORT}`]
     });

@@ -9,18 +9,21 @@ import { PeerPigeonServer } from './index.js';
  * - HOST: Server host (default: localhost)
  * - MAX_CONNECTIONS: Maximum connections (default: 1000)
  * - CORS_ORIGIN: CORS origin (default: *)
+ * - HUB_MESH_NAMESPACE: Hub network namespace (default: pigeonhub-mesh)
  */
 
 const port = parseInt(process.env.PORT || '3000', 10);
 const host = process.env.HOST || 'localhost';
 const maxConnections = parseInt(process.env.MAX_CONNECTIONS || '1000', 10);
 const corsOrigin = process.env.CORS_ORIGIN || '*';
+const hubMeshNamespace = process.env.HUB_MESH_NAMESPACE || 'pigeonhub-mesh';
 
 const server = new PeerPigeonServer({
     port,
     host,
     maxConnections,
     corsOrigin,
+    hubMeshNamespace,
     isHub: false // Regular signaling server by default
 });
 

@@ -99,7 +99,7 @@ function clientAnnounceAsHub() {
     // When a client connects to the signaling server and wants to identify as a hub:
     const announceMessage = {
         type: 'announce',
-        networkName: 'pigeonhub-mesh', // Special namespace for hubs
+        networkName: 'pigeonhub-mesh', // Default hub namespace (customizable on server)
         data: {
             isHub: true, // Identify as a hub
             // Add any additional hub metadata
@@ -107,6 +107,9 @@ function clientAnnounceAsHub() {
             capabilities: ['signaling', 'relay', 'storage']
         }
     };
+    
+    // Note: If the server is configured with a custom hub mesh namespace,
+    // use that namespace instead of 'pigeonhub-mesh'
     
     // Send this message via WebSocket
     // ws.send(JSON.stringify(announceMessage));
