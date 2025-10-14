@@ -6,6 +6,7 @@
 export class EnvironmentDetector {
   constructor() {
     this._cache = new Map();
+    this._pigeonRTC = null;
     this._init();
   }
 
@@ -21,61 +22,32 @@ export class EnvironmentDetector {
     this._cache.set('isBun', this._detectBun());
     this._cache.set('isNativeScript', this._detectNativeScript());
 
-    // Initialize WebRTC polyfill for Node.js if available
-    if (this._cache.get('isNodeJS')) {
-      this._initNodeWebRTC();
-    }
+    // Initialize PigeonRTC for cross-platform WebRTC support
+    this._initPigeonRTC();
   }
 
   /**
-   * Initialize WebRTC polyfill for Node.js environment
-   * Attempts to load @koush/wrtc and set up WebRTC globals
+   * Initialize PigeonRTC for cross-platform WebRTC support
+   * PigeonRTC provides a unified WebRTC interface across browser and Node.js
    * @private
    */
-  _initNodeWebRTC() {
+  _initPigeonRTC() {
     try {
-      // Check if WebRTC is already available globally
-      if (typeof global !== 'undefined' && typeof global.RTCPeerConnection !== 'undefined') {
-        return; // WebRTC already available
-      }
-
-      // Try to import @koush/wrtc package
-      let wrtc;
-      if (typeof require !== 'undefined') {
-        // CommonJS require
-        try {
-          wrtc = require('@koush/wrtc');
-        } catch (e) {
-          // @koush/wrtc not available, try node-webrtc as fallback
-          try {
-            wrtc = require('node-webrtc');
-          } catch (e2) {
-            // No WebRTC package available
-            return;
-          }
-        }
-      } else {
-        // ES modules - dynamic import would be needed
-        // Since we can't do synchronous dynamic imports, we'll skip this
-        // The async method initWebRTCAsync() should be used instead
-        return;
-      }
-
-      // Set up WebRTC globals if we successfully loaded a package
-      if (wrtc && typeof global !== 'undefined') {
-        global.RTCPeerConnection = wrtc.RTCPeerConnection;
-        global.RTCSessionDescription = wrtc.RTCSessionDescription;
-        global.RTCIceCandidate = wrtc.RTCIceCandidate;
-        global.MediaStream = wrtc.MediaStream || global.MediaStream;
-        global.MediaStreamTrack = wrtc.MediaStreamTrack || global.MediaStreamTrack;
-
-        // Update cache to reflect that WebRTC is now available
-        this._webrtcPolyfilled = true;
-      }
+      // PigeonRTC will be initialized asynchronously via initWebRTCAsync()
+      // This is a placeholder to mark that we're using PigeonRTC
+      this._webrtcPolyfilled = false;
     } catch (error) {
       // Silently fail - WebRTC polyfill is optional
       // The application will handle missing WebRTC through normal capability detection
     }
+  }
+
+  /**
+   * Get the PigeonRTC instance
+   * @returns {PigeonRTC|null} The PigeonRTC instance or null if not initialized
+   */
+  getPigeonRTC() {
+    return this._pigeonRTC;
   }
 
   // Primary environment detection
@@ -180,14 +152,19 @@ export class EnvironmentDetector {
 
   // WebRTC capability detection
   get hasWebRTC() {
+    // If PigeonRTC is initialized, use its support check
+    if (this._pigeonRTC) {
+      return this._pigeonRTC.isSupported();
+    }
+
+    // Fallback to native detection
     if (this.isBrowser) {
       return typeof RTCPeerConnection !== 'undefined' ||
                    typeof webkitRTCPeerConnection !== 'undefined' ||
                    typeof mozRTCPeerConnection !== 'undefined';
     }
     if (this.isNodeJS) {
-      // Check for Node.js WebRTC implementations or globally injected WebRTC
-      // This includes polyfills loaded by _initNodeWebRTC()
+      // Check for globally injected WebRTC (from PigeonRTC or other sources)
       return (typeof global !== 'undefined' &&
                    typeof global.RTCPeerConnection !== 'undefined') ||
                    typeof RTCPeerConnection !== 'undefined' ||
@@ -195,7 +172,6 @@ export class EnvironmentDetector {
     }
     if (this.isNativeScript) {
       // NativeScript can access native WebRTC implementations through native modules
-      // Check for globally injected WebRTC first
       return (typeof global !== 'undefined' &&
                    typeof global.RTCPeerConnection !== 'undefined') ||
                    typeof RTCPeerConnection !== 'undefined';
@@ -549,52 +525,53 @@ export class EnvironmentDetector {
   }
 
   /**
-   * Asynchronously initialize WebRTC polyfill for Node.js environment
-   * This method is useful for ES module environments where dynamic imports are preferred
+   * Asynchronously initialize WebRTC using PigeonRTC
+   * This method initializes PigeonRTC for cross-platform WebRTC support
    * @returns {Promise<boolean>} True if WebRTC was successfully initialized
    */
   async initWebRTCAsync() {
-    if (!this.isNodeJS) {
-      return false; // Only works in Node.js
-    }
-
     try {
-      // Check if WebRTC is already available globally
-      if (typeof global !== 'undefined' && typeof global.RTCPeerConnection !== 'undefined') {
-        return true; // WebRTC already available
-      }
-
-      let wrtc;
-      try {
-        // Try to import @koush/wrtc first
-        wrtc = await import('@koush/wrtc');
-      } catch (e) {
-        try {
-          // Fallback to node-webrtc
-          wrtc = await import('node-webrtc');
-        } catch (e2) {
-          // No WebRTC package available
-          return false;
-        }
-      }
-
-      // Set up WebRTC globals if we successfully loaded a package
-      if (wrtc && typeof global !== 'undefined') {
-        global.RTCPeerConnection = wrtc.RTCPeerConnection || wrtc.default?.RTCPeerConnection;
-        global.RTCSessionDescription = wrtc.RTCSessionDescription || wrtc.default?.RTCSessionDescription;
-        global.RTCIceCandidate = wrtc.RTCIceCandidate || wrtc.default?.RTCIceCandidate;
-        global.MediaStream = wrtc.MediaStream || wrtc.default?.MediaStream || global.MediaStream;
-        global.MediaStreamTrack = wrtc.MediaStreamTrack || wrtc.default?.MediaStreamTrack || global.MediaStreamTrack;
-
-        // Update cache to reflect that WebRTC is now available
-        this._webrtcPolyfilled = true;
+      // Check if already initialized
+      if (this._pigeonRTC) {
         return true;
       }
-    } catch (error) {
-      // Silently fail - WebRTC polyfill is optional
-    }
 
-    return false;
+      // Check for bundled PigeonRTC in browser builds
+      let createPigeonRTC;
+      if (typeof globalThis !== 'undefined' && globalThis.__PEERPIGEON_PIGEONRTC__) {
+        createPigeonRTC = globalThis.__PEERPIGEON_PIGEONRTC__.createPigeonRTC || 
+                         globalThis.__PEERPIGEON_PIGEONRTC__.default;
+      } else if (typeof window !== 'undefined' && window.__PEERPIGEON_PIGEONRTC__) {
+        createPigeonRTC = window.__PEERPIGEON_PIGEONRTC__.createPigeonRTC || 
+                         window.__PEERPIGEON_PIGEONRTC__.default;
+      }
+      
+      // If not found in globals, try dynamic import (Node.js only)
+      if (!createPigeonRTC && this.isNodeJS) {
+        try {
+          // Import PigeonRTC dynamically (for non-bundled Node.js environments)
+          const pigeonRTCModule = await import('pigeonrtc');
+          createPigeonRTC = pigeonRTCModule.createPigeonRTC || pigeonRTCModule.default;
+        } catch (error) {
+          console.error('Failed to dynamically import PigeonRTC:', error);
+        }
+      }
+      
+      if (!createPigeonRTC) {
+        throw new Error('PigeonRTC createPigeonRTC function not found');
+      }
+      
+      // Initialize PigeonRTC (auto-detects environment)
+      this._pigeonRTC = await createPigeonRTC();
+      
+      // Update cache to reflect that WebRTC is now available
+      this._webrtcPolyfilled = true;
+      
+      return this._pigeonRTC.isSupported();
+    } catch (error) {
+      console.error('Failed to initialize PigeonRTC:', error);
+      return false;
+    }
   }
 
   // Static method for quick environment check

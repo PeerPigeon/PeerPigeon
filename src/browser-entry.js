@@ -4,6 +4,9 @@
 // Import UnSEA directly from node_modules (esbuild will bundle it)
 import * as UnSEA from 'unsea';
 
+// Import browser-specific PigeonRTC (avoids Node.js dependencies)
+import { createPigeonRTC, PigeonRTC, BrowserRTCAdapter, RTCAdapter } from './PigeonRTC-browser.js';
+
 // Import only browser-compatible components
 export { PeerPigeonMesh } from '../src/PeerPigeonMesh.js';
 export { PeerConnection } from '../src/PeerConnection.js';
@@ -23,18 +26,33 @@ export {
   isWorker,
   hasWebRTC,
   hasWebSocket,
-  getEnvironmentReport
+  getEnvironmentReport,
+  initWebRTCAsync
 } from '../src/EnvironmentDetector.js';
 
 // Make UnSEA available globally for the existing dynamic import logic
 // This allows the CryptoManager to detect and use the bundled version
 if (typeof globalThis !== 'undefined') {
   globalThis.__PEERPIGEON_UNSEA__ = UnSEA;
+  globalThis.__PEERPIGEON_PIGEONRTC__ = {
+    createPigeonRTC,
+    PigeonRTC,
+    BrowserRTCAdapter,
+    RTCAdapter,
+    default: createPigeonRTC
+  };
 }
 
 // Also set it on window for browser compatibility
 if (typeof window !== 'undefined') {
   window.__PEERPIGEON_UNSEA__ = UnSEA;
+  window.__PEERPIGEON_PIGEONRTC__ = {
+    createPigeonRTC,
+    PigeonRTC,
+    BrowserRTCAdapter,
+    RTCAdapter,
+    default: createPigeonRTC
+  };
 }
 
-console.log('🔐 PeerPigeon browser bundle loaded with embedded UnSEA crypto');
+console.log('🔐 PeerPigeon browser bundle loaded with embedded UnSEA crypto and PigeonRTC');

@@ -77,6 +77,7 @@
   "homepage": "https://github.com/PeerPigeon/PeerPigeon#readme",
   "dependencies": {
     "@koush/wrtc": "^0.5.3",
+    "pigeonrtc": "^0.0.3",
     "unsea": "^1.1.2",
     "ws": "^8.18.0",
     "yamljs": "^0.3.0"

@@ -111,7 +111,14 @@ export class MediaManager extends EventEmitter {
         throw new Error('At least one of video or audio must be enabled');
       }
 
-      this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
+      // Try to use PigeonRTC's getUserMedia if available, otherwise fall back to navigator
+      const pigeonRTC = environmentDetector.getPigeonRTC();
+      if (pigeonRTC) {
+        this.localStream = await pigeonRTC.getUserMedia(constraints);
+      } else {
+        this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
+      }
+      
       this.isVideoEnabled = video;
       this.isAudioEnabled = audio;
 
@@ -215,10 +222,13 @@ export class MediaManager extends EventEmitter {
      * Check if browser supports required APIs
      */
   static checkSupport() {
+    // Get PigeonRTC instance if available
+    const pigeonRTC = environmentDetector.getPigeonRTC();
+    
     const support = {
       getUserMedia: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
       enumerateDevices: !!(navigator.mediaDevices && navigator.mediaDevices.enumerateDevices),
-      webRTC: !!(window.RTCPeerConnection)
+      webRTC: pigeonRTC ? pigeonRTC.isSupported() : !!(window.RTCPeerConnection)
     };
 
     support.fullSupport = support.getUserMedia && support.enumerateDevices && support.webRTC;
