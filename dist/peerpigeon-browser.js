@@ -6503,13 +6503,18 @@ ${b64.match(/.{1,64}/g).join("\n")}
       for (const [peerId, peerConnection] of this.peers) {
         if (peerConnection.connection?.signalingState === "have-local-offer") {
           const connectionAge = Date.now() - peerConnection.connectionStartTime;
-          if (connectionAge > 2e3) {
+          if (connectionAge > 1e4) {
             stuckConnections.push(peerId);
           }
         }
       }
       if (stuckConnections.length > 0) {
         this.debug.log(`\u{1F6A8} STUCK MONITOR: Found ${stuckConnections.length} stuck connections - forcing recovery`);
+        if (typeof window !== "undefined" && window.location?.hostname === "localhost") {
+          console.warn("\u26A0\uFE0F LOCAL TESTING: WebRTC connections on localhost require media permissions!");
+          console.warn('   Go to the Media tab and click "Start Media" to grant permissions.');
+          console.warn("   See docs/LOCAL_TESTING.md for details.");
+        }
         for (const peerId of stuckConnections) {
           this.forceConnectionRecovery(peerId).catch((error) => {
             this.debug.error(`Failed to recover stuck connection for ${peerId}:`, error);
@@ -6926,9 +6931,15 @@ ${b64.match(/.{1,64}/g).join("\n")}
       }
       const peerConnection = this.connectionManager.getPeer(fromPeerId);
       this.debug.log(`\u{1F504} ANSWER RECEIVE DEBUG: Found peer connection: ${!!peerConnection}`);
+      const allPeerIds = Array.from(this.connectionManager.peers.keys());
+      this.debug.log(`\u{1F504} ANSWER RECEIVE DEBUG: All current peers (${allPeerIds.length}): ${allPeerIds.map((p) => p.substring(0, 8)).join(", ")}`);
       if (peerConnection) {
         this.debug.log(`\u{1F504} ANSWER RECEIVE DEBUG: Peer connection state: ${peerConnection.connection?.signalingState}`);
         this.debug.log(`\u{1F504} ANSWER RECEIVE DEBUG: Is initiator: ${peerConnection.isInitiator}`);
+        this.debug.log(`\u{1F504} ANSWER RECEIVE DEBUG: Connection age: ${Date.now() - peerConnection.connectionStartTime}ms`);
+      } else {
+        this.debug.error(`\u{1F504} ANSWER RECEIVE DEBUG: NO PEER CONNECTION - Was expecting peer ${fromPeerId.substring(0, 8)}...`);
+        this.debug.error(`\u{1F504} ANSWER RECEIVE DEBUG: This means the peer connection was cleaned up or never created!`);
       }
       if (peerConnection) {
         try {
@@ -6946,7 +6957,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
           }
         }
       } else {
-        this.debug.log("\u274C ANSWER RECEIVE DEBUG: No peer connection found for answer from", fromPeerId);
+        this.debug.error("\u274C ANSWER RECEIVE DEBUG: No peer connection found for answer from", fromPeerId);
+        this.debug.error("\u274C ANSWER RECEIVE DEBUG: Peer connection may have been cleaned up prematurely - check connection timeout/cleanup logic");
       }
     }
     handleConnectionRejected(data, fromPeerId) {
@@ -11119,6 +11131,27 @@ ${b64.match(/.{1,64}/g).join("\n")}
           }
         } catch (error) {
           this.debug.warn("PigeonRTC initialization failed:", error.message);
+        }
+        if (environmentDetector.isBrowser) {
+          try {
+            const isLocalhost = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" || window.location.hostname === "";
+            if (isLocalhost && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+              this.debug.log("\u{1F3A4} Requesting media permissions for localhost WebRTC...");
+              const stream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: false
+              }).catch((err) => {
+                this.debug.warn("Media permission denied - connections may fail on localhost:", err.message);
+                return null;
+              });
+              if (stream) {
+                stream.getTracks().forEach((track) => track.stop());
+                this.debug.log("\u2705 Media permissions granted - localhost connections will work");
+              }
+            }
+          } catch (error) {
+            this.debug.warn("Could not request media permissions:", error.message);
+          }
         }
         if (this.providedPeerId) {
           if (_PeerPigeonMesh.validatePeerId(this.providedPeerId)) {

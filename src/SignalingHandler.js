@@ -410,9 +410,18 @@ export class SignalingHandler extends EventEmitter {
     // CRITICAL DEBUG: Check if we have a peer connection for this answer
     const peerConnection = this.connectionManager.getPeer(fromPeerId);
     this.debug.log(`🔄 ANSWER RECEIVE DEBUG: Found peer connection: ${!!peerConnection}`);
+    
+    // DEBUG: Log all current peers
+    const allPeerIds = Array.from(this.connectionManager.peers.keys());
+    this.debug.log(`🔄 ANSWER RECEIVE DEBUG: All current peers (${allPeerIds.length}): ${allPeerIds.map(p => p.substring(0, 8)).join(', ')}`);
+    
     if (peerConnection) {
       this.debug.log(`🔄 ANSWER RECEIVE DEBUG: Peer connection state: ${peerConnection.connection?.signalingState}`);
       this.debug.log(`🔄 ANSWER RECEIVE DEBUG: Is initiator: ${peerConnection.isInitiator}`);
+      this.debug.log(`🔄 ANSWER RECEIVE DEBUG: Connection age: ${Date.now() - peerConnection.connectionStartTime}ms`);
+    } else {
+      this.debug.error(`🔄 ANSWER RECEIVE DEBUG: NO PEER CONNECTION - Was expecting peer ${fromPeerId.substring(0, 8)}...`);
+      this.debug.error(`🔄 ANSWER RECEIVE DEBUG: This means the peer connection was cleaned up or never created!`);
     }
 
     if (peerConnection) {
@@ -433,7 +442,8 @@ export class SignalingHandler extends EventEmitter {
         }
       }
     } else {
-      this.debug.log('❌ ANSWER RECEIVE DEBUG: No peer connection found for answer from', fromPeerId);
+      this.debug.error('❌ ANSWER RECEIVE DEBUG: No peer connection found for answer from', fromPeerId);
+      this.debug.error('❌ ANSWER RECEIVE DEBUG: Peer connection may have been cleaned up prematurely - check connection timeout/cleanup logic');
     }
   }
 

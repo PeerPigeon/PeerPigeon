@@ -319,6 +319,38 @@ export class PeerPigeonMesh extends EventEmitter {
         this.debug.warn('PigeonRTC initialization failed:', error.message);
       }
 
+      // Request media permissions for localhost WebRTC to work
+      // This is required for Chrome to gather ICE candidates on localhost
+      if (environmentDetector.isBrowser) {
+        try {
+          const isLocalhost = window.location.hostname === 'localhost' || 
+                             window.location.hostname === '127.0.0.1' ||
+                             window.location.hostname === '';
+          
+          if (isLocalhost && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            this.debug.log('🎤 Requesting media permissions for localhost WebRTC...');
+            
+            // Request minimal audio permission (no video to reduce intrusiveness)
+            const stream = await navigator.mediaDevices.getUserMedia({ 
+              audio: true, 
+              video: false 
+            }).catch(err => {
+              this.debug.warn('Media permission denied - connections may fail on localhost:', err.message);
+              return null;
+            });
+            
+            // Immediately stop all tracks - we only needed the permission
+            if (stream) {
+              stream.getTracks().forEach(track => track.stop());
+              this.debug.log('✅ Media permissions granted - localhost connections will work');
+            }
+          }
+        } catch (error) {
+          this.debug.warn('Could not request media permissions:', error.message);
+          // Continue anyway - non-localhost environments don't need this
+        }
+      }
+
       // Use provided peer ID if valid, otherwise generate one
       if (this.providedPeerId) {
         if (PeerPigeonMesh.validatePeerId(this.providedPeerId)) {
