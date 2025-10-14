@@ -1043,8 +1043,9 @@ export class ConnectionManager extends EventEmitter {
       if (peerConnection.connection?.signalingState === 'have-local-offer') {
         const connectionAge = Date.now() - peerConnection.connectionStartTime;
 
-        // If connection has been stuck in "have-local-offer" for more than 2 seconds, fix it
-        if (connectionAge > 2000) {
+        // If connection has been stuck in "have-local-offer" for more than 10 seconds, fix it
+        // This timeout balances between allowing time for signaling and detecting truly stuck connections
+        if (connectionAge > 10000) {
           stuckConnections.push(peerId);
         }
       }
@@ -1052,6 +1053,13 @@ export class ConnectionManager extends EventEmitter {
 
     if (stuckConnections.length > 0) {
       this.debug.log(`🚨 STUCK MONITOR: Found ${stuckConnections.length} stuck connections - forcing recovery`);
+      
+      // Log a warning about local testing requirements
+      if (typeof window !== 'undefined' && window.location?.hostname === 'localhost') {
+        console.warn('⚠️ LOCAL TESTING: WebRTC connections on localhost require media permissions!');
+        console.warn('   Go to the Media tab and click "Start Media" to grant permissions.');
+        console.warn('   See docs/LOCAL_TESTING.md for details.');
+      }
 
       for (const peerId of stuckConnections) {
         this.forceConnectionRecovery(peerId).catch(error => {

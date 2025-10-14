@@ -8,6 +8,11 @@
 
 PeerPigeon is a production-ready library for building decentralized applications with true mesh networking, encrypted distributed storage, and selective media streaming. It handles peer discovery, connection management, and message routing automatically.
 
+> **⚠️ IMPORTANT: Local Testing Requirement**  
+> When testing on `localhost`, WebRTC connections require **media permissions** (microphone/camera) due to browser security.  
+> **Solution**: Click the "Media" tab in the browser example and grant permissions, or see [docs/LOCAL_TESTING.md](docs/LOCAL_TESTING.md) for details.  
+> This is **NOT required** for production HTTPS deployments.
+
 ## ✨ Key Features
 
 - **🕸️ True Mesh Networking** - Gossip protocol + XOR distance routing (Kademlia-inspired)
@@ -49,15 +54,27 @@ mesh.on('messageReceived', ({ from, content }) => {
 ### Run Signaling Server
 
 ```bash
-# Option 1: Use npm script
-npm start
+# Start both hub and HTTP server for testing
+npm run dev
 
-# Option 2: Custom port
-PORT=8080 npm start
+# Or run them separately:
+npm run dev:hub   # Just the signaling hub
+npm run dev:http  # Just the HTTP server
 
-# Option 3: Run as a hub (multi-server mesh)
-npm run hub
+# Custom port
+PORT=8080 npm run hub
 ```
+
+### Local Testing
+
+For localhost testing, you need to grant media permissions:
+
+1. Open browser example: `http://localhost:8080/`
+2. Go to **Media** tab
+3. Click **Start Media** button
+4. Allow microphone/camera access
+
+See [docs/LOCAL_TESTING.md](docs/LOCAL_TESTING.md) for full details.
 
 ## 📚 Examples
 
