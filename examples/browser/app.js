@@ -43,7 +43,7 @@ class PeerPigeonTestSuite {
                 enableDistributedStorage: true, // Enable distributed storage
                 networkName: 'global', // Default network
                 allowGlobalFallback: true, // Allow fallback to global network
-                maxPeers: 3,
+                maxPeers: 4,
                 minPeers: 2,
                 autoConnect: true,
                 autoDiscovery: true,
