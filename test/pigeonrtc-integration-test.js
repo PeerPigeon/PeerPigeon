@@ -67,7 +67,7 @@ async function testPigeonRTC() {
     // Test 5: Initialize PeerPigeonMesh (which should use PigeonRTC internally)
     console.log('\nTest 5: Initializing PeerPigeonMesh with PigeonRTC...');
     const mesh = new PeerPigeonMesh({
-      maxPeers: 3,
+      maxPeers: 4,
       autoConnect: false // Don't actually connect
     });
     
