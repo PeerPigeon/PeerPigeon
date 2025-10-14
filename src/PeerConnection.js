@@ -49,7 +49,16 @@ export class PeerConnection extends EventEmitter {
       throw error;
     }
 
-    this.connection = new RTCPeerConnection({
+    // Get PigeonRTC instance for cross-platform WebRTC support
+    const pigeonRTC = environmentDetector.getPigeonRTC();
+    if (!pigeonRTC) {
+      const error = new Error('PigeonRTC not initialized - call initWebRTCAsync() first');
+      this.emit('connectionFailed', { peerId: this.peerId, reason: error.message });
+      throw error;
+    }
+
+    // Create peer connection using PigeonRTC
+    this.connection = pigeonRTC.createPeerConnection({
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },

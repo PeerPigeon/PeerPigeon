@@ -308,16 +308,15 @@ export class PeerPigeonMesh extends EventEmitter {
 
   async init() {
     try {
-      // Initialize WebRTC polyfill for Node.js if needed
-      if (this.runtimeInfo?.isNodeJS) {
-        try {
-          const webrtcInitialized = await environmentDetector.initWebRTCAsync();
-          if (webrtcInitialized) {
-            this.debug.log('🌐 WebRTC polyfill initialized successfully for Node.js environment');
-          }
-        } catch (error) {
-          this.debug.warn('WebRTC polyfill initialization failed:', error.message);
+      // Initialize PigeonRTC for cross-platform WebRTC support
+      try {
+        const webrtcInitialized = await environmentDetector.initWebRTCAsync();
+        if (webrtcInitialized) {
+          const adapterName = environmentDetector.getPigeonRTC()?.getAdapterName();
+          this.debug.log(`🌐 PigeonRTC initialized successfully (${adapterName})`);
         }
+      } catch (error) {
+        this.debug.warn('PigeonRTC initialization failed:', error.message);
       }
 
       // Use provided peer ID if valid, otherwise generate one

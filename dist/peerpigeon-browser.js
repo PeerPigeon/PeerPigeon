@@ -3155,31 +3155,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
     }
   });
 
-  // node_modules/@koush/wrtc/lib/browser.js
-  var require_browser = __commonJS({
-    "node_modules/@koush/wrtc/lib/browser.js"(exports) {
-      "use strict";
-      exports.MediaStream = window.MediaStream;
-      exports.MediaStreamTrack = window.MediaStreamTrack;
-      exports.RTCDataChannel = window.RTCDataChannel;
-      exports.RTCDataChannelEvent = window.RTCDataChannelEvent;
-      exports.RTCDtlsTransport = window.RTCDtlsTransport;
-      exports.RTCIceCandidate = window.RTCIceCandidate;
-      exports.RTCIceTransport = window.RTCIceTransport;
-      exports.RTCPeerConnection = window.RTCPeerConnection;
-      exports.RTCPeerConnectionIceEvent = window.RTCPeerConnectionIceEvent;
-      exports.RTCRtpReceiver = window.RTCRtpReceiver;
-      exports.RTCRtpSender = window.RTCRtpSender;
-      exports.RTCRtpTransceiver = window.RTCRtpTransceiver;
-      exports.RTCSctpTransport = window.RTCSctpTransport;
-      exports.RTCSessionDescription = window.RTCSessionDescription;
-      exports.getUserMedia = window.getUserMedia;
-      exports.mediaDevices = navigator.mediaDevices;
-    }
-  });
-
   // node_modules/ws/browser.js
-  var require_browser2 = __commonJS({
+  var require_browser = __commonJS({
     "node_modules/ws/browser.js"(exports, module) {
       "use strict";
       module.exports = function() {
@@ -3204,11 +3181,184 @@ ${b64.match(/.{1,64}/g).join("\n")}
     getEnvironmentReport: () => getEnvironmentReport,
     hasWebRTC: () => hasWebRTC,
     hasWebSocket: () => hasWebSocket,
+    initWebRTCAsync: () => initWebRTCAsync,
     isBrowser: () => isBrowser2,
     isNodeJS: () => isNodeJS,
     isWorker: () => isWorker
   });
   init_unsea();
+
+  // src/PigeonRTC-browser.js
+  var RTCAdapter = class {
+    getRTCPeerConnection() {
+      throw new Error("getRTCPeerConnection must be implemented by adapter");
+    }
+    getRTCSessionDescription() {
+      throw new Error("getRTCSessionDescription must be implemented by adapter");
+    }
+    getRTCIceCandidate() {
+      throw new Error("getRTCIceCandidate must be implemented by adapter");
+    }
+    getMediaStream() {
+      return null;
+    }
+    isSupported() {
+      throw new Error("isSupported must be implemented by adapter");
+    }
+    getName() {
+      throw new Error("getName must be implemented by adapter");
+    }
+    async initialize() {
+    }
+    async getUserMedia(_constraints) {
+      throw new Error("getUserMedia not supported by this adapter");
+    }
+    async getDisplayMedia(_constraints) {
+      throw new Error("getDisplayMedia not supported by this adapter");
+    }
+  };
+  var BrowserRTCAdapter = class extends RTCAdapter {
+    constructor() {
+      super();
+      this._checkSupport();
+    }
+    _checkSupport() {
+      if (typeof window === "undefined" || typeof navigator === "undefined") {
+        return;
+      }
+      this.hasRTCPeerConnection = !!(window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection);
+      this.hasGetUserMedia = !!(navigator.mediaDevices?.getUserMedia || navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia);
+      this.hasGetDisplayMedia = !!navigator.mediaDevices?.getDisplayMedia;
+    }
+    getRTCPeerConnection() {
+      if (typeof window === "undefined") {
+        throw new Error("BrowserRTCAdapter requires a browser environment");
+      }
+      return window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+    }
+    getRTCSessionDescription() {
+      if (typeof window === "undefined") {
+        throw new Error("BrowserRTCAdapter requires a browser environment");
+      }
+      return window.RTCSessionDescription || window.mozRTCSessionDescription;
+    }
+    getRTCIceCandidate() {
+      if (typeof window === "undefined") {
+        throw new Error("BrowserRTCAdapter requires a browser environment");
+      }
+      return window.RTCIceCandidate || window.mozRTCIceCandidate;
+    }
+    getMediaStream() {
+      if (typeof window === "undefined") {
+        return null;
+      }
+      return window.MediaStream || window.webkitMediaStream;
+    }
+    isSupported() {
+      return typeof window !== "undefined" && this.hasRTCPeerConnection;
+    }
+    getName() {
+      return "BrowserRTCAdapter";
+    }
+    async getUserMedia(constraints) {
+      if (typeof navigator === "undefined") {
+        throw new Error("getUserMedia requires a browser environment");
+      }
+      if (navigator.mediaDevices?.getUserMedia) {
+        return await navigator.mediaDevices.getUserMedia(constraints);
+      }
+      const getUserMedia = navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia;
+      if (!getUserMedia) {
+        throw new Error("getUserMedia is not supported in this browser");
+      }
+      return new Promise((resolve, reject) => {
+        getUserMedia.call(navigator, constraints, resolve, reject);
+      });
+    }
+    async getDisplayMedia(constraints) {
+      if (typeof navigator === "undefined") {
+        throw new Error("getDisplayMedia requires a browser environment");
+      }
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        throw new Error("getDisplayMedia is not supported in this browser");
+      }
+      return await navigator.mediaDevices.getDisplayMedia(constraints);
+    }
+  };
+  var PigeonRTC = class {
+    constructor(options = {}) {
+      this.adapter = options.adapter || null;
+      this.initialized = false;
+    }
+    async initialize(options = {}) {
+      if (this.initialized) {
+        return;
+      }
+      if (options.adapter) {
+        this.adapter = options.adapter;
+      }
+      if (!this.adapter) {
+        this.adapter = new BrowserRTCAdapter();
+      }
+      await this.adapter.initialize();
+      this.initialized = true;
+    }
+    _ensureInitialized() {
+      if (!this.initialized || !this.adapter) {
+        throw new Error("PigeonRTC not initialized. Call initialize() first.");
+      }
+    }
+    getRTCPeerConnection() {
+      this._ensureInitialized();
+      return this.adapter.getRTCPeerConnection();
+    }
+    getRTCSessionDescription() {
+      this._ensureInitialized();
+      return this.adapter.getRTCSessionDescription();
+    }
+    getRTCIceCandidate() {
+      this._ensureInitialized();
+      return this.adapter.getRTCIceCandidate();
+    }
+    getMediaStream() {
+      this._ensureInitialized();
+      return this.adapter.getMediaStream();
+    }
+    createPeerConnection(config) {
+      this._ensureInitialized();
+      const RTCPeerConnection2 = this.adapter.getRTCPeerConnection();
+      return new RTCPeerConnection2(config);
+    }
+    createSessionDescription(init) {
+      this._ensureInitialized();
+      const RTCSessionDescription = this.adapter.getRTCSessionDescription();
+      return new RTCSessionDescription(init);
+    }
+    createIceCandidate(init) {
+      this._ensureInitialized();
+      const RTCIceCandidate = this.adapter.getRTCIceCandidate();
+      return new RTCIceCandidate(init);
+    }
+    async getUserMedia(constraints) {
+      this._ensureInitialized();
+      return await this.adapter.getUserMedia(constraints);
+    }
+    async getDisplayMedia(constraints) {
+      this._ensureInitialized();
+      return await this.adapter.getDisplayMedia(constraints);
+    }
+    isSupported() {
+      return this.adapter ? this.adapter.isSupported() : false;
+    }
+    getAdapterName() {
+      return this.adapter ? this.adapter.getName() : "None";
+    }
+  };
+  async function createPigeonRTC(options = {}) {
+    const rtc = new PigeonRTC(options);
+    await rtc.initialize(options);
+    return rtc;
+  }
 
   // src/EventEmitter.js
   var EventEmitter = class {
@@ -3311,6 +3461,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
   var EnvironmentDetector = class _EnvironmentDetector {
     constructor() {
       this._cache = /* @__PURE__ */ new Map();
+      this._pigeonRTC = null;
       this._init();
     }
     _init() {
@@ -3323,44 +3474,25 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this._cache.set("isDeno", this._detectDeno());
       this._cache.set("isBun", this._detectBun());
       this._cache.set("isNativeScript", this._detectNativeScript());
-      if (this._cache.get("isNodeJS")) {
-        this._initNodeWebRTC();
+      this._initPigeonRTC();
+    }
+    /**
+     * Initialize PigeonRTC for cross-platform WebRTC support
+     * PigeonRTC provides a unified WebRTC interface across browser and Node.js
+     * @private
+     */
+    _initPigeonRTC() {
+      try {
+        this._webrtcPolyfilled = false;
+      } catch (error) {
       }
     }
     /**
-     * Initialize WebRTC polyfill for Node.js environment
-     * Attempts to load @koush/wrtc and set up WebRTC globals
-     * @private
+     * Get the PigeonRTC instance
+     * @returns {PigeonRTC|null} The PigeonRTC instance or null if not initialized
      */
-    _initNodeWebRTC() {
-      try {
-        if (typeof globalThis !== "undefined" && typeof globalThis.RTCPeerConnection !== "undefined") {
-          return;
-        }
-        let wrtc;
-        if (typeof __require !== "undefined") {
-          try {
-            wrtc = require_browser();
-          } catch (e) {
-            try {
-              wrtc = __require("node-webrtc");
-            } catch (e2) {
-              return;
-            }
-          }
-        } else {
-          return;
-        }
-        if (wrtc && typeof globalThis !== "undefined") {
-          globalThis.RTCPeerConnection = wrtc.RTCPeerConnection;
-          globalThis.RTCSessionDescription = wrtc.RTCSessionDescription;
-          globalThis.RTCIceCandidate = wrtc.RTCIceCandidate;
-          globalThis.MediaStream = wrtc.MediaStream || globalThis.MediaStream;
-          globalThis.MediaStreamTrack = wrtc.MediaStreamTrack || globalThis.MediaStreamTrack;
-          this._webrtcPolyfilled = true;
-        }
-      } catch (error) {
-      }
+    getPigeonRTC() {
+      return this._pigeonRTC;
     }
     // Primary environment detection
     _detectBrowser() {
@@ -3426,6 +3558,9 @@ ${b64.match(/.{1,64}/g).join("\n")}
     }
     // WebRTC capability detection
     get hasWebRTC() {
+      if (this._pigeonRTC) {
+        return this._pigeonRTC.isSupported();
+      }
       if (this.isBrowser) {
         return typeof RTCPeerConnection !== "undefined" || typeof webkitRTCPeerConnection !== "undefined" || typeof mozRTCPeerConnection !== "undefined";
       }
@@ -3718,40 +3853,39 @@ ${b64.match(/.{1,64}/g).join("\n")}
       };
     }
     /**
-     * Asynchronously initialize WebRTC polyfill for Node.js environment
-     * This method is useful for ES module environments where dynamic imports are preferred
+     * Asynchronously initialize WebRTC using PigeonRTC
+     * This method initializes PigeonRTC for cross-platform WebRTC support
      * @returns {Promise<boolean>} True if WebRTC was successfully initialized
      */
     async initWebRTCAsync() {
-      if (!this.isNodeJS) {
-        return false;
-      }
       try {
-        if (typeof globalThis !== "undefined" && typeof globalThis.RTCPeerConnection !== "undefined") {
+        if (this._pigeonRTC) {
           return true;
         }
-        let wrtc;
-        try {
-          wrtc = await Promise.resolve().then(() => __toESM(require_browser(), 1));
-        } catch (e) {
+        let createPigeonRTC2;
+        if (typeof globalThis !== "undefined" && globalThis.__PEERPIGEON_PIGEONRTC__) {
+          createPigeonRTC2 = globalThis.__PEERPIGEON_PIGEONRTC__.createPigeonRTC || globalThis.__PEERPIGEON_PIGEONRTC__.default;
+        } else if (typeof window !== "undefined" && window.__PEERPIGEON_PIGEONRTC__) {
+          createPigeonRTC2 = window.__PEERPIGEON_PIGEONRTC__.createPigeonRTC || window.__PEERPIGEON_PIGEONRTC__.default;
+        }
+        if (!createPigeonRTC2 && this.isNodeJS) {
           try {
-            wrtc = await import("node-webrtc");
-          } catch (e2) {
-            return false;
+            const pigeonRTCModule = await import("pigeonrtc");
+            createPigeonRTC2 = pigeonRTCModule.createPigeonRTC || pigeonRTCModule.default;
+          } catch (error) {
+            console.error("Failed to dynamically import PigeonRTC:", error);
           }
         }
-        if (wrtc && typeof globalThis !== "undefined") {
-          globalThis.RTCPeerConnection = wrtc.RTCPeerConnection || wrtc.default?.RTCPeerConnection;
-          globalThis.RTCSessionDescription = wrtc.RTCSessionDescription || wrtc.default?.RTCSessionDescription;
-          globalThis.RTCIceCandidate = wrtc.RTCIceCandidate || wrtc.default?.RTCIceCandidate;
-          globalThis.MediaStream = wrtc.MediaStream || wrtc.default?.MediaStream || globalThis.MediaStream;
-          globalThis.MediaStreamTrack = wrtc.MediaStreamTrack || wrtc.default?.MediaStreamTrack || globalThis.MediaStreamTrack;
-          this._webrtcPolyfilled = true;
-          return true;
+        if (!createPigeonRTC2) {
+          throw new Error("PigeonRTC createPigeonRTC function not found");
         }
+        this._pigeonRTC = await createPigeonRTC2();
+        this._webrtcPolyfilled = true;
+        return this._pigeonRTC.isSupported();
       } catch (error) {
+        console.error("Failed to initialize PigeonRTC:", error);
+        return false;
       }
-      return false;
     }
     // Static method for quick environment check
     static detect() {
@@ -3770,6 +3904,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
   var hasWebRTC = () => environmentDetector.hasWebRTC;
   var hasWebSocket = () => environmentDetector.hasWebSocket;
   var getEnvironmentReport = () => environmentDetector.getEnvironmentReport();
+  var initWebRTCAsync = () => environmentDetector.initWebRTCAsync();
 
   // src/DebugLogger.js
   var DebugLogger = class {
@@ -3968,7 +4103,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
         }
         try {
           if (typeof __require !== "undefined") {
-            const WebSocket2 = require_browser2();
+            const WebSocket2 = require_browser();
             return new WebSocket2(url);
           } else {
             this.debug.warn('WebSocket package detection not available in ES modules. Ensure "ws" is installed.');
@@ -4501,7 +4636,13 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.emit("connectionFailed", { peerId: this.peerId, reason: error.message });
         throw error;
       }
-      this.connection = new RTCPeerConnection({
+      const pigeonRTC = environmentDetector.getPigeonRTC();
+      if (!pigeonRTC) {
+        const error = new Error("PigeonRTC not initialized - call initWebRTCAsync() first");
+        this.emit("connectionFailed", { peerId: this.peerId, reason: error.message });
+        throw error;
+      }
+      this.connection = pigeonRTC.createPeerConnection({
         iceServers: [
           { urls: "stun:stun.l.google.com:19302" },
           { urls: "stun:stun1.l.google.com:19302" },
@@ -8088,7 +8229,12 @@ ${b64.match(/.{1,64}/g).join("\n")}
         if (!video && !audio) {
           throw new Error("At least one of video or audio must be enabled");
         }
-        this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
+        const pigeonRTC = environmentDetector.getPigeonRTC();
+        if (pigeonRTC) {
+          this.localStream = await pigeonRTC.getUserMedia(constraints);
+        } else {
+          this.localStream = await navigator.mediaDevices.getUserMedia(constraints);
+        }
         this.isVideoEnabled = video;
         this.isAudioEnabled = audio;
         this.markStreamAsLocal(this.localStream);
@@ -8178,10 +8324,11 @@ ${b64.match(/.{1,64}/g).join("\n")}
        * Check if browser supports required APIs
        */
     static checkSupport() {
+      const pigeonRTC = environmentDetector.getPigeonRTC();
       const support = {
         getUserMedia: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
         enumerateDevices: !!(navigator.mediaDevices && navigator.mediaDevices.enumerateDevices),
-        webRTC: !!window.RTCPeerConnection
+        webRTC: pigeonRTC ? pigeonRTC.isSupported() : !!window.RTCPeerConnection
       };
       support.fullSupport = support.getUserMedia && support.enumerateDevices && support.webRTC;
       return support;
@@ -10964,15 +11111,14 @@ ${b64.match(/.{1,64}/g).join("\n")}
     }
     async init() {
       try {
-        if (this.runtimeInfo?.isNodeJS) {
-          try {
-            const webrtcInitialized = await environmentDetector.initWebRTCAsync();
-            if (webrtcInitialized) {
-              this.debug.log("\u{1F310} WebRTC polyfill initialized successfully for Node.js environment");
-            }
-          } catch (error) {
-            this.debug.warn("WebRTC polyfill initialization failed:", error.message);
+        try {
+          const webrtcInitialized = await environmentDetector.initWebRTCAsync();
+          if (webrtcInitialized) {
+            const adapterName = environmentDetector.getPigeonRTC()?.getAdapterName();
+            this.debug.log(`\u{1F310} PigeonRTC initialized successfully (${adapterName})`);
           }
+        } catch (error) {
+          this.debug.warn("PigeonRTC initialization failed:", error.message);
         }
         if (this.providedPeerId) {
           if (_PeerPigeonMesh.validatePeerId(this.providedPeerId)) {
@@ -12274,11 +12420,25 @@ ${b64.match(/.{1,64}/g).join("\n")}
   // src/browser-entry.js
   if (typeof globalThis !== "undefined") {
     globalThis.__PEERPIGEON_UNSEA__ = unsea_exports;
+    globalThis.__PEERPIGEON_PIGEONRTC__ = {
+      createPigeonRTC,
+      PigeonRTC,
+      BrowserRTCAdapter,
+      RTCAdapter,
+      default: createPigeonRTC
+    };
   }
   if (typeof window !== "undefined") {
     window.__PEERPIGEON_UNSEA__ = unsea_exports;
+    window.__PEERPIGEON_PIGEONRTC__ = {
+      createPigeonRTC,
+      PigeonRTC,
+      BrowserRTCAdapter,
+      RTCAdapter,
+      default: createPigeonRTC
+    };
   }
-  console.log("\u{1F510} PeerPigeon browser bundle loaded with embedded UnSEA crypto");
+  console.log("\u{1F510} PeerPigeon browser bundle loaded with embedded UnSEA crypto and PigeonRTC");
   return __toCommonJS(browser_entry_exports);
 })();
 /*! Bundled license information:

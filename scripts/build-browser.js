@@ -23,11 +23,13 @@ async function buildBrowser() {
       format: 'iife',
       globalName: 'PeerPigeon',
       outfile: join(projectRoot, 'dist/peerpigeon-browser.js'),
-      external: [], // Bundle everything including UnSEA
+      external: ['pigeonrtc', '@koush/wrtc'], // Don't bundle these - they're handled differently
       platform: 'browser',
       target: 'es2020',
       minify: false, // Keep readable for debugging
       sourcemap: true,
+      mainFields: ['module', 'main'], // Prefer ES modules over browser field
+      conditions: ['import', 'module'], // Use import conditions to get ESM versions
       define: {
         'process.env.NODE_ENV': '"production"',
         global: 'globalThis'

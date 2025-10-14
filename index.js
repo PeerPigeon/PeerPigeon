@@ -17,8 +17,14 @@ export {
   isWorker,
   hasWebRTC,
   hasWebSocket,
-  getEnvironmentReport
+  getEnvironmentReport,
+  initWebRTCAsync
 } from './src/EnvironmentDetector.js';
 
 // Export the WebSocket server class for programmatic use
 export { PeerPigeonServer } from './server/index.js';
+
+// Note: PeerPigeon now uses PigeonRTC for cross-platform WebRTC support.
+// The WebRTC implementation is automatically initialized when calling
+// mesh.init() or environmentDetector.initWebRTCAsync().
+// PigeonRTC handles browser native WebRTC and Node.js @koush/wrtc transparently.
