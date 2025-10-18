@@ -1,6 +1,6 @@
 {
   "name": "peerpigeon",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
   "main": "index.js",
   "type": "module",
@@ -79,7 +79,7 @@
   "homepage": "https://github.com/PeerPigeon/PeerPigeon#readme",
   "dependencies": {
     "@koush/wrtc": "^0.5.3",
-    "pigeonrtc": "^0.0.3",
+    "pigeonrtc": "^0.0.5",
     "unsea": "^1.1.2",
     "ws": "^8.18.0",
     "yamljs": "^0.3.0"
