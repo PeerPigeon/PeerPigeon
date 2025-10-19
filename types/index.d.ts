@@ -38,6 +38,42 @@ export interface MessageData {
     timestamp: number;
 }
 
+export interface BinaryMessageEvent {
+    from: string;
+    data: Uint8Array;
+    size: number;
+    timestamp: number;
+}
+
+export interface StreamMetadata {
+    streamId: string;
+    type: string;
+    filename?: string;
+    mimeType?: string;
+    totalSize?: number;
+    chunkSize?: number;
+    timestamp: number;
+}
+
+export interface StreamReceivedEvent {
+    peerId: string;
+    streamId: string;
+    stream: ReadableStream;
+    metadata: StreamMetadata;
+}
+
+export interface StreamCompletedEvent {
+    peerId: string;
+    streamId: string;
+    totalChunks: number;
+}
+
+export interface StreamAbortedEvent {
+    peerId: string;
+    streamId: string;
+    reason: string;
+}
+
 export interface PeerConnectionEvent {
     peerId: string;
 }
@@ -116,6 +152,16 @@ export declare class PeerPigeonMesh {
     sendMessage(content: any): string;
     sendDirectMessage(peerId: string, content: any): string;
     
+    // Binary messaging
+    sendBinaryData(targetPeerId: string, binaryData: Uint8Array | ArrayBuffer): Promise<boolean>;
+    broadcastBinaryData(binaryData: Uint8Array | ArrayBuffer): Promise<number>;
+    
+    // Streaming
+    createStreamToPeer(targetPeerId: string, options?: Partial<StreamMetadata>): WritableStream;
+    sendStream(targetPeerId: string, readableStream: ReadableStream, options?: Partial<StreamMetadata>): Promise<void>;
+    sendFile(targetPeerId: string, file: File): Promise<void>;
+    sendBlob(targetPeerId: string, blob: Blob, options?: Partial<StreamMetadata>): Promise<void>;
+    
     // Media
     startMedia(constraints?: MediaStreamConstraints): Promise<MediaStream>;
     stopMedia(): void;
@@ -152,6 +198,10 @@ export declare class PeerPigeonMesh {
     addEventListener(event: 'peerDiscovered', listener: (data: PeerConnectionEvent) => void): void;
     addEventListener(event: 'peerEvicted', listener: (data: PeerDisconnectionEvent) => void): void;
     addEventListener(event: 'messageReceived', listener: (data: MessageData) => void): void;
+    addEventListener(event: 'binaryMessageReceived', listener: (data: BinaryMessageEvent) => void): void;
+    addEventListener(event: 'streamReceived', listener: (data: StreamReceivedEvent) => void): void;
+    addEventListener(event: 'streamCompleted', listener: (data: StreamCompletedEvent) => void): void;
+    addEventListener(event: 'streamAborted', listener: (data: StreamAbortedEvent) => void): void;
     addEventListener(event: 'remoteStream', listener: (data: RemoteStreamEvent) => void): void;
     addEventListener(event: 'dhtValueChanged', listener: (data: DHTValueChangedEvent) => void): void;
     addEventListener(event: 'statusChanged', listener: (data: StatusChangedEvent) => void): void;
@@ -174,6 +224,10 @@ export declare class PeerPigeonMesh {
     on(event: 'peerDiscovered', listener: (data: PeerConnectionEvent) => void): this;
     on(event: 'peerEvicted', listener: (data: PeerDisconnectionEvent) => void): this;
     on(event: 'messageReceived', listener: (data: MessageData) => void): this;
+    on(event: 'binaryMessageReceived', listener: (data: BinaryMessageEvent) => void): this;
+    on(event: 'streamReceived', listener: (data: StreamReceivedEvent) => void): this;
+    on(event: 'streamCompleted', listener: (data: StreamCompletedEvent) => void): this;
+    on(event: 'streamAborted', listener: (data: StreamAbortedEvent) => void): this;
     on(event: 'remoteStream', listener: (data: RemoteStreamEvent) => void): this;
     on(event: 'dhtValueChanged', listener: (data: DHTValueChangedEvent) => void): this;
     on(event: 'statusChanged', listener: (data: StatusChangedEvent) => void): this;

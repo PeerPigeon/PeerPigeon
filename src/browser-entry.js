@@ -8,7 +8,8 @@ import * as UnSEA from 'unsea';
 import { createPigeonRTC, PigeonRTC, BrowserRTCAdapter, RTCAdapter } from './PigeonRTC-browser.js';
 
 // Import only browser-compatible components
-export { PeerPigeonMesh } from '../src/PeerPigeonMesh.js';
+import { PeerPigeonMesh as PeerPigeonMeshClass } from '../src/PeerPigeonMesh.js';
+export { PeerPigeonMeshClass as PeerPigeonMesh };
 export { PeerConnection } from '../src/PeerConnection.js';
 export { SignalingClient } from '../src/SignalingClient.js';
 export { WebDHT } from '../src/WebDHT.js';
@@ -53,6 +54,9 @@ if (typeof window !== 'undefined') {
     RTCAdapter,
     default: createPigeonRTC
   };
+  
+  // Make PeerPigeonMesh available globally for <script> tag usage
+  window.PeerPigeonMesh = PeerPigeonMeshClass;
 }
 
 console.log('🔐 PeerPigeon browser bundle loaded with embedded UnSEA crypto and PigeonRTC');

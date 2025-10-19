@@ -270,7 +270,7 @@
           </div>
           
           <button 
-            @click="signData"
+            @click="performSign"
             :disabled="!signData || !selectedSignKey"
             class="btn btn-primary"
           >
@@ -325,7 +325,7 @@
           </div>
           
           <button 
-            @click="verifySignature"
+            @click="performVerify"
             :disabled="!verifyData || !verifySignature || !selectedVerifyKey"
             class="btn btn-primary"
           >
@@ -740,7 +740,7 @@ const performDecryption = async () => {
   }
 };
 
-const signData = async () => {
+const performSign = async () => {
   try {
     const signature = await store.cryptoSign(
       signData.value,
@@ -758,7 +758,7 @@ const signData = async () => {
   }
 };
 
-const verifySignature = async () => {
+const performVerify = async () => {
   try {
     const isValid = await store.cryptoVerify(
       verifyData.value,

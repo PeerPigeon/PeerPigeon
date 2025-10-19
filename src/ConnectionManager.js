@@ -296,6 +296,22 @@ export class ConnectionManager extends EventEmitter {
       this.debug.log('🔄 MEDIA FORWARDING: Disabled to prevent renegotiation conflicts with 3+ peers');
     });
 
+    // Forward data stream events
+    peerConnection.addEventListener('streamReceived', (event) => {
+      this.debug.log(`[EVENT] Data stream received from ${event.peerId.substring(0, 8)}...`);
+      this.mesh.emit('streamReceived', event);
+    });
+
+    peerConnection.addEventListener('streamCompleted', (event) => {
+      this.debug.log(`[EVENT] Data stream completed from ${event.peerId.substring(0, 8)}...`);
+      this.mesh.emit('streamCompleted', event);
+    });
+
+    peerConnection.addEventListener('streamAborted', (event) => {
+      this.debug.log(`[EVENT] Data stream aborted from ${event.peerId.substring(0, 8)}...`);
+      this.mesh.emit('streamAborted', event);
+    });
+
     peerConnection.addEventListener('renegotiationNeeded', async (event) => {
       this.debug.log(`🔄 Renegotiation needed for ${event.peerId.substring(0, 8)}...`);
 
@@ -741,6 +757,20 @@ export class ConnectionManager extends EventEmitter {
   handleIncomingMessage(message, fromPeerId) {
     if (!message || typeof message !== 'object') {
       this.debug.warn('Received invalid message from', fromPeerId?.substring(0, 8));
+      return;
+    }
+
+    // Handle binary messages first
+    if (message.type === 'binary' && message.data instanceof Uint8Array) {
+      this.debug.log(`📦 Received binary message (${message.size} bytes) from ${fromPeerId.substring(0, 8)}...`);
+      
+      // Emit binary message directly to application
+      this.mesh.emit('binaryMessageReceived', {
+        from: fromPeerId,
+        data: message.data,
+        size: message.size,
+        timestamp: Date.now()
+      });
       return;
     }
 
