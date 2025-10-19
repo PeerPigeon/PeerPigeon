@@ -1,9 +1,31 @@
 import { defineStore } from 'pinia';
-import { ref, reactive, computed } from 'vue';
+import { ref, reactive, computed, markRaw } from 'vue';
+
+// Helper to wait for PeerPigeon to be available
+const waitForPeerPigeon = (maxWait = 5000) => {
+  return new Promise((resolve, reject) => {
+    const startTime = Date.now();
+    const checkInterval = 100;
+    
+    const check = () => {
+      if (window.PeerPigeon?.PeerPigeonMesh) {
+        console.log('✅ PeerPigeon loaded successfully');
+        resolve(window.PeerPigeon);
+      } else if (Date.now() - startTime > maxWait) {
+        console.error('❌ PeerPigeon failed to load within timeout');
+        reject(new Error('PeerPigeon library not available'));
+      } else {
+        setTimeout(check, checkInterval);
+      }
+    };
+    
+    check();
+  });
+};
 
 export const usePeerPigeonStore = defineStore('peerpigeon', () => {
-  // Core state
-  const mesh = ref(null);
+  // Core state  
+  const mesh = ref(null); // Will be wrapped with markRaw to prevent reactivity issues
   const isInitialized = ref(false);
   const isConnected = ref(false);
   const signalingUrl = ref('ws://localhost:3000');
@@ -20,8 +42,9 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
   const discoveredPeers = reactive(new Map());
   const networkStatus = reactive({
     connectedCount: 0,
-    maxPeers: 3,
+    maxPeers: 4,
     minPeers: 2,
+    autoConnect: true,
     autoDiscovery: true,
     evictionStrategy: true,
     xorRouting: true
@@ -74,10 +97,32 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
   // Core methods
   const initMesh = async (options = {}) => {
     try {
+      // Wait for PeerPigeon to be available
+      addDebugLog('Waiting for PeerPigeon library to load...', 'info');
+      
+      let PeerPigeonLib;
+      try {
+        PeerPigeonLib = await waitForPeerPigeon();
+      } catch (error) {
+        console.error('❌ PeerPigeon not available:', error);
+        addDebugLog('PeerPigeon library not found - using mock', 'error');
+        PeerPigeonLib = null;
+      }
+      
+      // Debug: Check if PeerPigeon is available
+      console.log('🔍 PeerPigeon availability:', {
+        available: !!PeerPigeonLib,
+        PeerPigeonMesh: !!(PeerPigeonLib?.PeerPigeonMesh),
+        keys: PeerPigeonLib ? Object.keys(PeerPigeonLib) : []
+      });
+      
       // Use real PeerPigeonMesh if available, otherwise mock
-      const PeerPigeonMeshClass = window.PeerPigeon?.PeerPigeonMesh;
+      const PeerPigeonMeshClass = PeerPigeonLib?.PeerPigeonMesh;
       
       if (!PeerPigeonMeshClass) {
+        console.error('❌ PeerPigeonMesh not found! Using mock implementation.');
+        addDebugLog('Using mock PeerPigeon implementation', 'warning');
+        
         // Fallback to mock implementation for development
         const MockPeerPigeonMesh = class {
           constructor(meshOptions) {
@@ -215,15 +260,23 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
           allowGlobalFallback: allowGlobalFallback.value,
           maxPeers: networkStatus.maxPeers,
           minPeers: networkStatus.minPeers,
+          autoConnect: true,
           autoDiscovery: networkStatus.autoDiscovery,
           evictionStrategy: networkStatus.evictionStrategy,
           xorRouting: networkStatus.xorRouting,
           ...options
         };
         
-        mesh.value = new MockPeerPigeonMesh(meshOptions);
+        mesh.value = markRaw(new MockPeerPigeonMesh(meshOptions));
       } else {
         // Use real PeerPigeonMesh
+        console.log('🚀 Initializing real PeerPigeonMesh with options:', {
+          networkName: networkName.value,
+          maxPeers: networkStatus.maxPeers,
+          autoConnect: true,
+          autoDiscovery: networkStatus.autoDiscovery
+        });
+        
         const meshOptions = {
           enableWebDHT: true,
           enableCrypto: true,
@@ -232,17 +285,22 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
           allowGlobalFallback: allowGlobalFallback.value,
           maxPeers: networkStatus.maxPeers,
           minPeers: networkStatus.minPeers,
+          autoConnect: true,
           autoDiscovery: networkStatus.autoDiscovery,
           evictionStrategy: networkStatus.evictionStrategy,
           xorRouting: networkStatus.xorRouting,
           ...options
         };
         
-        mesh.value = new PeerPigeonMeshClass(meshOptions);
+        // CRITICAL: Use markRaw to prevent Vue from making mesh reactive
+        // Vue's Proxy wrapper can interfere with WebRTC connections
+        mesh.value = markRaw(new PeerPigeonMeshClass(meshOptions));
+        console.log('✅ PeerPigeonMesh instance created (marked as raw)');
       }
       
       setupEventHandlers();
       
+      // Use raw instance for init to avoid Vue proxy issues
       await mesh.value.init();
       isInitialized.value = true;
       peerId.value = mesh.value.peerId;
@@ -326,6 +384,7 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     });
     
     mesh.value.addEventListener('peerConnected', (event) => {
+      console.log('🤝 PEER CONNECTED EVENT:', event);
       const peerInfo = {
         id: event.peerId,
         connected: true,
@@ -338,6 +397,7 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     });
     
     mesh.value.addEventListener('peerDisconnected', (event) => {
+      console.log('👋 PEER DISCONNECTED EVENT:', event);
       const peer = peers.get(event.peerId);
       if (peer) {
         peer.connected = false;
@@ -350,6 +410,7 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     });
     
     mesh.value.addEventListener('peerDiscovered', (event) => {
+      console.log('🔍 PEER DISCOVERED EVENT:', event);
       discoveredPeers.set(event.peerId, {
         id: event.peerId,
         discoveryTime: new Date(),

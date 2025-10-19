@@ -4611,10 +4611,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.isClosing = false;
       this.iceTimeoutId = null;
       this._forcedStatus = null;
-      this._pendingBinaryPayloads = [];
-      this._activeStreams = /* @__PURE__ */ new Map();
-      this._streamChunks = /* @__PURE__ */ new Map();
-      this._streamMetadata = /* @__PURE__ */ new Map();
       this.localStream = options.localStream || null;
       this.remoteStream = null;
       this.enableVideo = options.enableVideo || false;
@@ -4852,11 +4848,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
       };
     }
     setupDataChannel() {
-      if (!this.dataChannel) {
-        this.debug.error("setupDataChannel called without data channel instance");
-        return;
-      }
-      this.dataChannel.binaryType = "arraybuffer";
       this.dataChannel.onopen = () => {
         this.debug.log(`Data channel opened with ${this.peerId}`);
         this.dataChannelReady = true;
@@ -4865,60 +4856,13 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.dataChannel.onclose = () => {
         this.debug.log(`Data channel closed with ${this.peerId}`);
         this.dataChannelReady = false;
-        this._pendingBinaryPayloads.length = 0;
         if (!this.isClosing) {
           this.emit("disconnected", { peerId: this.peerId, reason: "data channel closed" });
         }
       };
       this.dataChannel.onmessage = (event) => {
-        const handleBinaryPayload = (buffer) => {
-          if (!buffer) return;
-          if (this._pendingBinaryPayloads.length === 0) {
-            this.debug.warn("Received unexpected binary payload without metadata");
-            return;
-          }
-          const payload = this._pendingBinaryPayloads.shift();
-          const uint8Array = new Uint8Array(buffer);
-          if (payload.type === "binaryMessage") {
-            if (payload.size && payload.size !== uint8Array.byteLength) {
-              this.debug.warn(`Binary message size mismatch: expected ${payload.size}, got ${uint8Array.byteLength}`);
-            }
-            this.debug.log(`\u{1F4E6} Received binary message (${uint8Array.byteLength} bytes) from ${this.peerId.substring(0, 8)}...`);
-            this.emit("message", {
-              peerId: this.peerId,
-              message: {
-                type: "binary",
-                data: uint8Array,
-                size: uint8Array.byteLength
-              }
-            });
-            return;
-          }
-          if (payload.type === "streamChunk") {
-            this._handleStreamChunkBinary(payload.header, uint8Array);
-            return;
-          }
-          this.debug.warn(`Received binary payload with unknown handler type: ${payload.type}`);
-        };
-        if (event.data instanceof ArrayBuffer) {
-          handleBinaryPayload(event.data);
-          return;
-        }
-        if (typeof Blob !== "undefined" && event.data instanceof Blob) {
-          event.data.arrayBuffer().then(handleBinaryPayload).catch((error) => this.debug.error("Failed to read binary payload:", error));
-          return;
-        }
         try {
           const message = JSON.parse(event.data);
-          if (message.type === "__BINARY__") {
-            this._pendingBinaryPayloads.push({ type: "binaryMessage", size: message.size });
-            this.debug.log(`\u{1F4E6} Binary message header received, expecting ${message.size} bytes`);
-            return;
-          }
-          if (message.type && message.type.startsWith("__STREAM_")) {
-            this._handleStreamMessage(message);
-            return;
-          }
           this.emit("message", { peerId: this.peerId, message });
         } catch (error) {
           this.debug.error("Failed to parse message:", error);
@@ -4928,7 +4872,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.dataChannel.onerror = (error) => {
         this.debug.error(`Data channel error with ${this.peerId}:`, error);
         this.dataChannelReady = false;
-        this._pendingBinaryPayloads.length = 0;
         if (!this.isClosing) {
           this.emit("disconnected", { peerId: this.peerId, reason: "data channel error" });
         }
@@ -5152,263 +5095,14 @@ ${b64.match(/.{1,64}/g).join("\n")}
     sendMessage(message) {
       if (this.dataChannel && this.dataChannel.readyState === "open") {
         try {
-          if (message instanceof ArrayBuffer || ArrayBuffer.isView(message)) {
-            this.debug.log(`\u{1F4E6} Sending binary message (${message.byteLength || message.buffer.byteLength} bytes) to ${this.peerId.substring(0, 8)}...`);
-            const buffer = ArrayBuffer.isView(message) ? message.buffer : message;
-            const header = JSON.stringify({ type: "__BINARY__", size: buffer.byteLength });
-            this.dataChannel.send(header);
-            this.dataChannel.send(buffer);
-            return true;
-          } else {
-            this.dataChannel.send(JSON.stringify(message));
-            return true;
-          }
+          this.dataChannel.send(JSON.stringify(message));
+          return true;
         } catch (error) {
           this.debug.error(`Failed to send message to ${this.peerId}:`, error);
           return false;
         }
       }
       return false;
-    }
-    /**
-     * Create a WritableStream for sending data to this peer
-     * @param {object} options - Stream options
-     * @returns {WritableStream} A writable stream for sending data
-     */
-    createWritableStream(options = {}) {
-      const streamId = options.streamId || this._generateStreamId();
-      const metadata = {
-        streamId,
-        type: options.type || "binary",
-        filename: options.filename,
-        mimeType: options.mimeType,
-        totalSize: options.totalSize,
-        chunkSize: options.chunkSize,
-        timestamp: Date.now()
-      };
-      this.debug.log(`\u{1F4E4} Creating writable stream ${streamId} to ${this.peerId.substring(0, 8)}...`);
-      const configuredChunkSize = typeof metadata.chunkSize === "number" && Number.isFinite(metadata.chunkSize) ? metadata.chunkSize : 16384;
-      const chunkSize = Math.max(4096, Math.min(configuredChunkSize, 65536));
-      metadata.chunkSize = chunkSize;
-      const highWaterMark = chunkSize * 32;
-      const lowWaterMark = chunkSize * 8;
-      const ensureChannelOpen = () => {
-        if (!this.dataChannel || this.dataChannel.readyState !== "open") {
-          throw new Error("Data channel not open");
-        }
-      };
-      const waitForBufferDrain = () => {
-        if (!this.dataChannel || this.dataChannel.readyState !== "open") {
-          return Promise.resolve();
-        }
-        if (this.dataChannel.bufferedAmount <= lowWaterMark) {
-          return Promise.resolve();
-        }
-        return new Promise((resolve) => {
-          const checkBuffer = () => {
-            if (!this.dataChannel || this.dataChannel.readyState !== "open") {
-              resolve();
-              return;
-            }
-            if (this.dataChannel.bufferedAmount <= lowWaterMark) {
-              resolve();
-            } else {
-              setTimeout(checkBuffer, 20);
-            }
-          };
-          checkBuffer();
-        });
-      };
-      this.sendMessage({
-        type: "__STREAM_INIT__",
-        streamId,
-        metadata
-      });
-      let chunkIndex = 0;
-      const self2 = this;
-      return new WritableStream({
-        async write(chunk) {
-          ensureChannelOpen();
-          const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
-          let offset = 0;
-          while (offset < data.byteLength) {
-            ensureChannelOpen();
-            const sliceEnd = Math.min(offset + chunkSize, data.byteLength);
-            const slice = data.subarray(offset, sliceEnd);
-            const sliceBuffer = slice.byteOffset === 0 && slice.byteLength === slice.buffer.byteLength ? slice.buffer : slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength);
-            const chunkMessage = {
-              type: "__STREAM_CHUNK__",
-              streamId,
-              chunkIndex: chunkIndex++,
-              size: slice.byteLength,
-              encoding: "binary"
-            };
-            try {
-              self2.dataChannel.send(JSON.stringify(chunkMessage));
-              self2.dataChannel.send(sliceBuffer);
-            } catch (error) {
-              throw error;
-            }
-            offset = sliceEnd;
-            if (self2.dataChannel && self2.dataChannel.bufferedAmount > highWaterMark) {
-              await waitForBufferDrain();
-            }
-          }
-        },
-        async close() {
-          if (self2.dataChannel && self2.dataChannel.readyState === "open") {
-            await waitForBufferDrain();
-            self2.sendMessage({
-              type: "__STREAM_END__",
-              streamId,
-              totalChunks: chunkIndex
-            });
-          }
-          self2._activeStreams.delete(streamId);
-          self2.debug.log(`\u{1F4E4} Closed writable stream ${streamId}`);
-        },
-        async abort(reason) {
-          if (self2.dataChannel && self2.dataChannel.readyState === "open") {
-            self2.sendMessage({
-              type: "__STREAM_ABORT__",
-              streamId,
-              reason: reason?.message || "Stream aborted"
-            });
-          }
-          self2._activeStreams.delete(streamId);
-          self2.debug.log(`\u274C Aborted writable stream ${streamId}: ${reason}`);
-        }
-      });
-    }
-    /**
-     * Handle incoming stream messages and create ReadableStream
-     * @private
-     */
-    _handleStreamMessage(message) {
-      const { type } = message;
-      switch (type) {
-        case "__STREAM_INIT__":
-          this._handleStreamInit(message);
-          break;
-        case "__STREAM_CHUNK__":
-          if (message.encoding === "binary") {
-            this._pendingBinaryPayloads.push({
-              type: "streamChunk",
-              header: message
-            });
-          } else {
-            this._handleStreamChunkLegacy(message);
-          }
-          break;
-        case "__STREAM_END__":
-          this._handleStreamEnd(message);
-          break;
-        case "__STREAM_ABORT__":
-          this._handleStreamAbort(message);
-          break;
-      }
-    }
-    _handleStreamInit(message) {
-      const { streamId, metadata } = message;
-      this.debug.log(`\u{1F4E5} Receiving stream ${streamId} from ${this.peerId.substring(0, 8)}...`);
-      this._streamMetadata.set(streamId, metadata);
-      this._streamChunks.set(streamId, []);
-      const chunks = this._streamChunks.get(streamId);
-      let controller;
-      const readable = new ReadableStream({
-        start(ctrl) {
-          controller = ctrl;
-        },
-        cancel(reason) {
-          this.debug.log(`\u{1F4E5} Stream ${streamId} cancelled: ${reason}`);
-        }
-      });
-      this._activeStreams.set(streamId, {
-        type: "readable",
-        stream: readable,
-        controller,
-        metadata,
-        chunks
-      });
-      this.emit("streamReceived", {
-        peerId: this.peerId,
-        streamId,
-        stream: readable,
-        metadata
-      });
-    }
-    _handleStreamChunkLegacy(message) {
-      const { streamId, chunkIndex, data } = message;
-      const streamData = this._activeStreams.get(streamId);
-      if (!streamData) {
-        this.debug.warn(`Received chunk for unknown stream ${streamId}`);
-        return;
-      }
-      const chunk = new Uint8Array(data);
-      if (streamData.controller) {
-        streamData.controller.enqueue(chunk);
-      }
-      if (Array.isArray(streamData.chunks)) {
-        streamData.chunks.push(chunk);
-      }
-      this.debug.log(`\u{1F4E5} Received chunk ${chunkIndex} for stream ${streamId} (${chunk.length} bytes)`);
-    }
-    _handleStreamChunkBinary(header, chunk) {
-      const { streamId, chunkIndex, size } = header;
-      const streamData = this._activeStreams.get(streamId);
-      if (!streamData) {
-        this.debug.warn(`Received binary chunk for unknown stream ${streamId}`);
-        return;
-      }
-      if (size && size !== chunk.byteLength) {
-        this.debug.warn(`Stream ${streamId} chunk ${chunkIndex} size mismatch: expected ${size}, got ${chunk.byteLength}`);
-      }
-      if (streamData.controller) {
-        streamData.controller.enqueue(chunk);
-      }
-      if (Array.isArray(streamData.chunks)) {
-        streamData.chunks.push(chunk);
-      }
-      this.debug.log(`\u{1F4E5} Received chunk ${chunkIndex} for stream ${streamId} (${chunk.byteLength} bytes)`);
-    }
-    _handleStreamEnd(message) {
-      const { streamId, totalChunks } = message;
-      const streamData = this._activeStreams.get(streamId);
-      if (!streamData) {
-        this.debug.warn(`Received end for unknown stream ${streamId}`);
-        return;
-      }
-      if (streamData.controller) {
-        streamData.controller.close();
-      }
-      this.debug.log(`\u{1F4E5} Stream ${streamId} completed (${totalChunks} chunks)`);
-      this._activeStreams.delete(streamId);
-      this._streamChunks.delete(streamId);
-      this._streamMetadata.delete(streamId);
-      this.emit("streamCompleted", {
-        peerId: this.peerId,
-        streamId,
-        totalChunks
-      });
-    }
-    _handleStreamAbort(message) {
-      const { streamId, reason } = message;
-      const streamData = this._activeStreams.get(streamId);
-      if (streamData && streamData.controller) {
-        streamData.controller.error(new Error(reason));
-      }
-      this.debug.log(`\u274C Stream ${streamId} aborted: ${reason}`);
-      this._activeStreams.delete(streamId);
-      this._streamChunks.delete(streamId);
-      this._streamMetadata.delete(streamId);
-      this.emit("streamAborted", {
-        peerId: this.peerId,
-        streamId,
-        reason
-      });
-    }
-    _generateStreamId() {
-      return `stream-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     }
     /**
      * CRITICAL FIX: Manually check for new remote tracks after renegotiation
@@ -6233,18 +5927,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.emit("remoteStream", event);
         this.debug.log("\u{1F504} MEDIA FORWARDING: Disabled to prevent renegotiation conflicts with 3+ peers");
       });
-      peerConnection.addEventListener("streamReceived", (event) => {
-        this.debug.log(`[EVENT] Data stream received from ${event.peerId.substring(0, 8)}...`);
-        this.mesh.emit("streamReceived", event);
-      });
-      peerConnection.addEventListener("streamCompleted", (event) => {
-        this.debug.log(`[EVENT] Data stream completed from ${event.peerId.substring(0, 8)}...`);
-        this.mesh.emit("streamCompleted", event);
-      });
-      peerConnection.addEventListener("streamAborted", (event) => {
-        this.debug.log(`[EVENT] Data stream aborted from ${event.peerId.substring(0, 8)}...`);
-        this.mesh.emit("streamAborted", event);
-      });
       peerConnection.addEventListener("renegotiationNeeded", async (event) => {
         this.debug.log(`\u{1F504} Renegotiation needed for ${event.peerId.substring(0, 8)}...`);
         if (this.activeRenegotiations.size >= this.maxConcurrentRenegotiations) {
@@ -6600,16 +6282,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
     handleIncomingMessage(message, fromPeerId) {
       if (!message || typeof message !== "object") {
         this.debug.warn("Received invalid message from", fromPeerId?.substring(0, 8));
-        return;
-      }
-      if (message.type === "binary" && message.data instanceof Uint8Array) {
-        this.debug.log(`\u{1F4E6} Received binary message (${message.size} bytes) from ${fromPeerId.substring(0, 8)}...`);
-        this.mesh.emit("binaryMessageReceived", {
-          from: fromPeerId,
-          data: message.data,
-          size: message.size,
-          timestamp: Date.now()
-        });
         return;
       }
       const filteredMessageTypes = /* @__PURE__ */ new Set([
@@ -11837,108 +11509,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
     async sendMessage(content) {
       return await this.gossipManager.broadcastMessage(content, "chat");
     }
-    /**
-     * Send binary data to a specific peer
-     * @param {string} targetPeerId - The destination peer's ID
-     * @param {Uint8Array|ArrayBuffer} binaryData - The binary data to send
-     * @returns {boolean} True if sent successfully
-     */
-    async sendBinaryData(targetPeerId, binaryData) {
-      if (!targetPeerId || typeof targetPeerId !== "string") {
-        this.debug.error("Invalid targetPeerId for binary message");
-        return false;
-      }
-      const peerConnection = this.connectionManager.peers.get(targetPeerId);
-      if (!peerConnection) {
-        this.debug.error(`No connection to peer ${targetPeerId.substring(0, 8)}...`);
-        return false;
-      }
-      return peerConnection.sendMessage(binaryData);
-    }
-    /**
-     * Broadcast binary data to all connected peers
-     * @param {Uint8Array|ArrayBuffer} binaryData - The binary data to broadcast
-     * @returns {number} Number of peers the data was sent to
-     */
-    async broadcastBinaryData(binaryData) {
-      const peers = this.getConnectedPeers();
-      let sentCount = 0;
-      for (const peer of peers) {
-        if (await this.sendBinaryData(peer.peerId, binaryData)) {
-          sentCount++;
-        }
-      }
-      this.debug.log(`\u{1F4E6} Binary data broadcasted to ${sentCount}/${peers.length} peers`);
-      return sentCount;
-    }
-    /**
-     * Create a writable stream to send data to a specific peer
-     * @param {string} targetPeerId - The destination peer's ID
-     * @param {object} options - Stream options (filename, mimeType, totalSize, etc.)
-     * @returns {WritableStream} A writable stream
-     */
-    createStreamToPeer(targetPeerId, options = {}) {
-      if (!targetPeerId || typeof targetPeerId !== "string") {
-        throw new Error("Invalid targetPeerId for stream");
-      }
-      const peerConnection = this.connectionManager.peers.get(targetPeerId);
-      if (!peerConnection) {
-        throw new Error(`No connection to peer ${targetPeerId.substring(0, 8)}...`);
-      }
-      return peerConnection.createWritableStream(options);
-    }
-    /**
-     * Send a ReadableStream to a peer
-     * @param {string} targetPeerId - The destination peer's ID
-     * @param {ReadableStream} readableStream - The stream to send
-     * @param {object} options - Stream options (filename, mimeType, etc.)
-     * @returns {Promise<void>}
-     */
-    async sendStream(targetPeerId, readableStream, options = {}) {
-      const writableStream = this.createStreamToPeer(targetPeerId, options);
-      try {
-        await readableStream.pipeTo(writableStream);
-        this.debug.log(`\u2705 Stream sent successfully to ${targetPeerId.substring(0, 8)}...`);
-      } catch (error) {
-        this.debug.error(`\u274C Failed to send stream to ${targetPeerId.substring(0, 8)}...:`, error);
-        throw error;
-      }
-    }
-    /**
-     * Send a File to a peer using streams
-     * @param {string} targetPeerId - The destination peer's ID
-     * @param {File} file - The file to send
-     * @returns {Promise<void>}
-     */
-    async sendFile(targetPeerId, file) {
-      this.debug.log(`\u{1F4C1} Sending file "${file.name}" (${file.size} bytes) to ${targetPeerId.substring(0, 8)}...`);
-      const options = {
-        filename: file.name,
-        mimeType: file.type,
-        totalSize: file.size,
-        type: "file"
-      };
-      const stream = file.stream();
-      await this.sendStream(targetPeerId, stream, options);
-    }
-    /**
-     * Send a Blob to a peer using streams
-     * @param {string} targetPeerId - The destination peer's ID
-     * @param {Blob} blob - The blob to send
-     * @param {object} options - Additional options
-     * @returns {Promise<void>}
-     */
-    async sendBlob(targetPeerId, blob, options = {}) {
-      this.debug.log(`\u{1F4E6} Sending blob (${blob.size} bytes) to ${targetPeerId.substring(0, 8)}...`);
-      const streamOptions = {
-        ...options,
-        mimeType: blob.type,
-        totalSize: blob.size,
-        type: "blob"
-      };
-      const stream = blob.stream();
-      await this.sendStream(targetPeerId, stream, streamOptions);
-    }
     // Helper methods for backward compatibility
     canAcceptMorePeers() {
       return this.connectionManager.canAcceptMorePeers();
@@ -12900,7 +12470,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
       RTCAdapter,
       default: createPigeonRTC
     };
-    window.PeerPigeonMesh = PeerPigeonMesh;
   }
   console.log("\u{1F510} PeerPigeon browser bundle loaded with embedded UnSEA crypto and PigeonRTC");
   return __toCommonJS(browser_entry_exports);
