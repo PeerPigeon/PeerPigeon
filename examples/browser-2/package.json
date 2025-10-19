@@ -4,9 +4,11 @@
   "description": "Comprehensive Vue 3 example showcasing all PeerPigeon features",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "dev": "npm run copy-peerpigeon && vite",
+    "build": "npm run copy-peerpigeon && vite build && npm run copy-to-dist",
+    "preview": "vite preview",
+    "copy-peerpigeon": "mkdir -p public && cp ../../dist/peerpigeon-browser.js public/ || true",
+    "copy-to-dist": "cp ../../dist/peerpigeon-browser.js dist/ || true"
   },
   "dependencies": {
     "vue": "^3.4.0",

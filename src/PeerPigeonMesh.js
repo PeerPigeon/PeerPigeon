@@ -815,6 +815,125 @@ export class PeerPigeonMesh extends EventEmitter {
     return await this.gossipManager.broadcastMessage(content, 'chat');
   }
 
+  /**
+   * Send binary data to a specific peer
+   * @param {string} targetPeerId - The destination peer's ID
+   * @param {Uint8Array|ArrayBuffer} binaryData - The binary data to send
+   * @returns {boolean} True if sent successfully
+   */
+  async sendBinaryData(targetPeerId, binaryData) {
+    if (!targetPeerId || typeof targetPeerId !== 'string') {
+      this.debug.error('Invalid targetPeerId for binary message');
+      return false;
+    }
+
+    const peerConnection = this.connectionManager.peers.get(targetPeerId);
+    if (!peerConnection) {
+      this.debug.error(`No connection to peer ${targetPeerId.substring(0, 8)}...`);
+      return false;
+    }
+
+    return peerConnection.sendMessage(binaryData);
+  }
+
+  /**
+   * Broadcast binary data to all connected peers
+   * @param {Uint8Array|ArrayBuffer} binaryData - The binary data to broadcast
+   * @returns {number} Number of peers the data was sent to
+   */
+  async broadcastBinaryData(binaryData) {
+    const peers = this.getConnectedPeers();
+    let sentCount = 0;
+
+    for (const peer of peers) {
+      if (await this.sendBinaryData(peer.peerId, binaryData)) {
+        sentCount++;
+      }
+    }
+
+    this.debug.log(`📦 Binary data broadcasted to ${sentCount}/${peers.length} peers`);
+    return sentCount;
+  }
+
+  /**
+   * Create a writable stream to send data to a specific peer
+   * @param {string} targetPeerId - The destination peer's ID
+   * @param {object} options - Stream options (filename, mimeType, totalSize, etc.)
+   * @returns {WritableStream} A writable stream
+   */
+  createStreamToPeer(targetPeerId, options = {}) {
+    if (!targetPeerId || typeof targetPeerId !== 'string') {
+      throw new Error('Invalid targetPeerId for stream');
+    }
+
+    const peerConnection = this.connectionManager.peers.get(targetPeerId);
+    if (!peerConnection) {
+      throw new Error(`No connection to peer ${targetPeerId.substring(0, 8)}...`);
+    }
+
+    return peerConnection.createWritableStream(options);
+  }
+
+  /**
+   * Send a ReadableStream to a peer
+   * @param {string} targetPeerId - The destination peer's ID
+   * @param {ReadableStream} readableStream - The stream to send
+   * @param {object} options - Stream options (filename, mimeType, etc.)
+   * @returns {Promise<void>}
+   */
+  async sendStream(targetPeerId, readableStream, options = {}) {
+    const writableStream = this.createStreamToPeer(targetPeerId, options);
+    
+    try {
+      await readableStream.pipeTo(writableStream);
+      this.debug.log(`✅ Stream sent successfully to ${targetPeerId.substring(0, 8)}...`);
+    } catch (error) {
+      this.debug.error(`❌ Failed to send stream to ${targetPeerId.substring(0, 8)}...:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Send a File to a peer using streams
+   * @param {string} targetPeerId - The destination peer's ID
+   * @param {File} file - The file to send
+   * @returns {Promise<void>}
+   */
+  async sendFile(targetPeerId, file) {
+    this.debug.log(`📁 Sending file "${file.name}" (${file.size} bytes) to ${targetPeerId.substring(0, 8)}...`);
+    
+    const options = {
+      filename: file.name,
+      mimeType: file.type,
+      totalSize: file.size,
+      type: 'file'
+    };
+
+    const stream = file.stream();
+    await this.sendStream(targetPeerId, stream, options);
+  }
+
+  /**
+   * Send a Blob to a peer using streams
+   * @param {string} targetPeerId - The destination peer's ID
+   * @param {Blob} blob - The blob to send
+   * @param {object} options - Additional options
+   * @returns {Promise<void>}
+   */
+  async sendBlob(targetPeerId, blob, options = {}) {
+    this.debug.log(`📦 Sending blob (${blob.size} bytes) to ${targetPeerId.substring(0, 8)}...`);
+    
+    const streamOptions = {
+      ...options,
+      mimeType: blob.type,
+      totalSize: blob.size,
+      type: 'blob'
+    };
+
+    const stream = blob.stream();
+    await this.sendStream(targetPeerId, stream, streamOptions);
+  }
+
   // Helper methods for backward compatibility
   canAcceptMorePeers() {
     return this.connectionManager.canAcceptMorePeers();
