@@ -19,7 +19,9 @@ PeerPigeon is a production-ready library for building decentralized applications
 - **🌐 Network Namespaces** - Isolated peer networks with automatic global fallback
 - **🗄️ Distributed Storage** - Encrypted, CRDT-enabled storage across the mesh
 - **🎥 Selective Streaming** - Efficient audio/video streaming with bandwidth management
-- **🏢 Hub System** - Connect multiple signaling servers for global peer discovery
+- **📦 Binary Messages** - Native support for efficient binary data transfer (Uint8Array/ArrayBuffer)
+- **� Stream API** - Transfer large files with ReadableStream/WritableStream (memory-efficient, backpressure handling)
+- **�🏢 Hub System** - Connect multiple signaling servers for global peer discovery
 - **🔐 End-to-End Encryption** - Built-in crypto for secure communication
 - **💰 Cost Optimized** - Smart routing reduces server costs by ~95%
 - **📱 Multi-Platform** - Browser, Node.js, NativeScript support
@@ -77,6 +79,59 @@ For localhost testing, you need to grant media permissions:
 See [docs/LOCAL_TESTING.md](docs/LOCAL_TESTING.md) for full details.
 
 ## 📚 Examples
+
+### Streaming File Transfer
+
+```javascript
+// Send a file using streams (memory-efficient for large files)
+const file = fileInput.files[0];
+await mesh.sendFile(targetPeerId, file);
+
+// Receive files
+mesh.on('streamReceived', async (event) => {
+  const { stream, metadata } = event;
+  console.log(`Receiving ${metadata.filename} (${metadata.totalSize} bytes)`);
+  
+  // Read stream and create blob
+  const chunks = [];
+  const reader = stream.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  const blob = new Blob(chunks, { type: metadata.mimeType });
+  
+  // Download file
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = metadata.filename;
+  a.click();
+});
+```
+
+### Binary Messages
+
+```javascript
+// Send binary data to specific peer
+const binaryData = new Uint8Array([1, 2, 3, 4, 5]);
+await mesh.sendBinaryData(targetPeerId, binaryData);
+
+// Broadcast binary to all peers
+const count = await mesh.broadcastBinaryData(binaryData);
+
+// Receive binary messages
+mesh.on('binaryMessageReceived', ({ from, data, size }) => {
+  console.log(`Received ${size} bytes from ${from}`);
+  // data is Uint8Array
+});
+
+// Send files
+const file = fileInput.files[0];
+const buffer = await file.arrayBuffer();
+await mesh.sendBinaryData(peerId, new Uint8Array(buffer));
+```
 
 ### Distributed Storage
 
@@ -150,6 +205,8 @@ await hub2.start();
 ### Core Guides
 - **[API Documentation](docs/API_DOCUMENTATION.md)** - Complete API reference
 - **[CLI Guide](docs/CLI_README.md)** - Command-line interface
+- **[Binary Messages](docs/BINARY_MESSAGES.md)** - Efficient binary data transfer
+- **[Streaming API](docs/STREAMING_API.md)** - Large file transfers with ReadableStream/WritableStream
 - **[Network Namespaces](docs/NETWORK_NAMESPACES.md)** - Isolated peer networks
 - **[Selective Streaming](docs/SELECTIVE_STREAMING_GUIDE.md)** - Media streaming optimization
 
@@ -161,6 +218,8 @@ await hub2.start();
 
 ### Examples
 - **[Browser Examples](examples/browser/)** - Web applications
+- **[Binary Message Demo](examples/binary-message-demo.html)** - Interactive binary transfer demo
+- **[Stream File Transfer Demo](examples/stream-file-transfer-demo.html)** - Large file transfer with progress
 - **[Node.js Examples](examples/node/)** - Server-side usage
 - **[NativeScript Examples](examples/nativescript/)** - Mobile apps
 

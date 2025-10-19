@@ -36,6 +36,9 @@ async function startServer() {
   // Serve the browser example specifically
   app.use('/examples/browser', express.static(path.join(__dirname, 'examples/browser')));
   
+  // Serve the browser-2 (Vue) example - serve the built dist folder
+  app.use('/examples/browser-2', express.static(path.join(__dirname, 'examples/browser-2/dist')));
+  
   // Serve the browser-3 example
   app.use('/examples/browser-3', express.static(path.join(__dirname, 'examples/browser-3')));
 
@@ -76,6 +79,11 @@ async function startServer() {
     res.sendFile(path.join(__dirname, 'examples/browser/index.html'));
   });
 
+  // Browser-2 (Vue) route
+  app.get('/browser-2', (req, res) => {
+    res.sendFile(path.join(__dirname, 'examples/browser-2/dist/index.html'));
+  });
+
   // Health check endpoint
   app.get('/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -84,11 +92,13 @@ async function startServer() {
   app.listen(PORT, () => {
     console.log(`🚀 Fast Dev Server running on http://localhost:${PORT}`);
     console.log(`🌐 Browser example: http://localhost:${PORT}/browser`);
+    console.log(`🌐 Browser-2 (Vue): http://localhost:${PORT}/browser-2`);
     console.log(`📊 Health check: http://localhost:${PORT}/health`);
     console.log('✅ Server is ready for connections');
     console.log('\n📁 Serving:');
     console.log('   • Browser bundle: /dist/peerpigeon-browser.js');
     console.log('   • Browser example: /examples/browser/');
+    console.log('   • Browser-2 (Vue): /examples/browser-2/dist/');
     console.log('   • Source files: /src/');
     console.log('   • Static assets: /assets/');
   }).on('error', (err) => {

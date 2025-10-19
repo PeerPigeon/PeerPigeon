@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PeerPigeon Binary Message Demo</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+
+        h1 {
+            color: #667eea;
+            margin-top: 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .status {
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            font-weight: 500;
+        }
+
+        .status.connected {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status.disconnected {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 20px 0;
+        }
+
+        .panel {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #dee2e6;
+        }
+
+        .panel h3 {
+            margin-top: 0;
+            color: #495057;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s;
+            width: 100%;
+            margin: 5px 0;
+        }
+
+        button:hover {
+            background: #5568d3;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        input, textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            font-size: 14px;
+            box-sizing: border-box;
+            margin: 5px 0;
+        }
+
+        textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        .log {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            border-radius: 8px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .log-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid #333;
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+        .log-entry.success { color: #4ec9b0; }
+        .log-entry.error { color: #f48771; }
+        .log-entry.info { color: #9cdcfe; }
+        .log-entry.binary { color: #dcdcaa; }
+
+        .peers-list {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin: 10px 0;
+        }
+
+        .peer-badge {
+            background: #667eea;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 32px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+
+        .stat-label {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            font-size: 14px;
+            margin: 5px 0;
+            background: white;
+        }
+
+        .binary-preview {
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 6px;
+            margin: 10px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 100px;
+            overflow-y: auto;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>
+            📦 PeerPigeon Binary Message Demo
+        </h1>
+
+        <div id="status" class="status disconnected">
+            ⏳ Initializing...
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-label">Connected Peers</div>
+                <div class="stat-value" id="peer-count">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Messages Sent</div>
+                <div class="stat-value" id="messages-sent">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Bytes Received</div>
+                <div class="stat-value" id="bytes-received">0</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <div class="panel">
+                <h3>📤 Send Binary Data</h3>
+                <label>Select Peer:</label>
+                <select id="target-peer">
+                    <option value="">Broadcast to All</option>
+                </select>
+                
+                <label>Data Size (bytes):</label>
+                <input type="number" id="data-size" value="1024" min="1" max="1000000">
+                
+                <label>Fill Byte (0-255):</label>
+                <input type="number" id="fill-byte" value="42" min="0" max="255">
+                
+                <button onclick="sendRandomBinary()">Send Random Binary</button>
+                <button onclick="sendTestPattern()">Send Test Pattern</button>
+                <button onclick="sendTextAsBinary()">Send Text as Binary</button>
+            </div>
+
+            <div class="panel">
+                <h3>📥 Custom Text Binary</h3>
+                <label>Enter text to send as binary:</label>
+                <textarea id="text-input" placeholder="Enter text here...">Hello from PeerPigeon! 🐦</textarea>
+                <div id="text-preview" class="binary-preview"></div>
+                <button onclick="sendCustomText()">Send as Binary</button>
+            </div>
+        </div>
+
+        <h3>📜 Activity Log</h3>
+        <div id="log" class="log"></div>
+
+        <div style="margin-top: 20px;">
+            <h3>🔗 Connected Peers</h3>
+            <div id="peers-list" class="peers-list">
+                <span style="color: #666;">No peers connected</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="../dist/peerpigeon-browser.js"></script>
+    <script>
+        let mesh = null;
+        let messagesSent = 0;
+        let bytesReceived = 0;
+
+        // Initialize
+        async function init() {
+            log('🚀 Initializing PeerPigeon...', 'info');
+
+            mesh = new PeerPigeonMesh({
+                signalingServer: 'ws://localhost:3000',
+                networkName: 'binary-demo',
+                autoConnect: true,
+                maxPeers: 4,
+                debug: true
+            });
+
+            await mesh.connect();
+
+            setupEventListeners();
+            updateTextPreview();
+        }
+
+        function setupEventListeners() {
+            mesh.addEventListener('connected', () => {
+                updateStatus('connected', '✅ Connected to mesh network');
+                log('✅ Connected to signaling server', 'success');
+            });
+
+            mesh.addEventListener('disconnected', () => {
+                updateStatus('disconnected', '❌ Disconnected from mesh network');
+                log('❌ Disconnected from signaling server', 'error');
+            });
+
+            mesh.addEventListener('peerConnected', (event) => {
+                log(`🤝 Peer connected: ${event.peerId.substring(0, 8)}...`, 'success');
+                updatePeersList();
+                updatePeerCount();
+            });
+
+            mesh.addEventListener('peerDisconnected', (event) => {
+                log(`👋 Peer disconnected: ${event.peerId.substring(0, 8)}...`, 'info');
+                updatePeersList();
+                updatePeerCount();
+            });
+
+            // Binary message handler
+            mesh.addEventListener('binaryMessageReceived', (event) => {
+                const { from, data, size } = event;
+                bytesReceived += size;
+                
+                log(`📦 Binary message received from ${from.substring(0, 8)}... (${size} bytes)`, 'binary');
+                
+                // Try to decode as text
+                try {
+                    const text = new TextDecoder().decode(data);
+                    if (isPrintableText(text)) {
+                        log(`   📝 Decoded text: "${text}"`, 'info');
+                    } else {
+                        log(`   🔢 Binary data: ${arrayToHex(data.slice(0, 20))}${size > 20 ? '...' : ''}`, 'info');
+                    }
+                } catch (e) {
+                    log(`   🔢 Binary data: ${arrayToHex(data.slice(0, 20))}${size > 20 ? '...' : ''}`, 'info');
+                }
+                
+                updateBytesReceived();
+            });
+
+            // Regular text messages
+            mesh.addEventListener('messageReceived', (event) => {
+                log(`💬 Text message from ${event.from.substring(0, 8)}...: ${JSON.stringify(event.content)}`, 'info');
+            });
+        }
+
+        async function sendRandomBinary() {
+            const size = parseInt(document.getElementById('data-size').value);
+            const targetPeer = document.getElementById('target-peer').value;
+            
+            // Create random binary data
+            const data = new Uint8Array(size);
+            crypto.getRandomValues(data);
+            
+            await sendBinaryData(data, targetPeer, 'random');
+        }
+
+        async function sendTestPattern() {
+            const size = parseInt(document.getElementById('data-size').value);
+            const fillByte = parseInt(document.getElementById('fill-byte').value);
+            const targetPeer = document.getElementById('target-peer').value;
+            
+            // Create pattern with repeating byte
+            const data = new Uint8Array(size);
+            data.fill(fillByte);
+            
+            await sendBinaryData(data, targetPeer, 'pattern');
+        }
+
+        async function sendTextAsBinary() {
+            const text = "Quick test message! 🚀";
+            await sendTextData(text, document.getElementById('target-peer').value);
+        }
+
+        async function sendCustomText() {
+            const text = document.getElementById('text-input').value;
+            if (!text) {
+                log('❌ No text entered', 'error');
+                return;
+            }
+            await sendTextData(text, document.getElementById('target-peer').value);
+        }
+
+        async function sendTextData(text, targetPeer) {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(text);
+            await sendBinaryData(data, targetPeer, 'text');
+        }
+
+        async function sendBinaryData(data, targetPeer, type) {
+            try {
+                if (targetPeer) {
+                    const success = await mesh.sendBinaryData(targetPeer, data);
+                    if (success) {
+                        log(`📤 Sent ${type} binary data (${data.length} bytes) to ${targetPeer.substring(0, 8)}...`, 'success');
+                        messagesSent++;
+                        updateMessagesSent();
+                    } else {
+                        log(`❌ Failed to send to peer`, 'error');
+                    }
+                } else {
+                    const count = await mesh.broadcastBinaryData(data);
+                    log(`📤 Broadcasted ${type} binary data (${data.length} bytes) to ${count} peers`, 'success');
+                    messagesSent++;
+                    updateMessagesSent();
+                }
+            } catch (error) {
+                log(`❌ Error sending binary data: ${error.message}`, 'error');
+            }
+        }
+
+        function updateTextPreview() {
+            const text = document.getElementById('text-input').value;
+            const encoder = new TextEncoder();
+            const bytes = encoder.encode(text);
+            const preview = `Size: ${bytes.length} bytes | Hex: ${arrayToHex(bytes.slice(0, 32))}${bytes.length > 32 ? '...' : ''}`;
+            document.getElementById('text-preview').textContent = preview;
+        }
+
+        // Update text preview on input
+        document.getElementById('text-input').addEventListener('input', updateTextPreview);
+
+        function updateStatus(state, message) {
+            const statusEl = document.getElementById('status');
+            statusEl.className = `status ${state}`;
+            statusEl.textContent = message;
+        }
+
+        function updatePeerCount() {
+            document.getElementById('peer-count').textContent = mesh.getConnectedPeers().length;
+        }
+
+        function updateMessagesSent() {
+            document.getElementById('messages-sent').textContent = messagesSent;
+        }
+
+        function updateBytesReceived() {
+            document.getElementById('bytes-received').textContent = formatBytes(bytesReceived);
+        }
+
+        function updatePeersList() {
+            const peers = mesh.getConnectedPeers();
+            const select = document.getElementById('target-peer');
+            const peersListEl = document.getElementById('peers-list');
+            
+            // Update dropdown
+            const currentValue = select.value;
+            select.innerHTML = '<option value="">Broadcast to All</option>';
+            peers.forEach(peer => {
+                const option = document.createElement('option');
+                option.value = peer.peerId;
+                option.textContent = peer.peerId.substring(0, 16) + '...';
+                select.appendChild(option);
+            });
+            select.value = currentValue;
+            
+            // Update badges
+            if (peers.length === 0) {
+                peersListEl.innerHTML = '<span style="color: #666;">No peers connected</span>';
+            } else {
+                peersListEl.innerHTML = peers.map(peer => 
+                    `<div class="peer-badge">${peer.peerId.substring(0, 8)}...</div>`
+                ).join('');
+            }
+        }
+
+        function log(message, type = 'info') {
+            const logEl = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function arrayToHex(array) {
+            return Array.from(array)
+                .map(b => b.toString(16).padStart(2, '0'))
+                .join(' ');
+        }
+
+        function isPrintableText(text) {
+            // Check if string contains mostly printable characters
+            const printable = text.split('').filter(c => {
+                const code = c.charCodeAt(0);
+                return (code >= 32 && code <= 126) || code === 10 || code === 13;
+            }).length;
+            return printable / text.length > 0.8;
+        }
+
+        function formatBytes(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+        }
+
+        // Start the demo
+        init().catch(error => {
+            log(`❌ Initialization error: ${error.message}`, 'error');
+            updateStatus('disconnected', '❌ Failed to initialize');
+        });
+    </script>
+</body>
+</html>

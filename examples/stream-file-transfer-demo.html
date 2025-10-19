@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PeerPigeon Stream File Transfer Demo</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+        }
+
+        .status-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .connection-panel {
+            background: rgba(255, 255, 255, 0.85);
+            border-radius: 12px;
+            border: 2px solid #dee2e6;
+            padding: 25px;
+            margin-bottom: 30px;
+        }
+
+        .connection-panel h2 {
+            color: #495057;
+            margin-bottom: 16px;
+            font-size: 20px;
+        }
+
+        .connection-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+
+        .connection-panel label {
+            font-weight: 600;
+            margin-bottom: 6px;
+            display: block;
+            color: #495057;
+        }
+
+        .connection-panel input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #dee2e6;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        .connection-panel input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.25);
+        }
+
+        .connection-buttons {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .connection-buttons button {
+            flex: 1;
+            min-width: 160px;
+        }
+
+        .status-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 14px;
+            border-radius: 999px;
+            font-weight: 600;
+            font-size: 13px;
+            margin-top: 10px;
+        }
+
+        .status-connected {
+            background: rgba(40, 167, 69, 0.15);
+            color: #1e7e34;
+            border: 1px solid rgba(40, 167, 69, 0.35);
+        }
+
+        .status-connecting {
+            background: rgba(255, 193, 7, 0.15);
+            color: #856404;
+            border: 1px solid rgba(255, 193, 7, 0.35);
+        }
+
+        .status-disconnected {
+            background: rgba(220, 53, 69, 0.15);
+            color: #841f2d;
+            border: 1px solid rgba(220, 53, 69, 0.35);
+        }
+
+        .status-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 12px;
+            text-align: center;
+        }
+
+        .status-label {
+            font-size: 14px;
+            opacity: 0.9;
+            margin-bottom: 8px;
+        }
+
+        .status-value {
+            font-size: 28px;
+            font-weight: bold;
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 30px;
+        }
+
+        .panel {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 25px;
+            border: 2px solid #dee2e6;
+        }
+
+        .panel h2 {
+            color: #495057;
+            margin-bottom: 20px;
+            font-size: 20px;
+        }
+
+        .file-upload {
+            border: 3px dashed #667eea;
+            border-radius: 12px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: white;
+        }
+
+        .file-upload:hover {
+            background: #f0f4ff;
+            border-color: #5568d3;
+        }
+
+        .file-upload.drag-over {
+            background: #e0e7ff;
+            border-color: #4f46e5;
+            transform: scale(1.02);
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        .file-info {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 15px 0;
+            border-left: 4px solid #667eea;
+        }
+
+        .file-name {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+        }
+
+        .file-size {
+            color: #666;
+            font-size: 14px;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 14px 28px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            transition: all 0.3s;
+            width: 100%;
+            margin: 10px 0;
+        }
+
+        button:hover:not(:disabled) {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #dee2e6;
+            border-radius: 8px;
+            font-size: 14px;
+            margin: 10px 0;
+            background: white;
+            cursor: pointer;
+        }
+
+        .progress-container {
+            background: #e9ecef;
+            border-radius: 8px;
+            height: 30px;
+            margin: 15px 0;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .progress-bar {
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            height: 100%;
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 600;
+            font-size: 14px;
+        }
+
+        .received-files {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .received-file {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+            border-left: 4px solid #28a745;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .download-btn {
+            background: #28a745;
+            padding: 8px 16px;
+            font-size: 14px;
+            width: auto;
+            margin: 0;
+        }
+
+        .download-btn:hover {
+            background: #218838;
+        }
+
+        .log {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            border-radius: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .log-entry {
+            padding: 4px 0;
+            border-bottom: 1px solid #333;
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+    .log-entry.success { color: #4ec9b0; }
+    .log-entry.error { color: #f48771; }
+    .log-entry.info { color: #9cdcfe; }
+    .log-entry.stream { color: #dcdcaa; }
+    .log-entry.warning { color: #f2cc60; }
+
+        .peers-list {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin: 15px 0;
+        }
+
+        .peer-badge {
+            background: #667eea;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>
+            📡 PeerPigeon Stream File Transfer
+        </h1>
+        <p class="subtitle">Transfer files efficiently using ReadableStream/WritableStream API</p>
+
+        <div class="status-bar">
+            <div class="status-card">
+                <div class="status-label">Connected Peers</div>
+                <div class="status-value" id="peer-count">0</div>
+            </div>
+            <div class="status-card">
+                <div class="status-label">Files Sent</div>
+                <div class="status-value" id="files-sent">0</div>
+            </div>
+            <div class="status-card">
+                <div class="status-label">Files Received</div>
+                <div class="status-value" id="files-received">0</div>
+            </div>
+            <div class="status-card">
+                <div class="status-label">Data Transferred</div>
+                <div class="status-value" id="data-transferred">0 MB</div>
+            </div>
+        </div>
+
+        <div class="connection-panel">
+            <h2>⚙️ Connection Settings</h2>
+            <div class="connection-grid">
+                <div>
+                    <label for="signaling-url">Signaling Server URL</label>
+                    <input type="text" id="signaling-url" value="ws://localhost:3000" placeholder="ws://localhost:3000">
+                </div>
+                <div>
+                    <label for="network-name">Network Namespace</label>
+                    <input type="text" id="network-name" value="file-transfer" placeholder="Enter namespace">
+                </div>
+            </div>
+            <div class="connection-buttons">
+                <button id="connect-btn">Connect</button>
+                <button id="disconnect-btn" disabled>Disconnect</button>
+            </div>
+            <div id="connection-status" class="status-tag status-disconnected">Disconnected</div>
+        </div>
+
+        <div class="main-content">
+            <div class="panel">
+                <h2>📤 Send Files</h2>
+                
+                <div class="file-upload" id="drop-zone">
+                    <div class="icon">📁</div>
+                    <p style="font-size: 18px; margin-bottom: 10px;">
+                        Drag & Drop files here
+                    </p>
+                    <p style="color: #666;">or click to browse</p>
+                    <input type="file" id="file-input" class="file-input" multiple>
+                </div>
+
+                <div id="selected-files"></div>
+
+                <label style="display: block; margin-top: 20px; font-weight: 600;">Send to:</label>
+                <select id="target-peer">
+                    <option value="">Select a peer...</option>
+                </select>
+
+                <div id="send-progress" style="display: none;">
+                    <div class="progress-container">
+                        <div class="progress-bar" id="send-progress-bar">0%</div>
+                    </div>
+                </div>
+
+                <button id="send-btn" disabled>Send Files</button>
+            </div>
+
+            <div class="panel">
+                <h2>📥 Received Files</h2>
+                <div class="received-files" id="received-files">
+                    <p style="color: #666; text-align: center; padding: 40px;">
+                        No files received yet
+                    </p>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>📜 Activity Log</h2>
+            <div class="log" id="log"></div>
+        </div>
+
+        <div class="panel" style="margin-top: 20px;">
+            <h2>🔗 Connected Peers</h2>
+            <div class="peers-list" id="peers-list">
+                <span style="color: #666;">No peers connected</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="../dist/peerpigeon-browser.js"></script>
+    <script>
+        const PeerPigeonMeshConstructor = window.PeerPigeonMesh || (window.PeerPigeon && window.PeerPigeon.PeerPigeonMesh);
+
+        let mesh = null;
+        let filesSent = 0;
+        let filesReceived = 0;
+        let dataTransferred = 0;
+        let selectedFiles = [];
+        let receivedFileBlobs = new Map(); // streamId -> blob
+    let isMeshConnected = false;
+
+        async function init() {
+            setupFileUpload();
+            setupConnectionControls();
+            updateUI();
+
+            if (!PeerPigeonMeshConstructor) {
+                log('❌ PeerPigeon browser bundle not found. Build the project with `npm run build`.', 'error');
+                setConnectionStatus('disconnected', 'Bundle unavailable');
+                document.getElementById('connect-btn').disabled = true;
+                return;
+            }
+
+            log('✅ Ready! Configure your namespace and click Connect when you are set.', 'info');
+        }
+
+        function setupConnectionControls() {
+            const connectBtn = document.getElementById('connect-btn');
+            const disconnectBtn = document.getElementById('disconnect-btn');
+            const networkInput = document.getElementById('network-name');
+
+            connectBtn.addEventListener('click', () => {
+                connectMesh().catch(error => {
+                    log(`❌ Connection error: ${error.message}`, 'error');
+                    setConnectionStatus('disconnected', 'Connection failed');
+                });
+            });
+
+            disconnectBtn.addEventListener('click', () => {
+                disconnectMesh().catch(error => {
+                    log(`⚠️ Error during disconnect: ${error.message}`, 'error');
+                });
+            });
+
+            networkInput.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    connectBtn.click();
+                }
+            });
+        }
+
+        async function connectMesh() {
+            const signalingUrl = document.getElementById('signaling-url').value.trim() || 'ws://localhost:3000';
+            const networkName = document.getElementById('network-name').value.trim() || 'file-transfer';
+            const connectBtn = document.getElementById('connect-btn');
+            const disconnectBtn = document.getElementById('disconnect-btn');
+
+            if (!PeerPigeonMeshConstructor) {
+                throw new Error('PeerPigeon bundle unavailable');
+            }
+
+            connectBtn.disabled = true;
+            disconnectBtn.disabled = true;
+            setConnectionStatus('connecting', `Connecting to ${networkName}...`);
+
+            if (mesh) {
+                try {
+                    await mesh.disconnect();
+                } catch (error) {
+                    log(`⚠️ Error disconnecting previous mesh: ${error.message}`, 'error');
+                }
+            }
+
+            mesh = new PeerPigeonMeshConstructor({
+                signalingServer: signalingUrl,
+                networkName,
+                autoConnect: true,
+                maxPeers: 8,
+                debug: true
+            });
+
+            attachMeshEventListeners(mesh);
+
+            try {
+                if (typeof mesh.init === 'function') {
+                    setConnectionStatus('connecting', 'Initializing mesh...');
+                    await mesh.init();
+                }
+
+                await mesh.connect(signalingUrl);
+                isMeshConnected = true;
+                setConnectionStatus('connected', `Connected to ${networkName}`);
+                log(`🤝 Connected to namespace "${networkName}"`, 'success');
+                updateUI();
+                disconnectBtn.disabled = false;
+            } catch (error) {
+                isMeshConnected = false;
+                setConnectionStatus('disconnected', 'Connection failed');
+                mesh = null;
+                throw error;
+            } finally {
+                connectBtn.disabled = false;
+                updateSendButton();
+            }
+        }
+
+        async function disconnectMesh() {
+            const disconnectBtn = document.getElementById('disconnect-btn');
+            const connectBtn = document.getElementById('connect-btn');
+            disconnectBtn.disabled = true;
+            connectBtn.disabled = true;
+
+            if (!mesh) {
+                setConnectionStatus('disconnected', 'No active connection');
+                connectBtn.disabled = false;
+                return;
+            }
+
+            try {
+                await mesh.disconnect();
+                log('👋 Disconnected from mesh', 'info');
+            } finally {
+                mesh = null;
+                isMeshConnected = false;
+                updateUI();
+                setConnectionStatus('disconnected', 'Disconnected');
+                connectBtn.disabled = false;
+            }
+        }
+
+        function attachMeshEventListeners(meshInstance) {
+            const safeHandler = (callback) => (event) => {
+                if (meshInstance !== mesh) return;
+                callback(event);
+            };
+
+            meshInstance.addEventListener('connected', safeHandler(() => {
+                log('✅ Connected to signaling server', 'success');
+            }));
+
+            meshInstance.addEventListener('peerConnected', safeHandler((event) => {
+                log(`🤝 Peer connected: ${event.peerId.substring(0, 8)}...`, 'success');
+                updateUI();
+            }));
+
+            meshInstance.addEventListener('peerDisconnected', safeHandler((event) => {
+                log(`👋 Peer disconnected: ${event.peerId.substring(0, 8)}...`, 'info');
+                updateUI();
+            }));
+
+            meshInstance.addEventListener('disconnected', safeHandler(() => {
+                if (!isMeshConnected) return;
+                isMeshConnected = false;
+                document.getElementById('disconnect-btn').disabled = true;
+                setConnectionStatus('disconnected', 'Disconnected');
+                updateUI();
+            }));
+
+            meshInstance.addEventListener('streamReceived', safeHandler(async (event) => {
+                const { peerId, streamId, stream, metadata } = event;
+                log(`📥 Receiving file "${metadata.filename}" from ${peerId.substring(0, 8)}... (${formatBytes(metadata.totalSize)})`, 'stream');
+
+                try {
+                    const chunks = [];
+                    const reader = stream.getReader();
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                        log(`📥 Received chunk (${value.length} bytes)`, 'info');
+                    }
+
+                    const blob = new Blob(chunks, { type: metadata.mimeType });
+                    receivedFileBlobs.set(streamId, blob);
+
+                    addReceivedFile({
+                        streamId,
+                        filename: metadata.filename,
+                        size: metadata.totalSize,
+                        mimeType: metadata.mimeType,
+                        from: peerId,
+                        blob
+                    });
+
+                    filesReceived++;
+                    dataTransferred += metadata.totalSize;
+                    updateStats();
+
+                    log(`✅ File "${metadata.filename}" received successfully`, 'success');
+                } catch (error) {
+                    log(`❌ Error receiving file: ${error.message}`, 'error');
+                }
+            }));
+
+            meshInstance.addEventListener('streamCompleted', safeHandler((event) => {
+                log(`✅ Stream ${event.streamId} completed`, 'success');
+            }));
+
+            meshInstance.addEventListener('streamAborted', safeHandler((event) => {
+                log(`❌ Stream ${event.streamId} aborted: ${event.reason}`, 'error');
+            }));
+        }
+
+        function setupFileUpload() {
+            const dropZone = document.getElementById('drop-zone');
+            const fileInput = document.getElementById('file-input');
+            const sendBtn = document.getElementById('send-btn');
+            const peerSelect = document.getElementById('target-peer');
+
+            dropZone.addEventListener('click', () => fileInput.click());
+
+            fileInput.addEventListener('change', (event) => {
+                handleFiles(event.target.files);
+            });
+
+            dropZone.addEventListener('dragover', (event) => {
+                event.preventDefault();
+                dropZone.classList.add('drag-over');
+            });
+
+            dropZone.addEventListener('dragleave', () => {
+                dropZone.classList.remove('drag-over');
+            });
+
+            dropZone.addEventListener('drop', (event) => {
+                event.preventDefault();
+                dropZone.classList.remove('drag-over');
+                handleFiles(event.dataTransfer.files);
+            });
+
+            peerSelect.addEventListener('change', updateSendButton);
+            sendBtn.addEventListener('click', sendFiles);
+        }
+
+        function handleFiles(files) {
+            selectedFiles = Array.from(files);
+            displaySelectedFiles();
+            updateSendButton();
+        }
+
+        function displaySelectedFiles() {
+            const container = document.getElementById('selected-files');
+
+            if (selectedFiles.length === 0) {
+                container.innerHTML = '';
+                return;
+            }
+
+            container.innerHTML = selectedFiles.map((file) => `
+                <div class="file-info">
+                    <div class="file-name">📄 ${file.name}</div>
+                    <div class="file-size">${formatBytes(file.size)} • ${file.type || 'unknown type'}</div>
+                </div>
+            `).join('');
+        }
+
+        function updateSendButton() {
+            const sendBtn = document.getElementById('send-btn');
+            const targetPeer = document.getElementById('target-peer').value;
+            sendBtn.disabled = !isMeshConnected || selectedFiles.length === 0 || !targetPeer;
+        }
+
+        async function sendFiles() {
+            const targetPeer = document.getElementById('target-peer').value;
+            if (!isMeshConnected || !mesh) {
+                log('⚠️ Connect to a namespace before sending files.', 'warning');
+                return;
+            }
+
+            if (!targetPeer || selectedFiles.length === 0) return;
+
+            const sendBtn = document.getElementById('send-btn');
+            const progressContainer = document.getElementById('send-progress');
+            const progressBar = document.getElementById('send-progress-bar');
+
+            sendBtn.disabled = true;
+            progressContainer.style.display = 'block';
+
+            try {
+                for (let i = 0; i < selectedFiles.length; i++) {
+                    const file = selectedFiles[i];
+                    const progress = Math.round(((i + 1) / selectedFiles.length) * 100);
+
+                    progressBar.style.width = `${progress}%`;
+                    progressBar.textContent = `${progress}% (${i + 1}/${selectedFiles.length})`;
+
+                    log(`📤 Sending file "${file.name}" to ${targetPeer.substring(0, 8)}...`, 'stream');
+
+                    await mesh.sendFile(targetPeer, file);
+
+                    filesSent++;
+                    dataTransferred += file.size;
+                    updateStats();
+
+                    log(`✅ File "${file.name}" sent successfully`, 'success');
+                }
+
+                selectedFiles = [];
+                document.getElementById('file-input').value = '';
+                displaySelectedFiles();
+                progressContainer.style.display = 'none';
+                updateSendButton();
+
+            } catch (error) {
+                log(`❌ Error sending files: ${error.message}`, 'error');
+            } finally {
+                sendBtn.disabled = false;
+            }
+        }
+
+        function addReceivedFile(fileData) {
+            const container = document.getElementById('received-files');
+
+            if (container.querySelector('p')) {
+                container.innerHTML = '';
+            }
+
+            const fileEl = document.createElement('div');
+            fileEl.className = 'received-file';
+            fileEl.innerHTML = `
+                <div>
+                    <div class="file-name">📄 ${fileData.filename}</div>
+                    <div class="file-size">
+                        ${formatBytes(fileData.size)} • From ${fileData.from.substring(0, 8)}...
+                    </div>
+                </div>
+                <button class="download-btn" onclick="downloadFile('${fileData.streamId}')">
+                    ⬇️ Download
+                </button>
+            `;
+            container.insertBefore(fileEl, container.firstChild);
+        }
+
+        function downloadFile(streamId) {
+            const blob = receivedFileBlobs.get(streamId);
+            if (!blob) return;
+
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `received-file-${Date.now()}`;
+            a.click();
+            URL.revokeObjectURL(url);
+
+            log('💾 File downloaded', 'success');
+        }
+
+        function updateUI() {
+            updatePeersList();
+            updatePeerDropdown();
+            updateStats();
+            updateSendButton();
+        }
+
+        function getConnectedPeers() {
+            if (!mesh || !isMeshConnected) {
+                return [];
+            }
+
+            const normalizePeer = (peer) => {
+                if (!peer) return null;
+                if (typeof peer === 'string') return { peerId: peer };
+                if (typeof peer.peerId === 'string') return { peerId: peer.peerId };
+                return null;
+            };
+
+            const collectPeers = (source) => {
+                if (!source) return [];
+                if (typeof source === 'string') {
+                    const single = normalizePeer(source);
+                    return single ? [single] : [];
+                }
+                const normalized = Array.from(source)
+                    .map(normalizePeer)
+                    .filter(Boolean);
+                return normalized;
+            };
+
+            try {
+                if (typeof mesh.getConnectedPeers === 'function') {
+                    const peers = mesh.getConnectedPeers();
+                    if (peers && typeof peers[Symbol.iterator] === 'function') {
+                        return collectPeers(peers);
+                    }
+                }
+
+                if (typeof mesh.getConnectedPeerIds === 'function') {
+                    return collectPeers(mesh.getConnectedPeerIds());
+                }
+
+                if (mesh.connectionManager) {
+                    if (typeof mesh.connectionManager.getConnectedPeers === 'function') {
+                        return collectPeers(mesh.connectionManager.getConnectedPeers());
+                    }
+
+                    if (typeof mesh.connectionManager.getPeers === 'function') {
+                        const peerSummaries = mesh.connectionManager.getPeers()
+                            .filter(peer => peer.status === 'connected')
+                            .map(peer => peer.peerId);
+                        return collectPeers(peerSummaries);
+                    }
+                }
+
+                if (mesh.peers) {
+                    if (typeof mesh.peers.values === 'function') {
+                        return collectPeers(mesh.peers.values());
+                    }
+                    return collectPeers(Object.values(mesh.peers));
+                }
+            } catch (error) {
+                log(`⚠️ Could not fetch peers: ${error.message}`, 'warning');
+            }
+
+            return [];
+        }
+
+        function updatePeersList() {
+            const peers = getConnectedPeers();
+            const container = document.getElementById('peers-list');
+
+            if (peers.length === 0) {
+                container.innerHTML = '<span style="color: #666;">No peers connected</span>';
+            } else {
+                container.innerHTML = peers.map(peer =>
+                    `<div class="peer-badge">${peer.peerId.substring(0, 12)}...</div>`
+                ).join('');
+            }
+
+            document.getElementById('peer-count').textContent = peers.length;
+        }
+
+        function updatePeerDropdown() {
+            const peers = getConnectedPeers();
+            const select = document.getElementById('target-peer');
+            const currentValue = select.value;
+
+            select.innerHTML = '<option value="">Select a peer...</option>';
+            peers.forEach(peer => {
+                const option = document.createElement('option');
+                option.value = peer.peerId;
+                option.textContent = peer.peerId.substring(0, 20) + '...';
+                select.appendChild(option);
+            });
+
+            if (peers.some(peer => peer.peerId === currentValue)) {
+                select.value = currentValue;
+            }
+        }
+
+        function updateStats() {
+            document.getElementById('files-sent').textContent = filesSent;
+            document.getElementById('files-received').textContent = filesReceived;
+            document.getElementById('data-transferred').textContent =
+                (dataTransferred / (1024 * 1024)).toFixed(2) + ' MB';
+        }
+
+        function setConnectionStatus(state, message) {
+            const statusEl = document.getElementById('connection-status');
+            statusEl.textContent = message;
+            statusEl.classList.remove('status-connected', 'status-connecting', 'status-disconnected');
+            statusEl.classList.add(`status-${state}`);
+        }
+
+        function log(message, type = 'info') {
+            const logEl = document.getElementById('log');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function formatBytes(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+            return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+        }
+
+        window.downloadFile = downloadFile;
+
+        init().catch(error => {
+            log(`❌ Initialization error: ${error.message}`, 'error');
+        });
+    </script>
+</body>
+</html>

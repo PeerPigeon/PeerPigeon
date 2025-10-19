@@ -5,7 +5,7 @@
       <div class="container">
         <div class="header-content">
           <div class="logo">
-            <img src="../browser/assets/images/favicon.png" alt="PeerPigeon" class="logo-img">
+            <span class="logo-icon">🐦</span>
             <h1>PeerPigeon Vue 3 Demo</h1>
           </div>
           
@@ -100,6 +100,10 @@
           <router-link to="/debug" class="tab">
             <span class="tab-icon">🐛</span>
             Debug
+          </router-link>
+          <router-link to="/testing" class="tab">
+            <span class="tab-icon">🧪</span>
+            Testing
           </router-link>
         </div>
       </div>
@@ -201,9 +205,8 @@ onMounted(async () => {
   gap: 12px;
 }
 
-.logo-img {
-  width: 32px;
-  height: 32px;
+.logo-icon {
+  font-size: 32px;
 }
 
 .logo h1 {
