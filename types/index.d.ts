@@ -74,6 +74,19 @@ export interface StreamAbortedEvent {
     reason: string;
 }
 
+export interface BroadcastStreamCompleteEvent {
+    streamId: string;
+    totalBytes: number;
+    totalChunks: number;
+    metadata: StreamMetadata;
+}
+
+export interface BroadcastStreamAbortedEvent {
+    streamId: string;
+    reason: string;
+    metadata: StreamMetadata;
+}
+
 export interface PeerConnectionEvent {
     peerId: string;
 }
@@ -162,6 +175,12 @@ export declare class PeerPigeonMesh {
     sendFile(targetPeerId: string, file: File): Promise<void>;
     sendBlob(targetPeerId: string, blob: Blob, options?: Partial<StreamMetadata>): Promise<void>;
     
+    // Broadcast streaming
+    createBroadcastStream(options?: Partial<StreamMetadata>): WritableStream;
+    broadcastStream(readableStream: ReadableStream, options?: Partial<StreamMetadata>): Promise<void>;
+    broadcastFile(file: File): Promise<void>;
+    broadcastBlob(blob: Blob, options?: Partial<StreamMetadata>): Promise<void>;
+    
     // Media
     startMedia(constraints?: MediaStreamConstraints): Promise<MediaStream>;
     stopMedia(): void;
@@ -202,6 +221,8 @@ export declare class PeerPigeonMesh {
     addEventListener(event: 'streamReceived', listener: (data: StreamReceivedEvent) => void): void;
     addEventListener(event: 'streamCompleted', listener: (data: StreamCompletedEvent) => void): void;
     addEventListener(event: 'streamAborted', listener: (data: StreamAbortedEvent) => void): void;
+    addEventListener(event: 'broadcastStreamComplete', listener: (data: BroadcastStreamCompleteEvent) => void): void;
+    addEventListener(event: 'broadcastStreamAborted', listener: (data: BroadcastStreamAbortedEvent) => void): void;
     addEventListener(event: 'remoteStream', listener: (data: RemoteStreamEvent) => void): void;
     addEventListener(event: 'dhtValueChanged', listener: (data: DHTValueChangedEvent) => void): void;
     addEventListener(event: 'statusChanged', listener: (data: StatusChangedEvent) => void): void;
@@ -228,6 +249,8 @@ export declare class PeerPigeonMesh {
     on(event: 'streamReceived', listener: (data: StreamReceivedEvent) => void): this;
     on(event: 'streamCompleted', listener: (data: StreamCompletedEvent) => void): this;
     on(event: 'streamAborted', listener: (data: StreamAbortedEvent) => void): this;
+    on(event: 'broadcastStreamComplete', listener: (data: BroadcastStreamCompleteEvent) => void): this;
+    on(event: 'broadcastStreamAborted', listener: (data: BroadcastStreamAbortedEvent) => void): this;
     on(event: 'remoteStream', listener: (data: RemoteStreamEvent) => void): this;
     on(event: 'dhtValueChanged', listener: (data: DHTValueChangedEvent) => void): this;
     on(event: 'statusChanged', listener: (data: StatusChangedEvent) => void): this;
