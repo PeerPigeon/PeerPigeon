@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PeerPigeon - Broadcast Stream Demo</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+        }
+
+        .container {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+        }
+
+        h1 {
+            color: #667eea;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+            font-style: italic;
+        }
+
+        .section {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .section h2 {
+            color: #764ba2;
+            margin-top: 0;
+            font-size: 1.3em;
+        }
+
+        input, button {
+            padding: 12px;
+            margin: 5px;
+            border-radius: 6px;
+            border: 1px solid #ddd;
+            font-size: 14px;
+        }
+
+        button {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+            transition: transform 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        #status {
+            padding: 15px;
+            border-radius: 6px;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+
+        .status-disconnected {
+            background: #fee;
+            color: #c33;
+            border: 1px solid #fcc;
+        }
+
+        .status-connected {
+            background: #efe;
+            color: #3c3;
+            border: 1px solid #cfc;
+        }
+
+        #peers {
+            background: white;
+            padding: 15px;
+            border-radius: 6px;
+            min-height: 60px;
+            border: 2px dashed #ddd;
+        }
+
+        .peer-badge {
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 5px 12px;
+            border-radius: 15px;
+            margin: 3px;
+            font-size: 12px;
+        }
+
+        #logs {
+            background: #2d2d2d;
+            color: #0f0;
+            padding: 15px;
+            border-radius: 6px;
+            height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+
+        .log-entry {
+            margin: 2px 0;
+            word-wrap: break-word;
+        }
+
+        .log-info { color: #0ff; }
+        .log-success { color: #0f0; }
+        .log-warning { color: #ff0; }
+        .log-error { color: #f00; }
+
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+        }
+
+        .file-input-wrapper input[type=file] {
+            position: absolute;
+            left: -9999px;
+        }
+
+        #progress-container {
+            display: none;
+            margin-top: 15px;
+        }
+
+        #progress-bar {
+            width: 100%;
+            height: 30px;
+            background: #e0e0e0;
+            border-radius: 15px;
+            overflow: hidden;
+        }
+
+        #progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            width: 0%;
+            transition: width 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        .stat-box {
+            background: white;
+            padding: 10px;
+            border-radius: 6px;
+            text-align: center;
+        }
+
+        .stat-label {
+            font-size: 11px;
+            color: #666;
+            text-transform: uppercase;
+        }
+
+        .stat-value {
+            font-size: 20px;
+            font-weight: bold;
+            color: #667eea;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🐦 PeerPigeon Broadcast Stream Demo</h1>
+        <p class="subtitle">Stream files to all connected peers simultaneously</p>
+
+        <div class="section">
+            <h2>📡 Connection</h2>
+            <input type="text" id="signalingUrl" placeholder="ws://localhost:3000" value="ws://localhost:3000" style="width: 300px;">
+            <button onclick="connect()" id="connectBtn">Connect</button>
+            <button onclick="disconnect()" id="disconnectBtn" disabled>Disconnect</button>
+            <div id="status" class="status-disconnected">Disconnected</div>
+            <div id="peers">No peers connected</div>
+        </div>
+
+        <div class="section">
+            <h2>📤 Broadcast Stream</h2>
+            <p>Select a file to broadcast to all connected peers:</p>
+            <div class="file-input-wrapper">
+                <button>Choose File</button>
+                <input type="file" id="fileInput" onchange="handleFileSelect(event)">
+            </div>
+            <button onclick="broadcastSelectedFile()" id="broadcastBtn" disabled>Broadcast File</button>
+            <button onclick="testBroadcastText()" id="testTextBtn" disabled>Test: Broadcast Text</button>
+            
+            <div id="progress-container">
+                <div id="progress-bar">
+                    <div id="progress-fill">0%</div>
+                </div>
+            </div>
+
+            <div class="stats">
+                <div class="stat-box">
+                    <div class="stat-label">Total Sent</div>
+                    <div class="stat-value" id="totalSent">0 KB</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Success Rate</div>
+                    <div class="stat-value" id="successRate">0%</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Broadcasts</div>
+                    <div class="stat-value" id="broadcastCount">0</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>📥 Received Streams</h2>
+            <div id="receivedStreams"></div>
+        </div>
+
+        <div class="section">
+            <h2>📊 Logs</h2>
+            <button onclick="clearLogs()">Clear Logs</button>
+            <div id="logs"></div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { PeerPigeonMesh } from '../src/PeerPigeonMesh.js';
+
+        let mesh;
+        let selectedFile = null;
+        let broadcastStats = {
+            totalBytes: 0,
+            successCount: 0,
+            totalPeers: 0,
+            broadcastCount: 0
+        };
+
+        window.connect = async function() {
+            const url = document.getElementById('signalingUrl').value;
+            log('Initializing PeerPigeon mesh...', 'info');
+            
+            mesh = new PeerPigeonMesh({
+                maxPeers: 10,
+                enableWebDHT: true
+            });
+
+            // Set up event listeners
+            mesh.addEventListener('connected', () => {
+                log('✅ Connected to signaling server', 'success');
+                updateStatus('Connected', true);
+                document.getElementById('connectBtn').disabled = true;
+                document.getElementById('disconnectBtn').disabled = false;
+                document.getElementById('broadcastBtn').disabled = selectedFile === null;
+                document.getElementById('testTextBtn').disabled = false;
+            });
+
+            mesh.addEventListener('disconnected', () => {
+                log('❌ Disconnected from signaling server', 'warning');
+                updateStatus('Disconnected', false);
+                document.getElementById('connectBtn').disabled = false;
+                document.getElementById('disconnectBtn').disabled = true;
+                document.getElementById('broadcastBtn').disabled = true;
+                document.getElementById('testTextBtn').disabled = true;
+            });
+
+            mesh.addEventListener('peerConnected', (data) => {
+                log(`🤝 Peer connected: ${data.peerId.substring(0, 8)}...`, 'success');
+                updatePeerList();
+                document.getElementById('broadcastBtn').disabled = selectedFile === null;
+            });
+
+            mesh.addEventListener('peerDisconnected', (data) => {
+                log(`👋 Peer disconnected: ${data.peerId.substring(0, 8)}...`, 'warning');
+                updatePeerList();
+            });
+
+            mesh.addEventListener('streamReceived', async (data) => {
+                log(`📥 Receiving stream from ${data.peerId.substring(0, 8)}...`, 'info');
+                log(`📋 Metadata: ${JSON.stringify(data.metadata)}`, 'info');
+                
+                // Collect stream chunks
+                const chunks = [];
+                const reader = data.stream.getReader();
+                
+                try {
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                    }
+                    
+                    // Combine chunks
+                    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+                    const combined = new Uint8Array(totalLength);
+                    let offset = 0;
+                    for (const chunk of chunks) {
+                        combined.set(chunk, offset);
+                        offset += chunk.length;
+                    }
+                    
+                    log(`✅ Stream received: ${totalLength} bytes`, 'success');
+                    
+                    // Display received stream
+                    displayReceivedStream(data.peerId, data.metadata, combined);
+                } catch (error) {
+                    log(`❌ Error receiving stream: ${error.message}`, 'error');
+                }
+            });
+
+            mesh.addEventListener('broadcastStreamComplete', (data) => {
+                log(`✅ Broadcast complete: ${data.totalBytes} bytes to ${data.successCount}/${data.totalPeers} peers`, 'success');
+                
+                // Update stats
+                broadcastStats.totalBytes += data.totalBytes;
+                broadcastStats.successCount += data.successCount;
+                broadcastStats.totalPeers = data.totalPeers;
+                broadcastStats.broadcastCount++;
+                updateStats();
+                
+                hideProgress();
+            });
+
+            mesh.addEventListener('broadcastStreamAborted', (data) => {
+                log(`❌ Broadcast aborted: ${data.reason}`, 'error');
+                hideProgress();
+            });
+
+            await mesh.init();
+            await mesh.connect(url);
+        };
+
+        window.disconnect = function() {
+            if (mesh) {
+                mesh.disconnect();
+                mesh = null;
+            }
+        };
+
+        window.handleFileSelect = function(event) {
+            selectedFile = event.target.files[0];
+            if (selectedFile) {
+                log(`📁 File selected: ${selectedFile.name} (${formatBytes(selectedFile.size)})`, 'info');
+                if (mesh && mesh.getConnectedPeerCount() > 0) {
+                    document.getElementById('broadcastBtn').disabled = false;
+                }
+            }
+        };
+
+        window.broadcastSelectedFile = async function() {
+            if (!selectedFile || !mesh) return;
+            
+            const peers = mesh.getConnectedPeerCount();
+            if (peers === 0) {
+                log('❌ No peers connected', 'error');
+                return;
+            }
+            
+            log(`📡 Broadcasting file "${selectedFile.name}" to ${peers} peer(s)...`, 'info');
+            showProgress();
+            
+            try {
+                await mesh.broadcastFile(selectedFile);
+                log(`✅ File broadcast completed`, 'success');
+            } catch (error) {
+                log(`❌ Broadcast failed: ${error.message}`, 'error');
+                hideProgress();
+            }
+        };
+
+        window.testBroadcastText = async function() {
+            if (!mesh) return;
+            
+            const peers = mesh.getConnectedPeerCount();
+            if (peers === 0) {
+                log('❌ No peers connected', 'error');
+                return;
+            }
+            
+            const text = `Hello from PeerPigeon! Timestamp: ${new Date().toISOString()}`;
+            const blob = new Blob([text], { type: 'text/plain' });
+            
+            log(`📡 Broadcasting text message to ${peers} peer(s)...`, 'info');
+            showProgress();
+            
+            try {
+                await mesh.broadcastBlob(blob, { filename: 'test-message.txt' });
+                log(`✅ Text broadcast completed`, 'success');
+            } catch (error) {
+                log(`❌ Broadcast failed: ${error.message}`, 'error');
+                hideProgress();
+            }
+        };
+
+        function displayReceivedStream(peerId, metadata, data) {
+            const container = document.getElementById('receivedStreams');
+            const div = document.createElement('div');
+            div.style.cssText = 'background: white; padding: 15px; margin: 10px 0; border-radius: 6px; border: 1px solid #ddd;';
+            
+            let content = `
+                <strong>From:</strong> ${peerId.substring(0, 8)}...<br>
+                <strong>Size:</strong> ${formatBytes(data.length)}<br>
+            `;
+            
+            if (metadata.filename) {
+                content += `<strong>Filename:</strong> ${metadata.filename}<br>`;
+            }
+            if (metadata.mimeType) {
+                content += `<strong>Type:</strong> ${metadata.mimeType}<br>`;
+            }
+            
+            // Try to display or download
+            if (metadata.mimeType && metadata.mimeType.startsWith('text/')) {
+                const text = new TextDecoder().decode(data);
+                content += `<br><pre style="background: #f0f0f0; padding: 10px; border-radius: 4px;">${text}</pre>`;
+            } else {
+                const blob = new Blob([data], { type: metadata.mimeType || 'application/octet-stream' });
+                const url = URL.createObjectURL(blob);
+                content += `<br><a href="${url}" download="${metadata.filename || 'download'}" style="color: #667eea; text-decoration: none; font-weight: bold;">📥 Download</a>`;
+            }
+            
+            div.innerHTML = content;
+            container.insertBefore(div, container.firstChild);
+        }
+
+        function updateStatus(text, connected) {
+            const statusDiv = document.getElementById('status');
+            statusDiv.textContent = text;
+            statusDiv.className = connected ? 'status-connected' : 'status-disconnected';
+        }
+
+        function updatePeerList() {
+            if (!mesh) return;
+            
+            const peers = mesh.getConnectedPeers();
+            const peerDiv = document.getElementById('peers');
+            
+            if (peers.length === 0) {
+                peerDiv.innerHTML = 'No peers connected';
+            } else {
+                peerDiv.innerHTML = peers.map(p => 
+                    `<span class="peer-badge">${p.peerId.substring(0, 8)}...</span>`
+                ).join('');
+            }
+        }
+
+        function updateStats() {
+            document.getElementById('totalSent').textContent = formatBytes(broadcastStats.totalBytes);
+            const rate = broadcastStats.totalPeers > 0 
+                ? Math.round((broadcastStats.successCount / broadcastStats.totalPeers) * 100)
+                : 0;
+            document.getElementById('successRate').textContent = `${rate}%`;
+            document.getElementById('broadcastCount').textContent = broadcastStats.broadcastCount;
+        }
+
+        function showProgress() {
+            document.getElementById('progress-container').style.display = 'block';
+            // Simulate progress animation
+            let progress = 0;
+            const interval = setInterval(() => {
+                progress += Math.random() * 10;
+                if (progress >= 90) progress = 90;
+                document.getElementById('progress-fill').style.width = `${progress}%`;
+                document.getElementById('progress-fill').textContent = `${Math.round(progress)}%`;
+            }, 100);
+            
+            // Store interval for cleanup
+            window.progressInterval = interval;
+        }
+
+        function hideProgress() {
+            if (window.progressInterval) {
+                clearInterval(window.progressInterval);
+            }
+            document.getElementById('progress-fill').style.width = '100%';
+            document.getElementById('progress-fill').textContent = '100%';
+            setTimeout(() => {
+                document.getElementById('progress-container').style.display = 'none';
+                document.getElementById('progress-fill').style.width = '0%';
+                document.getElementById('progress-fill').textContent = '0%';
+            }, 1000);
+        }
+
+        function log(message, type = 'info') {
+            const logs = document.getElementById('logs');
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logs.appendChild(entry);
+            logs.scrollTop = logs.scrollHeight;
+        }
+
+        window.clearLogs = function() {
+            document.getElementById('logs').innerHTML = '';
+        };
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+
+        // Make functions available globally
+        window.mesh = mesh;
+    </script>
+</body>
+</html>

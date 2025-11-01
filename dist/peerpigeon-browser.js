@@ -11941,6 +11941,163 @@ ${b64.match(/.{1,64}/g).join("\n")}
       const stream = blob.stream();
       await this.sendStream(targetPeerId, stream, streamOptions);
     }
+    /**
+     * Create a writable stream that broadcasts data to all connected peers
+     * @param {object} options - Stream options (filename, mimeType, totalSize, etc.)
+     * @returns {WritableStream} A writable stream that broadcasts to all peers
+     */
+    createBroadcastStream(options = {}) {
+      const peers = this.getConnectedPeers();
+      if (peers.length === 0) {
+        throw new Error("No connected peers to broadcast to");
+      }
+      const streamId = options.streamId || this._generateStreamId();
+      const metadata = {
+        streamId,
+        type: options.type || "broadcast",
+        filename: options.filename,
+        mimeType: options.mimeType,
+        totalSize: options.totalSize,
+        timestamp: Date.now(),
+        ...options
+      };
+      const peerStreams = /* @__PURE__ */ new Map();
+      const peerWriters = /* @__PURE__ */ new Map();
+      for (const peer of peers) {
+        try {
+          const peerConnection = this.connectionManager.peers.get(peer.peerId);
+          if (peerConnection) {
+            const stream = peerConnection.createWritableStream({
+              ...options,
+              streamId: `${streamId}_${peer.peerId.substring(0, 8)}`
+            });
+            peerStreams.set(peer.peerId, stream);
+            peerWriters.set(peer.peerId, stream.getWriter());
+          }
+        } catch (error) {
+          this.debug.error(`Failed to create stream for peer ${peer.peerId.substring(0, 8)}...:`, error);
+        }
+      }
+      this.debug.log(`\u{1F4E1} Created broadcast stream to ${peerWriters.size} peer(s)`);
+      const activePeers = Array.from(peerWriters.keys());
+      let totalBytesWritten = 0;
+      return new WritableStream({
+        async write(chunk) {
+          const writePromises = [];
+          const failedPeers = [];
+          for (const [peerId, writer] of peerWriters.entries()) {
+            const promise = writer.write(chunk).catch((error) => {
+              failedPeers.push(peerId);
+              return Promise.resolve();
+            });
+            writePromises.push(promise);
+          }
+          await Promise.all(writePromises);
+          for (const peerId of failedPeers) {
+            peerWriters.delete(peerId);
+            peerStreams.delete(peerId);
+          }
+          totalBytesWritten += chunk.byteLength || chunk.length || 0;
+          if (peerWriters.size === 0) {
+            throw new Error("All peer connections failed during broadcast");
+          }
+        },
+        async close() {
+          const closePromises = [];
+          for (const [peerId, writer] of peerWriters.entries()) {
+            closePromises.push(
+              writer.close().catch((error) => {
+                return Promise.resolve();
+              })
+            );
+          }
+          await Promise.all(closePromises);
+          const succeededCount = peerWriters.size;
+          const totalPeers = activePeers.length;
+          this.debug.log(`\u{1F4E1} Broadcast stream closed: ${totalBytesWritten} bytes sent to ${succeededCount}/${totalPeers} peer(s)`);
+          this.emit("broadcastStreamComplete", {
+            streamId,
+            totalBytes: totalBytesWritten,
+            successCount: succeededCount,
+            totalPeers,
+            metadata
+          });
+        },
+        async abort(reason) {
+          const abortPromises = [];
+          for (const [peerId, writer] of peerWriters.entries()) {
+            abortPromises.push(
+              writer.abort(reason).catch((error) => {
+                return Promise.resolve();
+              })
+            );
+          }
+          await Promise.all(abortPromises);
+          this.debug.log(`\u274C Broadcast stream aborted: ${reason}`);
+          this.emit("broadcastStreamAborted", {
+            streamId,
+            reason: reason?.message || String(reason),
+            metadata
+          });
+        }
+      });
+    }
+    /**
+     * Broadcast a ReadableStream to all connected peers
+     * @param {ReadableStream} readableStream - The stream to broadcast
+     * @param {object} options - Stream options (filename, mimeType, etc.)
+     * @returns {Promise<void>}
+     */
+    async broadcastStream(readableStream, options = {}) {
+      const writableStream = this.createBroadcastStream(options);
+      try {
+        await readableStream.pipeTo(writableStream);
+        this.debug.log(`\u2705 Stream broadcasted successfully to all peers`);
+      } catch (error) {
+        this.debug.error(`\u274C Failed to broadcast stream:`, error);
+        throw error;
+      }
+    }
+    /**
+     * Broadcast a File to all connected peers using streams
+     * @param {File} file - The file to broadcast
+     * @returns {Promise<void>}
+     */
+    async broadcastFile(file) {
+      this.debug.log(`\u{1F4C1} Broadcasting file "${file.name}" (${file.size} bytes) to all peers`);
+      const options = {
+        filename: file.name,
+        mimeType: file.type,
+        totalSize: file.size,
+        type: "file"
+      };
+      const stream = file.stream();
+      await this.broadcastStream(stream, options);
+    }
+    /**
+     * Broadcast a Blob to all connected peers using streams
+     * @param {Blob} blob - The blob to broadcast
+     * @param {object} options - Additional options
+     * @returns {Promise<void>}
+     */
+    async broadcastBlob(blob, options = {}) {
+      this.debug.log(`\u{1F4E6} Broadcasting blob (${blob.size} bytes) to all peers`);
+      const streamOptions = {
+        ...options,
+        mimeType: blob.type,
+        totalSize: blob.size,
+        type: "blob"
+      };
+      const stream = blob.stream();
+      await this.broadcastStream(stream, streamOptions);
+    }
+    /**
+     * Generate a unique stream ID
+     * @private
+     */
+    _generateStreamId() {
+      return `stream_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+    }
     // Helper methods for backward compatibility
     canAcceptMorePeers() {
       return this.connectionManager.canAcceptMorePeers();

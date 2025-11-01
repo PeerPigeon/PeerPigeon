@@ -240,6 +240,28 @@ export class GossipManager extends EventEmitter {
     } else if (subtype === 'mediaEvent') {
       // Handle media streaming events
       this.handleMediaEvent(content, originPeerId);
+    } else if (subtype === 'stream-chunk') {
+      // Handle gossip stream chunks - pass directly to mesh
+      this.emit('messageReceived', {
+        from: originPeerId,
+        message: {
+          type: 'stream-chunk',
+          ...content
+        },
+        timestamp,
+        messageId
+      });
+    } else if (subtype === 'stream-control') {
+      // Handle gossip stream control messages - pass directly to mesh
+      this.emit('messageReceived', {
+        from: originPeerId,
+        message: {
+          type: 'stream-control',
+          ...content
+        },
+        timestamp,
+        messageId
+      });
     } else if (subtype === 'dm') {
       // Direct message logic
       if (typeof to === 'string' && typeof this.mesh.peerId === 'string' && to.trim().toLowerCase() === this.mesh.peerId.trim().toLowerCase()) {
