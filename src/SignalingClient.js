@@ -19,6 +19,7 @@ export class SignalingClient extends EventEmitter {
     this.connectionPromise = null;
     this.reconnectTimeout = null;
     this.isReconnecting = false;
+    this.deliberateDisconnect = false; // Track if disconnect was intentional
   }
 
   setConnectionType(type) {
@@ -200,15 +201,18 @@ export class SignalingClient extends EventEmitter {
 
           this.debug.log('WebSocket closed:', event.code, event.reason);
 
-          if (event.code === 1000) {
-            // Normal closure
-            this.emit('disconnected');
-          } else {
-            // Abnormal closure - attempt reconnection
+          // Always emit disconnected event
+          this.emit('disconnected');
+
+          // Attempt reconnection unless this was a deliberate disconnect
+          if (!this.deliberateDisconnect) {
             this.emit('statusChanged', { type: 'warning', message: 'WebSocket connection lost - reconnecting...' });
             if (!this.isReconnecting) {
               this.attemptReconnect();
             }
+          } else {
+            // Reset the flag for future connections
+            this.deliberateDisconnect = false;
           }
         };
 
@@ -295,6 +299,9 @@ export class SignalingClient extends EventEmitter {
   }
 
   disconnect() {
+    // Mark as deliberate disconnect to prevent automatic reconnection
+    this.deliberateDisconnect = true;
+    
     // Clear reconnection state
     this.isReconnecting = false;
     if (this.reconnectTimeout) {

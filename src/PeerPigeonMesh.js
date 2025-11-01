@@ -444,7 +444,7 @@ export class PeerPigeonMesh extends EventEmitter {
       this.connected = false;
       this.polling = false;
       this.peerDiscovery.stop();
-      this.connectionManager.disconnectAllPeers();
+      // Don't disconnect peers - WebRTC connections are peer-to-peer and persist without signaling server
       this.emit('statusChanged', { type: 'disconnected' });
     });
 

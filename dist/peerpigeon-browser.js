@@ -4089,6 +4089,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.connectionPromise = null;
       this.reconnectTimeout = null;
       this.isReconnecting = false;
+      this.deliberateDisconnect = false;
     }
     setConnectionType(type) {
       this.debug.log(`WebSocket-only implementation - connection type setting ignored: ${type}`);
@@ -4226,13 +4227,14 @@ ${b64.match(/.{1,64}/g).join("\n")}
             this.connected = false;
             this.connectionPromise = null;
             this.debug.log("WebSocket closed:", event.code, event.reason);
-            if (event.code === 1e3) {
-              this.emit("disconnected");
-            } else {
+            this.emit("disconnected");
+            if (!this.deliberateDisconnect) {
               this.emit("statusChanged", { type: "warning", message: "WebSocket connection lost - reconnecting..." });
               if (!this.isReconnecting) {
                 this.attemptReconnect();
               }
+            } else {
+              this.deliberateDisconnect = false;
             }
           };
           this.websocket.onerror = (error) => {
@@ -4300,6 +4302,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
       }, delay);
     }
     disconnect() {
+      this.deliberateDisconnect = true;
       this.isReconnecting = false;
       if (this.reconnectTimeout) {
         clearTimeout(this.reconnectTimeout);
@@ -5319,7 +5322,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
         start(ctrl) {
           controller = ctrl;
         },
-        cancel(reason) {
+        cancel: (reason) => {
           this.debug.log(`\u{1F4E5} Stream ${streamId} cancelled: ${reason}`);
         }
       });
@@ -11549,7 +11552,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.connected = false;
         this.polling = false;
         this.peerDiscovery.stop();
-        this.connectionManager.disconnectAllPeers();
         this.emit("statusChanged", { type: "disconnected" });
       });
       this.signalingClient.addEventListener("signalingMessage", (message) => {
