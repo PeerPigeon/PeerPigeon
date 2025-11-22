@@ -8133,6 +8133,26 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.handlePeerAnnouncement(content, originPeerId);
       } else if (subtype === "mediaEvent") {
         this.handleMediaEvent(content, originPeerId);
+      } else if (subtype === "stream-chunk") {
+        this.emit("messageReceived", {
+          from: originPeerId,
+          message: {
+            type: "stream-chunk",
+            ...content
+          },
+          timestamp,
+          messageId
+        });
+      } else if (subtype === "stream-control") {
+        this.emit("messageReceived", {
+          from: originPeerId,
+          message: {
+            type: "stream-control",
+            ...content
+          },
+          timestamp,
+          messageId
+        });
       } else if (subtype === "dm") {
         if (typeof to === "string" && typeof this.mesh.peerId === "string" && to.trim().toLowerCase() === this.mesh.peerId.trim().toLowerCase()) {
           this.debug.log(`\u{1F50D} DM DEBUG: Received DM from ${originPeerId?.substring(0, 8)}, content type: ${typeof processedContent}`);
@@ -11276,6 +11296,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.discoveredPeers = /* @__PURE__ */ new Map();
       this.ongoingKeyExchanges = /* @__PURE__ */ new Set();
       this.emittedPeerKeyEvents = /* @__PURE__ */ new Set();
+      this.gossipStreams = /* @__PURE__ */ new Map();
       this.storageManager = new StorageManager(this);
       this.mediaManager = new MediaManager();
       this.connectionManager = new ConnectionManager(this);
@@ -11316,6 +11337,14 @@ ${b64.match(/.{1,64}/g).join("\n")}
         }
         if (data.message && data.message.type === "dht" && this.webDHT) {
           this.webDHT.handleMessage(data.message, data.from);
+          return;
+        }
+        if (data.message && data.message.type === "stream-chunk") {
+          this._handleGossipStreamChunk(data.message, data.from);
+          return;
+        }
+        if (data.message && data.message.type === "stream-control") {
+          this._handleGossipStreamControl(data.message, data.from);
           return;
         }
         if (data.content && typeof data.content === "string") {
@@ -11942,15 +11971,11 @@ ${b64.match(/.{1,64}/g).join("\n")}
       await this.sendStream(targetPeerId, stream, streamOptions);
     }
     /**
-     * Create a writable stream that broadcasts data to all connected peers
+     * Create a writable stream that broadcasts data to all peers in the mesh using gossip
      * @param {object} options - Stream options (filename, mimeType, totalSize, etc.)
-     * @returns {WritableStream} A writable stream that broadcasts to all peers
+     * @returns {WritableStream} A writable stream that broadcasts via gossip protocol
      */
     createBroadcastStream(options = {}) {
-      const peers = this.getConnectedPeers();
-      if (peers.length === 0) {
-        throw new Error("No connected peers to broadcast to");
-      }
       const streamId = options.streamId || this._generateStreamId();
       const metadata = {
         streamId,
@@ -11961,84 +11986,74 @@ ${b64.match(/.{1,64}/g).join("\n")}
         timestamp: Date.now(),
         ...options
       };
-      const peerStreams = /* @__PURE__ */ new Map();
-      const peerWriters = /* @__PURE__ */ new Map();
-      for (const peer of peers) {
-        try {
-          const peerConnection = this.connectionManager.peers.get(peer.peerId);
-          if (peerConnection) {
-            const stream = peerConnection.createWritableStream({
-              ...options,
-              streamId: `${streamId}_${peer.peerId.substring(0, 8)}`
-            });
-            peerStreams.set(peer.peerId, stream);
-            peerWriters.set(peer.peerId, stream.getWriter());
-          }
-        } catch (error) {
-          this.debug.error(`Failed to create stream for peer ${peer.peerId.substring(0, 8)}...:`, error);
-        }
-      }
-      this.debug.log(`\u{1F4E1} Created broadcast stream to ${peerWriters.size} peer(s)`);
-      const activePeers = Array.from(peerWriters.keys());
+      const chunks = [];
+      let chunkIndex = 0;
       let totalBytesWritten = 0;
+      const self2 = this;
+      this.debug.log(`\u{1F4E1} Creating gossip broadcast stream: ${streamId}`);
       return new WritableStream({
         async write(chunk) {
-          const writePromises = [];
-          const failedPeers = [];
-          for (const [peerId, writer] of peerWriters.entries()) {
-            const promise = writer.write(chunk).catch((error) => {
-              failedPeers.push(peerId);
-              return Promise.resolve();
-            });
-            writePromises.push(promise);
-          }
-          await Promise.all(writePromises);
-          for (const peerId of failedPeers) {
-            peerWriters.delete(peerId);
-            peerStreams.delete(peerId);
-          }
-          totalBytesWritten += chunk.byteLength || chunk.length || 0;
-          if (peerWriters.size === 0) {
-            throw new Error("All peer connections failed during broadcast");
+          const chunkData = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+          const chunkId = chunkIndex++;
+          chunks.push({
+            index: chunkId,
+            data: chunkData
+          });
+          totalBytesWritten += chunkData.length;
+          try {
+            await self2.gossipManager.broadcastMessage({
+              streamId,
+              chunkIndex: chunkId,
+              data: Array.from(chunkData),
+              // Convert to regular array for JSON
+              totalSize: metadata.totalSize,
+              metadata: chunkId === 0 ? metadata : void 0
+              // Include metadata with first chunk
+            }, "stream-chunk");
+            self2.debug.log(`\u{1F4E1} Gossiped chunk ${chunkId} (${chunkData.length} bytes) for stream ${streamId.substring(0, 8)}...`);
+          } catch (error) {
+            self2.debug.error(`Failed to gossip chunk ${chunkId}:`, error);
+            throw error;
           }
         },
         async close() {
-          const closePromises = [];
-          for (const [peerId, writer] of peerWriters.entries()) {
-            closePromises.push(
-              writer.close().catch((error) => {
-                return Promise.resolve();
-              })
-            );
+          try {
+            await self2.gossipManager.broadcastMessage({
+              streamId,
+              action: "end",
+              totalChunks: chunkIndex,
+              totalBytes: totalBytesWritten,
+              metadata
+            }, "stream-control");
+            self2.debug.log(`\u{1F4E1} Broadcast stream completed via gossip: ${totalBytesWritten} bytes in ${chunkIndex} chunks`);
+            self2.emit("broadcastStreamComplete", {
+              streamId,
+              totalBytes: totalBytesWritten,
+              totalChunks: chunkIndex,
+              metadata
+            });
+          } catch (error) {
+            self2.debug.error("Failed to broadcast stream end:", error);
+            throw error;
           }
-          await Promise.all(closePromises);
-          const succeededCount = peerWriters.size;
-          const totalPeers = activePeers.length;
-          this.debug.log(`\u{1F4E1} Broadcast stream closed: ${totalBytesWritten} bytes sent to ${succeededCount}/${totalPeers} peer(s)`);
-          this.emit("broadcastStreamComplete", {
-            streamId,
-            totalBytes: totalBytesWritten,
-            successCount: succeededCount,
-            totalPeers,
-            metadata
-          });
         },
         async abort(reason) {
-          const abortPromises = [];
-          for (const [peerId, writer] of peerWriters.entries()) {
-            abortPromises.push(
-              writer.abort(reason).catch((error) => {
-                return Promise.resolve();
-              })
-            );
+          try {
+            await self2.gossipManager.broadcastMessage({
+              streamId,
+              action: "abort",
+              reason: reason?.message || String(reason),
+              metadata
+            }, "stream-control");
+            self2.debug.log(`\u274C Broadcast stream aborted via gossip: ${reason}`);
+            self2.emit("broadcastStreamAborted", {
+              streamId,
+              reason: reason?.message || String(reason),
+              metadata
+            });
+          } catch (error) {
+            self2.debug.error("Failed to broadcast stream abort:", error);
           }
-          await Promise.all(abortPromises);
-          this.debug.log(`\u274C Broadcast stream aborted: ${reason}`);
-          this.emit("broadcastStreamAborted", {
-            streamId,
-            reason: reason?.message || String(reason),
-            metadata
-          });
         }
       });
     }
@@ -12755,6 +12770,118 @@ ${b64.match(/.{1,64}/g).join("\n")}
         viaMesh: true
       };
       this.signalingHandler.handleSignalingMessage(reconstitutedMessage);
+    }
+    /**
+     * Handle incoming gossip stream chunk
+     * @param {Object} message - The stream chunk message
+     * @param {string} from - Sender peer ID
+     * @private
+     */
+    _handleGossipStreamChunk(message, from) {
+      const { streamId, chunkIndex, data, metadata } = message;
+      if (!streamId || chunkIndex === void 0 || !data) {
+        this.debug.error("Invalid gossip stream chunk format");
+        return;
+      }
+      this.debug.log(`\u{1F4E5} Received gossip stream chunk ${chunkIndex} for ${streamId.substring(0, 8)}... from ${from.substring(0, 8)}...`);
+      if (!this.gossipStreams.has(streamId)) {
+        const chunks = /* @__PURE__ */ new Map();
+        let controller;
+        const readable = new ReadableStream({
+          start(ctrl) {
+            controller = ctrl;
+          },
+          cancel: (reason) => {
+            this.debug.log(`\u{1F4E5} Gossip stream ${streamId.substring(0, 8)}... cancelled: ${reason}`);
+          }
+        });
+        this.gossipStreams.set(streamId, {
+          chunks,
+          metadata: metadata || {},
+          controller,
+          stream: readable,
+          from,
+          totalChunks: null
+        });
+        this.emit("streamReceived", {
+          peerId: from,
+          streamId,
+          stream: readable,
+          metadata: metadata || {}
+        });
+      }
+      const streamData = this.gossipStreams.get(streamId);
+      streamData.chunks.set(chunkIndex, new Uint8Array(data));
+      this._enqueueOrderedChunks(streamId);
+    }
+    /**
+     * Handle incoming gossip stream control message
+     * @param {Object} message - The stream control message
+     * @param {string} from - Sender peer ID
+     * @private
+     */
+    _handleGossipStreamControl(message, from) {
+      const { streamId, action, totalChunks, totalBytes, metadata, reason } = message;
+      if (!streamId || !action) {
+        this.debug.error("Invalid gossip stream control format");
+        return;
+      }
+      const streamData = this.gossipStreams.get(streamId);
+      if (!streamData) {
+        this.debug.warn(`Received control message for unknown stream: ${streamId.substring(0, 8)}...`);
+        return;
+      }
+      if (action === "end") {
+        this.debug.log(`\u{1F4E5} Gossip stream ${streamId.substring(0, 8)}... ended: ${totalBytes} bytes in ${totalChunks} chunks`);
+        streamData.totalChunks = totalChunks;
+        this._enqueueOrderedChunks(streamId);
+        if (streamData.controller) {
+          streamData.controller.close();
+        }
+        this.emit("streamCompleted", {
+          peerId: from,
+          streamId,
+          totalChunks,
+          totalBytes
+        });
+        setTimeout(() => {
+          this.gossipStreams.delete(streamId);
+        }, 5e3);
+      } else if (action === "abort") {
+        this.debug.log(`\u274C Gossip stream ${streamId.substring(0, 8)}... aborted: ${reason}`);
+        if (streamData.controller) {
+          streamData.controller.error(new Error(reason || "Stream aborted"));
+        }
+        this.emit("streamAborted", {
+          peerId: from,
+          streamId,
+          reason
+        });
+        this.gossipStreams.delete(streamId);
+      }
+    }
+    /**
+     * Enqueue ordered chunks to the readable stream
+     * @param {string} streamId - The stream ID
+     * @private
+     */
+    _enqueueOrderedChunks(streamId) {
+      const streamData = this.gossipStreams.get(streamId);
+      if (!streamData || !streamData.controller) return;
+      const { chunks, controller } = streamData;
+      let nextIndex = streamData.nextIndex || 0;
+      while (chunks.has(nextIndex)) {
+        const chunk = chunks.get(nextIndex);
+        try {
+          controller.enqueue(chunk);
+          chunks.delete(nextIndex);
+          nextIndex++;
+        } catch (error) {
+          this.debug.error(`Failed to enqueue chunk ${nextIndex}:`, error);
+          break;
+        }
+      }
+      streamData.nextIndex = nextIndex;
     }
     /**
      * Send a signaling message, using mesh connections for renegotiation
