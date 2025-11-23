@@ -79,8 +79,15 @@ export class ConnectionManager extends EventEmitter {
     // Only become initiator if our peer ID is lexicographically greater than target's
     const shouldBeInitiator = this.mesh.peerId > targetPeerId;
     if (!shouldBeInitiator) {
-      this.debug.log(`🔄 INITIATOR LOGIC: Not becoming initiator for ${targetPeerId.substring(0, 8)}... (our ID: ${this.mesh.peerId.substring(0, 8)}... is smaller)`);
-      return; // Let the other peer initiate
+      // Allow override for low connectivity peers below connectivityFloor
+      const connectedCount = this.getConnectedPeerCount();
+      const floor = this.mesh.connectivityFloor || 0;
+      if (connectedCount < floor) {
+        this.debug.log(`🔄 INITIATOR OVERRIDE: Forcing initiation to ${targetPeerId.substring(0,8)}... (connected ${connectedCount} < floor ${floor})`);
+      } else {
+        this.debug.log(`🔄 INITIATOR LOGIC: Not becoming initiator for ${targetPeerId.substring(0, 8)}... (our ID smaller, connected ${connectedCount} >= floor ${floor})`);
+        return; // Let the other peer initiate
+      }
     }
 
     this.debug.log(`🔄 INITIATOR LOGIC: Becoming initiator for ${targetPeerId.substring(0, 8)}... (our ID: ${this.mesh.peerId.substring(0, 8)}... is greater)`);
@@ -179,6 +186,36 @@ export class ConnectionManager extends EventEmitter {
     }
   }
 
+  /**
+   * Force connection attempt ignoring standard initiator lexicographic rule (used for connectivity floor).
+   */
+  async connectToPeerOverride(targetPeerId) {
+    // Skip if already connected or attempting
+    if (this.peers.has(targetPeerId) || this.mesh.peerDiscovery.isAttemptingConnection(targetPeerId)) return;
+    const connectedCount = this.getConnectedPeerCount();
+    const floor = this.mesh.connectivityFloor || 0;
+    if (connectedCount >= floor) return; // Only override if below floor
+    this.debug.log(`⚡ OVERRIDE CONNECT: initiating to ${targetPeerId.substring(0,8)}... (connected ${connectedCount} < floor ${floor})`);
+    // Temporarily treat as initiator regardless of lexicographic order
+    const options = {
+      localStream: null,
+      enableAudio: true,
+      enableVideo: true
+    };
+    const peerConnection = new PeerConnection(targetPeerId, true, options);
+    this.setupPeerConnectionHandlers(peerConnection);
+    this.peers.set(targetPeerId, peerConnection);
+    try {
+      await peerConnection.createConnection();
+      const offer = await peerConnection.createOffer();
+      await this.mesh.sendSignalingMessage({ type: 'offer', data: offer }, targetPeerId);
+    } catch (e) {
+      this.debug.warn(`Override connection failed to ${targetPeerId.substring(0,8)}...: ${e.message}`);
+      this.mesh.peerDiscovery.removeDiscoveredPeer(targetPeerId);
+      this.peers.delete(targetPeerId);
+    }
+  }
+
   cleanupFailedConnection(peerId) {
     this.debug.log(`Cleaning up failed connection for ${peerId.substring(0, 8)}...`);
 
@@ -255,6 +292,8 @@ export class ConnectionManager extends EventEmitter {
       this.mesh.emit('statusChanged', { type: 'info', message: `WebRTC connected to ${event.peerId.substring(0, 8)}...` });
       this.mesh.peerDiscovery.clearConnectionAttempt(event.peerId);
       this.mesh.peerDiscovery.updateDiscoveryTimestamp(event.peerId);
+
+      // (Rollback) Removed adaptive gossip resend hook
 
       this.emit('peersUpdated');
     });

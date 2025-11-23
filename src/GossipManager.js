@@ -21,10 +21,12 @@ export class GossipManager extends EventEmitter {
     this.processedKeyExchanges = new Map(); // "peerId:keyType" -> timestamp
 
     // Configuration
-    this.maxTTL = 10; // Maximum hops before message expires
+    this.maxTTL = 10; // Maximum hops before message expires (adaptive override possible)
     this.messageExpiryTime = 5 * 60 * 1000; // 5 minutes
     this.cleanupInterval = 60 * 1000; // 1 minute
     this.cleanupTimer = null; // Track cleanup timer for proper cleanup
+
+    // (Rollback) Remove adaptive resend structures - rely on pure gossip
 
     this.startCleanupTimer();
   }
@@ -71,6 +73,8 @@ export class GossipManager extends EventEmitter {
     });
     this.messageHistory.set(messageId, message);
 
+    // (Rollback) No adaptive resend tracking
+
     // Send to all connected peers
     this.propagateMessage(message);
 
@@ -87,6 +91,12 @@ export class GossipManager extends EventEmitter {
 
     return messageId;
   }
+
+  /**
+   * Attempt adaptive resend of recent broadcasts to peers that connected
+   * after initial propagation window.
+   */
+  // (Rollback) attemptAdaptiveResends removed
 
   /**
      * Send a direct message to a specific peer using gossip routing (DM)
