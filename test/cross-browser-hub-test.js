@@ -22,8 +22,8 @@ import { dirname, join } from 'path';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // Test configuration
-const HUB_PORT = 3000; // Base hub port; server will auto-increment internally if needed
-let SELECTED_HUB_PORT = HUB_PORT; // Actual port after server starts
+const HUB_1_PORT = 3000;
+const HUB_2_PORT = 3001;
 const HTTP_PORT = 8766;
 const TEST_DURATION = 20000; // Used previously; monitoring removed
 const TOTAL_PEERS = 20;
@@ -31,13 +31,15 @@ const MAX_PEERS = 4;
 const MIN_PEERS = 3;
 
 // Browser distribution (total should equal TOTAL_PEERS)
+// Split peers across 2 hubs
 const BROWSERS = [
-    { name: 'Chrome', launcher: chromium, count: 7 },
-    { name: 'Firefox', launcher: firefox, count: 7 },
-    { name: 'WebKit', launcher: webkit, count: 6 }
+    { name: 'Chrome', launcher: chromium, count: 7, hubPort: HUB_1_PORT }, // 7 on hub 1
+    { name: 'Firefox', launcher: firefox, count: 7, hubPort: HUB_2_PORT }, // 7 on hub 2
+    { name: 'WebKit', launcher: webkit, count: 6, hubPort: HUB_1_PORT }    // 6 on hub 1
 ];
 
-let hubServer = null;
+let hubServer1 = null;
+let hubServer2 = null;
 let httpServer = null;
 const browsers = [];
 const contexts = [];
@@ -47,29 +49,67 @@ let lastBroadcastStats = null;
 
 console.log('🚀 Cross-Browser Hub Test with Playwright\n');
 console.log(`Configuration:`);
-console.log(`  • Hub base port: ${HUB_PORT}`);
+console.log(`  • Hub 1 port: ${HUB_1_PORT}`);
+console.log(`  • Hub 2 port: ${HUB_2_PORT}`);
 console.log(`  • HTTP server port: ${HTTP_PORT}`);
 console.log(`  • Total peers: ${TOTAL_PEERS}`);
 console.log(`  • maxPeers: ${MAX_PEERS}`);
 console.log(`  • minPeers: ${MIN_PEERS}`);
-console.log(`  • Browser distribution: Chrome(${BROWSERS[0].count}), Firefox(${BROWSERS[1].count}), WebKit(${BROWSERS[2].count})`);
+console.log(`  • Browser distribution:`);
+console.log(`    - Chrome(${BROWSERS[0].count}) on Hub 1`);
+console.log(`    - Firefox(${BROWSERS[1].count}) on Hub 2`);
+console.log(`    - WebKit(${BROWSERS[2].count}) on Hub 1`);
 console.log(`  • Test duration: ${TEST_DURATION / 1000}s\n`);
 
 /**
- * Start the signaling hub server
+ * Start the signaling hub servers
  */
-async function startHub() {
-    console.log(`🔄 Starting hub server on base port ${HUB_PORT}...`);
-    hubServer = new PeerPigeonServer({ port: HUB_PORT });
-    try {
-        // Use the server's start() method which emits 'started' (not 'listening')
-        const { port } = await hubServer.start();
-        SELECTED_HUB_PORT = port;
-        console.log(`✅ Hub server started on port ${SELECTED_HUB_PORT}\n`);
-    } catch (error) {
-        console.error(`❌ Failed to start hub server: ${error.message}`);
-        throw error;
-    }
+async function startHubs() {
+    console.log(`🔄 Starting Hub 1 on port ${HUB_1_PORT}...`);
+    hubServer1 = new PeerPigeonServer({ 
+        port: HUB_1_PORT,
+        host: '127.0.0.1',  // Explicit IPv4
+        isHub: true,
+        bootstrapHubs: [],  // Will connect manually after both are up
+        autoConnect: false
+    });
+    await hubServer1.start();
+    console.log(`✅ Hub 1 started on port ${HUB_1_PORT}`);
+
+    console.log(`🔄 Starting Hub 2 on port ${HUB_2_PORT}...`);
+    hubServer2 = new PeerPigeonServer({ 
+        port: HUB_2_PORT,
+        host: '127.0.0.1',  // Explicit IPv4
+        isHub: true,
+        bootstrapHubs: [],  // Will connect manually after both are up
+        autoConnect: false
+    });
+    await hubServer2.start();
+    console.log(`✅ Hub 2 started on port ${HUB_2_PORT}\n`);
+    
+    // Give servers a moment to be fully ready for connections
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
+    // Initialize hub meshes
+    console.log(`🔗 Initializing hub meshes...`);
+    await hubServer1.initializeHubMesh();
+    await hubServer2.initializeHubMesh();
+    
+    // Give mesh initialization a moment
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Now that both hubs are listening and initialized, connect them
+    console.log(`🔗 Connecting hubs together...`);
+    hubServer1.bootstrapHubs = [`ws://127.0.0.1:${HUB_2_PORT}`];
+    hubServer2.bootstrapHubs = [`ws://127.0.0.1:${HUB_1_PORT}`];
+    
+    await hubServer1.connectToBootstrapHubs();
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await hubServer2.connectToBootstrapHubs();
+    
+    // Give hubs a moment to establish P2P connections
+    console.log(`⏳ Waiting for hub mesh to establish...`);
+    await new Promise(resolve => setTimeout(resolve, 3000));
 }
 
 /**
@@ -178,7 +218,7 @@ async function launchBrowser(browserConfig, index) {
 /**
  * Create a peer in a browser context
  */
-async function createPeer(browser, browserName, peerIndex, totalIndex) {
+async function createPeer(browser, browserName, peerIndex, totalIndex, hubPort) {
     try {
         const contextOptions = { bypassCSP: true };
         // Only Chromium supports permissions option
@@ -230,6 +270,7 @@ async function createPeer(browser, browserName, peerIndex, totalIndex) {
         const peerInfo = {
             index: totalIndex,
             browserName,
+            hubPort,
             page,
             context,
             peerId: null,
@@ -341,7 +382,7 @@ async function createPeer(browser, browserName, peerIndex, totalIndex) {
                 console.log('PP_TEST init failure ' + e.message);
                 return false;
             }
-        }, { hubPort: SELECTED_HUB_PORT, maxPeers: MAX_PEERS, minPeers: MIN_PEERS });
+        }, { hubPort, maxPeers: MAX_PEERS, minPeers: MIN_PEERS });
         
         if (!connected) {
             peerInfo.status = 'failed';
@@ -404,9 +445,9 @@ async function startPeers() {
     for (let i = 0; i < BROWSERS.length; i++) {
         const browserConfig = BROWSERS[i];
         const browserInfo = launchedBrowsers[i];
-        const { name, count } = browserConfig;
+        const { name, count, hubPort } = browserConfig;
         
-        console.log(`  Queueing ${count} peers in ${name}...`);
+        console.log(`  Queueing ${count} peers in ${name} (Hub port ${hubPort})...`);
         
         for (let j = 0; j < count; j++) {
             const peerIdx = totalIndex;
@@ -415,7 +456,7 @@ async function startPeers() {
             
             peerPromises.push(
                 new Promise(resolve => setTimeout(resolve, delay))
-                    .then(() => createPeer(browserInfo.browser, name, j, peerIdx))
+                    .then(() => createPeer(browserInfo.browser, name, j, peerIdx, hubPort))
             );
             
             totalIndex++;
@@ -635,10 +676,17 @@ async function cleanup(silent = false) {
         httpServer.close();
     }
     
-    // Stop hub server
-    if (hubServer) {
+    // Stop hub servers
+    if (hubServer1) {
         try {
-            await hubServer.stop();
+            await hubServer1.stop();
+        } catch (error) {
+            // Ignore
+        }
+    }
+    if (hubServer2) {
+        try {
+            await hubServer2.stop();
         } catch (error) {
             // Ignore
         }
@@ -730,7 +778,7 @@ async function printSummary() {
 async function runTest() {
     try {
         // Start servers
-        await startHub();
+        await startHubs();
         await startHttpServer();
         
         // Start all peers
