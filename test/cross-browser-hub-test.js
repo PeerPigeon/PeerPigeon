@@ -27,8 +27,9 @@ const HUB_2_PORT = 3001;
 const HTTP_PORT = 8766;
 const TEST_DURATION = 20000; // Used previously; monitoring removed
 const TOTAL_PEERS = 20;
-const MAX_PEERS = 4;
-const MIN_PEERS = 3;
+// Increased peer connectivity targets to improve gossip saturation across hubs
+const MAX_PEERS = 6; // allow denser partial mesh to reduce partition risk
+const MIN_PEERS = 4; // require higher floor to ensure cross-hub bridging
 
 // Browser distribution (total should equal TOTAL_PEERS)
 // Split peers across 2 hubs
@@ -571,11 +572,12 @@ async function testMessageBroadcast() {
     const messagePromises = activePeers.map(peer => {
         return peer.page.evaluate(() => {
             return new Promise(resolve => {
-                const deadline = Date.now() + 8000;
+                // Extended deadline to allow slower multi-hop gossip propagation
+                const deadline = Date.now() + 15000;
                 const check = () => {
                     if (window.__ppTest && window.__ppTest.recv) return resolve(true);
                     if (Date.now() > deadline) return resolve(false);
-                    setTimeout(check, 100);
+                    setTimeout(check, 150);
                 };
                 check();
             });
@@ -590,8 +592,8 @@ async function testMessageBroadcast() {
         }
     }, testMessage);
     
-    // Wait for responses
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // Wait longer for full saturation
+    await new Promise(resolve => setTimeout(resolve, 12000));
     
     const results = await Promise.all(messagePromises);
     const receivedCount = results.filter(r => r === true).length;

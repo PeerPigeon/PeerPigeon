@@ -8018,7 +8018,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.seenMessages = /* @__PURE__ */ new Map();
       this.messageHistory = /* @__PURE__ */ new Map();
       this.processedKeyExchanges = /* @__PURE__ */ new Map();
-      this.maxTTL = 20;
+      this.maxTTL = 40;
       this.messageExpiryTime = 5 * 60 * 1e3;
       this.cleanupInterval = 60 * 1e3;
       this.cleanupTimer = null;
