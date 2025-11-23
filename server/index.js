@@ -3,6 +3,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer } from 'http';
 import { EventEmitter } from 'events';
 import { URL } from 'url';
+import { PeerPigeonMesh } from '../src/PeerPigeonMesh.js';
 
 /**
  * PeerPigeon WebSocket signaling server
@@ -20,6 +21,7 @@ export class PeerPigeonServer extends EventEmitter {
         this.corsOrigin = options.corsOrigin || '*';
         this.maxMessageSize = options.maxMessageSize || 1048576; // 1MB
         this.maxPortRetries = options.maxPortRetries || 10; // Try up to 10 ports
+        this.verboseLogging = options.verboseLogging === true; // Default false, set true to enable verbose logs
         
                 
         // Hub configuration
@@ -29,6 +31,9 @@ export class PeerPigeonServer extends EventEmitter {
         this.autoConnect = options.autoConnect !== false; // Auto-connect to bootstrap hubs (default: true)
         this.reconnectInterval = options.reconnectInterval || 5000; // Reconnect interval in ms
         this.maxReconnectAttempts = options.maxReconnectAttempts || 10; // Max reconnection attempts
+        this.hubMeshMaxPeers = options.hubMeshMaxPeers || 3; // Max P2P connections in hub mesh (for partial mesh)
+        this.hubMeshMinPeers = options.hubMeshMinPeers || 2; // Min P2P connections in hub mesh
+        this.meshMigrationDelay = options.meshMigrationDelay || 10000; // Delay before closing WS connections after mesh is ready (10s)
         
         // Generate hub peer ID if this is a hub
         this.hubPeerId = options.hubPeerId || (this.isHub ? this.generatePeerId() : null);
@@ -43,6 +48,13 @@ export class PeerPigeonServer extends EventEmitter {
         this.isRunning = false;
         this.cleanupTimer = null;
         this.startTime = null;
+        
+        // Hub mesh P2P properties
+        this.hubMesh = null; // PeerPigeonMesh instance for hub-to-hub P2P connections
+        this.hubMeshReady = false; // Whether the P2P mesh is established
+        this.hubMeshPeers = new Map(); // hubPeerId -> { p2pConnected: boolean, wsConnection: WebSocket }
+        this.migratedToP2P = new Set(); // Set of hub peer IDs that have migrated from WS to P2P
+        this.migrationTimer = null; // Timer for WS disconnection after mesh establishment
     }
 
     /**
@@ -162,7 +174,9 @@ export class PeerPigeonServer extends EventEmitter {
 
         // Clean up stale connections
         stalePeers.forEach(peerId => {
-            console.log(`🧹 Cleaning up stale connection: ${peerId.substring(0, 8)}...`);
+            if (this.verboseLogging) {
+                console.log(`🧹 Cleaning up stale connection: ${peerId.substring(0, 8)}...`);
+            }
             this.cleanupPeer(peerId);
         });
 
@@ -319,8 +333,12 @@ export class PeerPigeonServer extends EventEmitter {
         try {
             const result = await this.tryPort(this.port);
             
-            // If this is a hub, connect to bootstrap hubs
+            // If this is a hub, initialize hub mesh AFTER server is running, then connect to bootstrap hubs
             if (this.isHub && this.autoConnect) {
+                // Give the server a moment to be fully ready for connections
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                
+                await this.initializeHubMesh();
                 await this.connectToBootstrapHubs();
             }
             
@@ -329,6 +347,323 @@ export class PeerPigeonServer extends EventEmitter {
             console.error('❌ Failed to start server:', error);
             throw error;
         }
+    }
+
+    /**
+     * Initialize the hub P2P mesh
+     */
+    async initializeHubMesh() {
+        if (!this.isHub || this.hubMesh) {
+            return;
+        }
+
+        console.log(`🔗 Initializing hub P2P mesh on namespace: ${this.hubMeshNamespace}`);
+        console.log(`   Hub Peer ID: ${this.hubPeerId.substring(0, 8)}...`);
+        console.log(`   Max P2P connections: ${this.hubMeshMaxPeers} (partial mesh with XOR routing)`);
+
+        // Create PeerPigeonMesh instance for hub-to-hub connections
+        this.hubMesh = new PeerPigeonMesh({
+            peerId: this.hubPeerId,
+            networkName: this.hubMeshNamespace,
+            maxPeers: this.hubMeshMaxPeers,
+            minPeers: this.hubMeshMinPeers,
+            autoConnect: true,
+            autoDiscovery: true,
+            xorRouting: true, // Use XOR routing for partial mesh
+            enableWebDHT: false, // Don't need DHT for hub mesh
+            enableCrypto: false // Hubs don't need encryption between themselves
+        });
+
+        // Initialize the mesh (required before connecting)
+        await this.hubMesh.init();
+
+        // Set up hub mesh event handlers
+        this.setupHubMeshEventHandlers();
+
+        // Connect to local signaling server (ourselves)
+        // Use 127.0.0.1 for localhost to avoid potential DNS issues
+        const host = this.host === '0.0.0.0' ? '127.0.0.1' : this.host;
+        const signalingUrl = `ws://${host}:${this.port}`;
+        
+        console.log(`🔌 Connecting hub mesh to local signaling: ${signalingUrl}`);
+        await this.hubMesh.connect(signalingUrl);
+
+        console.log(`✅ Hub mesh connected to local signaling`);
+    }
+
+    /**
+     * Set up event handlers for the hub P2P mesh
+     */
+    setupHubMeshEventHandlers() {
+        if (!this.hubMesh) return;
+
+        // Track P2P connections to other hubs
+        this.hubMesh.addEventListener('peerConnected', (event) => {
+            const hubPeerId = event.peerId;
+            console.log(`🔗 P2P connection established with hub: ${hubPeerId.substring(0, 8)}...`);
+            
+            // Update hub peer tracking
+            if (!this.hubMeshPeers.has(hubPeerId)) {
+                this.hubMeshPeers.set(hubPeerId, { p2pConnected: false, wsConnection: null });
+            }
+            const hubInfo = this.hubMeshPeers.get(hubPeerId);
+            hubInfo.p2pConnected = true;
+
+            this.emit('hubP2PConnected', { hubPeerId });
+            
+            // Check if we should migrate to P2P-only
+            this.checkMeshReadiness();
+        });
+
+        this.hubMesh.addEventListener('peerDisconnected', (event) => {
+            const hubPeerId = event.peerId;
+            console.log(`🔌 P2P connection lost with hub: ${hubPeerId.substring(0, 8)}...`);
+            
+            const hubInfo = this.hubMeshPeers.get(hubPeerId);
+            if (hubInfo) {
+                hubInfo.p2pConnected = false;
+            }
+            
+            this.migratedToP2P.delete(hubPeerId);
+            this.emit('hubP2PDisconnected', { hubPeerId });
+        });
+
+        // Handle messages from other hubs via P2P
+        this.hubMesh.addEventListener('messageReceived', (event) => {
+            this.handleHubP2PMessage(event.from, event.data);
+        });
+
+        // Track mesh status updates
+        this.hubMesh.addEventListener('peersUpdated', () => {
+            const connectedCount = this.hubMesh.connectionManager.getConnectedPeers().length;
+            console.log(`📊 Hub mesh status: ${connectedCount} P2P connections active`);
+            this.checkMeshReadiness();
+        });
+    }
+
+    /**
+     * Check if the hub mesh is ready and trigger migration from WS to P2P
+     */
+    checkMeshReadiness() {
+        if (!this.isHub || !this.hubMesh || this.hubMeshReady) {
+            return;
+        }
+
+        const connectedP2PPeers = this.hubMesh.connectionManager.getConnectedPeers().length;
+        const discoveredHubs = this.hubs.size;
+
+        // Consider mesh ready if we have P2P connections to at least minPeers hubs
+        // OR if there are fewer than minPeers total hubs available
+        const isReady = connectedP2PPeers >= this.hubMeshMinPeers || 
+                       (discoveredHubs < this.hubMeshMinPeers && connectedP2PPeers >= discoveredHubs);
+
+        if (isReady && !this.hubMeshReady) {
+            this.hubMeshReady = true;
+            console.log(`✅ Hub mesh is READY! ${connectedP2PPeers} P2P connections established`);
+            console.log(`   Scheduling WebSocket migration in ${this.meshMigrationDelay}ms...`);
+            
+            this.emit('hubMeshReady', { 
+                p2pConnections: connectedP2PPeers, 
+                totalHubs: discoveredHubs 
+            });
+
+            // Schedule migration from WebSocket to P2P-only
+            if (this.migrationTimer) {
+                clearTimeout(this.migrationTimer);
+            }
+            this.migrationTimer = setTimeout(() => {
+                this.migrateToP2POnly();
+            }, this.meshMigrationDelay);
+        }
+    }
+
+    /**
+     * Migrate from WebSocket connections to P2P-only for hub-to-hub communication
+     */
+    migrateToP2POnly() {
+        if (!this.isHub || !this.hubMesh) {
+            return;
+        }
+
+        console.log(`🔄 MIGRATING to P2P-only hub mesh...`);
+        
+        const p2pConnectedHubs = this.hubMesh.connectionManager.getConnectedPeers();
+        let migratedCount = 0;
+        let skippedCount = 0;
+
+        for (const hubPeerId of p2pConnectedHubs) {
+            // Check if this hub has both WS and P2P connections
+            const hubInfo = this.hubMeshPeers.get(hubPeerId);
+            if (!hubInfo || !hubInfo.p2pConnected) {
+                continue;
+            }
+
+            // Check if we have a direct WebSocket connection to this hub (incoming)
+            const directWsConnection = this.connections.get(hubPeerId);
+            if (directWsConnection && directWsConnection.readyState === WebSocket.OPEN) {
+                console.log(`🔌 Closing direct WebSocket to hub ${hubPeerId.substring(0, 8)}... (P2P active)`);
+                
+                try {
+                    directWsConnection.close(1000, 'Migrated to P2P mesh');
+                    this.migratedToP2P.add(hubPeerId);
+                    migratedCount++;
+                } catch (error) {
+                    console.error(`❌ Error closing WebSocket for hub ${hubPeerId.substring(0, 8)}...:`, error);
+                }
+            } else {
+                skippedCount++;
+            }
+        }
+
+        // Also close bootstrap WebSocket connections if we have P2P to those hubs
+        console.log(`🔌 Closing bootstrap WebSocket connections (migrating to P2P)...`);
+        let bootstrapClosed = 0;
+        
+        for (const [uri, connInfo] of this.bootstrapConnections) {
+            if (connInfo.connected && connInfo.ws && connInfo.ws.readyState === WebSocket.OPEN) {
+                // Check if we have P2P connection (we may not know the exact peer ID for bootstrap)
+                // Close bootstrap connections if we have sufficient P2P connections
+                if (p2pConnectedHubs.length >= this.hubMeshMinPeers) {
+                    console.log(`🔌 Closing bootstrap WebSocket: ${uri} (sufficient P2P connections)`);
+                    try {
+                        connInfo.ws.close(1000, 'Migrated to P2P mesh');
+                        connInfo.connected = false;
+                        bootstrapClosed++;
+                    } catch (error) {
+                        console.error(`❌ Error closing bootstrap WebSocket ${uri}:`, error);
+                    }
+                }
+            }
+        }
+
+        console.log(`✅ Migration complete:`);
+        console.log(`   - ${migratedCount} direct hub WebSocket connections closed`);
+        console.log(`   - ${bootstrapClosed} bootstrap WebSocket connections closed`);
+        console.log(`   - ${skippedCount} connections already closed or non-existent`);
+        console.log(`🌐 Hub mesh now operating on P2P (${p2pConnectedHubs.length} connections)`);
+        
+        this.emit('hubMeshMigrated', { 
+            migratedCount: migratedCount + bootstrapClosed,
+            p2pConnections: p2pConnectedHubs.length 
+        });
+    }
+
+    /**
+     * Handle P2P messages from other hubs
+     */
+    handleHubP2PMessage(fromHubPeerId, message) {
+        console.log(`📨 P2P message from hub ${fromHubPeerId.substring(0, 8)}...: ${message.type || 'unknown'}`);
+        
+        // Handle signaling relay through P2P mesh
+        if (message.type === 'client-signal-relay') {
+            this.handleClientSignalRelay(fromHubPeerId, message);
+            return;
+        }
+
+        // Handle peer announcements through P2P mesh
+        if (message.type === 'peer-announce-relay') {
+            this.handlePeerAnnounceRelay(fromHubPeerId, message);
+            return;
+        }
+
+        // Default: log unknown message types
+        console.log(`⚠️  Unknown P2P message type from hub: ${message.type}`);
+    }
+
+    /**
+     * Handle client signaling relay through P2P hub mesh
+     */
+    handleClientSignalRelay(fromHubPeerId, message) {
+        const { targetPeerId, signalData } = message;
+        
+        if (!targetPeerId || !signalData) {
+            console.log(`⚠️  Invalid client signal relay from ${fromHubPeerId.substring(0, 8)}...`);
+            return;
+        }
+
+        // Check if target peer is connected to this hub
+        const targetConnection = this.connections.get(targetPeerId);
+        if (targetConnection && targetConnection.readyState === WebSocket.OPEN) {
+            console.log(`📥 Relaying signal to local client ${targetPeerId.substring(0, 8)}...`);
+            this.sendToConnection(targetConnection, signalData);
+        } else {
+            // Forward to other hubs via P2P if we have more connections
+            console.log(`🔄 Client ${targetPeerId.substring(0, 8)}... not local, forwarding to other hubs`);
+            this.forwardSignalToHubMesh(targetPeerId, signalData, fromHubPeerId);
+        }
+    }
+
+    /**
+     * Handle peer announcement relay through P2P hub mesh
+     */
+    handlePeerAnnounceRelay(fromHubPeerId, message) {
+        const { peerId, networkName, peerData } = message;
+        
+        if (!peerId || !networkName) {
+            console.log(`⚠️  Invalid peer announce relay from ${fromHubPeerId.substring(0, 8)}...`);
+            return;
+        }
+
+        console.log(`📣 Peer ${peerId.substring(0, 8)}... announced via hub ${fromHubPeerId.substring(0, 8)}... on network: ${networkName}`);
+        
+        // Forward to local clients in the same network
+        const localPeers = this.getActivePeers(null, networkName);
+        localPeers.forEach(localPeerId => {
+            const localConnection = this.connections.get(localPeerId);
+            if (localConnection) {
+                this.sendToConnection(localConnection, {
+                    type: 'peer-discovered',
+                    data: peerData,
+                    networkName,
+                    fromPeerId: 'system',
+                    targetPeerId: localPeerId,
+                    timestamp: Date.now()
+                });
+            }
+        });
+    }
+
+    /**
+     * Forward signaling message to hub mesh via P2P
+     */
+    forwardSignalToHubMesh(targetPeerId, signalData, excludeHubPeerId = null) {
+        if (!this.hubMesh) {
+            return;
+        }
+
+        const connectedHubConnections = this.hubMesh.connectionManager.getConnectedPeers();
+        const connectedHubs = connectedHubConnections
+            .map(conn => conn.peerId)
+            .filter(hubId => hubId !== excludeHubPeerId);
+
+        if (connectedHubs.length === 0) {
+            console.log(`⚠️  No other hubs available in P2P mesh for forwarding`);
+            return;
+        }
+
+        const relayMessage = {
+            type: 'client-signal-relay',
+            targetPeerId,
+            signalData,
+            timestamp: Date.now()
+        };
+
+        // Use XOR routing to find closest hubs
+        const closestHubs = this.findClosestPeers(targetPeerId, connectedHubs, 2);
+        
+        closestHubs.forEach(hubPeerIdObj => {
+            const hubPeerId = typeof hubPeerIdObj === 'string' ? hubPeerIdObj : hubPeerIdObj.peerId;
+            console.log(`📤 Forwarding signal to hub ${hubPeerId.substring(0, 8)}... via P2P`);
+            
+            // Get the peer connection and send the message
+            const peerConnection = this.hubMesh.connectionManager.peers.get(hubPeerId);
+            if (peerConnection && peerConnection.sendMessage) {
+                peerConnection.sendMessage(relayMessage);
+                console.log(`✅ Sent signal via P2P to hub ${hubPeerId.substring(0, 8)}...`);
+            } else {
+                console.error(`❌ No peer connection found for hub ${hubPeerId.substring(0, 8)}...`);
+            }
+        });
     }
 
     /**
@@ -341,6 +676,22 @@ export class PeerPigeonServer extends EventEmitter {
 
         return new Promise((resolve) => {
             console.log('🛑 Stopping PeerPigeon WebSocket server...');
+
+            // Stop migration timer if running
+            if (this.migrationTimer) {
+                clearTimeout(this.migrationTimer);
+                this.migrationTimer = null;
+            }
+
+            // Disconnect hub mesh if this is a hub
+            if (this.isHub && this.hubMesh) {
+                console.log('🔌 Disconnecting hub P2P mesh...');
+                this.hubMesh.disconnect();
+                this.hubMesh = null;
+                this.hubMeshReady = false;
+                this.hubMeshPeers.clear();
+                this.migratedToP2P.clear();
+            }
 
             // Disconnect from bootstrap hubs if this is a hub
             if (this.isHub) {
@@ -537,38 +888,47 @@ export class PeerPigeonServer extends EventEmitter {
     }
     
     /**
-     * Announce all local (non-hub) peers to a bootstrap hub
+     * Announce all local peers to a bootstrap hub (including hub mesh peers for P2P discovery)
      */
     announceLocalPeersToHub(ws) {
         let totalAnnounced = 0;
         
+        console.log(`📡 Announcing local peers to bootstrap hub (${this.networkPeers.size} networks)`);
+        
         // Iterate through all networks and announce their peers
         for (const [networkName, peerSet] of this.networkPeers) {
-            // Skip the hub mesh namespace
-            if (networkName === this.hubMeshNamespace) {
-                continue;
-            }
+            console.log(`   Network '${networkName}': ${peerSet.size} peers`);
             
             for (const peerId of peerSet) {
                 const peerData = this.peerData.get(peerId);
                 
-                // Skip hubs, only announce regular peers
-                if (peerData?.isHub) {
+                // For hub mesh namespace, only announce our own hub mesh client (not other hubs)
+                if (networkName === this.hubMeshNamespace && peerId !== this.hubPeerId) {
+                    console.log(`   Skipping hub ${peerId.substring(0, 8)}... (not our mesh client)`);
+                    continue;
+                }
+                
+                // For other namespaces, skip hub peers
+                if (networkName !== this.hubMeshNamespace && peerData?.isHub) {
+                    console.log(`   Skipping hub peer ${peerId.substring(0, 8)}... in network ${networkName}`);
                     continue;
                 }
                 
                 // Skip if not connected or not announced
                 const connection = this.connections.get(peerId);
                 if (!connection || connection.readyState !== WebSocket.OPEN || !peerData?.announced) {
+                    console.log(`   Skipping ${peerId.substring(0, 8)}... (not connected or not announced)`);
                     continue;
                 }
+                
+                console.log(`   ✅ Announcing ${peerId.substring(0, 8)}... from network '${networkName}'`);
                 
                 // Send peer-discovered message to bootstrap hub
                 const peerAnnouncement = {
                     type: 'peer-discovered',
                     data: {
                         peerId,
-                        isHub: false,
+                        isHub: networkName === this.hubMeshNamespace,
                         ...peerData.data
                     },
                     networkName: networkName,
@@ -666,6 +1026,26 @@ export class PeerPigeonServer extends EventEmitter {
                 if (data?.isHub) {
                     console.log(`🏢 Discovered hub via bootstrap: ${data.peerId?.substring(0, 8)}...`);
                     this.emit('hubDiscovered', { peerId: data.peerId, via: uri, data });
+                    
+                    // Forward to our local hub mesh client so it can form P2P connections
+                    const discoveredNetwork = networkName || this.hubMeshNamespace;
+                    if (discoveredNetwork === this.hubMeshNamespace) {
+                        console.log(`📥 Forwarding hub ${data.peerId?.substring(0, 8)}... to local mesh client`);
+                        const localPeers = this.getActivePeers(null, discoveredNetwork);
+                        localPeers.forEach(localPeerId => {
+                            const localConnection = this.connections.get(localPeerId);
+                            if (localConnection) {
+                                this.sendToConnection(localConnection, {
+                                    type: 'peer-discovered',
+                                    data,
+                                    networkName: discoveredNetwork,
+                                    fromPeerId: 'system',
+                                    targetPeerId: localPeerId,
+                                    timestamp: Date.now()
+                                });
+                            }
+                        });
+                    }
                 } else if (data?.peerId) {
                     // Regular peer discovered on another hub - notify our local peers in same network
                     const discoveredPeerId = data.peerId;
@@ -858,7 +1238,9 @@ export class PeerPigeonServer extends EventEmitter {
         const { type, data: messageData, targetPeerId, networkName, fromPeerId: originalFromPeerId } = message;
 
         // Log message type
-        console.log(`📨 Received ${type} from ${peerId.substring(0, 8)}... in network: ${networkName || 'global'}`);
+        if (this.verboseLogging) {
+            console.log(`📨 Received ${type} from ${peerId.substring(0, 8)}... in network: ${networkName || 'global'}`);
+        }
 
         // Preserve the original fromPeerId if it exists (for relayed messages from other hubs)
         // Otherwise use the peerId of the connection
@@ -894,7 +1276,9 @@ export class PeerPigeonServer extends EventEmitter {
                 this.handleCleanup(peerId, message);
                 break;
             default:
-                console.log(`⚠️  Ignoring non-signaling message type '${type}' - peers should route their own messages`);
+                if (this.verboseLogging) {
+                    console.log(`⚠️  Ignoring non-signaling message type '${type}' - peers should route their own messages`);
+                }
                 const connection = this.connections.get(peerId);
                 if (connection && connection.readyState === WebSocket.OPEN) {
                     this.sendToConnection(connection, {
@@ -917,10 +1301,12 @@ export class PeerPigeonServer extends EventEmitter {
         // Detect if this peer is a hub
         const isHub = message.data?.isHub === true || peerNetworkName === this.hubMeshNamespace;
         
-        if (isHub) {
-            console.log(`📢 Hub announced: ${peerId.substring(0, 8)}... in network: ${peerNetworkName}`);
-        } else {
-            console.log(`📢 Peer announced: ${peerId.substring(0, 8)}... in network: ${peerNetworkName}`);
+        if (this.verboseLogging) {
+            if (isHub) {
+                console.log(`📢 Hub announced: ${peerId.substring(0, 8)}... in network: ${peerNetworkName}`);
+            } else {
+                console.log(`📢 Peer announced: ${peerId.substring(0, 8)}... in network: ${peerNetworkName}`);
+            }
         }
 
         // Update peer data with network information
@@ -940,6 +1326,16 @@ export class PeerPigeonServer extends EventEmitter {
                 data: message.data,
                 connectedAt: peerInfo?.connectedAt || Date.now()
             });
+            
+            // Track WebSocket connection with this hub
+            const wsConnection = this.connections.get(peerId);
+            if (wsConnection) {
+                if (!this.hubMeshPeers.has(peerId)) {
+                    this.hubMeshPeers.set(peerId, { p2pConnected: false, wsConnection: null });
+                }
+                this.hubMeshPeers.get(peerId).wsConnection = wsConnection;
+                console.log(`📊 Tracking hub ${peerId.substring(0, 8)}... WebSocket connection for migration`);
+            }
             
             // When a new hub announces itself, send it all our local peers
             if (this.isHub) {
@@ -1005,6 +1401,36 @@ export class PeerPigeonServer extends EventEmitter {
             }
         }
 
+        // ALSO broadcast through P2P hub mesh if available and mesh is ready
+        if (this.isHub && !isHub && this.hubMesh && this.hubMeshReady) {
+            const p2pConnectedHubs = this.hubMesh.connectionManager.getConnectedPeers();
+            if (p2pConnectedHubs.length > 0) {
+                console.log(`📡 Broadcasting peer ${peerId.substring(0, 8)}... to ${p2pConnectedHubs.length} P2P-connected hub(s)`);
+                
+                const p2pRelayMessage = {
+                    type: 'peer-announce-relay',
+                    peerId,
+                    networkName: peerNetworkName,
+                    peerData: {
+                        peerId,
+                        isHub: false,
+                        ...message.data
+                    },
+                    timestamp: Date.now()
+                };
+                
+                p2pConnectedHubs.forEach(hubPeerConnection => {
+                    try {
+                        const hubPeerId = hubPeerConnection.peerId;
+                        this.hubMesh.sendMessage(p2pRelayMessage, hubPeerId);
+                    } catch (error) {
+                        const hubPeerId = hubPeerConnection.peerId || 'unknown';
+                        console.error(`❌ Error broadcasting to P2P hub ${hubPeerId.substring(0, 8)}...:`, error.message);
+                    }
+                });
+            }
+        }
+
         // Get active peers in the same network
         const activePeers = this.getActivePeers(peerId, peerNetworkName);
 
@@ -1065,7 +1491,9 @@ export class PeerPigeonServer extends EventEmitter {
      * Handle peer goodbye
      */
     handleGoodbye(peerId, message, responseMessage) {
-        console.log(`👋 Peer goodbye: ${peerId.substring(0, 8)}...`);
+        if (this.verboseLogging) {
+            console.log(`👋 Peer goodbye: ${peerId.substring(0, 8)}...`);
+        }
 
         // Broadcast to closest peers before removing peer data
         this.broadcastToClosestPeers(peerId, responseMessage);
@@ -1082,10 +1510,14 @@ export class PeerPigeonServer extends EventEmitter {
         const targetPeerId = message.targetPeerId;
         const networkName = message.networkName || 'global';
         
-        console.log(`🔍 SIGNALING DEBUG: Received ${message.type} from ${peerId.substring(0, 8)}... to ${targetPeerId?.substring(0, 8)}... in network '${networkName}'`);
+        if (this.verboseLogging) {
+            console.log(`🔍 SIGNALING DEBUG: Received ${message.type} from ${peerId.substring(0, 8)}... to ${targetPeerId?.substring(0, 8)}... in network '${networkName}'`);
+        }
         
         if (!targetPeerId) {
-            console.log(`❌ No target peer ID in signaling message from ${peerId.substring(0, 8)}...`);
+            if (this.verboseLogging) {
+                console.log(`❌ No target peer ID in signaling message from ${peerId.substring(0, 8)}...`);
+            }
             return;
         }
 
@@ -1097,12 +1529,16 @@ export class PeerPigeonServer extends EventEmitter {
             const targetNetwork = targetPeerData?.networkName || 'global';
             
             if (networkName !== targetNetwork) {
-                console.log(`🚫 Blocking ${message.type} from ${peerId.substring(0, 8)}... (network: ${networkName}) to ${targetPeerId.substring(0, 8)}... (network: ${targetNetwork}) - different networks`);
+                if (this.verboseLogging) {
+                    console.log(`🚫 Blocking ${message.type} from ${peerId.substring(0, 8)}... (network: ${networkName}) to ${targetPeerId.substring(0, 8)}... (network: ${targetNetwork}) - different networks`);
+                }
                 return;
             }
             
             // Target is local - forward directly
-            console.log(`✅ Forwarding ${message.type} to LOCAL peer ${targetPeerId.substring(0, 8)}...`);
+            if (this.verboseLogging) {
+                console.log(`✅ Forwarding ${message.type} to LOCAL peer ${targetPeerId.substring(0, 8)}...`);
+            }
             this.sendToConnection(targetConnection, responseMessage);
         } else {
             // Target peer not on this hub - relay to other hubs
@@ -1110,9 +1546,19 @@ export class PeerPigeonServer extends EventEmitter {
             
             let relayed = false;
             
-            // First try relaying through bootstrap hubs (if we're not the bootstrap)
-            if (this.bootstrapConnections.size > 0) {
-                console.log(`� Relaying ${message.type} through ${this.bootstrapConnections.size} bootstrap connection(s)`);
+            // PRIORITY: Try P2P hub mesh first if available and ready
+            if (this.isHub && this.hubMesh && this.hubMeshReady) {
+                const p2pConnectedHubs = this.hubMesh.connectionManager.getConnectedPeers();
+                if (p2pConnectedHubs.length > 0) {
+                    console.log(`📡 Relaying ${message.type} through P2P hub mesh (${p2pConnectedHubs.length} hubs)`);
+                    this.forwardSignalToHubMesh(targetPeerId, responseMessage);
+                    relayed = true;
+                }
+            }
+            
+            // Fallback: Try relaying through WebSocket bootstrap hubs
+            if (!relayed && this.bootstrapConnections.size > 0) {
+                console.log(`🔗 Relaying ${message.type} through ${this.bootstrapConnections.size} WebSocket bootstrap connection(s)`);
                 
                 for (const [uri, connInfo] of this.bootstrapConnections) {
                     if (connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
@@ -1123,9 +1569,9 @@ export class PeerPigeonServer extends EventEmitter {
                 }
             }
             
-            // If we're the bootstrap hub (or bootstrap relay failed), forward to all connected hubs
-            if (this.hubs.size > 0) {
-                console.log(`� Forwarding ${message.type} to ${this.hubs.size} connected hub(s)`);
+            // Final fallback: Forward to WebSocket-connected hubs
+            if (!relayed && this.hubs.size > 0) {
+                console.log(`🔗 Forwarding ${message.type} to ${this.hubs.size} WebSocket-connected hub(s)`);
                 
                 for (const [hubPeerId, hubInfo] of this.hubs) {
                     const hubConnection = this.connections.get(hubPeerId);
@@ -1139,6 +1585,7 @@ export class PeerPigeonServer extends EventEmitter {
             
             if (!relayed) {
                 console.log(`❌ FAILED TO RELAY: No hubs available for ${targetPeerId.substring(0, 8)}... (network: ${networkName})`);
+                console.log(`   - P2P hub mesh: ${this.hubMesh ? this.hubMesh.connectionManager.getConnectedPeers().length : 0}`);
                 console.log(`   - Bootstrap connections: ${this.bootstrapConnections.size}`);
                 console.log(`   - Connected hubs: ${this.hubs.size}`);
             }
@@ -1227,7 +1674,9 @@ export class PeerPigeonServer extends EventEmitter {
      * Handle peer disconnection
      */
     handleDisconnection(peerId, code, reason) {
-        console.log(`❌ Peer disconnected: ${peerId.substring(0, 8)}... (code: ${code}, reason: ${reason})`);
+        if (this.verboseLogging) {
+            console.log(`❌ Peer disconnected: ${peerId.substring(0, 8)}... (code: ${code}, reason: ${reason})`);
+        }
 
         // Notify other peers about disconnection
         this.broadcastToOthers(peerId, {
@@ -1276,7 +1725,9 @@ export class PeerPigeonServer extends EventEmitter {
 
         if (wasConnected) {
             const peerType = isHub ? 'hub' : 'peer';
-            console.log(`🧹 Cleaned up ${peerType}: ${peerId.substring(0, 8)}... from network: ${peerInfo?.networkName || 'unknown'}`);
+            if (this.verboseLogging) {
+                console.log(`🧹 Cleaned up ${peerType}: ${peerId.substring(0, 8)}... from network: ${peerInfo?.networkName || 'unknown'}`);
+            }
 
             // Notify other peers in the same network about disconnection
             if (peerInfo && peerInfo.networkName) {
@@ -1336,7 +1787,9 @@ export class PeerPigeonServer extends EventEmitter {
                 }
             }
         }
-        console.log(`📡 Broadcast to ${sentCount} peers`);
+        if (this.verboseLogging) {
+            console.log(`📡 Broadcast to ${sentCount} peers`);
+        }
         return sentCount;
     }
 
@@ -1349,7 +1802,9 @@ export class PeerPigeonServer extends EventEmitter {
         const activePeers = this.getActivePeers(fromPeerId, networkName);
         const closestPeers = this.findClosestPeers(fromPeerId, activePeers, maxPeers);
 
-        console.log(`Broadcasting from ${fromPeerId.substring(0, 8)}... to ${closestPeers.length} closest peers in network: ${networkName}`);
+        if (this.verboseLogging) {
+            console.log(`Broadcasting from ${fromPeerId.substring(0, 8)}... to ${closestPeers.length} closest peers in network: ${networkName}`);
+        }
 
         closestPeers.forEach(peerId => {
             this.sendToConnection(this.connections.get(peerId), message);

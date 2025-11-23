@@ -428,25 +428,24 @@ export class ConnectionManager extends EventEmitter {
   }
 
   canAcceptMorePeers() {
-    // Count connected peers first (these are guaranteed slots)
+    // Count connected peers for capacity check
     const connectedCount = this.getConnectedPeerCount();
-
-    // If we have room for connected peers, always accept
-    if (connectedCount < this.mesh.maxPeers) {
-      return true;
-    }
-
-    // If at max connected peers, check if we have stale peers we can evict
-    const stalePeerCount = this.getStalePeerCount();
     const totalPeerCount = this.peers.size;
-
-    // Accept if we have stale peers that can be cleaned up
-    if (stalePeerCount > 0 && totalPeerCount >= this.mesh.maxPeers) {
-      this.debug.log(`At capacity (${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total) but have ${stalePeerCount} stale peers that can be evicted`);
-      return true;
+    
+    // STRICT: Don't accept if we're at or over maxPeers
+    // Remove the "+1 overhead" logic that was causing overshoot
+    if (connectedCount >= this.mesh.maxPeers) {
+      this.debug.log(`At or over capacity: ${connectedCount}/${this.mesh.maxPeers} connected, rejecting new connections`);
+      return false;
     }
-
-    // Reject if we're at capacity with all viable peers
+    
+    // Also check total peer count (including connecting) to prevent race conditions
+    if (totalPeerCount >= this.mesh.maxPeers) {
+      this.debug.log(`Total peer count at capacity: ${totalPeerCount}/${this.mesh.maxPeers}, rejecting new connections`);
+      return false;
+    }
+    
+    return true;
     this.debug.log(`Cannot accept more peers: ${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total peers in Map`);
     return false;
   }
@@ -759,6 +758,13 @@ export class ConnectionManager extends EventEmitter {
       this.debug.warn('Received invalid message from', fromPeerId?.substring(0, 8));
       return;
     }
+
+    // Emit generic messageReceived event for all messages (used by hub server)
+    this.mesh.emit('messageReceived', {
+      from: fromPeerId,
+      data: message,
+      timestamp: Date.now()
+    });
 
     // Handle binary messages first
     if (message.type === 'binary' && message.data instanceof Uint8Array) {

@@ -20,8 +20,9 @@ PeerPigeon is a production-ready library for building decentralized applications
 - **🗄️ Distributed Storage** - Encrypted, CRDT-enabled storage across the mesh
 - **🎥 Selective Streaming** - Efficient audio/video streaming with bandwidth management
 - **📦 Binary Messages** - Native support for efficient binary data transfer (Uint8Array/ArrayBuffer)
-- **� Stream API** - Transfer large files with ReadableStream/WritableStream (memory-efficient, backpressure handling)
-- **�🏢 Hub System** - Connect multiple signaling servers for global peer discovery
+- **🌊 Stream API** - Transfer large files with ReadableStream/WritableStream (memory-efficient, backpressure handling)
+- **🏢 Hub System** - Connect multiple signaling servers for global peer discovery
+- **🔗 Hub P2P Mesh** - Hubs form WebRTC mesh with XOR routing, auto-migrate from WebSocket to P2P
 - **🔐 End-to-End Encryption** - Built-in crypto for secure communication
 - **💰 Cost Optimized** - Smart routing reduces server costs by ~95%
 - **📱 Multi-Platform** - Browser, Node.js, NativeScript support
@@ -197,7 +198,14 @@ const hub2 = new PeerPigeonServer({
 });
 await hub2.start();
 
+// Hubs automatically form P2P mesh with XOR routing
+// WebSocket connections are closed once P2P mesh is established
+// Clients connect via WebSocket, hub-to-hub uses P2P for efficiency
+
 // Peers on hub2 can discover peers on hub1!
+```
+
+**New in v1.1**: Hubs now form a true P2P mesh network using WebRTC with XOR-based routing. WebSocket connections between hubs are automatically closed once the P2P mesh is established, significantly reducing server load. See [docs/HUB_P2P_MESH.md](docs/HUB_P2P_MESH.md) for details.
 ```
 
 ## 📖 Documentation

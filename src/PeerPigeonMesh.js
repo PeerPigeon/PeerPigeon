@@ -334,17 +334,18 @@ export class PeerPigeonMesh extends EventEmitter {
         this.debug.warn('PigeonRTC initialization failed:', error.message);
       }
 
-      // Request media permissions for localhost WebRTC to work
-      // This is required for Chrome to gather ICE candidates on localhost
+      // Request media permissions for localhost WebRTC to work unless explicitly disabled
+      // Added DISABLE_LOCALHOST_MEDIA_REQUEST override for automated/headless test environments
       if (environmentDetector.isBrowser) {
         try {
+          const disableLocalhostMedia = typeof window !== 'undefined' && window.DISABLE_LOCALHOST_MEDIA_REQUEST;
           const isLocalhost = window.location.hostname === 'localhost' || 
                              window.location.hostname === '127.0.0.1' ||
                              window.location.hostname === '';
-          
-          if (isLocalhost && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-            this.debug.log('🎤 Requesting media permissions for localhost WebRTC...');
-            
+
+          if (!disableLocalhostMedia && isLocalhost && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            this.debug.log('🎤 Requesting media permissions for localhost WebRTC (not disabled)...');
+
             // Request minimal audio permission (no video to reduce intrusiveness)
             const stream = await navigator.mediaDevices.getUserMedia({ 
               audio: true, 
@@ -353,12 +354,14 @@ export class PeerPigeonMesh extends EventEmitter {
               this.debug.warn('Media permission denied - connections may fail on localhost:', err.message);
               return null;
             });
-            
+
             // Immediately stop all tracks - we only needed the permission
             if (stream) {
               stream.getTracks().forEach(track => track.stop());
               this.debug.log('✅ Media permissions granted - localhost connections will work');
             }
+          } else if (disableLocalhostMedia) {
+            this.debug.log('🚫 Skipping localhost media permission request (DISABLE_LOCALHOST_MEDIA_REQUEST flag set)');
           }
         } catch (error) {
           this.debug.warn('Could not request media permissions:', error.message);
