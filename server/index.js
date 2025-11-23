@@ -87,6 +87,21 @@ export class PeerPigeonServer extends EventEmitter {
     }
 
     /**
+     * Create a simple hash of signal data for deduplication
+     */
+    hashSignalData(data) {
+        if (!data) return 'null';
+        const str = JSON.stringify(data);
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32bit integer
+        }
+        return hash.toString(16);
+    }
+
+    /**
      * Check if a peer is registered as a hub
      */
     isPeerHub(peerId) {
@@ -469,20 +484,23 @@ export class PeerPigeonServer extends EventEmitter {
         if (isReady && !this.hubMeshReady) {
             this.hubMeshReady = true;
             console.log(`✅ Hub mesh is READY! ${connectedP2PPeers} P2P connections established`);
-            console.log(`   Scheduling WebSocket migration in ${this.meshMigrationDelay}ms...`);
+            console.log(`   Migrating to P2P-only immediately...`);
             
             this.emit('hubMeshReady', { 
                 p2pConnections: connectedP2PPeers, 
                 totalHubs: discoveredHubs 
             });
 
-            // Schedule migration from WebSocket to P2P-only
+            // Migrate immediately from WebSocket to P2P-only
             if (this.migrationTimer) {
                 clearTimeout(this.migrationTimer);
+                this.migrationTimer = null;
             }
-            this.migrationTimer = setTimeout(() => {
+            
+            // Use setImmediate to allow current processing to complete before migration
+            setImmediate(() => {
                 this.migrateToP2POnly();
-            }, this.meshMigrationDelay);
+            });
         }
     }
 
@@ -524,23 +542,19 @@ export class PeerPigeonServer extends EventEmitter {
             }
         }
 
-        // Also close bootstrap WebSocket connections if we have P2P to those hubs
-        console.log(`🔌 Closing bootstrap WebSocket connections (migrating to P2P)...`);
+        // Also close ALL bootstrap WebSocket connections - we're on P2P mesh now
+        console.log(`🔌 Closing ALL bootstrap WebSocket connections (P2P mesh active)...`);
         let bootstrapClosed = 0;
         
         for (const [uri, connInfo] of this.bootstrapConnections) {
             if (connInfo.connected && connInfo.ws && connInfo.ws.readyState === WebSocket.OPEN) {
-                // Check if we have P2P connection (we may not know the exact peer ID for bootstrap)
-                // Close bootstrap connections if we have sufficient P2P connections
-                if (p2pConnectedHubs.length >= this.hubMeshMinPeers) {
-                    console.log(`🔌 Closing bootstrap WebSocket: ${uri} (sufficient P2P connections)`);
-                    try {
-                        connInfo.ws.close(1000, 'Migrated to P2P mesh');
-                        connInfo.connected = false;
-                        bootstrapClosed++;
-                    } catch (error) {
-                        console.error(`❌ Error closing bootstrap WebSocket ${uri}:`, error);
-                    }
+                console.log(`🔌 Closing bootstrap WebSocket: ${uri}`);
+                try {
+                    connInfo.ws.close(1000, 'Migrated to P2P mesh');
+                    connInfo.connected = false;
+                    bootstrapClosed++;
+                } catch (error) {
+                    console.error(`❌ Error closing bootstrap WebSocket ${uri}:`, error);
                 }
             }
         }
@@ -1109,12 +1123,41 @@ export class PeerPigeonServer extends EventEmitter {
                         console.log(`📥 Received ${type} from ${fromPeerId?.substring(0, 8)}... for local peer ${targetPeerId.substring(0, 8)}...`);
                         this.sendToConnection(targetConnection, message);
                     } else {
-                        // Not our peer, relay to other bootstrap hubs
-                        console.log(`🔄 Relaying ${type} from ${fromPeerId?.substring(0, 8)}... for ${targetPeerId.substring(0, 8)}... (not local)`);
+                        // Not our peer - check if we should relay
+                        
+                        // CRITICAL: If hub mesh is ready, DO NOT relay via bootstrap WebSocket - clients should use P2P mesh
+                        if (this.hubMeshReady) {
+                            if (this.verboseLogging) {
+                                console.log(`⏭️  Skipping bootstrap relay of ${type} - hub mesh is ready, P2P should be used`);
+                            }
+                            break; // Exit - no bootstrap relay when mesh is ready
+                        }
+                        
+                        // Create unique message ID for deduplication (include signal data hash)
+                        const dataHash = this.hashSignalData(data);
+                        const messageId = `${type}:${fromPeerId}:${targetPeerId}:${dataHash}`;
+                        
+                        // Check if we've already relayed this message recently
+                        if (this.recentlyRelayedMessages.has(messageId)) {
+                            if (this.verboseLogging) {
+                                console.log(`⏭️  Skipping duplicate bootstrap relay of ${type} (${messageId.substring(0, 50)}...)`);
+                            }
+                            break; // Skip this message
+                        }
+                        
+                        // Mark message as relayed
+                        this.recentlyRelayedMessages.set(messageId, Date.now());
+                        
+                        console.log(`🔄 Relaying ${type} from ${fromPeerId?.substring(0, 8)}... for ${targetPeerId.substring(0, 8)}... (not local) [BOOTSTRAP MODE]`);
+                        let relayCount = 0;
                         for (const [otherUri, connInfo] of this.bootstrapConnections) {
                             if (otherUri !== uri && connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
                                 connInfo.ws.send(JSON.stringify(message));
+                                relayCount++;
                             }
+                        }
+                        if (this.verboseLogging && relayCount > 0) {
+                            console.log(`   ✅ Relayed to ${relayCount} bootstrap hub(s)`);
                         }
                     }
                 } else {
@@ -1591,8 +1634,9 @@ export class PeerPigeonServer extends EventEmitter {
         } else {
             // Target peer not on this hub - relay to other hubs
             
-            // Create unique message ID for deduplication (type + from + to + timestamp)
-            const messageId = `${message.type}:${peerId}:${targetPeerId}:${message.timestamp || Date.now()}`;
+            // Create unique message ID for deduplication (include signal data hash)
+            const dataHash = this.hashSignalData(message.data);
+            const messageId = `${message.type}:${peerId}:${targetPeerId}:${dataHash}`;
             
             // Check if we've already relayed this message recently
             if (this.recentlyRelayedMessages.has(messageId)) {
