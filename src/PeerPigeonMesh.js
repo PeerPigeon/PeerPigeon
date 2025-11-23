@@ -37,6 +37,9 @@ export class PeerPigeonMesh extends EventEmitter {
     // Configuration - Optional features enabled by default (opt-out)
     this.maxPeers = options.maxPeers !== undefined ? options.maxPeers : 3;
     this.minPeers = options.minPeers !== undefined ? options.minPeers : 2;
+    // Connectivity floor: ensure each peer obtains at least this many connections for robust gossip
+    const webKitBiasFloor = (environmentDetector.isBrowser && typeof navigator !== 'undefined' && /Safari|WebKit/i.test(navigator.userAgent)) ? 3 : 2;
+    this.connectivityFloor = options.connectivityFloor !== undefined ? options.connectivityFloor : webKitBiasFloor;
     this.autoConnect = options.autoConnect !== false; // Default to true, can be disabled by setting to false
     this.autoDiscovery = options.autoDiscovery !== false;
     this.evictionStrategy = options.evictionStrategy !== false;
@@ -85,6 +88,9 @@ export class PeerPigeonMesh extends EventEmitter {
 
     // Load saved signaling URL immediately
     this.storageManager.loadSignalingUrlFromStorage();
+
+    // Connectivity enforcement timer handle
+    this._connectivityEnforcementTimer = null;
   }
 
   setupManagerEventHandlers() {
@@ -419,6 +425,8 @@ export class PeerPigeonMesh extends EventEmitter {
         maxPeers: this.maxPeers
       });
       this.setupDiscoveryHandlers();
+      // Start connectivity enforcement loop once discovery is ready
+      this.startConnectivityEnforcement();
 
       // Initialize crypto manager if enabled
       if (this.cryptoManager) {
@@ -560,6 +568,10 @@ export class PeerPigeonMesh extends EventEmitter {
     if (this.peerDiscovery) {
       this.peerDiscovery.stop();
     }
+    if (this._connectivityEnforcementTimer) {
+      clearInterval(this._connectivityEnforcementTimer);
+      this._connectivityEnforcementTimer = null;
+    }
 
     this.connectionManager.disconnectAllPeers();
     this.connectionManager.cleanup();
@@ -570,6 +582,44 @@ export class PeerPigeonMesh extends EventEmitter {
     this.gossipManager.cleanup();
 
     this.emit('statusChanged', { type: 'disconnected' });
+  }
+
+  /**
+   * Periodically attempt extra connections for under-connected peers until reaching connectivityFloor.
+   */
+  startConnectivityEnforcement() {
+    if (this._connectivityEnforcementTimer) return;
+    const intervalMs = 3000; // modest cadence to avoid churn
+    this._connectivityEnforcementTimer = setInterval(() => {
+      if (!this.connected || !this.peerDiscovery) return;
+      const connectedCount = this.connectionManager.getConnectedPeerCount();
+      if (connectedCount >= this.connectivityFloor) return; // met floor
+
+      // Gather candidate peer IDs
+      const discovered = this.peerDiscovery.getDiscoveredPeers().map(p => p.peerId);
+      const notConnected = discovered.filter(pid => !this.connectionManager.hasPeer(pid));
+      if (notConnected.length === 0) return;
+
+      // Prioritize by XOR distance for diversity and stability
+      const prioritized = notConnected.sort((a, b) => {
+        const distA = this.peerDiscovery.calculateXorDistance(this.peerId, a);
+        const distB = this.peerDiscovery.calculateXorDistance(this.peerId, b);
+        return distA < distB ? -1 : 1;
+      });
+
+      // Attempt limited number per cycle
+      const attemptLimit = Math.min(prioritized.length, Math.max(1, this.connectivityFloor - connectedCount));
+      const batch = prioritized.slice(0, attemptLimit);
+      batch.forEach(pid => {
+        this.debug.log(`🔧 CONNECTIVITY FLOOR (${connectedCount}/${this.connectivityFloor}) attempting extra connection to ${pid.substring(0,8)}...`);
+        if (this.connectionManager.connectToPeerOverride) {
+          this.connectionManager.connectToPeerOverride(pid);
+        } else {
+          // Fallback: regular connect (may skip due to initiator logic)
+          this.connectionManager.connectToPeer(pid);
+        }
+      });
+    }, intervalMs);
   }
 
   // Configuration methods

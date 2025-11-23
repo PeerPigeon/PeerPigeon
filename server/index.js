@@ -51,6 +51,7 @@ export class PeerPigeonServer extends EventEmitter {
         this.networkPeers = new Map(); // networkName -> Set of peerIds
         this.hubs = new Map(); // peerId -> hub info (for peers identified as hubs)
         this.bootstrapConnections = new Map(); // bootstrapUri -> connection info
+        this.crossHubDiscoveredPeers = new Map(); // networkName -> Map(peerId -> peerData) for peers on other hubs
         this.isRunning = false;
         this.cleanupTimer = null;
         this.startTime = null;
@@ -1059,8 +1060,15 @@ export class PeerPigeonServer extends EventEmitter {
                     
                     console.log(`📥 Peer ${discoveredPeerId.substring(0, 8)}... discovered on another hub (network: ${discoveredNetwork})`);
                     
+                    // Cache for late joiners (so peers announcing later still learn about this peer)
+                    if (!this.crossHubDiscoveredPeers.has(discoveredNetwork)) {
+                        this.crossHubDiscoveredPeers.set(discoveredNetwork, new Map());
+                    }
+                    this.crossHubDiscoveredPeers.get(discoveredNetwork).set(discoveredPeerId, { ...data, cachedAt: Date.now() });
+
                     // Forward to all our local peers in the same network
                     const localPeers = this.getActivePeers(null, discoveredNetwork);
+                       let forwardCount = 0;
                     localPeers.forEach(localPeerId => {
                         const localConnection = this.connections.get(localPeerId);
                         if (localConnection) {
@@ -1072,8 +1080,10 @@ export class PeerPigeonServer extends EventEmitter {
                                 targetPeerId: localPeerId,
                                 timestamp: Date.now()
                             });
+                               forwardCount++;
                         }
                     });
+                       console.log(`📤 Forwarded to ${forwardCount} local peer(s) in network '${discoveredNetwork}'`);
                 }
                 break;
 
@@ -1490,6 +1500,27 @@ export class PeerPigeonServer extends EventEmitter {
             });
         });
 
+        // Include ALL cached cross-hub peers immediately (original behavior) to maximize candidate pool
+        const cachedRemotePeers = this.crossHubDiscoveredPeers.get(peerNetworkName);
+        if (cachedRemotePeers && newPeerConnection && newPeerConnection.readyState === newPeerConnection.OPEN) {
+            let sentCount = 0;
+            for (const [remotePeerId, remotePeerData] of cachedRemotePeers) {
+                if (validatedPeers.includes(remotePeerId)) continue;
+                this.sendToConnection(newPeerConnection, {
+                    type: 'peer-discovered',
+                    data: { peerId: remotePeerId, isHub: remotePeerData.isHub || false, ...remotePeerData },
+                    networkName: peerNetworkName,
+                    fromPeerId: 'system',
+                    targetPeerId: peerId,
+                    timestamp: Date.now()
+                });
+                sentCount++;
+            }
+            if (sentCount > 0) {
+                console.log(`📦 Sent ${sentCount} cached cross-hub peer(s) to late joiner ${peerId.substring(0,8)}... in network '${peerNetworkName}'`);
+            }
+        }
+
         this.emit('peerAnnounced', { peerId, networkName: peerNetworkName, isHub });
     }
 
@@ -1635,12 +1666,15 @@ export class PeerPigeonServer extends EventEmitter {
             return;
         }
 
-        // Check if sender is a hub
+        // Check if sender is a hub (either a regular hub or a hub via bootstrap)
         const senderPeerData = this.peerData.get(fromHubPeerId);
-        const isFromHub = senderPeerData?.isHub || senderPeerData?.networkName === this.hubMeshNamespace;
+        const isFromHub = senderPeerData?.isHub || 
+                         senderPeerData?.networkName === this.hubMeshNamespace ||
+                         this.hubs.has(fromHubPeerId);
 
         if (!isFromHub) {
             console.log(`⚠️ Received peer-discovered from non-hub peer ${fromHubPeerId.substring(0, 8)}... - ignoring`);
+            console.log(`   Debug: isHub=${senderPeerData?.isHub}, networkName=${senderPeerData?.networkName}, inHubsMap=${this.hubs.has(fromHubPeerId)}`);
             return;
         }
 

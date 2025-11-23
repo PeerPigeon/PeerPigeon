@@ -6089,8 +6089,14 @@ ${b64.match(/.{1,64}/g).join("\n")}
       }
       const shouldBeInitiator = this.mesh.peerId > targetPeerId;
       if (!shouldBeInitiator) {
-        this.debug.log(`\u{1F504} INITIATOR LOGIC: Not becoming initiator for ${targetPeerId.substring(0, 8)}... (our ID: ${this.mesh.peerId.substring(0, 8)}... is smaller)`);
-        return;
+        const connectedCount = this.getConnectedPeerCount();
+        const floor = this.mesh.connectivityFloor || 0;
+        if (connectedCount < floor) {
+          this.debug.log(`\u{1F504} INITIATOR OVERRIDE: Forcing initiation to ${targetPeerId.substring(0, 8)}... (connected ${connectedCount} < floor ${floor})`);
+        } else {
+          this.debug.log(`\u{1F504} INITIATOR LOGIC: Not becoming initiator for ${targetPeerId.substring(0, 8)}... (our ID smaller, connected ${connectedCount} >= floor ${floor})`);
+          return;
+        }
       }
       this.debug.log(`\u{1F504} INITIATOR LOGIC: Becoming initiator for ${targetPeerId.substring(0, 8)}... (our ID: ${this.mesh.peerId.substring(0, 8)}... is greater)`);
       if (!this.mesh.canAcceptMorePeers()) {
@@ -6159,6 +6165,33 @@ ${b64.match(/.{1,64}/g).join("\n")}
           });
         }
         this.cleanupFailedConnection(targetPeerId);
+      }
+    }
+    /**
+     * Force connection attempt ignoring standard initiator lexicographic rule (used for connectivity floor).
+     */
+    async connectToPeerOverride(targetPeerId) {
+      if (this.peers.has(targetPeerId) || this.mesh.peerDiscovery.isAttemptingConnection(targetPeerId)) return;
+      const connectedCount = this.getConnectedPeerCount();
+      const floor = this.mesh.connectivityFloor || 0;
+      if (connectedCount >= floor) return;
+      this.debug.log(`\u26A1 OVERRIDE CONNECT: initiating to ${targetPeerId.substring(0, 8)}... (connected ${connectedCount} < floor ${floor})`);
+      const options = {
+        localStream: null,
+        enableAudio: true,
+        enableVideo: true
+      };
+      const peerConnection = new PeerConnection(targetPeerId, true, options);
+      this.setupPeerConnectionHandlers(peerConnection);
+      this.peers.set(targetPeerId, peerConnection);
+      try {
+        await peerConnection.createConnection();
+        const offer = await peerConnection.createOffer();
+        await this.mesh.sendSignalingMessage({ type: "offer", data: offer }, targetPeerId);
+      } catch (e) {
+        this.debug.warn(`Override connection failed to ${targetPeerId.substring(0, 8)}...: ${e.message}`);
+        this.mesh.peerDiscovery.removeDiscoveredPeer(targetPeerId);
+        this.peers.delete(targetPeerId);
       }
     }
     cleanupFailedConnection(peerId) {
@@ -8038,6 +8071,11 @@ ${b64.match(/.{1,64}/g).join("\n")}
       }
       return messageId;
     }
+    /**
+     * Attempt adaptive resend of recent broadcasts to peers that connected
+     * after initial propagation window.
+     */
+    // (Rollback) attemptAdaptiveResends removed
     /**
        * Send a direct message to a specific peer using gossip routing (DM)
        * @param {string} targetPeerId - The destination peer's ID
@@ -11310,6 +11348,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.originalNetworkName = this.networkName;
       this.maxPeers = options.maxPeers !== void 0 ? options.maxPeers : 3;
       this.minPeers = options.minPeers !== void 0 ? options.minPeers : 2;
+      const webKitBiasFloor = environmentDetector.isBrowser && typeof navigator !== "undefined" && /Safari|WebKit/i.test(navigator.userAgent) ? 3 : 2;
+      this.connectivityFloor = options.connectivityFloor !== void 0 ? options.connectivityFloor : webKitBiasFloor;
       this.autoConnect = options.autoConnect !== false;
       this.autoDiscovery = options.autoDiscovery !== false;
       this.evictionStrategy = options.evictionStrategy !== false;
@@ -11340,6 +11380,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.setupManagerEventHandlers();
       this.cleanupManager.setupUnloadHandlers();
       this.storageManager.loadSignalingUrlFromStorage();
+      this._connectivityEnforcementTimer = null;
     }
     setupManagerEventHandlers() {
       this.connectionManager.addEventListener("peersUpdated", () => {
@@ -11577,6 +11618,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
           maxPeers: this.maxPeers
         });
         this.setupDiscoveryHandlers();
+        this.startConnectivityEnforcement();
         if (this.cryptoManager) {
           try {
             this.debug.log("\u{1F510} Initializing crypto manager with automatic key persistence...");
@@ -11684,12 +11726,46 @@ ${b64.match(/.{1,64}/g).join("\n")}
       if (this.peerDiscovery) {
         this.peerDiscovery.stop();
       }
+      if (this._connectivityEnforcementTimer) {
+        clearInterval(this._connectivityEnforcementTimer);
+        this._connectivityEnforcementTimer = null;
+      }
       this.connectionManager.disconnectAllPeers();
       this.connectionManager.cleanup();
       this.evictionManager.cleanup();
       this.cleanupManager.cleanup();
       this.gossipManager.cleanup();
       this.emit("statusChanged", { type: "disconnected" });
+    }
+    /**
+     * Periodically attempt extra connections for under-connected peers until reaching connectivityFloor.
+     */
+    startConnectivityEnforcement() {
+      if (this._connectivityEnforcementTimer) return;
+      const intervalMs = 3e3;
+      this._connectivityEnforcementTimer = setInterval(() => {
+        if (!this.connected || !this.peerDiscovery) return;
+        const connectedCount = this.connectionManager.getConnectedPeerCount();
+        if (connectedCount >= this.connectivityFloor) return;
+        const discovered = this.peerDiscovery.getDiscoveredPeers().map((p) => p.peerId);
+        const notConnected = discovered.filter((pid) => !this.connectionManager.hasPeer(pid));
+        if (notConnected.length === 0) return;
+        const prioritized = notConnected.sort((a, b) => {
+          const distA = this.peerDiscovery.calculateXorDistance(this.peerId, a);
+          const distB = this.peerDiscovery.calculateXorDistance(this.peerId, b);
+          return distA < distB ? -1 : 1;
+        });
+        const attemptLimit = Math.min(prioritized.length, Math.max(1, this.connectivityFloor - connectedCount));
+        const batch = prioritized.slice(0, attemptLimit);
+        batch.forEach((pid) => {
+          this.debug.log(`\u{1F527} CONNECTIVITY FLOOR (${connectedCount}/${this.connectivityFloor}) attempting extra connection to ${pid.substring(0, 8)}...`);
+          if (this.connectionManager.connectToPeerOverride) {
+            this.connectionManager.connectToPeerOverride(pid);
+          } else {
+            this.connectionManager.connectToPeer(pid);
+          }
+        });
+      }, intervalMs);
     }
     // Configuration methods
     setMaxPeers(maxPeers) {
