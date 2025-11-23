@@ -52,6 +52,8 @@ export class PeerPigeonServer extends EventEmitter {
         this.hubs = new Map(); // peerId -> hub info (for peers identified as hubs)
         this.bootstrapConnections = new Map(); // bootstrapUri -> connection info
         this.crossHubDiscoveredPeers = new Map(); // networkName -> Map(peerId -> peerData) for peers on other hubs
+        this.recentlyRelayedMessages = new Map(); // messageId -> timestamp (for deduplication)
+        this.relayedMessageTTL = 5000; // Keep relay records for 5 seconds
         this.isRunning = false;
         this.cleanupTimer = null;
         this.startTime = null;
@@ -710,6 +712,9 @@ export class PeerPigeonServer extends EventEmitter {
                 clearInterval(this.cleanupTimer);
                 this.cleanupTimer = null;
             }
+            
+            // Clear relay deduplication cache
+            this.recentlyRelayedMessages.clear();
 
             // Close all WebSocket connections
             for (const [peerId, ws] of this.connections) {
@@ -1366,84 +1371,90 @@ export class PeerPigeonServer extends EventEmitter {
         }
         this.networkPeers.get(peerNetworkName).add(peerId);
 
-        // If this is a hub, broadcast this peer to ALL other connected hubs (both bootstrap and incoming)
+        // If this is a hub, broadcast this peer to other connected hubs
         if (this.isHub && !isHub) {
-            const connectedHubs = [];
+            // Check if there are any other hubs at all
+            const hasOtherHubs = this.hubs.size > 0 || this.bootstrapConnections.size > 0;
             
-            // 1. Add outgoing bootstrap connections
-            for (const [uri, connInfo] of this.bootstrapConnections) {
-                if (connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
-                    connectedHubs.push({ type: 'bootstrap', ws: connInfo.ws, id: uri });
-                }
-            }
-            
-            // 2. Add incoming hub connections (hubs that connected to us)
-            for (const [hubPeerId, hubInfo] of this.hubs) {
-                // Skip self and the announcing hub
-                if (hubPeerId === this.hubPeerId || hubPeerId === peerId) {
-                    continue;
-                }
-                const hubConnection = this.connections.get(hubPeerId);
-                if (hubConnection && hubConnection.readyState === WebSocket.OPEN) {
-                    connectedHubs.push({ type: 'incoming', ws: hubConnection, id: hubPeerId });
-                }
-            }
-            
-            if (connectedHubs.length > 0) {
-                console.log(`📡 Broadcasting peer ${peerId.substring(0, 8)}... to ${connectedHubs.length} connected hub(s)`);
-                const peerAnnouncement = {
-                    type: 'peer-discovered',
-                    data: {
+            // PRIORITY: Use P2P hub mesh if ready AND there are other hubs
+            if (this.hubMesh && this.hubMeshReady && hasOtherHubs) {
+                const p2pConnectedHubs = this.hubMesh.connectionManager.getConnectedPeers();
+                if (p2pConnectedHubs.length > 0) {
+                    console.log(`📡 Broadcasting peer ${peerId.substring(0, 8)}... to ${p2pConnectedHubs.length} P2P-connected hub(s) [MESH MODE]`);
+                    
+                    const p2pRelayMessage = {
+                        type: 'peer-announce-relay',
                         peerId,
-                        isHub: false,
-                        ...message.data
-                    },
-                    networkName: peerNetworkName,
-                    fromPeerId: 'system',
-                    timestamp: Date.now()
-                };
-                
-                for (const hub of connectedHubs) {
-                    try {
-                        if (hub.type === 'bootstrap') {
-                            hub.ws.send(JSON.stringify(peerAnnouncement));
-                        } else {
-                            this.sendToConnection(hub.ws, peerAnnouncement);
+                        networkName: peerNetworkName,
+                        peerData: {
+                            peerId,
+                            isHub: false,
+                            ...message.data
+                        },
+                        timestamp: Date.now()
+                    };
+                    
+                    p2pConnectedHubs.forEach(hubPeerConnection => {
+                        try {
+                            const hubPeerId = hubPeerConnection.peerId;
+                            this.hubMesh.sendMessage(p2pRelayMessage, hubPeerId);
+                        } catch (error) {
+                            const hubPeerId = hubPeerConnection.peerId || 'unknown';
+                            console.error(`❌ Error broadcasting to P2P hub ${hubPeerId.substring(0, 8)}...:`, error.message);
                         }
-                    } catch (error) {
-                        console.error(`❌ Error broadcasting to hub ${hub.id}:`, error.message);
+                    });
+                }
+                // When mesh is ready and we have other hubs, ONLY use P2P - skip WebSocket broadcast
+                // (Fall through to peer list broadcast below)
+            } else if (hasOtherHubs) {
+                // Fallback: Use WebSocket connections (only when mesh NOT ready)
+                const connectedHubs = [];
+                
+                // 1. Add outgoing bootstrap connections
+                for (const [uri, connInfo] of this.bootstrapConnections) {
+                    if (connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
+                        connectedHubs.push({ type: 'bootstrap', ws: connInfo.ws, id: uri });
                     }
                 }
-            }
-        }
-
-        // ALSO broadcast through P2P hub mesh if available and mesh is ready
-        if (this.isHub && !isHub && this.hubMesh && this.hubMeshReady) {
-            const p2pConnectedHubs = this.hubMesh.connectionManager.getConnectedPeers();
-            if (p2pConnectedHubs.length > 0) {
-                console.log(`📡 Broadcasting peer ${peerId.substring(0, 8)}... to ${p2pConnectedHubs.length} P2P-connected hub(s)`);
                 
-                const p2pRelayMessage = {
-                    type: 'peer-announce-relay',
-                    peerId,
-                    networkName: peerNetworkName,
-                    peerData: {
-                        peerId,
-                        isHub: false,
-                        ...message.data
-                    },
-                    timestamp: Date.now()
-                };
-                
-                p2pConnectedHubs.forEach(hubPeerConnection => {
-                    try {
-                        const hubPeerId = hubPeerConnection.peerId;
-                        this.hubMesh.sendMessage(p2pRelayMessage, hubPeerId);
-                    } catch (error) {
-                        const hubPeerId = hubPeerConnection.peerId || 'unknown';
-                        console.error(`❌ Error broadcasting to P2P hub ${hubPeerId.substring(0, 8)}...:`, error.message);
+                // 2. Add incoming hub connections (hubs that connected to us)
+                for (const [hubPeerId, hubInfo] of this.hubs) {
+                    // Skip self and the announcing hub
+                    if (hubPeerId === this.hubPeerId || hubPeerId === peerId) {
+                        continue;
                     }
-                });
+                    const hubConnection = this.connections.get(hubPeerId);
+                    if (hubConnection && hubConnection.readyState === WebSocket.OPEN) {
+                        connectedHubs.push({ type: 'incoming', ws: hubConnection, id: hubPeerId });
+                    }
+                }
+                
+                if (connectedHubs.length > 0) {
+                    console.log(`📡 Broadcasting peer ${peerId.substring(0, 8)}... to ${connectedHubs.length} WebSocket hub(s) [BOOTSTRAP MODE]`);
+                    const peerAnnouncement = {
+                        type: 'peer-discovered',
+                        data: {
+                            peerId,
+                            isHub: false,
+                            ...message.data
+                        },
+                        networkName: peerNetworkName,
+                        fromPeerId: 'system',
+                        timestamp: Date.now()
+                    };
+                    
+                    for (const hub of connectedHubs) {
+                        try {
+                            if (hub.type === 'bootstrap') {
+                                hub.ws.send(JSON.stringify(peerAnnouncement));
+                            } else {
+                                this.sendToConnection(hub.ws, peerAnnouncement);
+                            }
+                        } catch (error) {
+                            console.error(`❌ Error broadcasting to hub ${hub.id}:`, error.message);
+                        }
+                    }
+                }
             }
         }
 
@@ -1579,21 +1590,49 @@ export class PeerPigeonServer extends EventEmitter {
             this.sendToConnection(targetConnection, responseMessage);
         } else {
             // Target peer not on this hub - relay to other hubs
+            
+            // Create unique message ID for deduplication (type + from + to + timestamp)
+            const messageId = `${message.type}:${peerId}:${targetPeerId}:${message.timestamp || Date.now()}`;
+            
+            // Check if we've already relayed this message recently
+            if (this.recentlyRelayedMessages.has(messageId)) {
+                if (this.verboseLogging) {
+                    console.log(`⏭️  Skipping duplicate relay of ${message.type} (${messageId})`);
+                }
+                return;
+            }
+            
+            // Mark message as relayed
+            this.recentlyRelayedMessages.set(messageId, Date.now());
+            
             console.log(`🔄 Target peer ${targetPeerId.substring(0, 8)}... NOT LOCAL, relaying to other hubs (network: ${networkName})`);
             
             let relayed = false;
             
+            // Check if there are any other hubs at all
+            const hasOtherHubs = this.hubs.size > 0 || this.bootstrapConnections.size > 0;
+            
             // PRIORITY: Try P2P hub mesh first if available and ready
-            if (this.isHub && this.hubMesh && this.hubMeshReady) {
+            if (this.isHub && this.hubMesh && this.hubMeshReady && hasOtherHubs) {
                 const p2pConnectedHubs = this.hubMesh.connectionManager.getConnectedPeers();
                 if (p2pConnectedHubs.length > 0) {
                     console.log(`📡 Relaying ${message.type} through P2P hub mesh (${p2pConnectedHubs.length} hubs)`);
                     this.forwardSignalToHubMesh(targetPeerId, responseMessage);
                     relayed = true;
+                } else {
+                    console.log(`⚠️  Hub mesh ready but no P2P connections available`);
+                }
+                
+                // CRITICAL: When mesh is ready AND we have other hubs, ONLY use P2P - do NOT fall back to WebSocket
+                if (this.hubMeshReady && hasOtherHubs) {
+                    if (!relayed) {
+                        console.log(`❌ FAILED TO RELAY via P2P: Mesh ready but no connections for ${targetPeerId.substring(0, 8)}...`);
+                    }
+                    return; // Exit early - no WebSocket fallback when mesh is ready and other hubs exist
                 }
             }
             
-            // Fallback: Try relaying through WebSocket bootstrap hubs
+            // Fallback: Try relaying through WebSocket bootstrap hubs (ONLY if mesh not ready)
             if (!relayed && this.bootstrapConnections.size > 0) {
                 console.log(`🔗 Relaying ${message.type} through ${this.bootstrapConnections.size} WebSocket bootstrap connection(s)`);
                 
@@ -1606,7 +1645,7 @@ export class PeerPigeonServer extends EventEmitter {
                 }
             }
             
-            // Final fallback: Forward to WebSocket-connected hubs
+            // Final fallback: Forward to WebSocket-connected hubs (ONLY if mesh not ready)
             if (!relayed && this.hubs.size > 0) {
                 console.log(`🔗 Forwarding ${message.type} to ${this.hubs.size} WebSocket-connected hub(s)`);
                 
@@ -1875,6 +1914,20 @@ export class PeerPigeonServer extends EventEmitter {
 
         if (cleanedUp > 0) {
             console.log(`🧹 Periodic cleanup: removed ${cleanedUp} stale connections, ${this.connections.size} active across ${this.networkPeers.size} networks`);
+        }
+        
+        // Clean up old relayed message records
+        const now = Date.now();
+        let relayRecordsRemoved = 0;
+        for (const [messageId, timestamp] of this.recentlyRelayedMessages) {
+            if (now - timestamp > this.relayedMessageTTL) {
+                this.recentlyRelayedMessages.delete(messageId);
+                relayRecordsRemoved++;
+            }
+        }
+        
+        if (relayRecordsRemoved > 0 && this.verboseLogging) {
+            console.log(`🧹 Cleaned up ${relayRecordsRemoved} old relay records`);
         }
     }
 
