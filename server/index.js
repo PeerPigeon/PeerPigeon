@@ -1050,28 +1050,10 @@ export class PeerPigeonServer extends EventEmitter {
 
             case 'peer-discovered':
                 if (data?.isHub) {
-                    console.log(`🏢 Discovered hub via bootstrap: ${data.peerId?.substring(0, 8)}...`);
+                    // Hub discovered via bootstrap - DON'T forward to prevent loops
+                    // Hubs will discover each other via their local mesh namespace connections
+                    console.log(`🏢 Hub ${data.peerId?.substring(0, 8)}... seen via bootstrap ${uri} (not forwarding to prevent loop)`);
                     this.emit('hubDiscovered', { peerId: data.peerId, via: uri, data });
-                    
-                    // Forward to our local hub mesh client so it can form P2P connections
-                    const discoveredNetwork = networkName || this.hubMeshNamespace;
-                    if (discoveredNetwork === this.hubMeshNamespace) {
-                        console.log(`📥 Forwarding hub ${data.peerId?.substring(0, 8)}... to local mesh client`);
-                        const localPeers = this.getActivePeers(null, discoveredNetwork);
-                        localPeers.forEach(localPeerId => {
-                            const localConnection = this.connections.get(localPeerId);
-                            if (localConnection) {
-                                this.sendToConnection(localConnection, {
-                                    type: 'peer-discovered',
-                                    data,
-                                    networkName: discoveredNetwork,
-                                    fromPeerId: 'system',
-                                    targetPeerId: localPeerId,
-                                    timestamp: Date.now()
-                                });
-                            }
-                        });
-                    }
                 } else if (data?.peerId) {
                     // Regular peer discovered on another hub - notify our local peers in same network
                     const discoveredPeerId = data.peerId;
@@ -1125,40 +1107,13 @@ export class PeerPigeonServer extends EventEmitter {
                     } else {
                         // Not our peer - check if we should relay
                         
-                        // CRITICAL: If hub mesh is ready, DO NOT relay via bootstrap WebSocket - clients should use P2P mesh
-                        if (this.hubMeshReady) {
-                            if (this.verboseLogging) {
-                                console.log(`⏭️  Skipping bootstrap relay of ${type} - hub mesh is ready, P2P should be used`);
-                            }
-                            break; // Exit - no bootstrap relay when mesh is ready
+                        // CRITICAL: DO NOT relay via bootstrap WebSocket - this causes loops
+                        // Clients should signal directly through their hub, and hubs use P2P mesh
+                        if (this.verboseLogging) {
+                            console.log(`⏭️  Skipping bootstrap relay of ${type} - not relaying client signaling via bootstrap`);
                         }
-                        
-                        // Create unique message ID for deduplication (include signal data hash)
-                        const dataHash = this.hashSignalData(data);
-                        const messageId = `${type}:${fromPeerId}:${targetPeerId}:${dataHash}`;
-                        
-                        // Check if we've already relayed this message recently
-                        if (this.recentlyRelayedMessages.has(messageId)) {
-                            if (this.verboseLogging) {
-                                console.log(`⏭️  Skipping duplicate bootstrap relay of ${type} (${messageId.substring(0, 50)}...)`);
-                            }
-                            break; // Skip this message
-                        }
-                        
-                        // Mark message as relayed
-                        this.recentlyRelayedMessages.set(messageId, Date.now());
-                        
-                        console.log(`🔄 Relaying ${type} from ${fromPeerId?.substring(0, 8)}... for ${targetPeerId.substring(0, 8)}... (not local) [BOOTSTRAP MODE]`);
-                        let relayCount = 0;
-                        for (const [otherUri, connInfo] of this.bootstrapConnections) {
-                            if (otherUri !== uri && connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
-                                connInfo.ws.send(JSON.stringify(message));
-                                relayCount++;
-                            }
-                        }
-                        if (this.verboseLogging && relayCount > 0) {
-                            console.log(`   ✅ Relayed to ${relayCount} bootstrap hub(s)`);
-                        }
+                        // Completely disable bootstrap relay to prevent loops
+                        break;
                     }
                 } else {
                     console.log(`⚠️  Received ${type} without targetPeerId via ${uri}`);
