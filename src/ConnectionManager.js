@@ -190,12 +190,19 @@ export class ConnectionManager extends EventEmitter {
    * Force connection attempt ignoring standard initiator lexicographic rule (used for connectivity floor).
    */
   async connectToPeerOverride(targetPeerId) {
-    // Skip if already connected or attempting
-    if (this.peers.has(targetPeerId) || this.mesh.peerDiscovery.isAttemptingConnection(targetPeerId)) return;
+    // Skip if already connected
+    if (this.peers.has(targetPeerId)) return;
+    
     const connectedCount = this.getConnectedPeerCount();
     const floor = this.mesh.connectivityFloor || 0;
     if (connectedCount >= floor) return; // Only override if below floor
+    
+    // Don't skip if attempting - override takes precedence when below floor
     this.debug.log(`⚡ OVERRIDE CONNECT: initiating to ${targetPeerId.substring(0,8)}... (connected ${connectedCount} < floor ${floor})`);
+    
+    // Clear any existing attempt record to allow override
+    this.mesh.peerDiscovery.clearConnectionAttempt(targetPeerId);
+    
     // Temporarily treat as initiator regardless of lexicographic order
     const options = {
       localStream: null,

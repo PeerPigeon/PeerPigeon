@@ -709,9 +709,10 @@ async function runTest() {
         // Start all peers
         await startPeers();
         
-        // Wait a bit for connections to establish
-        console.log('\n⏳ Waiting for mesh to stabilize...\n');
-        await new Promise(resolve => setTimeout(resolve, 10000));
+        // Wait for connectivity floor enforcement to run multiple cycles
+        // (3s interval, need ~4 cycles for full mesh = 12-15s)
+        console.log('\n⏳ Waiting for mesh to stabilize (15s for connectivity floor enforcement)...\n');
+        await new Promise(resolve => setTimeout(resolve, 15000));
         
         // Test messaging
         await testMessageBroadcast();

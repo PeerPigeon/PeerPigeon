@@ -11742,7 +11742,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
      */
     startConnectivityEnforcement() {
       if (this._connectivityEnforcementTimer) return;
-      const intervalMs = 3e3;
+      const intervalMs = 2e3;
       this._connectivityEnforcementTimer = setInterval(() => {
         if (!this.connected || !this.peerDiscovery) return;
         const connectedCount = this.connectionManager.getConnectedPeerCount();
@@ -11755,7 +11755,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
           const distB = this.peerDiscovery.calculateXorDistance(this.peerId, b);
           return distA < distB ? -1 : 1;
         });
-        const attemptLimit = Math.min(prioritized.length, Math.max(1, this.connectivityFloor - connectedCount));
+        const needed = this.connectivityFloor - connectedCount;
+        const attemptLimit = Math.min(prioritized.length, Math.max(2, needed * 2));
         const batch = prioritized.slice(0, attemptLimit);
         batch.forEach((pid) => {
           this.debug.log(`\u{1F527} CONNECTIVITY FLOOR (${connectedCount}/${this.connectivityFloor}) attempting extra connection to ${pid.substring(0, 8)}...`);

@@ -589,7 +589,7 @@ export class PeerPigeonMesh extends EventEmitter {
    */
   startConnectivityEnforcement() {
     if (this._connectivityEnforcementTimer) return;
-    const intervalMs = 3000; // modest cadence to avoid churn
+    const intervalMs = 2000; // More aggressive: check every 2s instead of 3s
     this._connectivityEnforcementTimer = setInterval(() => {
       if (!this.connected || !this.peerDiscovery) return;
       const connectedCount = this.connectionManager.getConnectedPeerCount();
@@ -607,8 +607,9 @@ export class PeerPigeonMesh extends EventEmitter {
         return distA < distB ? -1 : 1;
       });
 
-      // Attempt limited number per cycle
-      const attemptLimit = Math.min(prioritized.length, Math.max(1, this.connectivityFloor - connectedCount));
+      // More aggressive: attempt up to 2x the needed connections per cycle to handle failures
+      const needed = this.connectivityFloor - connectedCount;
+      const attemptLimit = Math.min(prioritized.length, Math.max(2, needed * 2));
       const batch = prioritized.slice(0, attemptLimit);
       batch.forEach(pid => {
         this.debug.log(`🔧 CONNECTIVITY FLOOR (${connectedCount}/${this.connectivityFloor}) attempting extra connection to ${pid.substring(0,8)}...`);
