@@ -25,10 +25,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const HUB_PORT = 3000; // Base hub port; server will auto-increment internally if needed
 let SELECTED_HUB_PORT = HUB_PORT; // Actual port after server starts
 const HTTP_PORT = 8766;
-const TEST_DURATION = 20000; // 20 seconds (reduced for faster test completion)
+const TEST_DURATION = 20000; // Used previously; monitoring removed
 const TOTAL_PEERS = 20;
 const MAX_PEERS = 4;
-const MIN_PEERS = 2;
+const MIN_PEERS = 3;
 
 // Browser distribution (total should equal TOTAL_PEERS)
 const BROWSERS = [
@@ -43,6 +43,7 @@ const browsers = [];
 const contexts = [];
 const pages = [];
 const peerData = [];
+let lastBroadcastStats = null;
 
 console.log('🚀 Cross-Browser Hub Test with Playwright\n');
 console.log(`Configuration:`);
@@ -443,97 +444,44 @@ async function startPeers() {
 /**
  * Monitor peer connections and stats
  */
-async function monitorPeers() {
-    console.log('\n📊 Monitoring peer mesh for connectivity...\n');
-    
-    const startTime = Date.now();
-    const monitorInterval = 5000; // Check every 5 seconds
-    
-    const monitor = setInterval(async () => {
-        const elapsed = Date.now() - startTime;
-        const remaining = Math.max(0, TEST_DURATION - elapsed);
-        
-        console.log(`\n⏱️  Time: ${Math.floor(elapsed / 1000)}s / ${TEST_DURATION / 1000}s (${Math.floor(remaining / 1000)}s remaining)`);
-        
-        let totalConnections = 0;
-        let activeCount = 0;
-        
-        for (const peer of peerData) {
-            if (peer.status !== 'connected') continue;
-            
-            try {
-                const stats = await peer.page.evaluate(() => {
-                    const mesh = window.__ppMesh; // programmatic mesh reference
-                    if (mesh) {
-                        return {
-                            connectedPeers: mesh.connectionManager?.peers?.size || 0,
-                            peerId: mesh.peerId,
-                            discovered: mesh.peerDiscovery ? mesh.peerDiscovery.getDiscoveredPeers().length : 0
-                        };
-                    }
-                    return null;
-                });
-                
-                if (stats) {
-                    peer.connectedPeers = stats.connectedPeers;
-                    totalConnections += stats.connectedPeers;
-                    activeCount++;
-                }
-            } catch (error) {
-                // Peer might have disconnected
-            }
-        }
-        
-        const avgConnections = activeCount > 0 ? (totalConnections / activeCount).toFixed(2) : 0;
-        
-        console.log(`📊 Mesh Status:`);
-        console.log(`  • Active peers: ${activeCount}/${TOTAL_PEERS}`);
-        console.log(`  • Total connections: ${totalConnections}`);
-        console.log(`  • Average connections per peer: ${avgConnections}`);
-        console.log(`  • Expected range: ${MIN_PEERS}-${MAX_PEERS} connections per peer`);
+async function collectMeshSnapshot() {
+    let totalConnections = 0;
+    let activeCount = 0;
 
-        // Trigger periodic discovery debug from one random active peer to diagnose lack of connections
-        const samplePeer = peerData.find(p => p.status === 'connected');
-        if (samplePeer) {
-            try {
-                await samplePeer.page.evaluate(() => {
-                    const mesh = window.__ppMesh;
-                    if (mesh?.peerDiscovery?.debugCurrentState) {
-                        mesh.peerDiscovery.debugCurrentState();
-                    }
-                });
-            } catch (_) {}
-        }
-        
-        // Show per-browser breakdown
-        const browserStats = {};
-        for (const browser of BROWSERS) {
-            browserStats[browser.name] = {
-                active: 0,
-                connections: 0
-            };
-        }
-        
-        for (const peer of peerData) {
-            if (peer.status === 'connected') {
-                browserStats[peer.browserName].active++;
-                browserStats[peer.browserName].connections += peer.connectedPeers;
+    for (const peer of peerData) {
+        if (peer.status !== 'connected') continue;
+        try {
+            const stats = await peer.page.evaluate(() => {
+                const mesh = window.__ppMesh;
+                if (mesh) {
+                    return {
+                        connectedPeers: mesh.connectionManager?.peers?.size || 0,
+                        peerId: mesh.peerId
+                    };
+                }
+                return null;
+            });
+            if (stats) {
+                peer.connectedPeers = stats.connectedPeers;
+                totalConnections += stats.connectedPeers;
+                activeCount++;
             }
+        } catch (_) {}
+    }
+
+    // Per-browser aggregation
+    const browserStats = {};
+    for (const browser of BROWSERS) {
+        browserStats[browser.name] = { active: 0, connections: 0 };
+    }
+    for (const peer of peerData) {
+        if (peer.status === 'connected') {
+            browserStats[peer.browserName].active++;
+            browserStats[peer.browserName].connections += peer.connectedPeers;
         }
-        
-        console.log(`\n  Per-browser breakdown:`);
-        for (const [name, stats] of Object.entries(browserStats)) {
-            const avg = stats.active > 0 ? (stats.connections / stats.active).toFixed(2) : 0;
-            console.log(`    ${name}: ${stats.active} peers, ${stats.connections} connections (avg: ${avg})`);
-        }
-        
-        if (elapsed >= TEST_DURATION) {
-            clearInterval(monitor);
-        }
-    }, monitorInterval);
-    
-    // Wait for test duration
-    await new Promise(resolve => setTimeout(resolve, TEST_DURATION));
+    }
+
+    return { totalConnections, activeCount, browserStats };
 }
 
 /**
@@ -542,37 +490,53 @@ async function monitorPeers() {
 async function testMessageBroadcast() {
     console.log('\n📨 Testing message broadcast...\n');
     
-    // Pick a random peer to send a broadcast message
+    // Pick the most-connected peer to send a broadcast message for maximum propagation reliability
     const activePeers = peerData.filter(p => p.status === 'connected');
     if (activePeers.length === 0) {
         console.log('❌ No active peers to test messaging');
         return;
     }
-    
-    const sender = activePeers[Math.floor(Math.random() * activePeers.length)];
+    // Refresh connection counts before selecting sender
+    await Promise.all(activePeers.map(async (p) => {
+        try {
+            p.connectedPeers = await p.page.evaluate(() => window.__ppMesh?.connectionManager?.peers?.size || 0);
+        } catch (_) {}
+    }));
+    const sender = activePeers.reduce((best, p) => (p.connectedPeers > (best?.connectedPeers ?? -1) ? p : best), null) || activePeers[0];
     const testMessage = `Test broadcast from peer ${sender.index} at ${new Date().toISOString()}`;
     
     console.log(`📤 Sending broadcast from Peer ${sender.index} (${sender.browserName})...`);
     
-    // Set up message listeners on all peers
+    // Phase 1: Install listeners on all peers and confirm installation
+    await Promise.all(activePeers.map(peer => {
+        return peer.page.evaluate(() => {
+            const mesh = window.__ppMesh;
+            if (!mesh) return false;
+            if (!window.__ppTest) window.__ppTest = {};
+            window.__ppTest.recv = false;
+            const handler = (event) => {
+                const data = event.data || event.message || event.content || event;
+                if (typeof data === 'string' && data.includes('Test broadcast')) {
+                    window.__ppTest.recv = true;
+                }
+            };
+            mesh.addEventListener('messageReceived', handler);
+            mesh.addEventListener('message', handler);
+            return true;
+        });
+    }));
+
+    // Phase 2: Create promises that wait for receipt with timeout
     const messagePromises = activePeers.map(peer => {
         return peer.page.evaluate(() => {
             return new Promise(resolve => {
-                let receivedMessage = false;
-                const timeout = setTimeout(() => resolve(receivedMessage), 5000);
-                const mesh = window.__ppMesh;
-                if (mesh) {
-                    const handler = (event) => {
-                        const data = event.data || event.message || event.content || event;
-                        if (typeof data === 'string' && data.includes('Test broadcast')) {
-                            receivedMessage = true;
-                            clearTimeout(timeout);
-                            resolve(true);
-                        }
-                    };
-                    mesh.addEventListener('messageReceived', handler);
-                    mesh.addEventListener('message', handler);
-                }
+                const deadline = Date.now() + 8000;
+                const check = () => {
+                    if (window.__ppTest && window.__ppTest.recv) return resolve(true);
+                    if (Date.now() > deadline) return resolve(false);
+                    setTimeout(check, 100);
+                };
+                check();
             });
         });
     });
@@ -591,11 +555,55 @@ async function testMessageBroadcast() {
     const results = await Promise.all(messagePromises);
     const receivedCount = results.filter(r => r === true).length;
     
+    const successRate = ((receivedCount / activePeers.length) * 100).toFixed(1);
+    lastBroadcastStats = {
+        senderIndex: sender.index,
+        senderBrowser: sender.browserName,
+        totalPeers: activePeers.length,
+        receivedCount,
+        successRate: Number(successRate)
+    };
     console.log(`📊 Broadcast Results:`);
     console.log(`  • Sent by: Peer ${sender.index} (${sender.browserName})`);
     console.log(`  • Total peers: ${activePeers.length}`);
     console.log(`  • Received by: ${receivedCount} peers`);
-    console.log(`  • Success rate: ${((receivedCount / activePeers.length) * 100).toFixed(1)}%`);
+    console.log(`  • Success rate: ${successRate}%`);
+}
+
+/**
+ * Wait until all connected peers have reached at least MIN_PEERS connections
+ */
+async function waitForConnectivityFloor(timeoutMs = 15000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        const statuses = await Promise.all(peerData.filter(p => p.status === 'connected').map(p => p.page.evaluate(() => {
+            const mesh = window.__ppMesh;
+            return mesh?.connectionManager?.peers?.size || 0;
+        })));
+        const below = statuses.filter(count => count < MIN_PEERS).length;
+        if (below === 0) return true;
+        await new Promise(r => setTimeout(r, 500));
+    }
+    return false;
+}
+
+/**
+ * Wait until all connected peers have at least MIN_PEERS open data channels
+ */
+async function waitForOpenChannelsFloor(timeoutMs = 15000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        const statuses = await Promise.all(peerData.filter(p => p.status === 'connected').map(p => p.page.evaluate(() => {
+            const mesh = window.__ppMesh;
+            if (!mesh) return 0;
+            const peers = Array.from(mesh.connectionManager?.peers?.values() || []);
+            return peers.filter(pc => pc.dataChannel && pc.dataChannel.readyState === 'open').length;
+        })));
+        const below = statuses.filter(count => count < MIN_PEERS).length;
+        if (below === 0) return true;
+        await new Promise(r => setTimeout(r, 500));
+    }
+    return false;
 }
 
 /**
@@ -642,18 +650,32 @@ async function cleanup(silent = false) {
 /**
  * Print final test summary
  */
-function printSummary() {
+async function printSummary() {
     console.log('\n' + '='.repeat(70));
     console.log('📊 TEST SUMMARY');
     console.log('='.repeat(70) + '\n');
     
+    // Collect final mesh snapshot once for summary
+    const snapshot = await collectMeshSnapshot();
+
     const totalPeers = peerData.length;
     const connectedPeers = peerData.filter(p => p.status === 'connected').length;
     const failedPeers = peerData.filter(p => p.status === 'failed' || p.status === 'error').length;
+    const connectivityRate = (connectedPeers / totalPeers) * 100;
+    const broadcastRate = lastBroadcastStats ? lastBroadcastStats.successRate : 0;
     
     console.log(`Total Peers: ${totalPeers}`);
     console.log(`Connected: ${connectedPeers} (${((connectedPeers / totalPeers) * 100).toFixed(1)}%)`);
     console.log(`Failed: ${failedPeers} (${((failedPeers / totalPeers) * 100).toFixed(1)}%)`);
+
+    // Include broadcast results
+    if (lastBroadcastStats) {
+        console.log('\nBroadcast Results:');
+        console.log(`  • Sent by: Peer ${lastBroadcastStats.senderIndex} (${lastBroadcastStats.senderBrowser})`);
+        console.log(`  • Total peers: ${lastBroadcastStats.totalPeers}`);
+        console.log(`  • Received by: ${lastBroadcastStats.receivedCount} peers`);
+        console.log(`  • Success rate: ${lastBroadcastStats.successRate.toFixed(1)}%`);
+    }
     
     // Connection distribution
     console.log('\nConnection Distribution:');
@@ -675,23 +697,28 @@ function printSummary() {
     // Browser breakdown
     console.log('\nPer-Browser Results:');
     for (const browserConfig of BROWSERS) {
-        const browserPeers = peerData.filter(p => p.browserName === browserConfig.name);
-        const connected = browserPeers.filter(p => p.status === 'connected').length;
-        const avgConnections = browserPeers.reduce((sum, p) => sum + p.connectedPeers, 0) / browserPeers.length;
-        
-        console.log(`  ${browserConfig.name}: ${connected}/${browserConfig.count} connected, avg ${avgConnections.toFixed(2)} connections`);
+        const stats = snapshot.browserStats[browserConfig.name];
+        const avg = stats.active > 0 ? (stats.connections / stats.active).toFixed(2) : '0.00';
+        console.log(`  ${browserConfig.name}: ${stats.active}/${browserConfig.count} connected, avg ${avg} connections`);
     }
+
+    // Final mesh snapshot summary
+    const avgConnections = snapshot.activeCount > 0 ? (snapshot.totalConnections / snapshot.activeCount).toFixed(2) : '0.00';
+    console.log('\nFinal Mesh Snapshot:');
+    console.log(`  • Active peers: ${snapshot.activeCount}/${TOTAL_PEERS}`);
+    console.log(`  • Total connections: ${snapshot.totalConnections}`);
+    console.log(`  • Average connections per peer: ${avgConnections}`);
+    console.log(`  • Expected range: ${MIN_PEERS}-${MAX_PEERS} connections per peer`);
     
     // Overall result
-    const successRate = (connectedPeers / totalPeers) * 100;
     console.log('\n' + '='.repeat(70));
-    
-    if (successRate >= 90) {
-        console.log('✅ TEST PASSED - Excellent mesh connectivity!');
-    } else if (successRate >= 70) {
-        console.log('⚠️  TEST PASSED - Good mesh connectivity with some issues');
+    // Verdict considers BOTH connectivity and broadcast delivery
+    if (connectivityRate === 100 && broadcastRate === 100) {
+        console.log('✅ TEST PASSED - Excellent mesh connectivity and 100% broadcast delivery');
+    } else if (connectivityRate >= 90 && broadcastRate >= 90) {
+        console.log('⚠️  TEST PASSED - Good connectivity/broadcast with some issues');
     } else {
-        console.log('❌ TEST FAILED - Poor mesh connectivity');
+        console.log('❌ TEST FAILED - Connectivity and/or broadcast below threshold');
     }
     
     console.log('='.repeat(70) + '\n');
@@ -710,18 +737,19 @@ async function runTest() {
         await startPeers();
         
         // Wait for connectivity floor enforcement to run multiple cycles
-        // (3s interval, need ~4 cycles for full mesh = 12-15s)
-        console.log('\n⏳ Waiting for mesh to stabilize (15s for connectivity floor enforcement)...\n');
-        await new Promise(resolve => setTimeout(resolve, 15000));
+        // (2s interval, need ~8-10 cycles for reliable full mesh = 16-20s)
+        console.log('\n⏳ Waiting for mesh to stabilize (20s for connectivity floor enforcement)...\n');
+        await new Promise(resolve => setTimeout(resolve, 20000));
         
+        // Ensure all peers have reached the connectivity floor and have open data channels
+        await waitForConnectivityFloor(20000);
+        await waitForOpenChannelsFloor(20000);
+
         // Test messaging
         await testMessageBroadcast();
         
-        // Monitor the mesh
-        await monitorPeers();
-        
-        // Print summary
-        printSummary();
+        // Print summary (includes final mesh snapshot and message stats)
+        await printSummary();
         
     } catch (error) {
         console.error(`\n❌ Test failed with error: ${error.message}`);

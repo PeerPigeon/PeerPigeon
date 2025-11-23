@@ -38,8 +38,9 @@ export class PeerPigeonMesh extends EventEmitter {
     this.maxPeers = options.maxPeers !== undefined ? options.maxPeers : 3;
     this.minPeers = options.minPeers !== undefined ? options.minPeers : 2;
     // Connectivity floor: ensure each peer obtains at least this many connections for robust gossip
-    const webKitBiasFloor = (environmentDetector.isBrowser && typeof navigator !== 'undefined' && /Safari|WebKit/i.test(navigator.userAgent)) ? 3 : 2;
-    this.connectivityFloor = options.connectivityFloor !== undefined ? options.connectivityFloor : webKitBiasFloor;
+    // Default to 3 across browsers (capped by maxPeers) for consistent propagation
+    const defaultFloor = Math.min(3, this.maxPeers ?? 3);
+    this.connectivityFloor = options.connectivityFloor !== undefined ? options.connectivityFloor : defaultFloor;
     this.autoConnect = options.autoConnect !== false; // Default to true, can be disabled by setting to false
     this.autoDiscovery = options.autoDiscovery !== false;
     this.evictionStrategy = options.evictionStrategy !== false;
@@ -589,7 +590,7 @@ export class PeerPigeonMesh extends EventEmitter {
    */
   startConnectivityEnforcement() {
     if (this._connectivityEnforcementTimer) return;
-    const intervalMs = 2000; // More aggressive: check every 2s instead of 3s
+    const intervalMs = 4000; // Slower enforcement to avoid connection storms
     this._connectivityEnforcementTimer = setInterval(() => {
       if (!this.connected || !this.peerDiscovery) return;
       const connectedCount = this.connectionManager.getConnectedPeerCount();
@@ -597,7 +598,10 @@ export class PeerPigeonMesh extends EventEmitter {
 
       // Gather candidate peer IDs
       const discovered = this.peerDiscovery.getDiscoveredPeers().map(p => p.peerId);
-      const notConnected = discovered.filter(pid => !this.connectionManager.hasPeer(pid));
+      const notConnected = discovered.filter(pid => 
+        !this.connectionManager.hasPeer(pid) && 
+        !this.peerDiscovery.isAttemptingConnection(pid)
+      );
       if (notConnected.length === 0) return;
 
       // Prioritize by XOR distance for diversity and stability
@@ -607,18 +611,14 @@ export class PeerPigeonMesh extends EventEmitter {
         return distA < distB ? -1 : 1;
       });
 
-      // More aggressive: attempt up to 2x the needed connections per cycle to handle failures
+      // Conservative: attempt exactly what's needed, one at a time
       const needed = this.connectivityFloor - connectedCount;
-      const attemptLimit = Math.min(prioritized.length, Math.max(2, needed * 2));
+      const attemptLimit = Math.min(prioritized.length, Math.max(1, needed));
       const batch = prioritized.slice(0, attemptLimit);
       batch.forEach(pid => {
         this.debug.log(`🔧 CONNECTIVITY FLOOR (${connectedCount}/${this.connectivityFloor}) attempting extra connection to ${pid.substring(0,8)}...`);
-        if (this.connectionManager.connectToPeerOverride) {
-          this.connectionManager.connectToPeerOverride(pid);
-        } else {
-          // Fallback: regular connect (may skip due to initiator logic)
-          this.connectionManager.connectToPeer(pid);
-        }
+        // Use normal connect, but with initiator override below floor
+        this.connectionManager.connectToPeer(pid);
       });
     }, intervalMs);
   }

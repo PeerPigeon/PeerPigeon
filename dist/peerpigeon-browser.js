@@ -6171,11 +6171,12 @@ ${b64.match(/.{1,64}/g).join("\n")}
      * Force connection attempt ignoring standard initiator lexicographic rule (used for connectivity floor).
      */
     async connectToPeerOverride(targetPeerId) {
-      if (this.peers.has(targetPeerId) || this.mesh.peerDiscovery.isAttemptingConnection(targetPeerId)) return;
+      if (this.peers.has(targetPeerId)) return;
       const connectedCount = this.getConnectedPeerCount();
       const floor = this.mesh.connectivityFloor || 0;
       if (connectedCount >= floor) return;
       this.debug.log(`\u26A1 OVERRIDE CONNECT: initiating to ${targetPeerId.substring(0, 8)}... (connected ${connectedCount} < floor ${floor})`);
+      this.mesh.peerDiscovery.clearConnectionAttempt(targetPeerId);
       const options = {
         localStream: null,
         enableAudio: true,
@@ -8017,7 +8018,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.seenMessages = /* @__PURE__ */ new Map();
       this.messageHistory = /* @__PURE__ */ new Map();
       this.processedKeyExchanges = /* @__PURE__ */ new Map();
-      this.maxTTL = 10;
+      this.maxTTL = 20;
       this.messageExpiryTime = 5 * 60 * 1e3;
       this.cleanupInterval = 60 * 1e3;
       this.cleanupTimer = null;
@@ -11348,8 +11349,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.originalNetworkName = this.networkName;
       this.maxPeers = options.maxPeers !== void 0 ? options.maxPeers : 3;
       this.minPeers = options.minPeers !== void 0 ? options.minPeers : 2;
-      const webKitBiasFloor = environmentDetector.isBrowser && typeof navigator !== "undefined" && /Safari|WebKit/i.test(navigator.userAgent) ? 3 : 2;
-      this.connectivityFloor = options.connectivityFloor !== void 0 ? options.connectivityFloor : webKitBiasFloor;
+      const defaultFloor = Math.min(3, this.maxPeers ?? 3);
+      this.connectivityFloor = options.connectivityFloor !== void 0 ? options.connectivityFloor : defaultFloor;
       this.autoConnect = options.autoConnect !== false;
       this.autoDiscovery = options.autoDiscovery !== false;
       this.evictionStrategy = options.evictionStrategy !== false;
@@ -11742,13 +11743,15 @@ ${b64.match(/.{1,64}/g).join("\n")}
      */
     startConnectivityEnforcement() {
       if (this._connectivityEnforcementTimer) return;
-      const intervalMs = 2e3;
+      const intervalMs = 4e3;
       this._connectivityEnforcementTimer = setInterval(() => {
         if (!this.connected || !this.peerDiscovery) return;
         const connectedCount = this.connectionManager.getConnectedPeerCount();
         if (connectedCount >= this.connectivityFloor) return;
         const discovered = this.peerDiscovery.getDiscoveredPeers().map((p) => p.peerId);
-        const notConnected = discovered.filter((pid) => !this.connectionManager.hasPeer(pid));
+        const notConnected = discovered.filter(
+          (pid) => !this.connectionManager.hasPeer(pid) && !this.peerDiscovery.isAttemptingConnection(pid)
+        );
         if (notConnected.length === 0) return;
         const prioritized = notConnected.sort((a, b) => {
           const distA = this.peerDiscovery.calculateXorDistance(this.peerId, a);
@@ -11756,15 +11759,11 @@ ${b64.match(/.{1,64}/g).join("\n")}
           return distA < distB ? -1 : 1;
         });
         const needed = this.connectivityFloor - connectedCount;
-        const attemptLimit = Math.min(prioritized.length, Math.max(2, needed * 2));
+        const attemptLimit = Math.min(prioritized.length, Math.max(1, needed));
         const batch = prioritized.slice(0, attemptLimit);
         batch.forEach((pid) => {
           this.debug.log(`\u{1F527} CONNECTIVITY FLOOR (${connectedCount}/${this.connectivityFloor}) attempting extra connection to ${pid.substring(0, 8)}...`);
-          if (this.connectionManager.connectToPeerOverride) {
-            this.connectionManager.connectToPeerOverride(pid);
-          } else {
-            this.connectionManager.connectToPeer(pid);
-          }
+          this.connectionManager.connectToPeer(pid);
         });
       }, intervalMs);
     }
