@@ -161,7 +161,20 @@ export class ConnectionManager extends EventEmitter {
       this.mesh.emit('statusChanged', { type: 'info', message: `Offer sent to ${targetPeerId.substring(0, 8)}...` });
     } catch (error) {
       this.debug.error('Failed to connect to peer:', error);
-      this.mesh.emit('statusChanged', { type: 'error', message: `Failed to connect to ${targetPeerId.substring(0, 8)}...: ${error.message}` });
+      
+      // Check if this was due to a connection timeout (createOffer/setLocalDescription timeout)
+      // These are expected and normal in a partial mesh when peers are at capacity
+      const isConnectionTimeout = error.message?.includes('timeout');
+      
+      if (!isConnectionTimeout) {
+        // Only emit error for non-timeout failures
+        this.mesh.emit('statusChanged', { 
+          type: 'error', 
+          message: `Failed to connect to ${targetPeerId.substring(0, 8)}...: ${error.message}` 
+        });
+      }
+      // Note: connection timeouts are logged to debug but not emitted as errors
+      
       this.cleanupFailedConnection(targetPeerId);
     }
   }
