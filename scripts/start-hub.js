@@ -19,11 +19,29 @@ const PORT = parseInt(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 const HUB_MESH_NAMESPACE = process.env.HUB_MESH_NAMESPACE || 'pigeonhub-mesh';
 
-// Get bootstrap hubs from environment variable
+// Detect hostname for cloud deployment bootstrap configuration
+const HOSTNAME = process.env.HOSTNAME || process.env.FLY_APP_NAME || '';
+
+// Get bootstrap hubs from environment variable or auto-configure for cloud deployments
 let bootstrapHubs = [];
 if (process.env.BOOTSTRAP_HUBS) {
+    // Explicit bootstrap configuration takes precedence
     bootstrapHubs = process.env.BOOTSTRAP_HUBS.split(',').map(uri => uri.trim()).filter(uri => uri);
     console.log(`🔗 Bootstrap hubs configured: ${bootstrapHubs.join(', ')}\n`);
+} else if (HOSTNAME.includes('fly.dev') || HOSTNAME.includes('fly.io')) {
+    // Auto-configure bootstrap hubs for cloud deployment
+    if (HOSTNAME.includes('pigeonhub-c')) {
+        // Hub C bootstraps from Hub B only
+        bootstrapHubs = ['wss://pigeonhub-b.fly.dev'];
+        console.log(`🔗 Cloud deployment (Hub C): Bootstrapping from Hub B\n`);
+    } else if (!HOSTNAME.includes('pigeonhub-b')) {
+        // Other hubs use both Hub B and Hub C as bootstraps
+        bootstrapHubs = ['wss://pigeonhub-b.fly.dev', 'wss://pigeonhub-c.fly.dev'];
+        console.log(`🔗 Cloud deployment: Using Hub B and Hub C as bootstraps\n`);
+    } else {
+        // Hub B doesn't bootstrap from anyone (it's the primary)
+        console.log(`🔗 Cloud deployment (Hub B): Primary bootstrap hub\n`);
+    }
 }
 
 console.log('🚀 Starting PeerPigeon Hub...\n');
