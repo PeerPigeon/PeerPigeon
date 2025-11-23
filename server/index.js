@@ -604,6 +604,14 @@ export class PeerPigeonServer extends EventEmitter {
             return;
         }
 
+        // Deduplicate relay: create hash from targetPeer + signal type + data hash
+        const relayHash = `${targetPeerId}:${signalData.type}:${this.hashSignalData(signalData.data)}`;
+        if (this.recentlyRelayedMessages.has(relayHash)) {
+            console.log(`🔁 Duplicate P2P signal relay detected for ${targetPeerId.substring(0, 8)}..., ignoring`);
+            return;
+        }
+        this.recentlyRelayedMessages.set(relayHash, Date.now());
+
         // Check if target peer is connected to this hub
         const targetConnection = this.connections.get(targetPeerId);
         if (targetConnection && targetConnection.readyState === WebSocket.OPEN) {
