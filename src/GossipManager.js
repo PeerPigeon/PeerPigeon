@@ -21,7 +21,8 @@ export class GossipManager extends EventEmitter {
     this.processedKeyExchanges = new Map(); // "peerId:keyType" -> timestamp
 
     // Configuration
-    this.maxTTL = 20; // Increased TTL to improve reliability across sparse/partial meshes
+    // Increased TTL further to improve reliability across multi-hub partial meshes
+    this.maxTTL = 40; // allow deeper multi-hop propagation before expiry
     this.messageExpiryTime = 5 * 60 * 1000; // 5 minutes
     this.cleanupInterval = 60 * 1000; // 1 minute
     this.cleanupTimer = null; // Track cleanup timer for proper cleanup
