@@ -5,6 +5,12 @@ import { EventEmitter } from 'events';
 import { URL } from 'url';
 import { PeerPigeonMesh } from '../src/PeerPigeonMesh.js';
 
+// Inject WebSocket into global scope for use by SignalingClient in Node.js
+// This is necessary for hub mesh initialization
+if (typeof global !== 'undefined' && typeof global.WebSocket === 'undefined') {
+    global.WebSocket = WebSocket;
+}
+
 /**
  * PeerPigeon WebSocket signaling server
  * Can be used programmatically or as a standalone server

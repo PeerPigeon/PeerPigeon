@@ -6151,7 +6151,13 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.mesh.emit("statusChanged", { type: "info", message: `Offer sent to ${targetPeerId.substring(0, 8)}...` });
       } catch (error) {
         this.debug.error("Failed to connect to peer:", error);
-        this.mesh.emit("statusChanged", { type: "error", message: `Failed to connect to ${targetPeerId.substring(0, 8)}...: ${error.message}` });
+        const isConnectionTimeout = error.message?.includes("timeout");
+        if (!isConnectionTimeout) {
+          this.mesh.emit("statusChanged", {
+            type: "error",
+            message: `Failed to connect to ${targetPeerId.substring(0, 8)}...: ${error.message}`
+          });
+        }
         this.cleanupFailedConnection(targetPeerId);
       }
     }
