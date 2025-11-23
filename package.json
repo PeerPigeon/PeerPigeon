@@ -29,6 +29,9 @@
     "lint": "node -c src/*.js examples/**/*.js server/*.js",
     "lint:fix": "eslint --cache --cache-location .eslintcache src/ examples/ server/ --ext .js --fix",
     "test": "node test/browser-integration-test.js",
+    "test:hub-mesh": "node test/test-hub-mesh.js",
+    "test:cross-browser": "npm run build && node test/cross-browser-hub-test.js",
+    "test:simple-cross": "npm run build && node test/simple-cross-browser-test.js",
     "test:storage": "node examples/node/storage-test.js",
     "test:browser:visual": "HEADLESS=false node test/browser-integration-test.js",
     "test:video": "node test/video-streaming-test.js",
@@ -92,6 +95,7 @@
     "express": "^4.19.2",
     "jsdoc": "^4.0.4",
     "nodemon": "^3.1.10",
+    "playwright": "^1.56.1",
     "puppeteer": "^22.0.0"
   },
   "engines": {

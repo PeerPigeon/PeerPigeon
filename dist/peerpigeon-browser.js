@@ -4404,12 +4404,26 @@ ${b64.match(/.{1,64}/g).join("\n")}
       this.discoveredPeers.set(peerId, Date.now());
       this.emit("peerDiscovered", { peerId });
       this.debug.log(`Discovered peer ${peerId.substring(0, 8)}...`);
-      if (this.autoDiscovery && this.shouldInitiateConnection(peerId) && !this.connectionAttempts.has(peerId)) {
+      const shouldInitiate = this.shouldInitiateConnection(peerId);
+      const alreadyAttempting = this.connectionAttempts.has(peerId);
+      this.debug.log(`\u{1F50D} Connection decision for ${peerId.substring(0, 8)}...: autoDiscovery=${this.autoDiscovery}, shouldInitiate=${shouldInitiate}, alreadyAttempting=${alreadyAttempting}`);
+      if (this.autoDiscovery && shouldInitiate && !alreadyAttempting) {
         this.debug.log(`Considering connection to ${peerId.substring(0, 8)}...`);
         const canAccept = this.canAcceptMorePeers();
+        this.debug.log(`Can accept more peers: ${canAccept}`);
         if (canAccept) {
-          this.debug.log(`Connecting to ${peerId.substring(0, 8)}...`);
+          this.debug.log(`\u{1F680} Connecting to ${peerId.substring(0, 8)}...`);
           this.emit("connectToPeer", { peerId });
+        } else {
+          this.debug.log(`\u274C Cannot accept more peers (at capacity)`);
+        }
+      } else {
+        if (!this.autoDiscovery) {
+          this.debug.log(`\u274C Auto-discovery disabled, not connecting to ${peerId.substring(0, 8)}...`);
+        } else if (!shouldInitiate) {
+          this.debug.log(`\u23F8\uFE0F  Not initiating to ${peerId.substring(0, 8)}... (they should initiate to us)`);
+        } else if (alreadyAttempting) {
+          this.debug.log(`\u23F8\uFE0F  Already attempting connection to ${peerId.substring(0, 8)}...`);
         }
       }
       this.scheduleMeshOptimization();
@@ -6332,15 +6346,16 @@ ${b64.match(/.{1,64}/g).join("\n")}
     }
     canAcceptMorePeers() {
       const connectedCount = this.getConnectedPeerCount();
-      if (connectedCount < this.mesh.maxPeers) {
-        return true;
-      }
-      const stalePeerCount = this.getStalePeerCount();
       const totalPeerCount = this.peers.size;
-      if (stalePeerCount > 0 && totalPeerCount >= this.mesh.maxPeers) {
-        this.debug.log(`At capacity (${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total) but have ${stalePeerCount} stale peers that can be evicted`);
-        return true;
+      if (connectedCount >= this.mesh.maxPeers) {
+        this.debug.log(`At or over capacity: ${connectedCount}/${this.mesh.maxPeers} connected, rejecting new connections`);
+        return false;
       }
+      if (totalPeerCount >= this.mesh.maxPeers) {
+        this.debug.log(`Total peer count at capacity: ${totalPeerCount}/${this.mesh.maxPeers}, rejecting new connections`);
+        return false;
+      }
+      return true;
       this.debug.log(`Cannot accept more peers: ${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total peers in Map`);
       return false;
     }
@@ -6605,6 +6620,11 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.debug.warn("Received invalid message from", fromPeerId?.substring(0, 8));
         return;
       }
+      this.mesh.emit("messageReceived", {
+        from: fromPeerId,
+        data: message,
+        timestamp: Date.now()
+      });
       if (message.type === "binary" && message.data instanceof Uint8Array) {
         this.debug.log(`\u{1F4E6} Received binary message (${message.size} bytes) from ${fromPeerId.substring(0, 8)}...`);
         this.mesh.emit("binaryMessageReceived", {
@@ -11494,9 +11514,10 @@ ${b64.match(/.{1,64}/g).join("\n")}
         }
         if (environmentDetector.isBrowser) {
           try {
+            const disableLocalhostMedia = typeof window !== "undefined" && window.DISABLE_LOCALHOST_MEDIA_REQUEST;
             const isLocalhost = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1" || window.location.hostname === "";
-            if (isLocalhost && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-              this.debug.log("\u{1F3A4} Requesting media permissions for localhost WebRTC...");
+            if (!disableLocalhostMedia && isLocalhost && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+              this.debug.log("\u{1F3A4} Requesting media permissions for localhost WebRTC (not disabled)...");
               const stream = await navigator.mediaDevices.getUserMedia({
                 audio: true,
                 video: false
@@ -11508,6 +11529,8 @@ ${b64.match(/.{1,64}/g).join("\n")}
                 stream.getTracks().forEach((track) => track.stop());
                 this.debug.log("\u2705 Media permissions granted - localhost connections will work");
               }
+            } else if (disableLocalhostMedia) {
+              this.debug.log("\u{1F6AB} Skipping localhost media permission request (DISABLE_LOCALHOST_MEDIA_REQUEST flag set)");
             }
           } catch (error) {
             this.debug.warn("Could not request media permissions:", error.message);

@@ -51,13 +51,29 @@ export class PeerDiscovery extends EventEmitter {
     this.debug.log(`Discovered peer ${peerId.substring(0, 8)}...`);
 
     // Only auto-connect if we should initiate to this peer and we're not already trying
-    if (this.autoDiscovery && this.shouldInitiateConnection(peerId) && !this.connectionAttempts.has(peerId)) {
+    const shouldInitiate = this.shouldInitiateConnection(peerId);
+    const alreadyAttempting = this.connectionAttempts.has(peerId);
+    
+    this.debug.log(`🔍 Connection decision for ${peerId.substring(0, 8)}...: autoDiscovery=${this.autoDiscovery}, shouldInitiate=${shouldInitiate}, alreadyAttempting=${alreadyAttempting}`);
+    
+    if (this.autoDiscovery && shouldInitiate && !alreadyAttempting) {
       this.debug.log(`Considering connection to ${peerId.substring(0, 8)}...`);
 
       const canAccept = this.canAcceptMorePeers();
+      this.debug.log(`Can accept more peers: ${canAccept}`);
       if (canAccept) {
-        this.debug.log(`Connecting to ${peerId.substring(0, 8)}...`);
+        this.debug.log(`🚀 Connecting to ${peerId.substring(0, 8)}...`);
         this.emit('connectToPeer', { peerId });
+      } else {
+        this.debug.log(`❌ Cannot accept more peers (at capacity)`);
+      }
+    } else {
+      if (!this.autoDiscovery) {
+        this.debug.log(`❌ Auto-discovery disabled, not connecting to ${peerId.substring(0, 8)}...`);
+      } else if (!shouldInitiate) {
+        this.debug.log(`⏸️  Not initiating to ${peerId.substring(0, 8)}... (they should initiate to us)`);
+      } else if (alreadyAttempting) {
+        this.debug.log(`⏸️  Already attempting connection to ${peerId.substring(0, 8)}...`);
       }
     }
 
