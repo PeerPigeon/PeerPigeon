@@ -196,20 +196,22 @@ export class SignalingClient extends EventEmitter {
 
         this.websocket.onclose = (event) => {
           clearTimeout(connectTimeout);
+          const wasConnected = this.connected; // Track if we were connected
           this.connected = false;
           this.connectionPromise = null;
+          this.isReconnecting = false; // Always reset this flag
 
           this.debug.log('WebSocket closed:', event.code, event.reason);
 
-          // Always emit disconnected event
-          this.emit('disconnected');
+          // Always emit disconnected event (but only if we were actually connected)
+          if (wasConnected) {
+            this.emit('disconnected');
+          }
 
           // Attempt reconnection unless this was a deliberate disconnect
           if (!this.deliberateDisconnect) {
-            this.emit('statusChanged', { type: 'warning', message: 'WebSocket connection lost - reconnecting...' });
-            if (!this.isReconnecting) {
-              this.attemptReconnect();
-            }
+            // Always attempt reconnect when connection is lost (whether it was a new disconnect or a failed reconnection)
+            this.attemptReconnect();
           } else {
             // Reset the flag for future connections
             this.deliberateDisconnect = false;
@@ -265,6 +267,14 @@ export class SignalingClient extends EventEmitter {
       // If we have healthy peers, use much longer delays to avoid disrupting the mesh
       const baseExtendedDelay = hasHealthyPeers ? 600000 : this.maxReconnectDelay * 2; // 10 min vs 2x normal
       const extendedDelay = Math.min(baseExtendedDelay, 600000); // Max 10 minutes
+      this.emit('statusChanged', { 
+        type: 'reconnecting', 
+        message: `Max attempts reached. Retrying in ${Math.round(extendedDelay/1000)}s...`,
+        delay: extendedDelay,
+        attempt: this.reconnectAttempts,
+        maxAttempts: this.maxReconnectAttempts,
+        extendedBackoff: true
+      });
       this.reconnectTimeout = setTimeout(() => {
         this.reconnectAttempts = Math.floor(this.maxReconnectAttempts / 2); // Reset to half max
         this.attemptReconnect();
@@ -281,6 +291,13 @@ export class SignalingClient extends EventEmitter {
     const delay = Math.min(baseDelay * delayMultiplier, hasHealthyPeers ? 300000 : this.maxReconnectDelay);
 
     this.debug.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}, healthy peers: ${hasHealthyPeers})`);
+    this.emit('statusChanged', { 
+      type: 'reconnecting', 
+      message: `Reconnecting in ${Math.round(delay/1000)}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
+      delay,
+      attempt: this.reconnectAttempts,
+      maxAttempts: this.maxReconnectAttempts
+    });
 
     this.reconnectTimeout = setTimeout(async () => {
       if (!this.connected && this.signalingUrl) {
@@ -288,12 +305,9 @@ export class SignalingClient extends EventEmitter {
           await this.connect(this.signalingUrl);
           this.emit('statusChanged', { type: 'info', message: 'WebSocket reconnected successfully' });
         } catch (error) {
-          this.debug.error('Reconnection failed:', error);
-          this.isReconnecting = false;
-          this.attemptReconnect();
+          this.debug.error('Reconnection attempt failed:', error);
+          // onclose will handle the next reconnection attempt
         }
-      } else {
-        this.isReconnecting = false;
       }
     }, delay);
   }

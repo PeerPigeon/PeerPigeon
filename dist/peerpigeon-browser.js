@@ -4224,15 +4224,16 @@ ${b64.match(/.{1,64}/g).join("\n")}
           };
           this.websocket.onclose = (event) => {
             clearTimeout(connectTimeout);
+            const wasConnected = this.connected;
             this.connected = false;
             this.connectionPromise = null;
+            this.isReconnecting = false;
             this.debug.log("WebSocket closed:", event.code, event.reason);
-            this.emit("disconnected");
+            if (wasConnected) {
+              this.emit("disconnected");
+            }
             if (!this.deliberateDisconnect) {
-              this.emit("statusChanged", { type: "warning", message: "WebSocket connection lost - reconnecting..." });
-              if (!this.isReconnecting) {
-                this.attemptReconnect();
-              }
+              this.attemptReconnect();
             } else {
               this.deliberateDisconnect = false;
             }
@@ -4274,6 +4275,14 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.debug.log("Max reconnection attempts reached, using exponential backoff");
         const baseExtendedDelay = hasHealthyPeers ? 6e5 : this.maxReconnectDelay * 2;
         const extendedDelay = Math.min(baseExtendedDelay, 6e5);
+        this.emit("statusChanged", {
+          type: "reconnecting",
+          message: `Max attempts reached. Retrying in ${Math.round(extendedDelay / 1e3)}s...`,
+          delay: extendedDelay,
+          attempt: this.reconnectAttempts,
+          maxAttempts: this.maxReconnectAttempts,
+          extendedBackoff: true
+        });
         this.reconnectTimeout = setTimeout(() => {
           this.reconnectAttempts = Math.floor(this.maxReconnectAttempts / 2);
           this.attemptReconnect();
@@ -4286,18 +4295,21 @@ ${b64.match(/.{1,64}/g).join("\n")}
       const delayMultiplier = hasHealthyPeers ? 3 : 1;
       const delay = Math.min(baseDelay * delayMultiplier, hasHealthyPeers ? 3e5 : this.maxReconnectDelay);
       this.debug.log(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}, healthy peers: ${hasHealthyPeers})`);
+      this.emit("statusChanged", {
+        type: "reconnecting",
+        message: `Reconnecting in ${Math.round(delay / 1e3)}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
+        delay,
+        attempt: this.reconnectAttempts,
+        maxAttempts: this.maxReconnectAttempts
+      });
       this.reconnectTimeout = setTimeout(async () => {
         if (!this.connected && this.signalingUrl) {
           try {
             await this.connect(this.signalingUrl);
             this.emit("statusChanged", { type: "info", message: "WebSocket reconnected successfully" });
           } catch (error) {
-            this.debug.error("Reconnection failed:", error);
-            this.isReconnecting = false;
-            this.attemptReconnect();
+            this.debug.error("Reconnection attempt failed:", error);
           }
-        } else {
-          this.isReconnecting = false;
         }
       }, delay);
     }
@@ -4393,6 +4405,10 @@ ${b64.match(/.{1,64}/g).join("\n")}
         clearTimeout(this.meshOptimizationTimeout);
         this.meshOptimizationTimeout = null;
       }
+    }
+    // Full cleanup method for deliberate disconnects
+    cleanup() {
+      this.stop();
       this.discoveredPeers.clear();
       this.connectionAttempts.clear();
     }
@@ -11725,7 +11741,7 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.signalingClient.disconnect();
       }
       if (this.peerDiscovery) {
-        this.peerDiscovery.stop();
+        this.peerDiscovery.cleanup();
       }
       if (this._connectivityEnforcementTimer) {
         clearInterval(this._connectivityEnforcementTimer);

@@ -23,6 +23,9 @@ export class PeerDiscovery extends EventEmitter {
   }
 
   stop() {
+    // Only stop the cleanup interval, DO NOT clear discovered peers
+    // Discovered peers should persist even when signaling server connection is lost
+    // because the WebRTC connections remain active
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
       this.cleanupInterval = null;
@@ -33,6 +36,14 @@ export class PeerDiscovery extends EventEmitter {
       this.meshOptimizationTimeout = null;
     }
 
+    // DO NOT CLEAR: this.discoveredPeers
+    // DO NOT CLEAR: this.connectionAttempts
+    // These should persist so we don't try to reconnect to already-connected peers
+  }
+
+  // Full cleanup method for deliberate disconnects
+  cleanup() {
+    this.stop();
     this.discoveredPeers.clear();
     this.connectionAttempts.clear();
   }

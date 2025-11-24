@@ -467,6 +467,13 @@ export class PeerPigeonMesh extends EventEmitter {
       this.emit('statusChanged', { type: 'connected' });
     });
 
+    // IMPORTANT: When the WebSocket signaling connection is lost, we do NOT disconnect peers!
+    // WebRTC connections are peer-to-peer and remain active even without the signaling server.
+    // Peers can continue to communicate directly through their existing WebRTC data channels.
+    // The signaling server is only needed for:
+    // 1. Initial peer discovery and connection negotiation
+    // 2. Discovering new peers that join the network
+    // Once peers are connected via WebRTC, they are independent of the signaling server.
     this.signalingClient.addEventListener('disconnected', () => {
       this.connected = false;
       this.polling = false;
@@ -567,7 +574,7 @@ export class PeerPigeonMesh extends EventEmitter {
     }
 
     if (this.peerDiscovery) {
-      this.peerDiscovery.stop();
+      this.peerDiscovery.cleanup(); // Use cleanup() instead of stop() for full cleanup
     }
     if (this._connectivityEnforcementTimer) {
       clearInterval(this._connectivityEnforcementTimer);

@@ -1621,10 +1621,17 @@ class PeerPigeonTestSuite {
                 break;
             case 'disconnected':
                 this.log('🔴 Disconnected from signaling server');
-                this.updateConnectionButtons(false);
+                // Don't update buttons yet - reconnection will start automatically
+                break;
+            case 'reconnecting':
+                this.log(`🔄 ${data.message}`);
+                // Keep buttons disabled during reconnection
                 break;
             case 'connecting':
                 this.log('🟡 Connecting to signaling server...');
+                break;
+            case 'warning':
+                this.log(`⚠️ ${data.message}`);
                 break;
             case 'error':
                 this.log(`❌ ${data.message}`, 'error');
