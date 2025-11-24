@@ -43,8 +43,8 @@ class PeerPigeonTestSuite {
                 enableDistributedStorage: true, // Enable distributed storage
                 networkName: 'global', // Default network
                 allowGlobalFallback: true, // Allow fallback to global network
-                maxPeers: 4,
-                minPeers: 2,
+                maxPeers: 6, // Increased for better cross-hub connectivity
+                minPeers: 3, // Increased for partition resistance
                 autoConnect: true,
                 autoDiscovery: true,
                 evictionStrategy: true,
@@ -52,6 +52,20 @@ class PeerPigeonTestSuite {
             });
 
             await this.mesh.init();
+            
+            // CRITICAL: Explicitly set connection manager limits to match test configuration
+            if (this.mesh.connectionManager) {
+                this.mesh.connectionManager.maxPeers = 6;
+                this.mesh.connectionManager.minPeers = 3;
+            }
+            
+            // Ensure peer discovery settings match
+            if (this.mesh.peerDiscovery) {
+                this.mesh.peerDiscovery.maxPeers = 6;
+                this.mesh.peerDiscovery.minPeers = 3;
+                this.mesh.peerDiscovery.evictionStrategy = true;
+                this.mesh.peerDiscovery.xorRouting = true;
+            }
             this.setupEventListeners();
             this.setupUI();
             this.updatePeerInfo();
@@ -1633,11 +1647,24 @@ class PeerPigeonTestSuite {
         if (data.from !== this.mesh.peerId) {
             console.log('🔍 DEBUG handleMessageReceived:', data);
             
+            // Filter out system/signaling messages that shouldn't be displayed
+            const filteredMessageTypes = ['signaling-relay', 'peer-announce-relay', 'bootstrap-keepalive', 
+                                          'client-peer-announcement', 'cross-bootstrap-signaling', 'gossip',
+                                          'dht', 'eviction', 'renegotiation-offer', 'renegotiation-answer',
+                                          'signaling', 'binary'];
+            
+            // Check if data.data exists (ConnectionManager format) and filter by type
+            if (data.data && data.data.type && filteredMessageTypes.includes(data.data.type)) {
+                console.log('🔇 Filtered system message type:', data.data.type);
+                return;
+            }
+            
             const messageType = data.direct ? 'direct' : 'broadcast';
             const sender = data.from.substring(0, 8) + '...';
             
             // Handle content properly - it might be an object or string
-            let content = data.content;
+            // Support both data.content (gossip format) and data.data (ConnectionManager format)
+            let content = data.content || (data.data && typeof data.data === 'string' ? data.data : null);
             let isEncrypted = false;
             
             if (typeof content === 'object') {
@@ -1650,10 +1677,24 @@ class PeerPigeonTestSuite {
                 } else if (content.broadcast && content.data) {
                     content = content.data;
                     isEncrypted = content.encrypted || false;
+                } else if (content.event) {
+                    // This is likely a media event or system message - don't display it
+                    console.log('🔇 Filtered system/media event message:', content);
+                    return;
+                } else if (content.type && filteredMessageTypes.includes(content.type)) {
+                    // Filter system messages wrapped in content
+                    console.log('🔇 Filtered system message in content:', content.type);
+                    return;
                 } else {
                     // Fallback: stringify the object
                     content = JSON.stringify(content);
                 }
+            }
+            
+            // Validate that we have actual content to display
+            if (!content || (typeof content === 'string' && content.trim().length === 0)) {
+                console.log('🔇 Filtered empty message from:', sender);
+                return;
             }
             
             // Also check if data.encrypted flag is set

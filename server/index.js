@@ -1364,6 +1364,33 @@ export class PeerPigeonServer extends EventEmitter {
                 console.log(`📊 Tracking hub ${peerId.substring(0, 8)}... WebSocket connection for migration`);
             }
             
+            // CRITICAL: Forward hub announcement to local hub mesh for P2P discovery
+            // When Hub A announces to Hub B, Hub B's hubMesh needs to know about Hub A
+            if (this.isHub && this.hubMesh && peerId !== this.hubPeerId) {
+                console.log(`🔗 Forwarding hub ${peerId.substring(0, 8)}... to local hub mesh for P2P discovery`);
+                
+                // Send peer-discovered to this hub's local signaling connection
+                // This will trigger the hub mesh to discover and connect to the announcing hub
+                const localConnection = this.connections.get(this.hubPeerId);
+                if (localConnection && localConnection.readyState === WebSocket.OPEN) {
+                    this.sendToConnection(localConnection, {
+                        type: 'peer-discovered',
+                        data: { 
+                            peerId,
+                            isHub: true,
+                            ...message.data 
+                        },
+                        networkName: this.hubMeshNamespace,
+                        fromPeerId: 'system',
+                        targetPeerId: this.hubPeerId,
+                        timestamp: Date.now()
+                    });
+                    console.log(`✅ Sent peer-discovered to local hub mesh for ${peerId.substring(0, 8)}...`);
+                } else {
+                    console.log(`⚠️  Local hub mesh connection not ready, cannot forward hub announcement`);
+                }
+            }
+            
             // When a new hub announces itself, send it all our local peers
             if (this.isHub) {
                 console.log(`📡 New hub connected, sending our local peers to ${peerId.substring(0, 8)}...`);
@@ -1378,6 +1405,7 @@ export class PeerPigeonServer extends EventEmitter {
         this.networkPeers.get(peerNetworkName).add(peerId);
 
         // If this is a hub, broadcast this peer to other connected hubs
+        // CRITICAL: Do NOT broadcast hub mesh peers (isHub=true) to prevent discovery loops
         if (this.isHub && !isHub) {
             // Check if there are any other hubs at all
             const hasOtherHubs = this.hubs.size > 0 || this.bootstrapConnections.size > 0;
