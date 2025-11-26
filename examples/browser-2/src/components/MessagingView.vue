@@ -67,7 +67,7 @@
                 <span class="message-type">{{ message.type }}</span>
               </div>
               <div class="message-content">
-                <pre>{{ formatMessageContent(message.content) }}</pre>
+                <pre>{{ formatMessageContent(message.content) || '[Empty message]' }}</pre>
               </div>
             </div>
           </div>
@@ -110,14 +110,22 @@
               @keydown.ctrl.enter="sendDirect"
             ></textarea>
             <div class="composer-actions">
-              <button 
-                @click="sendDirect"
-                :disabled="!directMessage.trim() || !selectedPeer || !isConnected"
-                class="btn btn-primary"
-              >
-                <span class="btn-icon">📤</span>
-                Send Direct
-              </button>
+              <div class="encrypt-toggle">
+                <label class="checkbox-label">
+                  <input type="checkbox" v-model="encryptDirect" />
+                  Encrypt Direct Message
+                </label>
+              </div>
+              <div class="composer-buttons">
+                <button 
+                  @click="sendDirect"
+                  :disabled="!directMessage.trim() || !selectedPeer || !isConnected"
+                  class="btn btn-primary"
+                >
+                  <span class="btn-icon">📤</span>
+                  {{ encryptDirect ? 'Send Encrypted' : 'Send Direct' }}
+                </button>
+              </div>
               <span class="shortcut-hint">Ctrl+Enter</span>
             </div>
           </div>
@@ -233,6 +241,7 @@ const directMessage = ref('');
 const selectedPeer = ref('');
 const messageFilter = ref('');
 const filteringEnabled = ref(false);
+const encryptDirect = ref(false);
 
 // Computed properties
 const messages = computed(() => store.messages);
@@ -296,7 +305,11 @@ const sendDirect = () => {
   if (!directMessage.value.trim() || !selectedPeer.value || !isConnected.value) return;
   
   try {
-    store.sendDirectMessage(selectedPeer.value, directMessage.value.trim());
+    if (encryptDirect.value) {
+      store.sendEncryptedDirectMessage(selectedPeer.value, directMessage.value.trim());
+    } else {
+      store.sendDirectMessage(selectedPeer.value, directMessage.value.trim());
+    }
     directMessage.value = '';
     store.addDebugLog(`Direct message sent to ${selectedPeer.value.substring(0, 8)}...`, 'success');
   } catch (error) {

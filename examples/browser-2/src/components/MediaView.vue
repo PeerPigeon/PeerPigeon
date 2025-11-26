@@ -183,6 +183,85 @@
       </div>
     </div>
 
+    <!-- Selective Streaming Controls -->
+    <div class="media-controls">
+      <h3>🎯 Selective Streaming</h3>
+      <div class="controls-grid">
+        <div class="control-group">
+          <h4>Target Peers</h4>
+          <div class="device-selectors">
+            <select multiple v-model="selectedPeers" class="device-select">
+              <option 
+                v-for="peer in connectedPeersList" 
+                :key="peer.id"
+                :value="peer.id"
+              >
+                {{ peer.id.substring(0, 16) }}...
+              </option>
+            </select>
+            <small class="hint">Hold Cmd/Ctrl to select multiple</small>
+          </div>
+        </div>
+        <div class="control-group">
+          <h4>Actions</h4>
+          <div class="control-buttons">
+            <button 
+              @click="startSelective"
+              :disabled="!isConnected || selectedPeers.length === 0"
+              class="btn btn-primary"
+            >
+              <span class="btn-icon">🎯</span>
+              Start Selective
+            </button>
+            <button 
+              @click="switchToBroadcast"
+              :disabled="!mediaState.localStream"
+              class="btn btn-secondary"
+            >
+              <span class="btn-icon">📡</span>
+              Switch to Broadcast
+            </button>
+            <button 
+              @click="stopSelective"
+              :disabled="!mediaState.localStream"
+              class="btn btn-danger"
+            >
+              <span class="btn-icon">⏹️</span>
+              Stop Selective
+            </button>
+          </div>
+        </div>
+        <div class="control-group">
+          <h4>Block/Allow</h4>
+          <div class="control-buttons">
+            <button 
+              @click="blockSelected"
+              :disabled="selectedPeers.length === 0"
+              class="btn btn-secondary"
+            >
+              <span class="btn-icon">🚫</span>
+              Block Selected
+            </button>
+            <button 
+              @click="allowSelected"
+              :disabled="selectedPeers.length === 0"
+              class="btn btn-secondary"
+            >
+              <span class="btn-icon">✅</span>
+              Allow Selected
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="streaming-status">
+        <strong>Status:</strong>
+        <span>{{ isStreamingToAll() ? 'Broadcast' : 'Selective' }}</span>
+        <span>• Streaming to: {{ getStreamingPeers().length }}</span>
+        <span>• Blocked: {{ getBlockedStreamingPeers().length }}</span>
+      </div>
+    </div>
+
     <!-- Media Statistics -->
     <div class="stats-section">
       <h3>📊 Media Statistics</h3>
@@ -309,6 +388,7 @@ const localVideo = ref(null);
 const remoteVideoRefs = ref(new Map());
 const selectedVideoDevice = ref('');
 const selectedAudioDevice = ref('');
+const selectedPeers = ref([]);
 const videoDevices = ref([]);
 const audioDevices = ref([]);
 const videoQuality = ref('medium');
@@ -370,16 +450,20 @@ const stopAllMedia = async () => {
 };
 
 const toggleVideo = () => {
-  if (store.mesh) {
-    store.mesh.toggleVideo();
-    store.addDebugLog(`Video ${mediaState.value.videoEnabled ? 'disabled' : 'enabled'}`);
+  try {
+    const enabled = store.toggleVideo();
+    store.addDebugLog(`Video ${enabled ? 'enabled' : 'disabled'}`);
+  } catch (e) {
+    store.addDebugLog(`Failed to toggle video: ${e.message}`, 'error');
   }
 };
 
 const toggleAudio = () => {
-  if (store.mesh) {
-    store.mesh.toggleAudio();
-    store.addDebugLog(`Audio ${mediaState.value.audioEnabled ? 'disabled' : 'enabled'}`);
+  try {
+    const enabled = store.toggleAudio();
+    store.addDebugLog(`Audio ${enabled ? 'enabled' : 'disabled'}`);
+  } catch (e) {
+    store.addDebugLog(`Failed to toggle audio: ${e.message}`, 'error');
   }
 };
 
@@ -402,12 +486,77 @@ const setRemoteVideoRef = (el, peerId) => {
 
 const refreshDevices = async () => {
   try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    videoDevices.value = devices.filter(device => device.kind === 'videoinput');
-    audioDevices.value = devices.filter(device => device.kind === 'audioinput');
-    store.addDebugLog(`Found ${devices.length} media devices`, 'info');
+    const devices = await store.enumerateMediaDevices();
+    if (devices && (devices.cameras || devices.microphones)) {
+      videoDevices.value = devices.cameras || [];
+      audioDevices.value = devices.microphones || [];
+    } else if (Array.isArray(devices)) {
+      videoDevices.value = devices.filter(d => d.kind === 'videoinput');
+      audioDevices.value = devices.filter(d => d.kind === 'audioinput');
+    } else {
+      // Fallback to browser API
+      const raw = await navigator.mediaDevices.enumerateDevices();
+      videoDevices.value = raw.filter(d => d.kind === 'videoinput');
+      audioDevices.value = raw.filter(d => d.kind === 'audioinput');
+    }
+    const total = videoDevices.value.length + audioDevices.value.length;
+    store.addDebugLog(`Found ${total} media devices`, 'info');
   } catch (error) {
     store.addDebugLog(`Failed to enumerate devices: ${error.message}`, 'error');
+  }
+};
+
+// Selective streaming actions
+const startSelective = async () => {
+  if (selectedPeers.value.length === 0) return;
+  try {
+    await store.initializeMedia();
+    const opts = {
+      video: true,
+      audio: true
+    };
+    await store.startSelectiveStream(selectedPeers.value, opts);
+    store.addDebugLog(`Selective streaming started to ${selectedPeers.value.length} peer(s)`, 'success');
+  } catch (error) {
+    store.addDebugLog(`Failed to start selective streaming: ${error.message}`, 'error');
+  }
+};
+
+const stopSelective = async () => {
+  try {
+    await store.stopSelectiveStream(false);
+    store.addDebugLog('Selective streaming stopped', 'info');
+  } catch (error) {
+    store.addDebugLog(`Failed to stop selective streaming: ${error.message}`, 'error');
+  }
+};
+
+const switchToBroadcast = async () => {
+  try {
+    await store.switchToBroadcastMode();
+    store.addDebugLog('Switched to broadcast mode', 'info');
+  } catch (error) {
+    store.addDebugLog(`Failed to switch to broadcast mode: ${error.message}`, 'error');
+  }
+};
+
+const blockSelected = async () => {
+  if (selectedPeers.value.length === 0) return;
+  try {
+    await store.blockStreamingToPeers(selectedPeers.value);
+    store.addDebugLog('Streaming blocked to selected peers', 'warning');
+  } catch (error) {
+    store.addDebugLog(`Failed to block streaming: ${error.message}`, 'error');
+  }
+};
+
+const allowSelected = async () => {
+  if (selectedPeers.value.length === 0) return;
+  try {
+    await store.allowStreamingToPeers(selectedPeers.value);
+    store.addDebugLog('Streaming allowed to selected peers', 'success');
+  } catch (error) {
+    store.addDebugLog(`Failed to allow streaming: ${error.message}`, 'error');
   }
 };
 

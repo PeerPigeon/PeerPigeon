@@ -477,7 +477,7 @@ const performGet = async () => {
 const performSubscribe = async () => {
   try {
     if (store.mesh) {
-      await store.mesh.dhtSubscribe(subscribeKey.value);
+      await store.dhtSubscribe(subscribeKey.value);
       subscriptions.value.add(subscribeKey.value);
       store.addDebugLog(`Subscribed to DHT key: ${subscribeKey.value}`, 'success');
       subscribeKey.value = '';
@@ -490,7 +490,7 @@ const performSubscribe = async () => {
 const performUnsubscribe = async () => {
   try {
     if (store.mesh) {
-      await store.mesh.dhtUnsubscribe(subscribeKey.value);
+      await store.dhtUnsubscribe(subscribeKey.value);
       subscriptions.value.delete(subscribeKey.value);
       store.addDebugLog(`Unsubscribed from DHT key: ${subscribeKey.value}`, 'success');
       subscribeKey.value = '';
@@ -529,7 +529,7 @@ const isSubscribed = (key) => {
 const unsubscribeFromKey = async (key) => {
   try {
     if (store.mesh) {
-      await store.mesh.dhtUnsubscribe(key);
+      await store.dhtUnsubscribe(key);
       subscriptions.value.delete(key);
       store.addDebugLog(`Unsubscribed from DHT key: ${key}`, 'success');
     }
@@ -541,7 +541,7 @@ const unsubscribeFromKey = async (key) => {
 const quickSubscribe = async (key) => {
   try {
     if (store.mesh) {
-      await store.mesh.dhtSubscribe(key);
+      await store.dhtSubscribe(key);
       subscriptions.value.add(key);
       store.addDebugLog(`Subscribed to DHT key: ${key}`, 'success');
     }
@@ -620,7 +620,7 @@ const storeSharedCounter = async () => {
   
   // Subscribe to counter changes
   if (store.mesh) {
-    await store.mesh.dhtSubscribe('shared:counter');
+    await store.dhtSubscribe('shared:counter');
     subscriptions.value.add('shared:counter');
   }
   
@@ -683,7 +683,7 @@ const demonstrateReplication = async () => {
   
   // Subscribe to changes
   if (store.mesh) {
-    await store.mesh.dhtSubscribe(testKey);
+    await store.dhtSubscribe(testKey);
     subscriptions.value.add(testKey);
   }
   

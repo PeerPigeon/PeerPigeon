@@ -368,9 +368,11 @@ const disconnectPeer = (peerId) => {
 };
 
 const connectToPeer = (peerId) => {
-  if (store.mesh) {
-    store.mesh.connectToPeer(peerId);
+  try {
+    store.connectToPeer(peerId);
     store.addDebugLog(`Connection attempt to ${peerId.substring(0, 8)}...`);
+  } catch (e) {
+    store.addDebugLog(`Failed to connect to peer: ${e.message}`, 'error');
   }
 };
 
@@ -385,9 +387,9 @@ const getNetworkHealth = () => {
   const max = networkStatus.value.maxPeers;
   
   if (connected === 0) return 'Isolated';
-  if (connected < min) return 'Poor';
-  if (connected >= min && connected < max) return 'Good';
-  if (connected === max) return 'Excellent';
+  if (connected >= max) return 'Excellent';
+  if (connected >= min) return 'Good';
+  if (connected > 0) return 'Fair';
   return 'Unknown';
 };
 
@@ -395,18 +397,16 @@ const getNetworkHealthClass = () => {
   const health = getNetworkHealth();
   return {
     'health-isolated': health === 'Isolated',
-    'health-poor': health === 'Poor',
+    'health-poor': health === 'Poor' || health === 'Fair',
     'health-good': health === 'Good',
     'health-excellent': health === 'Excellent'
   };
 };
 
 const getEnvironmentInfo = () => {
-  if (store.mesh && store.mesh.getEnvironmentReport) {
-    const report = store.mesh.getEnvironmentReport();
-    return `${report.environment} (WebRTC: ${report.webrtcSupported ? 'Yes' : 'No'})`;
-  }
-  return 'Browser (WebRTC: Yes)';
+  // Check if WebRTC is available
+  const hasWebRTC = !!(window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection);
+  return `Browser (WebRTC: ${hasWebRTC ? 'Yes' : 'No'})`;
 };
 
 const updateUptime = () => {
