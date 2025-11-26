@@ -159,18 +159,22 @@ async function startHTTPServer() {
                 contentType = 'text/css';
             } else if (filePath.endsWith('.json')) {
                 contentType = 'application/json';
+            } else if (filePath.endsWith('.map')) {
+                contentType = 'application/json';
             }
             
             try {
                 const content = readFileSync(filePath);
                 res.writeHead(200, { 
                     'Content-Type': contentType,
-                    'Access-Control-Allow-Origin': '*'
+                    'Access-Control-Allow-Origin': '*',
+                    'X-Content-Type-Options': 'nosniff'
                 });
                 res.end(content);
             } catch (error) {
-                res.writeHead(404);
-                res.end('Not found');
+                console.log(`[HTTP 404] ${req.url} -> ${filePath}`);
+                res.writeHead(404, { 'Content-Type': 'text/plain' });
+                res.end('Not found: ' + req.url);
             }
         });
         
