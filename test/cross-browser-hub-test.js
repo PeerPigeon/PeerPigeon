@@ -132,7 +132,7 @@ async function startHttpServer() {
     console.log(`🔄 Starting HTTP server on port ${HTTP_PORT}...`);
     
     return new Promise((resolve, reject) => {
-        const examplesDir = join(__dirname, '..', 'examples');
+        const examplesDir = join(__dirname, '..', 'examples', 'browser', 'vanilla');
         const distDir = join(__dirname, '..', 'dist');
         
         httpServer = createServer((req, res) => {
@@ -140,20 +140,20 @@ async function startHttpServer() {
             
             // Route requests appropriately
             if (req.url === '/' || req.url === '/index.html') {
-                filePath = join(examplesDir, 'browser', 'index.html');
+                filePath = join(examplesDir, 'index.html');
             } else if (req.url === '/app.js') {
-                filePath = join(examplesDir, 'browser', 'app.js');
+                filePath = join(examplesDir, 'app.js');
             } else if (req.url === '/styles.css') {
-                filePath = join(examplesDir, 'browser', 'styles.css');
+                filePath = join(examplesDir, 'styles.css');
             } else if (req.url.includes('peerpigeon-browser.js')) {
                 // Handle any path to the peerpigeon browser bundle
                 filePath = join(distDir, 'peerpigeon-browser.js');
             } else if (req.url.startsWith('/dist/')) {
                 filePath = join(__dirname, '..', req.url);
             } else if (req.url.startsWith('/browser/')) {
-                filePath = join(examplesDir, req.url);
+                filePath = join(__dirname, '..', 'examples', req.url);
             } else {
-                filePath = join(examplesDir, 'browser', req.url.substring(1));
+                filePath = join(examplesDir, req.url.substring(1));
             }
             
             // Determine content type

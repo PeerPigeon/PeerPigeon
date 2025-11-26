@@ -128,33 +128,22 @@ async function startHTTPServer() {
         console.log(`🔄 Starting HTTP server on port ${HTTP_PORT}...`);
         
         const rootDir = join(__dirname, '..');
-        const distDir = join(rootDir, 'examples', 'browser-2', 'dist');
+        const distDir = join(rootDir, 'examples', 'browser', 'vue', 'dist');
         const libDir = join(rootDir, 'dist');
         
         httpServer = createServer((req, res) => {
             let filePath;
             
-            // Strip /browser-2/ prefix if present
-            let url = req.url;
-            if (url.startsWith('/browser-2/')) {
-                url = url.substring(11); // Remove '/browser-2/'
-            }
-            
             // Route to Vue app dist
+            let url = req.url;
             if (url === '/' || url === '' || url === '/index.html') {
                 filePath = join(distDir, 'index.html');
             } else if (url.startsWith('/assets/')) {
                 // Vue app assets
                 filePath = join(distDir, url);
             } else if (url === '/peerpigeon-browser.js' || url === '/peerpigeon-browser.js.map') {
-                // Serve from dist root OR from browser-2/dist/public
-                const publicPath = join(distDir, url);
-                const rootPath = join(libDir, url);
-                if (existsSync(publicPath)) {
-                    filePath = publicPath;
-                } else {
-                    filePath = rootPath;
-                }
+                // Serve from project root dist
+                filePath = join(libDir, url);
             } else if (url.startsWith('/dist/')) {
                 // Serve from project root dist
                 filePath = join(rootDir, url);
