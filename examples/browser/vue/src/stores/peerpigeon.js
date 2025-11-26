@@ -544,7 +544,7 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
         encrypted: isEncrypted || !!event.encrypted
       };
 
-      if (event.subtype === 'direct') {
+      if (event.direct || event.subtype === 'dm') {
         if (!directMessages.has(event.from)) {
           directMessages.set(event.from, []);
         }

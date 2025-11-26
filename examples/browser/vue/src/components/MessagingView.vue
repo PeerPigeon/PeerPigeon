@@ -64,7 +64,10 @@
               <div class="message-header">
                 <span class="message-sender">{{ message.fromPeerId }}</span>
                 <span class="message-time">{{ formatTime(message.timestamp) }}</span>
-                <span class="message-type">{{ message.type }}</span>
+                <span class="message-type">
+                  {{ message.type }}
+                  <span v-if="message.encrypted" class="encryption-indicator" title="Encrypted message">🔒</span>
+                </span>
               </div>
               <div class="message-content">
                 <pre>{{ formatMessageContent(message.content) || '[Empty message]' }}</pre>
@@ -160,7 +163,10 @@
                 :class="['message-item', 'direct', { 'own-message': message.fromPeerId === 'You' }]"
               >
                 <div class="message-header">
-                  <span class="message-sender">{{ message.fromPeerId }}</span>
+                  <span class="message-sender">
+                    {{ message.fromPeerId }}
+                    <span v-if="message.encrypted" class="encryption-indicator" title="Encrypted message">🔒</span>
+                  </span>
                   <span class="message-time">{{ formatTime(message.timestamp) }}</span>
                 </div>
                 <div class="message-content">
@@ -763,6 +769,15 @@ const enableMessageFiltering = () => {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
+}
+
+/* Encryption indicator styling */
+.encryption-indicator {
+  display: inline-block;
+  margin-left: 4px;
+  font-size: 12px;
+  opacity: 0.8;
+  vertical-align: middle;
 }
 
 /* Responsive design */
