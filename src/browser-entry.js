@@ -1,6 +1,12 @@
 // Browser entry point that bundles UnSEA crypto library
 // This file is used by esbuild to create a self-contained browser bundle
 
+// Force automated test flag early so PeerConnection can apply optimized ICE/STUN settings
+if (typeof globalThis !== 'undefined' && globalThis.AUTOMATED_TEST === undefined) {
+  // Allow overriding by page scripts; do not clobber if already set
+  globalThis.AUTOMATED_TEST = typeof window !== 'undefined' && window.AUTOMATED_TEST === true ? true : false;
+}
+
 // Import UnSEA directly from node_modules (esbuild will bundle it)
 import * as UnSEA from 'unsea';
 

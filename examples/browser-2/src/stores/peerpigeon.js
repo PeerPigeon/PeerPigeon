@@ -42,8 +42,8 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
   const discoveredPeers = reactive(new Map());
   const networkStatus = reactive({
     connectedCount: 0,
-    maxPeers: 4,
-    minPeers: 2,
+    maxPeers: 6,
+    minPeers: 3,
     autoConnect: true,
     autoDiscovery: true,
     evictionStrategy: true,
@@ -84,6 +84,7 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
   const debugLogs = ref([]);
   const debugModules = ref([]);
   const enabledModules = ref(new Set());
+  const connectionStats = ref([]);
   
   // Computed
   const connectedPeersList = computed(() => {
@@ -115,6 +116,14 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
         PeerPigeonMesh: !!(PeerPigeonLib?.PeerPigeonMesh),
         keys: PeerPigeonLib ? Object.keys(PeerPigeonLib) : []
       });
+
+      // Enable core debug logs to surface initiator decisions and signaling flow
+      try {
+        if (PeerPigeonLib?.DebugLogger?.enableAll) {
+          PeerPigeonLib.DebugLogger.enableAll();
+          addDebugLog('DebugLogger enabled for all modules', 'info');
+        }
+      } catch {}
       
       // Use real PeerPigeonMesh if available, otherwise mock
       const PeerPigeonMeshClass = PeerPigeonLib?.PeerPigeonMesh;
@@ -289,6 +298,7 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
           autoDiscovery: networkStatus.autoDiscovery,
           evictionStrategy: networkStatus.evictionStrategy,
           xorRouting: networkStatus.xorRouting,
+          debug: true, // Enable debug logging
           ...options
         };
         
@@ -333,11 +343,18 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
       throw new Error('Mesh not initialized');
     }
     
+    // Guard: prevent duplicate connects
+    if (isConnected.value && signalingUrl.value === url) {
+      addDebugLog('Already connected to this signaling server', 'warning');
+      return;
+    }
+    
     try {
       signalingUrl.value = url;
       await mesh.value.connect(url);
       isConnected.value = true;
       addDebugLog(`Connected to signaling server: ${url}`, 'success');
+
       return true;
     } catch (error) {
       addDebugLog(`Failed to connect to signaling server: ${error.message}`, 'error');
@@ -385,6 +402,18 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     
     mesh.value.addEventListener('peerConnected', (event) => {
       console.log('🤝 PEER CONNECTED EVENT:', event);
+      
+      // CRITICAL FIX: Enable remote stream reception from this newly connected peer
+      // This ensures ALL peers can receive streams whether they're senders or not
+      if (mesh.value.connectionManager) {
+        const connection = mesh.value.connectionManager.peers.get(event.peerId);
+        if (connection && connection.allowRemoteStreamEmission) {
+          connection.allowRemoteStreamEmission();
+          console.log(`🔓 Enabled remote stream reception from ${event.peerId.substring(0, 8)}...`);
+          addDebugLog(`Enabled remote stream reception from ${event.peerId.substring(0, 8)}...`, 'info');
+        }
+      }
+      
       const peerInfo = {
         id: event.peerId,
         connected: true,
@@ -411,25 +440,101 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     
     mesh.value.addEventListener('peerDiscovered', (event) => {
       console.log('🔍 PEER DISCOVERED EVENT:', event);
+      console.log('🆔 OUR PEER ID:', mesh.value?.peerId);
+      console.log('🆔 DISCOVERED PEER ID:', event.peerId);
       discoveredPeers.set(event.peerId, {
         id: event.peerId,
         discoveryTime: new Date(),
         status: 'discovered'
       });
       addDebugLog(`Peer discovered: ${event.peerId.substring(0, 8)}...`, 'info');
+      
+      // REMOVED: Manual proactive connection logic
+      // PeerPigeon's internal PeerDiscovery and ConnectionManager handle connection
+      // initiation automatically with proper isolation prevention and initiator logic.
+      // Manual intervention here was causing Vue-to-Vue connection failures.
     });
     
     // Message events
     mesh.value.addEventListener('messageReceived', (event) => {
+      // Debug: log full event structure
+      console.log('[DEBUG] messageReceived event:', JSON.stringify({
+        from: event.from,
+        message: event.message,
+        content: event.content,
+        data: event.data,
+        subtype: event.subtype,
+        messageId: event.messageId
+      }, null, 2));
+
+      // Ignore messages we originated to avoid duplicates
+      if (event.from && (event.from === peerId.value || event.from === mesh.value.peerId)) {
+        console.log('[DEBUG] Filtering out self-originated message');
+        return;
+      }
+
+      // Helper to filter out internal/system messages
+      const filteredTypes = new Set([
+        'signaling-relay','peer-announce-relay','bootstrap-keepalive','client-peer-announcement',
+        'cross-bootstrap-signaling','dht','eviction','renegotiation-offer','renegotiation-answer',
+        'signaling','binary','key_exchange'
+      ]);
+
+      const rawContent = event.message ?? event.content ?? event.data ?? null;
+      console.log('[DEBUG] rawContent:', rawContent);
+
+      // Determine if content is internal
+      const isInternal = (() => {
+        if (!rawContent) return false;
+        try {
+          const obj = typeof rawContent === 'string' ? null : rawContent;
+          if (obj) {
+            if (obj.event) return true; // media/system events
+            if (obj.type && filteredTypes.has(obj.type)) return true;
+            if (obj.broadcast && obj.data && obj.type && filteredTypes.has(obj.type)) return true;
+          }
+          // Also support nested data envelope
+          if (event.data && event.data.type && filteredTypes.has(event.data.type)) return true;
+        } catch {}
+        return false;
+      })();
+
+      if (isInternal) {
+        return;
+      }
+
+      // Normalize content for display
+      let displayContent = rawContent;
+      let isEncrypted = false;
+      if (displayContent && typeof displayContent === 'object') {
+        if (displayContent.encrypted && displayContent.data) {
+          isEncrypted = true;
+          displayContent = displayContent.data;
+        } else if (displayContent.message) {
+          displayContent = displayContent.message;
+        } else if (displayContent.broadcast && displayContent.data) {
+          displayContent = displayContent.data;
+          if (displayContent && displayContent.encrypted) isEncrypted = true;
+        }
+      }
+
+      if (!displayContent || (typeof displayContent === 'string' && displayContent.trim().length === 0)) {
+        console.log('[DEBUG] Filtering out empty displayContent:', displayContent);
+        return;
+      }
+
+      console.log('[DEBUG] Creating message object with displayContent:', displayContent);
+
       const message = {
         id: event.messageId || Date.now().toString(),
-        content: event.message || event.content,
+        content: displayContent,
         from: event.from,
         timestamp: new Date(),
         type: event.subtype || 'broadcast',
-        fromPeerId: event.from?.substring(0, 8) + '...' || 'unknown'
+        fromPeerId: event.from?.substring(0, 8) + '...' || 'unknown',
+        encrypted: isEncrypted || !!event.encrypted
       };
-      
+
       if (event.subtype === 'direct') {
         if (!directMessages.has(event.from)) {
           directMessages.set(event.from, []);
@@ -438,8 +543,8 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
       } else {
         messages.value.push(message);
       }
-      
-      addDebugLog(`Message received from ${message.fromPeerId}: ${JSON.stringify(message.content)}`, 'info');
+
+      addDebugLog(`Message received from ${message.fromPeerId}: ${typeof message.content === 'string' ? message.content : JSON.stringify(message.content)}`, 'info');
     });
     
     // Media events
@@ -495,6 +600,32 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     mesh.value.addEventListener('peerKeyAdded', (event) => {
       cryptoState.peerKeys.set(event.peerId, event.publicKey);
       addDebugLog(`Peer key added: ${event.peerId.substring(0, 8)}...`, 'success');
+    });
+
+    // Monitoring events
+    mesh.value.addEventListener('connectionStats', (stats) => {
+      // Keep a rolling window of the last 100 samples
+      connectionStats.value.push({ ...stats, timestamp: Date.now() });
+      if (connectionStats.value.length > 100) {
+        connectionStats.value.shift();
+      }
+    });
+
+    // Selective streaming events (log only for now)
+    mesh.value.addEventListener('selectiveStreamStarted', (event) => {
+      addDebugLog(`Selective streaming started to ${event.targetPeerIds?.length || 0} peer(s)`, 'info');
+    });
+    mesh.value.addEventListener('selectiveStreamStopped', (event) => {
+      addDebugLog(`Selective streaming stopped${event.returnToBroadcast ? ' (broadcast mode)' : ''}`, 'info');
+    });
+    mesh.value.addEventListener('broadcastStreamEnabled', () => {
+      addDebugLog('Broadcast streaming enabled for all peers', 'info');
+    });
+    mesh.value.addEventListener('streamingBlockedToPeers', (event) => {
+      addDebugLog(`Streaming blocked to ${event.blockedPeerIds?.length || 0} peer(s)`, 'warning');
+    });
+    mesh.value.addEventListener('streamingAllowedToPeers', (event) => {
+      addDebugLog(`Streaming allowed to ${event.allowedPeerIds?.length || 0} peer(s)`, 'success');
     });
   };
   
@@ -569,6 +700,53 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     addDebugLog(`Direct message sent to ${targetPeerId.substring(0, 8)}...: ${JSON.stringify(content)}`, 'success');
     return messageId;
   };
+
+  // Encrypted messaging methods
+  const sendEncryptedDirectMessage = async (targetPeerId, content) => {
+    if (!mesh.value || !isConnected.value) {
+      throw new Error('Not connected to mesh');
+    }
+    if (!mesh.value.sendEncryptedMessage) {
+      throw new Error('Encrypted messaging not available');
+    }
+    const messageId = await mesh.value.sendEncryptedMessage(targetPeerId, content);
+    const message = {
+      id: messageId,
+      content,
+      from: peerId.value,
+      to: targetPeerId,
+      timestamp: new Date(),
+      type: 'encrypted-direct',
+      fromPeerId: 'You'
+    };
+    if (!directMessages.has(targetPeerId)) {
+      directMessages.set(targetPeerId, []);
+    }
+    directMessages.get(targetPeerId).push(message);
+    addDebugLog(`Encrypted direct message sent to ${targetPeerId.substring(0, 8)}...`, 'success');
+    return messageId;
+  };
+
+  const sendEncryptedBroadcastMessage = async (content, groupId = null) => {
+    if (!mesh.value || !isConnected.value) {
+      throw new Error('Not connected to mesh');
+    }
+    if (!mesh.value.sendEncryptedBroadcast) {
+      throw new Error('Encrypted broadcast not available');
+    }
+    const messageId = await mesh.value.sendEncryptedBroadcast(content, groupId);
+    const message = {
+      id: messageId,
+      content,
+      from: peerId.value,
+      timestamp: new Date(),
+      type: 'encrypted',
+      fromPeerId: 'You'
+    };
+    messages.value.push(message);
+    addDebugLog('Encrypted broadcast message sent', 'success');
+    return messageId;
+  };
   
   // Media methods
   const startMedia = async (options = {}) => {
@@ -586,6 +764,76 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     await mesh.value.stopMedia();
     mediaState.audioEnabled = false;
     mediaState.videoEnabled = false;
+  };
+
+  // Advanced media helpers
+  const initializeMedia = async () => {
+    if (!mesh.value?.initializeMedia) throw new Error('Media initialization not available');
+    return await mesh.value.initializeMedia();
+  };
+
+  const enumerateMediaDevices = async () => {
+    if (!mesh.value?.enumerateMediaDevices) throw new Error('Media device enumeration not available');
+    const devices = await mesh.value.enumerateMediaDevices();
+    mediaState.devices = devices;
+    return devices;
+  };
+
+  const toggleVideo = () => {
+    if (!mesh.value?.toggleVideo) throw new Error('Video toggle not available');
+    const enabled = mesh.value.toggleVideo();
+    mediaState.videoEnabled = !!enabled;
+    return enabled;
+  };
+
+  const toggleAudio = () => {
+    if (!mesh.value?.toggleAudio) throw new Error('Audio toggle not available');
+    const enabled = mesh.value.toggleAudio();
+    mediaState.audioEnabled = !!enabled;
+    return enabled;
+  };
+
+  // Selective streaming controls
+  const startSelectiveStream = async (peerIds, options = {}) => {
+    if (!mesh.value?.startSelectiveStream) throw new Error('Selective streaming not available');
+    const stream = await mesh.value.startSelectiveStream(peerIds, options);
+    mediaState.audioEnabled = !!options.audio;
+    mediaState.videoEnabled = !!options.video;
+    return stream;
+  };
+
+  const stopSelectiveStream = async (returnToBroadcast = false) => {
+    if (!mesh.value?.stopSelectiveStream) throw new Error('Selective streaming not available');
+    return await mesh.value.stopSelectiveStream(returnToBroadcast);
+  };
+
+  const switchToBroadcastMode = async () => {
+    return await stopSelectiveStream(true);
+  };
+
+  const blockStreamingToPeers = async (peerIds) => {
+    if (!mesh.value?.blockStreamingToPeers) throw new Error('Selective streaming not available');
+    return await mesh.value.blockStreamingToPeers(peerIds);
+  };
+
+  const allowStreamingToPeers = async (peerIds) => {
+    if (!mesh.value?.allowStreamingToPeers) throw new Error('Selective streaming not available');
+    return await mesh.value.allowStreamingToPeers(peerIds);
+  };
+
+  const getStreamingPeers = () => {
+    if (!mesh.value?.getStreamingPeers) return [];
+    return mesh.value.getStreamingPeers();
+  };
+
+  const getBlockedStreamingPeers = () => {
+    if (!mesh.value?.getBlockedStreamingPeers) return [];
+    return mesh.value.getBlockedStreamingPeers();
+  };
+
+  const isStreamingToAll = () => {
+    if (!mesh.value?.isStreamingToAll) return false;
+    return mesh.value.isStreamingToAll();
   };
   
   // DHT methods
@@ -622,6 +870,20 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
   const getDHTStats = () => {
     if (!mesh.value) return {};
     return mesh.value.getDHTStats();
+  };
+
+  const dhtSubscribe = async (key) => {
+    if (!mesh.value?.dhtSubscribe) throw new Error('WebDHT not available');
+    const result = await mesh.value.dhtSubscribe(key);
+    addDebugLog(`DHT subscribe: ${key}`, 'info');
+    return result;
+  };
+
+  const dhtUnsubscribe = async (key) => {
+    if (!mesh.value?.dhtUnsubscribe) throw new Error('WebDHT not available');
+    const result = await mesh.value.dhtUnsubscribe(key);
+    addDebugLog(`DHT unsubscribe: ${key}`, 'info');
+    return result;
   };
   
   // Storage methods
@@ -809,6 +1071,20 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     }
   };
 
+  // Real crypto wrappers where available on mesh
+  const exchangeKeysWithPeer = async (targetPeerId) => {
+    if (!mesh.value?.exchangeKeysWithPeer) throw new Error('Key exchange not available');
+    await mesh.value.exchangeKeysWithPeer(targetPeerId);
+    addDebugLog(`Key exchange initiated with ${targetPeerId.substring(0, 8)}...`, 'info');
+  };
+
+  const addPeerPublicKey = async (targetPeerId, publicKey) => {
+    if (!mesh.value?.addPeerPublicKey) throw new Error('Add peer key not available');
+    const res = await mesh.value.addPeerPublicKey(targetPeerId, publicKey);
+    if (res) addDebugLog(`Public key added for ${targetPeerId.substring(0, 8)}...`, 'success');
+    return res;
+  };
+
   const cryptoRefreshKeys = async () => {
     addDebugLog('Key store refreshed', 'info');
   };
@@ -882,6 +1158,63 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
       addDebugLog('Force return to original network not available', 'warning');
     }
   };
+
+  // Additional network and monitoring utilities for parity
+  const cleanupStaleSignalingData = async () => {
+    if (!mesh.value?.cleanupStaleSignalingData) throw new Error('Cleanup not available');
+    const res = await mesh.value.cleanupStaleSignalingData();
+    addDebugLog('Stale signaling data cleaned up', 'success');
+    return res;
+  };
+
+  const forceConnectToAllPeers = () => {
+    if (!mesh.value?.forceConnectToAllPeers) throw new Error('Force connect not available');
+    const attempts = mesh.value.forceConnectToAllPeers();
+    addDebugLog(`Forced ${attempts} connection attempt(s)`, 'info');
+    return attempts;
+  };
+
+  const getPeerStateSummary = () => {
+    if (!mesh.value?.getPeerStateSummary) return {};
+    return mesh.value.getPeerStateSummary();
+  };
+
+  const startConnectionMonitoring = () => {
+    if (!mesh.value?.startConnectionMonitoring) return;
+    mesh.value.startConnectionMonitoring();
+    addDebugLog('Connection monitoring started', 'info');
+  };
+
+  const stopConnectionMonitoring = () => {
+    if (!mesh.value?.stopConnectionMonitoring) return;
+    mesh.value.stopConnectionMonitoring();
+    addDebugLog('Connection monitoring stopped', 'info');
+  };
+
+  const debugConnectivity = () => {
+    if (!mesh.value?.debugConnectivity) return;
+    mesh.value.debugConnectivity();
+    addDebugLog('Connectivity debug invoked', 'info');
+  };
+
+  const getConnectedPeerIds = () => {
+    if (mesh.value?.getConnectedPeerIds) return mesh.value.getConnectedPeerIds();
+    return connectedPeersList.value.map(p => p.id);
+  };
+
+  const getPeers = () => Array.from(peers.values());
+  const getDiscoveredPeers = () => Array.from(discoveredPeers.values());
+
+  const validatePeerId = (id) => {
+    const cls = window.PeerPigeon?.PeerPigeonMesh;
+    if (!cls?.validatePeerId) return false;
+    return cls.validatePeerId(id);
+  };
+
+  const connectToPeer = (id) => {
+    if (!mesh.value?.connectToPeer) throw new Error('Connect-to-peer not available');
+    return mesh.value.connectToPeer(id);
+  };
   
   return {
     // State
@@ -933,12 +1266,24 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     disableDebugModule,
     clearDebugLogs,
     addDebugLog,
+    connectionStats,
     
     // Network management methods
     setNetworkName,
     getNetworkInfo,
     setAllowGlobalFallback,
     forceReturnToOriginalNetwork,
+    cleanupStaleSignalingData,
+    forceConnectToAllPeers,
+    getPeerStateSummary,
+    startConnectionMonitoring,
+    stopConnectionMonitoring,
+    debugConnectivity,
+    getConnectedPeerIds,
+    getPeers,
+    getDiscoveredPeers,
+    validatePeerId,
+    connectToPeer,
     
     // Crypto methods
     initializeCrypto,
@@ -949,8 +1294,32 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     cryptoSign,
     cryptoVerify,
     cryptoKeyExchange,
+    exchangeKeysWithPeer,
+    addPeerPublicKey,
     cryptoRefreshKeys,
     cryptoExportKey,
-    cryptoDeleteKey
+    cryptoDeleteKey,
+
+    // Messaging
+    sendEncryptedDirectMessage,
+    sendEncryptedBroadcastMessage,
+
+    // Media helpers
+    initializeMedia,
+    enumerateMediaDevices,
+    toggleVideo,
+    toggleAudio,
+    startSelectiveStream,
+    stopSelectiveStream,
+    switchToBroadcastMode,
+    blockStreamingToPeers,
+    allowStreamingToPeers,
+    getStreamingPeers,
+    getBlockedStreamingPeers,
+    isStreamingToAll,
+
+    // DHT helpers
+    dhtSubscribe,
+    dhtUnsubscribe
   };
 });

@@ -56,7 +56,7 @@ const routes = [
 ];
 
 const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHistory('/browser-2/'),
   routes
 });
 

@@ -36,7 +36,8 @@ async function startServer() {
   // Serve the browser example specifically
   app.use('/examples/browser', express.static(path.join(__dirname, 'examples/browser')));
   
-  // Serve the browser-2 (Vue) example - serve the built dist folder
+  // Serve the browser-2 (Vue) example - serve the built dist folder at /browser-2
+  app.use('/browser-2', express.static(path.join(__dirname, 'examples/browser-2/dist')));
   app.use('/examples/browser-2', express.static(path.join(__dirname, 'examples/browser-2/dist')));
   
   // Serve the browser-3 example
@@ -79,8 +80,8 @@ async function startServer() {
     res.sendFile(path.join(__dirname, 'examples/browser/index.html'));
   });
 
-  // Browser-2 (Vue) route
-  app.get('/browser-2', (req, res) => {
+  // SPA fallback for browser-2 Vue app - must come after static routes
+  app.get('/browser-2/*', (req, res) => {
     res.sendFile(path.join(__dirname, 'examples/browser-2/dist/index.html'));
   });
 

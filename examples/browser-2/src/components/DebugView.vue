@@ -643,6 +643,11 @@ const startMonitoring = () => {
     collectMonitoringData();
   }, monitoringConfig.value.interval);
   
+  // Start mesh connection monitoring if available
+  if (store.startConnectionMonitoring) {
+    store.startConnectionMonitoring();
+  }
+  
   store.addDebugLog('System monitoring started', 'success');
 };
 
@@ -652,6 +657,11 @@ const stopMonitoring = () => {
   if (monitoringInterval.value) {
     clearInterval(monitoringInterval.value);
     monitoringInterval.value = null;
+  }
+  
+  // Stop mesh connection monitoring if available
+  if (store.stopConnectionMonitoring) {
+    store.stopConnectionMonitoring();
   }
   
   store.addDebugLog('System monitoring stopped', 'info');

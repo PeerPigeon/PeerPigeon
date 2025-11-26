@@ -4679,20 +4679,23 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.emit("connectionFailed", { peerId: this.peerId, reason: error.message });
         throw error;
       }
+      const testMode = typeof window !== "undefined" && window.AUTOMATED_TEST === true || typeof globalThis !== "undefined" && globalThis.AUTOMATED_TEST === true;
+      const iceServers = testMode ? [
+        // Single STUN server (or none) is sufficient for localhost; fewer servers reduces Firefox slowdown warnings
+        { urls: "stun:stun.l.google.com:19302" }
+      ] : [
+        { urls: "stun:stun.l.google.com:19302" },
+        { urls: "stun:stun1.l.google.com:19302" },
+        { urls: "stun:stun2.l.google.com:19302" },
+        { urls: "stun:stun3.l.google.com:19302" },
+        { urls: "stun:stun4.l.google.com:19302" }
+      ];
+      this.debug.log(`\u{1F9EA} Automated test mode: ${testMode} (iceServers before create = ${iceServers.length})`);
       this.connection = pigeonRTC.createPeerConnection({
-        iceServers: [
-          { urls: "stun:stun.l.google.com:19302" },
-          { urls: "stun:stun1.l.google.com:19302" },
-          { urls: "stun:stun2.l.google.com:19302" },
-          { urls: "stun:stun3.l.google.com:19302" },
-          { urls: "stun:stun4.l.google.com:19302" }
-        ],
-        iceCandidatePoolSize: 10,
-        // Pre-gather ICE candidates for faster connection
+        iceServers,
+        iceCandidatePoolSize: testMode ? 4 : 10,
         bundlePolicy: "max-bundle",
-        // Bundle all media on single transport for efficiency
         rtcpMuxPolicy: "require"
-        // Multiplex RTP and RTCP for faster setup
       });
       this.setupConnectionHandlers();
       this.debug.log("\u{1F504} Using addTrack() approach for proper ontrack event firing");
@@ -5133,9 +5136,9 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.debug.error(`Invalid ICE candidate from ${this.peerId} - not an object:`, candidate);
         throw new Error("Invalid ICE candidate: not an object");
       }
-      if (!candidate.candidate || typeof candidate.candidate !== "string") {
-        this.debug.error(`Invalid ICE candidate from ${this.peerId} - missing candidate string:`, candidate);
-        throw new Error("Invalid ICE candidate: missing candidate string");
+      if (!candidate.candidate || typeof candidate.candidate !== "string" || candidate.candidate.trim() === "") {
+        this.debug.log(`\u{1F9CA} Received end-of-candidates signal for ${this.peerId.substring(0, 8)}...`);
+        return;
       }
       this.debug.log(`\u{1F9CA} Received ICE candidate for ${this.peerId.substring(0, 8)}...`, {
         type: candidate.type,
@@ -13288,6 +13291,9 @@ ${b64.match(/.{1,64}/g).join("\n")}
   };
 
   // src/browser-entry.js
+  if (typeof globalThis !== "undefined" && globalThis.AUTOMATED_TEST === void 0) {
+    globalThis.AUTOMATED_TEST = typeof window !== "undefined" && window.AUTOMATED_TEST === true ? true : false;
+  }
   if (typeof globalThis !== "undefined") {
     globalThis.__PEERPIGEON_UNSEA__ = unsea_exports;
     globalThis.__PEERPIGEON_PIGEONRTC__ = {
