@@ -36,12 +36,9 @@ async function startServer() {
   // Serve the browser example specifically
   app.use('/examples/browser', express.static(path.join(__dirname, 'examples/browser')));
   
-  // Serve the browser-2 (Vue) example - serve the built dist folder at /browser-2
-  app.use('/browser-2', express.static(path.join(__dirname, 'examples/browser-2/dist')));
-  app.use('/examples/browser-2', express.static(path.join(__dirname, 'examples/browser-2/dist')));
-  
-  // Serve the browser-3 example
-  app.use('/examples/browser-3', express.static(path.join(__dirname, 'examples/browser-3')));
+  // Serve browser examples
+  app.use('/vanilla', express.static(path.join(__dirname, 'examples/browser/vanilla')));
+  app.use('/vue', express.static(path.join(__dirname, 'examples/browser/vue/dist')));
 
   // Serve the dist folder for browser bundles
   app.use('/dist', express.static(path.join(__dirname, 'dist')));
@@ -49,40 +46,51 @@ async function startServer() {
   // Serve source files for the browser
   app.use('/src', express.static(path.join(__dirname, 'src')));
 
-  // Serve browser example assets from root for convenience
+  // Serve peerpigeon-browser.js from Vue dist (Vue app needs it at root)
+  app.get('/peerpigeon-browser.js', (req, res) => {
+    res.sendFile(path.join(__dirname, 'examples/browser/vue/dist/peerpigeon-browser.js'));
+  });
+
+  // Serve assets from Vue dist first (Vue app needs /assets/ at root)
+  // Then fall back to vanilla assets
+  app.use('/assets', express.static(path.join(__dirname, 'examples/browser/vue/dist/assets')));
+  app.use('/assets', express.static(path.join(__dirname, 'examples/browser/vanilla/assets')));
+
+  // Serve browser example assets from root for convenience (vanilla)
   app.get('/styles.css', (req, res) => {
-    res.sendFile(path.join(__dirname, 'examples/browser/styles.css'));
+    res.sendFile(path.join(__dirname, 'examples/browser/vanilla/styles.css'));
   });
 
   app.get('/ui.js', (req, res) => {
-    res.sendFile(path.join(__dirname, 'examples/browser/ui.js'));
+    res.sendFile(path.join(__dirname, 'examples/browser/vanilla/ui.js'));
   });
 
   app.get('/app.js', (req, res) => {
-    res.sendFile(path.join(__dirname, 'examples/browser/app.js'));
+    res.sendFile(path.join(__dirname, 'examples/browser/vanilla/app.js'));
   });
-
-  // Serve assets directory
-  app.use('/assets', express.static(path.join(__dirname, 'examples/browser/assets')));
 
   // Serve the main index.js
   app.get('/index.js', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.js'));
   });
 
-  // Default route - serve the browser example
+  // Default route - redirect to Network page in Vue app
   app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'examples/browser/index.html'));
+    res.redirect('/vue/');
   });
 
-  // Catch-all for browser example
-  app.get('/browser', (req, res) => {
-    res.sendFile(path.join(__dirname, 'examples/browser/index.html'));
+  // Catch-all for vanilla browser example
+  app.get('/vanilla', (req, res) => {
+    res.sendFile(path.join(__dirname, 'examples/browser/vanilla/index.html'));
   });
 
-  // SPA fallback for browser-2 Vue app - must come after static routes
-  app.get('/browser-2/*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'examples/browser-2/dist/index.html'));
+  // SPA fallback for Vue app - must come after static routes
+  app.get('/vue/*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'examples/browser/vue/dist/index.html'));
+  });
+
+  app.get('/vue', (req, res) => {
+    res.sendFile(path.join(__dirname, 'examples/browser/vue/dist/index.html'));
   });
 
   // Health check endpoint
@@ -92,14 +100,14 @@ async function startServer() {
 
   app.listen(PORT, () => {
     console.log(`🚀 Fast Dev Server running on http://localhost:${PORT}`);
-    console.log(`🌐 Browser example: http://localhost:${PORT}/browser`);
-    console.log(`🌐 Browser-2 (Vue): http://localhost:${PORT}/browser-2`);
+    console.log(`🌐 Vanilla example: http://localhost:${PORT}/vanilla`);
+    console.log(`🌐 Vue example: http://localhost:${PORT}/vue`);
     console.log(`📊 Health check: http://localhost:${PORT}/health`);
     console.log('✅ Server is ready for connections');
     console.log('\n📁 Serving:');
     console.log('   • Browser bundle: /dist/peerpigeon-browser.js');
-    console.log('   • Browser example: /examples/browser/');
-    console.log('   • Browser-2 (Vue): /examples/browser-2/dist/');
+    console.log('   • Vanilla example: /examples/browser/vanilla/');
+    console.log('   • Vue example: /examples/browser/vue/dist/');
     console.log('   • Source files: /src/');
     console.log('   • Static assets: /assets/');
   }).on('error', (err) => {
