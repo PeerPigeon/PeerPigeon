@@ -6679,11 +6679,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
         this.debug.warn("Received invalid message from", fromPeerId?.substring(0, 8));
         return;
       }
-      this.mesh.emit("messageReceived", {
-        from: fromPeerId,
-        data: message,
-        timestamp: Date.now()
-      });
       if (message.type === "binary" && message.data instanceof Uint8Array) {
         this.debug.log(`\u{1F4E6} Received binary message (${message.size} bytes) from ${fromPeerId.substring(0, 8)}...`);
         this.mesh.emit("binaryMessageReceived", {

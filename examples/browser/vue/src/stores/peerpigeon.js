@@ -381,6 +381,15 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
     mesh.value.addEventListener('statusChanged', (event) => {
       addDebugLog(`Status: ${event.type} - ${event.message || ''}`, 'info');
       
+      // Handle signaling connection state changes
+      if (event.type === 'connected') {
+        isConnected.value = true;
+        addDebugLog('Signaling connection established', 'success');
+      } else if (event.type === 'disconnected') {
+        isConnected.value = false;
+        addDebugLog('Signaling connection lost', 'warning');
+      }
+      
       // Handle network-specific status changes
       if (event.type === 'network') {
         networkName.value = event.networkName || networkName.value;

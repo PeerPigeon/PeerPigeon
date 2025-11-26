@@ -818,13 +818,6 @@ export class ConnectionManager extends EventEmitter {
       return;
     }
 
-    // Emit generic messageReceived event for all messages (used by hub server)
-    this.mesh.emit('messageReceived', {
-      from: fromPeerId,
-      data: message,
-      timestamp: Date.now()
-    });
-
     // Handle binary messages first
     if (message.type === 'binary' && message.data instanceof Uint8Array) {
       this.debug.log(`📦 Received binary message (${message.size} bytes) from ${fromPeerId.substring(0, 8)}...`);
