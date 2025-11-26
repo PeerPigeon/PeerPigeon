@@ -7,8 +7,8 @@
     "dev": "npm run copy-peerpigeon && vite",
     "build": "npm run copy-peerpigeon && vite build && npm run copy-to-dist",
     "preview": "vite preview",
-    "copy-peerpigeon": "mkdir -p public && cp ../../dist/peerpigeon-browser.js public/ || true",
-    "copy-to-dist": "cp ../../dist/peerpigeon-browser.js dist/ || true"
+    "copy-peerpigeon": "mkdir -p public && cp ../../../dist/peerpigeon-browser.js public/ || true",
+    "copy-to-dist": "cp ../../../dist/peerpigeon-browser.js dist/ || true"
   },
   "dependencies": {
     "vue": "^3.4.0",

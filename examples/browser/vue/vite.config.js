@@ -3,8 +3,8 @@ import vue from '@vitejs/plugin-vue';
 
 export default defineConfig({
   plugins: [vue()],
-  // Use root base for dev server to avoid routing issues
-  base: process.env.NODE_ENV === 'production' ? '/browser-2/' : '/',
+  // Use root base for both dev and production to avoid path issues
+  base: '/',
   server: {
     port: 5173,
     strictPort: false,

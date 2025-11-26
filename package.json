@@ -14,7 +14,11 @@
     }
   },
   "scripts": {
-    "build": "node scripts/build-browser.js",
+    "build": "npm run build:browser && npm run build:examples",
+    "build:browser": "node scripts/build-browser.js",
+    "build:examples": "npm run build:vanilla && npm run build:vue",
+    "build:vanilla": "mkdir -p examples/browser/vanilla/dist && cp dist/peerpigeon-browser.js examples/browser/vanilla/",
+    "build:vue": "cd examples/browser/vue && npm run build",
     "prebuild": "mkdir -p dist",
     "cli": "node cli.js",
     "cli:server": "node cli.js server",
