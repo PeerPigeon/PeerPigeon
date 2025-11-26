@@ -5,7 +5,7 @@
       <div class="container">
         <div class="header-content">
           <div class="logo">
-            <span class="logo-icon">🐦</span>
+            <img src="/pigeonlogo.svg" alt="PeerPigeon Logo" width="40" height="40" class="logo-icon">
             <h1>PeerPigeon Vue 3 Demo</h1>
           </div>
           

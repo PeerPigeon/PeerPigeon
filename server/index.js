@@ -1097,8 +1097,41 @@ export class PeerPigeonServer extends EventEmitter {
                 break;
 
             case 'peer-disconnected':
-                if (data?.isHub) {
-                    console.log(`🏢 Hub disconnected: ${data.peerId?.substring(0, 8)}...`);
+                // Handle peer disconnection from another hub
+                if (data?.peerId) {
+                    const disconnectedPeerId = data.peerId;
+                    const peerNetwork = networkName || 'global';
+                    
+                    if (data?.isHub) {
+                        console.log(`🏢 Hub disconnected: ${disconnectedPeerId.substring(0, 8)}... from network: ${peerNetwork}`);
+                    } else {
+                        if (this.verboseLogging) {
+                            console.log(`👋 Remote peer disconnected: ${disconnectedPeerId.substring(0, 8)}... from network: ${peerNetwork}`);
+                        }
+                    }
+
+                    // Remove from cross-hub discovered peers cache
+                    const cachedRemotePeers = this.crossHubDiscoveredPeers.get(peerNetwork);
+                    if (cachedRemotePeers && cachedRemotePeers.has(disconnectedPeerId)) {
+                        cachedRemotePeers.delete(disconnectedPeerId);
+                        console.log(`🧹 Cleaned up remote peer ${disconnectedPeerId.substring(0, 8)}... from cross-hub cache (network: ${peerNetwork})`);
+                    }
+
+                    // Notify local peers in the same network about the disconnection
+                    const activePeers = this.getActivePeers(null, peerNetwork);
+                    activePeers.forEach(localPeerId => {
+                        this.sendToConnection(this.connections.get(localPeerId), {
+                            type: 'peer-disconnected',
+                            data: {
+                                peerId: disconnectedPeerId,
+                                isHub: data?.isHub || false
+                            },
+                            networkName: peerNetwork,
+                            fromPeerId: 'system',
+                            targetPeerId: localPeerId,
+                            timestamp: Date.now()
+                        });
+                    });
                 }
                 break;
 
@@ -1792,17 +1825,64 @@ export class PeerPigeonServer extends EventEmitter {
             console.log(`❌ Peer disconnected: ${peerId.substring(0, 8)}... (code: ${code}, reason: ${reason})`);
         }
 
+        // Get peer info before cleanup
+        const peerInfo = this.peerData.get(peerId);
+        const networkName = peerInfo?.networkName || 'global';
+        const isHub = peerInfo?.isHub || false;
+
         // Notify other peers about disconnection
         this.broadcastToOthers(peerId, {
             type: 'peer-disconnected',
             data: {
                 peerId,
+                isHub,
                 reason: reason?.toString() || 'disconnected',
                 timestamp: Date.now()
             },
             fromPeerId: 'system',
             timestamp: Date.now()
         });
+
+        // Broadcast peer disconnection to other hubs so they can clean up their caches
+        if (this.isHub) {
+            const disconnectMessage = {
+                type: 'peer-disconnected',
+                data: {
+                    peerId,
+                    isHub,
+                    reason: reason?.toString() || 'disconnected',
+                    timestamp: Date.now()
+                },
+                networkName,
+                fromPeerId: 'system',
+                timestamp: Date.now()
+            };
+
+            // Broadcast via P2P hub mesh if available
+            if (this.hubMesh && this.hubMeshReady) {
+                const p2pConnectedHubs = this.hubMesh.connectionManager.getConnectedPeers();
+                if (p2pConnectedHubs.length > 0) {
+                    console.log(`📡 Broadcasting peer disconnection to ${p2pConnectedHubs.length} hub(s) via P2P mesh`);
+                    this.hubMesh.sendMessage(disconnectMessage);
+                }
+            }
+
+            // Also broadcast to WebSocket-connected hubs (bootstrap and incoming)
+            for (const [uri, connInfo] of this.bootstrapConnections) {
+                if (connInfo.connected && connInfo.ws.readyState === WebSocket.OPEN) {
+                    connInfo.ws.send(JSON.stringify(disconnectMessage));
+                }
+            }
+
+            for (const [hubPeerId, hubInfo] of this.hubs) {
+                if (hubPeerId !== peerId) {
+                    const hubConnection = this.connections.get(hubPeerId);
+                    if (hubConnection && hubConnection.readyState === WebSocket.OPEN) {
+                        hubConnection.send(JSON.stringify(disconnectMessage));
+                    }
+                }
+            }
+        }
 
         // Remove peer
         this.cleanupPeer(peerId);
@@ -1833,6 +1913,15 @@ export class PeerPigeonServer extends EventEmitter {
                 // Clean up empty network sets
                 if (networkPeerSet.size === 0) {
                     this.networkPeers.delete(peerInfo.networkName);
+                }
+            }
+
+            // Remove from cross-hub discovered peers cache
+            const cachedRemotePeers = this.crossHubDiscoveredPeers.get(peerInfo.networkName);
+            if (cachedRemotePeers) {
+                cachedRemotePeers.delete(peerId);
+                if (this.verboseLogging) {
+                    console.log(`🧹 Removed peer ${peerId.substring(0, 8)}... from cross-hub cache for network: ${peerInfo.networkName}`);
                 }
             }
         }
