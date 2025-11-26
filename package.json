@@ -5,7 +5,7 @@
   "main": "index.js",
   "type": "module",
   "bin": {
-    "peerpigeon": "./cli.js"
+    "peerpigeon": "cli.js"
   },
   "exports": {
     ".": {
