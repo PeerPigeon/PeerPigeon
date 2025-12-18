@@ -89,8 +89,7 @@
     "@koush/wrtc": "^0.5.3",
     "pigeonrtc": "^0.0.5",
     "unsea": "^1.1.2",
-    "ws": "^8.18.0",
-    "yamljs": "^0.3.0"
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "concurrently": "^9.2.0",
