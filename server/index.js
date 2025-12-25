@@ -64,6 +64,7 @@ export class PeerPigeonServer extends EventEmitter {
         this.hubMeshPeers = new Map(); // hubPeerId -> { p2pConnected: boolean, wsConnection: WebSocket }
         this.migratedToP2P = new Set(); // Set of hub peer IDs that have migrated from WS to P2P
         this.migrationTimer = null; // Timer for WS disconnection after mesh establishment
+        this.isShuttingDown = false; // Flag to prevent reconnects during shutdown
     }
 
     /**
@@ -270,7 +271,8 @@ export class PeerPigeonServer extends EventEmitter {
                     res.end('PeerPigeon WebSocket Signaling Server');
                 });
 
-                // Create WebSocket server
+                // Set max listeners to prevent warnings
+                this.httpServer.setMaxListeners(0);                // Create WebSocket server
                 this.wss = new WebSocketServer({ 
                     server: this.httpServer,
                     maxPayload: this.maxMessageSize
@@ -454,7 +456,8 @@ export class PeerPigeonServer extends EventEmitter {
 
         // Handle messages from other hubs via P2P
         this.hubMesh.addEventListener('messageReceived', (event) => {
-            this.handleHubP2PMessage(event.from, event.data);
+            console.log(`📨 Hub mesh received message: ${event.message?.type || 'unknown'} from ${event.from?.substring(0, 8)}`);
+            this.handleHubP2PMessage(event.from, event.message);
         });
 
         // Track mesh status updates
@@ -599,6 +602,8 @@ export class PeerPigeonServer extends EventEmitter {
     handleClientSignalRelay(fromHubPeerId, message) {
         const { targetPeerId, signalData } = message;
         
+        console.log(`🔄 Processing client signal relay: target=${targetPeerId?.substring(0, 8)}, type=${signalData?.type}, fromHub=${fromHubPeerId?.substring(0, 8)}`);
+        
         if (!targetPeerId || !signalData) {
             console.log(`⚠️  Invalid client signal relay from ${fromHubPeerId.substring(0, 8)}...`);
             return;
@@ -705,6 +710,8 @@ export class PeerPigeonServer extends EventEmitter {
             return;
         }
 
+        this.isShuttingDown = true; // Prevent reconnects during shutdown
+
         return new Promise((resolve) => {
             console.log('🛑 Stopping PeerPigeon WebSocket server...');
 
@@ -712,6 +719,14 @@ export class PeerPigeonServer extends EventEmitter {
             if (this.migrationTimer) {
                 clearTimeout(this.migrationTimer);
                 this.migrationTimer = null;
+            }
+
+            // Clear all bootstrap reconnect timers
+            for (const connectionInfo of this.bootstrapConnections.values()) {
+                if (connectionInfo.reconnectTimer) {
+                    clearTimeout(connectionInfo.reconnectTimer);
+                    connectionInfo.reconnectTimer = null;
+                }
             }
 
             // Disconnect hub mesh if this is a hub
@@ -801,6 +816,17 @@ export class PeerPigeonServer extends EventEmitter {
 
         for (const uri of bootstrapUris) {
             try {
+                // Parse URI to check if it's our own server
+                const url = new URL(uri);
+                const hubPort = parseInt(url.port) || 3000;
+                const hubHost = url.hostname;
+
+                // Skip if it's our own server
+                if (hubHost === this.host && hubPort === this.port) {
+                    console.log(`⚠️  Skipping self-bootstrap to ${uri}`);
+                    continue;
+                }
+
                 await this.connectToHub(uri);
             } catch (error) {
                 console.error(`❌ Failed to connect to bootstrap hub ${uri}:`, error.message);
@@ -869,8 +895,8 @@ export class PeerPigeonServer extends EventEmitter {
                     
                     this.emit('bootstrapDisconnected', { uri, code, reason });
                     
-                    // Attempt to reconnect
-                    if (this.isRunning && attemptNumber < this.maxReconnectAttempts) {
+                    // Attempt to reconnect only if server is still running and not shutting down
+                    if (this.isRunning && !this.isShuttingDown && attemptNumber < this.maxReconnectAttempts) {
                         connectionInfo.reconnectTimer = setTimeout(() => {
                             console.log(`🔄 Reconnecting to ${uri}...`);
                             this.connectToHub(uri, attemptNumber + 1);
@@ -1664,9 +1690,7 @@ export class PeerPigeonServer extends EventEmitter {
             
             // Check if we've already relayed this message recently
             if (this.recentlyRelayedMessages.has(messageId)) {
-                if (this.verboseLogging) {
-                    console.log(`⏭️  Skipping duplicate relay of ${message.type} (${messageId})`);
-                }
+                console.log(`⏭️  Skipping duplicate relay of ${message.type} (${messageId})`);
                 return;
             }
             
@@ -1674,6 +1698,7 @@ export class PeerPigeonServer extends EventEmitter {
             this.recentlyRelayedMessages.set(messageId, Date.now());
             
             console.log(`🔄 Target peer ${targetPeerId.substring(0, 8)}... NOT LOCAL, relaying to other hubs (network: ${networkName})`);
+            console.log(`🔍 DEBUG: Hub mesh ready: ${this.hubMeshReady}, P2P connections: ${this.hubMesh?.connectionManager?.getConnectedPeers().length || 0}, Other hubs: ${this.hubs.size}`);
             
             let relayed = false;
             

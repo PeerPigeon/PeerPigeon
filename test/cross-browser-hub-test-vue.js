@@ -620,17 +620,19 @@ async function testBroadcastMessaging() {
         };
     }
     
-    // Wait for propagation
-    await new Promise(resolve => setTimeout(resolve, 8000));
+    // Wait for propagation (increased from 8 to 12 seconds for better reliability)
+    console.log('  ⏳ Waiting 12 seconds for message propagation...');
+    await new Promise(resolve => setTimeout(resolve, 12000));
     
-    // Check reception
+    // Check reception with detailed logging
     let receiveCount = 0;
+    const failedPeers = [];
     for (const peer of activePeers) {
         if (peer.index === sender.index) continue;
         
         try {
             const received = await peer.page.evaluate((msg) => {
-                // Check received messages tracking (exactly like baseline test)
+                // Check received messages tracking
                 if (window.__ppTest?.receivedMessages?.has && window.__ppTest.receivedMessages.size > 0) {
                     // Look for message in received set
                     for (const msgContent of window.__ppTest.receivedMessages) {
@@ -642,9 +644,13 @@ async function testBroadcastMessaging() {
                 return false;
             }, testMessage);
             
-            if (received) receiveCount++;
+            if (received) {
+                receiveCount++;
+            } else {
+                failedPeers.push(`Peer ${peer.index} (${peer.browserName})`);
+            }
         } catch (e) {
-            // Skip
+            failedPeers.push(`Peer ${peer.index} (${peer.browserName}) - eval error`);
         }
     }
     
@@ -653,7 +659,13 @@ async function testBroadcastMessaging() {
     
     console.log(`  📊 Reception: ${receiveCount}/${activePeers.length - 1} (${receptionRate}%)`);
     
-    const success = receptionRate >= 80;
+    if (failedPeers.length > 0) {
+        console.log(`  ⚠️  Failed peers: ${failedPeers.join(', ')}`);
+    }
+    
+    // For localhost testing, we expect high but not necessarily 100% success due to WebRTC limitations
+    // Require 95% success rate instead of 80%
+    const success = receptionRate >= 95;
     if (success) {
         console.log('  ✅ Broadcast test passed\n');
     } else {
@@ -827,7 +839,11 @@ async function cleanup(silent = false) {
         } catch (e) {}
     }
     
-    if (!silent) console.log('✅ Cleanup complete\n');
+    if (!silent) {
+        // Generate final report after all cleanup
+        await generateReport();
+        console.log('✅ Cleanup complete\n');
+    }
 }
 
 /**
@@ -889,9 +905,6 @@ async function main() {
         
         // Test broadcast messaging
         broadcastResults = await testBroadcastMessaging();
-        
-        // Generate final report
-        await generateReport();
         
         // Cleanup
         await cleanup();

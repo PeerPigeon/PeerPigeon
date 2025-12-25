@@ -785,29 +785,6 @@ export class PeerPigeonMesh extends EventEmitter {
   _checkNetworkHealth() {
     // TEMPORARILY DISABLED - aggressive fallback for debugging
     return;
-    
-    if (this.originalNetworkName === 'global' || !this.allowGlobalFallback) {
-      return;
-    }
-
-    const connectedCount = this.connectionManager.getConnectedPeerCount();
-    const discoveredCount = this.discoveredPeers.size;
-
-    // If we're in the original network but have insufficient peers, activate fallback
-    if (!this.isInFallbackMode && this.networkName === this.originalNetworkName) {
-      if (connectedCount === 0 && discoveredCount === 0) {
-        this.debug.log(`Network ${this.originalNetworkName} appears empty, activating global fallback`);
-        this._activateGlobalFallback().then(activated => {
-          if (activated && this.connected && this.signalingUrl) {
-            // Reconnect to signaling server with global network
-            this.disconnect();
-            setTimeout(() => {
-              this.connect(this.signalingUrl);
-            }, 1000);
-          }
-        });
-      }
-    }
   }
 
   // Status and information methods

@@ -22,36 +22,30 @@ const HUB_MESH_NAMESPACE = process.env.HUB_MESH_NAMESPACE || 'pigeonhub-mesh';
 // Detect hostname for cloud deployment bootstrap configuration
 const HOSTNAME = process.env.HOSTNAME || process.env.FLY_APP_NAME || '';
 
-// Get bootstrap hubs from environment variable or auto-configure for cloud deployments
+// Get bootstrap hubs from environment variable, argument, or auto-configure for cloud deployments
 // Note: ALL hubs register as bootstrap hubs in the mesh (via isHub: true)
 let bootstrapHubs = [];
-if (process.env.BOOTSTRAP_HUBS) {
+const argBootstraps = process.argv.find(arg => arg.startsWith('--bootstraps='));
+if (argBootstraps) {
+    const value = argBootstraps.split('=')[1];
+    if (value === 'fly') {
+        bootstrapHubs = ['wss://pigeonhub.fly.dev', 'wss://pigeonhub-b.fly.dev', 'wss://pigeonhub-c.fly.dev'];
+        console.log(`🔗 Bootstraps set to fly.dev hubs: ${bootstrapHubs.join(', ')}\n`);
+    } else {
+        bootstrapHubs = value.split(',').map(uri => uri.trim()).filter(uri => uri);
+        console.log(`🔗 Bootstraps set from argument: ${bootstrapHubs.join(', ')}\n`);
+    }
+    console.log(`🔗 This hub will register as a bootstrap hub in the mesh\n`);
+} else if (process.env.BOOTSTRAP_HUBS) {
     // Explicit bootstrap configuration takes precedence
     bootstrapHubs = process.env.BOOTSTRAP_HUBS.split(',').map(uri => uri.trim()).filter(uri => uri);
     console.log(`🔗 Bootstrap hubs configured: ${bootstrapHubs.join(', ')}\n`);
     console.log(`🔗 This hub will register as a bootstrap hub in the mesh\n`);
 } else if (HOSTNAME.includes('fly.dev') || HOSTNAME.includes('fly.io')) {
-    // Auto-configure bootstrap hubs for cloud deployment
-    if (HOSTNAME === 'pigeonhub.fly.dev') {
-        // Primary hub doesn't bootstrap from anyone
-        console.log(`🔗 Cloud deployment (Primary Hub): No bootstrap needed\n`);
-        console.log(`🔗 This hub will register as a bootstrap hub in the mesh\n`);
-    } else if (HOSTNAME.includes('pigeonhub-b')) {
-        // Hub B (secondary) bootstraps from primary only
-        bootstrapHubs = ['wss://pigeonhub.fly.dev'];
-        console.log(`🔗 Cloud deployment (Hub B - Secondary): Bootstrapping from primary\n`);
-        console.log(`🔗 This hub will register as a bootstrap hub in the mesh\n`);
-    } else if (HOSTNAME.includes('pigeonhub-c')) {
-        // Hub C (tertiary) bootstraps from primary and secondary
-        bootstrapHubs = ['wss://pigeonhub.fly.dev', 'wss://pigeonhub-b.fly.dev'];
-        console.log(`🔗 Cloud deployment (Hub C - Tertiary): Bootstrapping from primary and secondary\n`);
-        console.log(`🔗 This hub will register as a bootstrap hub in the mesh\n`);
-    } else {
-        // Other hubs use all three as bootstraps
-        bootstrapHubs = ['wss://pigeonhub.fly.dev', 'wss://pigeonhub-b.fly.dev', 'wss://pigeonhub-c.fly.dev'];
-        console.log(`🔗 Cloud deployment: Using primary, secondary, and tertiary hubs as bootstraps\n`);
-        console.log(`🔗 This hub will register as a bootstrap hub in the mesh\n`);
-    }
+    // PROGRAMMATIC DEFAULT: All fly.dev hubs use all three as bootstraps
+    bootstrapHubs = ['wss://pigeonhub.fly.dev', 'wss://pigeonhub-b.fly.dev', 'wss://pigeonhub-c.fly.dev'];
+    console.log(`🔗 PROGRAMMATIC DEFAULT: Using all fly.dev hubs as bootstraps: ${bootstrapHubs.join(', ')}\n`);
+    console.log(`🔗 This hub will register as a bootstrap hub in the mesh\n`);
 } else {
     // Local or other deployment - still registers as a bootstrap hub
     console.log(`🔗 This hub will register as a bootstrap hub in the mesh\n`);

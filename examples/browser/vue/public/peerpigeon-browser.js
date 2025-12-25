@@ -6415,8 +6415,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
         return false;
       }
       return true;
-      this.debug.log(`Cannot accept more peers: ${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total peers in Map`);
-      return false;
     }
     /**
        * Count peers that are in stale/non-viable states
@@ -6778,6 +6776,14 @@ ${b64.match(/.{1,64}/g).join("\n")}
               timestamp: message.originalMessage.timestamp || message.timestamp
             });
           }
+          return;
+        // Early return to prevent fallback to gossip handler
+        case "client-signal-relay":
+          console.log(`\u{1F4E1} Emitting client-signal-relay from ${fromPeerId?.substring(0, 8)} to application`);
+          this.mesh.emit("messageReceived", {
+            from: fromPeerId,
+            message
+          });
           return;
         // Early return to prevent fallback to gossip handler
         default:
@@ -11897,24 +11903,6 @@ ${b64.match(/.{1,64}/g).join("\n")}
     }
     _checkNetworkHealth() {
       return;
-      if (this.originalNetworkName === "global" || !this.allowGlobalFallback) {
-        return;
-      }
-      const connectedCount = this.connectionManager.getConnectedPeerCount();
-      const discoveredCount = this.discoveredPeers.size;
-      if (!this.isInFallbackMode && this.networkName === this.originalNetworkName) {
-        if (connectedCount === 0 && discoveredCount === 0) {
-          this.debug.log(`Network ${this.originalNetworkName} appears empty, activating global fallback`);
-          this._activateGlobalFallback().then((activated) => {
-            if (activated && this.connected && this.signalingUrl) {
-              this.disconnect();
-              setTimeout(() => {
-                this.connect(this.signalingUrl);
-              }, 1e3);
-            }
-          });
-        }
-      }
     }
     // Status and information methods
     getStatus() {

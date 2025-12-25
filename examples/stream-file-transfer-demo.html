@@ -377,7 +377,7 @@
             <div class="connection-grid">
                 <div>
                     <label for="signaling-url">Signaling Server URL</label>
-                    <input type="text" id="signaling-url" value="ws://localhost:3000" placeholder="ws://localhost:3000">
+                    <input type="text" id="signaling-url" value="ws://127.0.0.1:3000" placeholder="ws://127.0.0.1:3000">
                 </div>
                 <div>
                     <label for="network-name">Network Namespace</label>
@@ -497,7 +497,7 @@
         }
 
         async function connectMesh() {
-            const signalingUrl = document.getElementById('signaling-url').value.trim() || 'ws://localhost:3000';
+            const signalingUrl = document.getElementById('signaling-url').value.trim() || 'ws://127.0.0.1:3000';
             const networkName = document.getElementById('network-name').value.trim() || 'file-transfer';
             const connectBtn = document.getElementById('connect-btn');
             const disconnectBtn = document.getElementById('disconnect-btn');

@@ -28,7 +28,7 @@ export const usePeerPigeonStore = defineStore('peerpigeon', () => {
   const mesh = ref(null); // Will be wrapped with markRaw to prevent reactivity issues
   const isInitialized = ref(false);
   const isConnected = ref(false);
-  const signalingUrl = ref('ws://localhost:3000');
+  const signalingUrl = ref('ws://127.0.0.1:3000');
   const peerId = ref('');
   
   // Network namespace state

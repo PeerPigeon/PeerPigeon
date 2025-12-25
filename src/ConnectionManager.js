@@ -505,8 +505,6 @@ export class ConnectionManager extends EventEmitter {
     }
     
     return true;
-    this.debug.log(`Cannot accept more peers: ${connectedCount}/${this.mesh.maxPeers} connected, ${totalPeerCount} total peers in Map`);
-    return false;
   }
 
   /**
@@ -953,6 +951,15 @@ export class ConnectionManager extends EventEmitter {
             timestamp: message.originalMessage.timestamp || message.timestamp
           });
         }
+        return; // Early return to prevent fallback to gossip handler
+
+      case 'client-signal-relay':
+        // Emit client signal relay messages to the application (server)
+        console.log(`📡 Emitting client-signal-relay from ${fromPeerId?.substring(0, 8)} to application`);
+        this.mesh.emit('messageReceived', {
+          from: fromPeerId,
+          message: message
+        });
         return; // Early return to prevent fallback to gossip handler
 
       default:

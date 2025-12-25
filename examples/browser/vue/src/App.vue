@@ -44,7 +44,7 @@
               <input 
                 id="url-input"
                 v-model="signalingUrl" 
-                placeholder="ws://localhost:3000"
+                placeholder="ws://127.0.0.1:3000"
                 class="url-input"
                 :disabled="isConnected"
               >

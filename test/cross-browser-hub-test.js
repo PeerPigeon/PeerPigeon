@@ -84,7 +84,8 @@ async function startHubs() {
         host: '127.0.0.1',  // Explicit IPv4
         isHub: true,
         bootstrapHubs: [],  // Will connect manually after both are up
-        autoConnect: false
+        autoConnect: false,
+        hubMeshMinPeers: 1  // For 2-hub setup, only need 1 P2P connection
     });
     await hubServer1.start();
     console.log(`✅ Hub 1 started on port ${HUB_1_PORT}`);
@@ -95,7 +96,8 @@ async function startHubs() {
         host: '127.0.0.1',  // Explicit IPv4
         isHub: true,
         bootstrapHubs: [],  // Will connect manually after both are up
-        autoConnect: false
+        autoConnect: false,
+        hubMeshMinPeers: 1  // For 2-hub setup, only need 1 P2P connection
     });
     await hubServer2.start();
     console.log(`✅ Hub 2 started on port ${HUB_2_PORT}\n`);
@@ -902,7 +904,15 @@ async function cleanup(silent = false) {
         }
     }
     
-    if (!silent) console.log('✅ Cleanup complete\n');
+    if (!silent) {
+        // Print summary after all cleanup is done
+        try {
+            await printSummary();
+        } catch (summaryError) {
+            console.error('Failed to print summary:', summaryError.message);
+        }
+        console.log('✅ Cleanup complete\n');
+    }
 }
 
 /**
@@ -1267,8 +1277,7 @@ async function runTest() {
             }
         }
         
-        // Print summary (includes final mesh snapshot and message stats)
-        await printSummary();
+        // Summary will be printed after cleanup
         
     } catch (error) {
         console.error(`\n❌ Test failed with error: ${error.message}`);
@@ -1283,12 +1292,7 @@ async function runTest() {
                 successRate: 0
             };
         }
-        // Still print summary on error
-        try {
-            await printSummary();
-        } catch (summaryError) {
-            console.error('Failed to print summary:', summaryError.message);
-        }
+        // Summary will be printed after cleanup
     } finally {
         await cleanup();
         process.exit(0);
