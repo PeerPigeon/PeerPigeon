@@ -12,7 +12,7 @@
 
         <div>Room ID</div>
         <div class="row">
-          <input v-model="signalingRoom" placeholder="Auto-generated room" class="input" style="flex:1;" />
+          <input v-model="signalingRoom" placeholder="Auto-generated room" class="input" style="flex:1;" readonly />
           <button class="btn" @click="reconnect">Reconnect</button>
         </div>
 
@@ -63,34 +63,94 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onBeforeUnmount } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { PartialMesh } from '/node_modules/webdht/src/vendor/partialmesh.ts'
-import { GossipProtocol } from '/node_modules/webdht/src/vendor/gossip-protocol.ts'
+import { dht, connected, nodeId, peerList } from '../dhtStore.js'
 
 const signalingServer = ref('wss://signal.peer.ooo/ws')
 const signalingRoom = ref('')
 const messages = ref([])
-const connected = ref(false)
-const nodeId = ref('')
-const connectedPeers = ref([])
 const discoveredPeers = ref([])
-let mesh = null
-let gossip = null
+const connectedPeers = computed(() => peerList.value)
 
-const buildIceServers = () => {
-  return [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' }
+let mesh = null
+let eventBindings = []
+
+const buildIceServers = () => [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' }
+]
+
+const detachMeshEvents = () => {
+  if (mesh && eventBindings.length) {
+    eventBindings.forEach(([event, handler]) => mesh.off(event, handler))
+  }
+  eventBindings = []
+}
+
+const attachMeshEvents = () => {
+  if (!mesh) return
+  detachMeshEvents()
+
+  const bindings = [
+    ['signaling:connected', (data) => {
+      nodeId.value = data.clientId
+      connected.value = true
+      addMessage('✅ Connected to signaling server')
+      addMessage(`🆔 Node ID: ${data.clientId?.substring(0, 16)}...`)
+    }],
+    ['signaling:disconnected', () => {
+      connected.value = false
+      addMessage('⚠️ Signaling disconnected (peers may stay connected)')
+    }],
+    ['signaling:error', (err) => {
+      addMessage(`❌ Signaling error: ${err?.message || err}`)
+      console.error('Signaling error:', err)
+    }],
+    ['peer:connected', (peerId) => {
+      addMessage(`✅ Peer connected: ${peerId.substring(0, 16)}...`)
+      peerList.value = mesh.getConnectedPeers()
+    }],
+    ['peer:discovered', () => {
+      discoveredPeers.value = mesh.getDiscoveredPeers()
+    }],
+    ['peer:disconnected', (peerId) => {
+      addMessage(`❌ Peer disconnected: ${peerId.substring(0, 16)}...`)
+      peerList.value = mesh.getConnectedPeers()
+      discoveredPeers.value = mesh.getDiscoveredPeers()
+    }],
+    ['peer:error', (payload) => {
+      addMessage(`❌ Peer error: ${payload?.peerId?.substring(0, 16) || 'unknown'}`)
+      console.error('Peer error:', payload)
+    }],
+    ['mesh:reset', (data) => {
+      addMessage(`⚠️ Mesh reset: ${data?.reason || 'unknown'}`)
+      peerList.value = mesh.getConnectedPeers()
+      discoveredPeers.value = mesh.getDiscoveredPeers()
+    }],
   ]
+
+  bindings.forEach(([event, handler]) => mesh.on(event, handler))
+  eventBindings = bindings
 }
 
 const setupMesh = async () => {
   try {
     addMessage('🚀 Initializing PartialMesh...')
-    
+
+    // Reuse existing mesh if present to keep peers alive across pages
+    if (dht.value) {
+      mesh = dht.value
+      attachMeshEvents()
+      peerList.value = mesh.getConnectedPeers()
+      discoveredPeers.value = mesh.getDiscoveredPeers()
+      addMessage('♻️ Reusing existing mesh instance')
+      return
+    }
+
     mesh = new PartialMesh({
       signalingServer: signalingServer.value,
-      room: signalingRoom.value,
+      sessionId: signalingRoom.value,
       minPeers: 1,
       maxPeers: 10,
       trickle: true,
@@ -100,63 +160,12 @@ const setupMesh = async () => {
       debug: true,
     })
 
-    mesh.on('signaling:connected', (data) => {
-      nodeId.value = data.clientId
-      connected.value = true
-      addMessage(`✅ Connected to signaling server`)
-      addMessage(`🆔 Node ID: ${data.clientId?.substring(0, 16)}...`)
-    })
+    dht.value = mesh
+    attachMeshEvents()
 
-    mesh.on('signaling:disconnected', () => {
-      addMessage('⚠️ Signaling disconnected (WebRTC peers stay connected)')
-    })
-
-    mesh.on('peer:connected', (peerId) => {
-      addMessage(`✅ Peer connected: ${peerId.substring(0, 16)}...`)
-      if (!connectedPeers.value.includes(peerId)) {
-        connectedPeers.value.push(peerId)
-      }
-    })
-
-    mesh.on('peer:discovered', (peerId) => {
-      addMessage(`🔎 Discovered peer: ${peerId.substring(0, 16)}...`)
-      if (!discoveredPeers.value.includes(peerId)) {
-        discoveredPeers.value.push(peerId)
-      }
-    })
-
-    mesh.on('peer:disconnected', (peerId) => {
-      addMessage(`❌ Peer disconnected: ${peerId.substring(0, 16)}...`)
-      connectedPeers.value = connectedPeers.value.filter(p => p !== peerId)
-    })
-
-    mesh.on('peer:error', (payload) => {
-      addMessage(`❌ Peer error: ${payload?.peerId?.substring(0, 16) || 'unknown'}`)
-      console.error('Peer error:', payload)
-    })
-
-    mesh.on('signaling:error', (err) => {
-      addMessage(`❌ Signaling error: ${err.message || err}`)
-      console.error('Signaling error:', err)
-    })
-
-    mesh.on('mesh:reset', (data) => {
-      addMessage(`⚠️ Mesh reset: ${data?.reason || 'unknown'}`)
-      console.warn('[mesh] reset', data)
-    })
-
-    // Initialize gossip protocol for messaging
-    gossip = new GossipProtocol(mesh, { maxHops: 10 })
-    
-    gossip.on('messageReceived', (data) => {
-      const { message, local, fromPeer } = data
-      if (!local) {
-        addMessage(`📨 Message from ${fromPeer?.substring(0, 16) || 'unknown'}: ${String(message.data).substring(0, 50)}`)
-      }
-    })
-
-    // Initialize and connect to signaling
     await mesh.init()
+    peerList.value = mesh.getConnectedPeers()
+    discoveredPeers.value = mesh.getDiscoveredPeers()
     addMessage('✅ Mesh initialized successfully')
   } catch (err) {
     addMessage(`❌ Mesh initialization error: ${err.message || err}`)
@@ -166,12 +175,20 @@ const setupMesh = async () => {
 
 const reconnect = async () => {
   addMessage('🔄 Reconnecting...')
+  detachMeshEvents()
   if (mesh) {
-    mesh.destroy()
+    try {
+      mesh.destroy()
+    } catch (err) {
+      console.warn('Mesh destroy failed', err)
+    }
   }
-  connectedPeers.value = []
-  discoveredPeers.value = []
+  mesh = null
+  dht.value = null
   connected.value = false
+  nodeId.value = ''
+  peerList.value = []
+  discoveredPeers.value = []
   await setupMesh()
 }
 
@@ -185,33 +202,33 @@ const addMessage = (text) => {
     text,
     time: new Date().toLocaleTimeString()
   })
-  // Keep only last 100 messages
   if (messages.value.length > 100) {
     messages.value.shift()
   }
 }
 
 onMounted(async () => {
-  // Parse URL params for room
-  const params = new URLSearchParams(window.location.search)
-  const room = params.get('room')
-  if (room) {
-    signalingRoom.value = room
-    addMessage(`📍 Using room from URL: ${room}`)
-  } else {
-    // Generate random private room to avoid public peer collisions
-    signalingRoom.value = 'peer-' + Math.random().toString(36).substring(2, 10)
-    window.history.replaceState({}, '', `?room=${signalingRoom.value}`)
-    addMessage(`📍 Generated private room: ${signalingRoom.value}`)
-  }
+  // ALWAYS generate deterministic room based on 30-minute UTC time bucket
+  // NO URL params - every browser computes the same room independently
+  const now = Date.now()
+  const thirtyMinMs = 30 * 60 * 1000
+  const bucket = Math.floor(now / thirtyMinMs)
   
+  // Create a short random-looking but deterministic room ID from the bucket
+  signalingRoom.value = `room-${bucket.toString(36)}`
+  
+  const nextBucket = (bucket + 1) * thirtyMinMs
+  const remainingMin = Math.ceil((nextBucket - now) / 60000)
+  
+  addMessage(`📍 Room: ${signalingRoom.value} (expires in ${remainingMin}min)`)
+  addMessage(`🕐 All browsers use same room for next ${remainingMin}min`)
+
   await setupMesh()
 })
 
 onBeforeUnmount(() => {
-  if (mesh) {
-    mesh.destroy()
-  }
+  // Keep mesh running so other pages (Messaging) stay connected; just drop UI listeners.
+  detachMeshEvents()
 })
 </script>
 
