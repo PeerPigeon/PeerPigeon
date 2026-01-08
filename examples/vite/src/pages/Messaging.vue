@@ -60,12 +60,11 @@
 </template>
 
 <script setup>
-import { ref, watch, onMounted } from 'vue';
-import { dht, connected, nodeId, peerList } from '../dhtStore.js';
+import { ref } from 'vue';
+import { dht, connected, nodeId, peerList, messages } from '../dhtStore.js';
 
 const selectedPeer = ref('');
 const message = ref('');
-const messages = ref([]);
 
 function sendMessage() {
   if (!message.value.trim() || !dht.value) return;
@@ -77,42 +76,26 @@ function sendMessage() {
     timestamp: Date.now()
   };
 
-  if (selectedPeer.value) {
-    const peer = dht.value.peers.get(selectedPeer.value);
-    if (peer && peer.connected) {
-      peer.send(JSON.stringify(msg));
-      addMessage(msg);
+  try {
+    if (selectedPeer.value) {
+      dht.value.send(selectedPeer.value, JSON.stringify(msg));
+      messages.value.push({
+        from: msg.from,
+        text: msg.text,
+        time: new Date(msg.timestamp).toLocaleTimeString()
+      });
+    } else {
+      dht.value.broadcast(JSON.stringify(msg));
+      messages.value.push({
+        from: msg.from,
+        text: msg.text,
+        time: new Date(msg.timestamp).toLocaleTimeString()
+      });
     }
-  } else {
-    for (const [peerId, peer] of dht.value.peers.entries()) {
-      if (peer.connected) {
-        peer.send(JSON.stringify(msg));
-      }
-    }
-    addMessage(msg);
+  } catch (err) {
+    console.error('Send failed', err);
   }
 
   message.value = '';
 }
-
-function addMessage(msg) {
-  messages.value.push({
-    from: msg.from,
-    text: msg.text,
-    time: new Date(msg.timestamp).toLocaleTimeString()
-  });
-}
-
-onMounted(() => {
-  if (dht.value) {
-    dht.value.on('peer:data', ({ peerId, data }) => {
-      try {
-        const msg = JSON.parse(data);
-        if (msg.type === 'chat') {
-          addMessage(msg);
-        }
-      } catch (e) {}
-    });
-  }
-});
 </script>

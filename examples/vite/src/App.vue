@@ -24,8 +24,5 @@
 </template>
 
 <script setup>
-import { ref } from 'vue';
-
-// Global UI connection state (simplified placeholder)
-const connected = ref(false);
+import { connected } from './dhtStore.js';
 </script>
