@@ -1,0 +1,19 @@
+{
+  "name": "webdht-example",
+  "version": "1.0.0",
+  "description": "WebDHT example",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "vue": "^3.4.0",
+    "webdht": "^2.0.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.3",
+    "vite": "^5.0.0"
+  }
+}
