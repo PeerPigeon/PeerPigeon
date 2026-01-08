@@ -4,7 +4,10 @@
   "description": "WebDHT distributed hash table examples",
   "type": "module",
   "scripts": {
-    "example": "cd examples/webdht-example && npm run dev"
+    "example": "cd examples/vite && npm run dev",
+    "dev": "npm run example",
+    "build": "cd examples/vite && npm run build",
+    "preview": "cd examples/vite && npm run preview"
   },
   "dependencies": {
     "webdht": "^2.0.1"

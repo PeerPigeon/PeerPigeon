@@ -1,7 +1,7 @@
 {
-  "name": "webdht-example",
+  "name": "peerpigeon-vite-demo",
   "version": "1.0.0",
-  "description": "WebDHT example",
+  "description": "PeerPigeon Vue 3 demo (Vite) with UI features",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,9 @@
   },
   "dependencies": {
     "vue": "^3.4.0",
+    "pinia": "^2.1.7",
+    "vue-router": "^4.3.0",
+    "@vueuse/core": "^10.9.0",
     "webdht": "^2.0.1"
   },
   "devDependencies": {
