@@ -5,15 +5,20 @@
       <p class="small">WebDHT P2P Mesh Network using PartialMesh</p>
 
       <div class="kv" style="margin-top: 12px;">
-        <div>Signaling Server</div>
+        <div>Signaling Server (use /ws path)</div>
         <div class="row">
           <input v-model="signalingServer" placeholder="wss://signal.peer.ooo/ws" class="input" style="flex:1;" />
         </div>
 
-        <div>Room ID</div>
+        <div>Signaling Session</div>
         <div class="row">
           <input v-model="signalingRoom" placeholder="Auto-generated room" class="input" style="flex:1;" readonly />
           <button class="btn" @click="reconnect">Reconnect</button>
+        </div>
+
+        <div>ROOM ID (30 min)</div>
+        <div class="row">
+          <input :value="globalRoomId" class="input" style="flex:1;" readonly />
         </div>
 
         <div>Your Node ID</div>
@@ -63,9 +68,9 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { PartialMesh } from '/node_modules/webdht/src/vendor/partialmesh.ts'
-import { dht, connected, nodeId, peerList } from '../dhtStore.js'
+import { dht, connected, nodeId, peerList, initRoomKey, roomId as globalRoomId } from '../dhtStore.js'
 
 const signalingServer = ref('wss://signal.peer.ooo/ws')
 const signalingRoom = ref('')
@@ -75,6 +80,7 @@ const connectedPeers = computed(() => peerList.value)
 
 let mesh = null
 let eventBindings = []
+let roomCheckInterval = null
 
 const buildIceServers = () => [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -207,28 +213,68 @@ const addMessage = (text) => {
   }
 }
 
-onMounted(async () => {
-  // ALWAYS generate deterministic room based on 30-minute UTC time bucket
-  // NO URL params - every browser computes the same room independently
+const generateRoom = () => {
   const now = Date.now()
   const thirtyMinMs = 30 * 60 * 1000
   const bucket = Math.floor(now / thirtyMinMs)
+  // Always use same deterministic bucket room across all tabs
+  return {
+    room: `room-${bucket.toString(36)}`,
+    expiresAt: (bucket + 1) * thirtyMinMs,
+    bucket
+  }
+}
+
+// No automatic reconnect on expiry; session stays stable.
+
+onMounted(async () => {
+  // ALWAYS generate deterministic room based on 30-minute UTC time bucket
+  // NO URL params - every browser computes the same room independently
+  const { room, expiresAt } = generateRoom()
+  const now = Date.now()
+  const remainingMin = Math.ceil((expiresAt - now) / 60000)
   
-  // Create a short random-looking but deterministic room ID from the bucket
-  signalingRoom.value = `room-${bucket.toString(36)}`
+  signalingRoom.value = room
+  // DON'T set globalRoomId here; it will be set by dhtStore on first peer join
+  // This ensures ROOM ID field shows the active room with suffix, not the signaling room
+  await initRoomKey(room)
   
-  const nextBucket = (bucket + 1) * thirtyMinMs
-  const remainingMin = Math.ceil((nextBucket - now) / 60000)
-  
-  addMessage(`📍 Room: ${signalingRoom.value} (expires in ${remainingMin}min)`)
-  addMessage(`🕐 All browsers use same room for next ${remainingMin}min`)
+  addMessage(`📍 Signaling Session: ${room} (expires in ${remainingMin}min)`)
+  addMessage(`⏳ Waiting for 1st peer to set active ROOM ID...`)
 
   await setupMesh()
+  
+  // No forced reconnects; keep session stable for testing
+  
+  // Listen for global room-switch events (broadcasted from dhtStore)
+  const onRoomSwitch = (e) => {
+    const next = e?.detail?.room
+    if (next && next !== signalingRoom.value) {
+      // Update crypto room/key only; do NOT reconnect signaling session
+      globalRoomId.value = next
+      initRoomKey(next)
+      addMessage(`🔐 Active ROOM ID: ${next}`)
+    }
+  }
+  window.addEventListener('room-switch', onRoomSwitch)
+  
+  // Also react to globalRoomId changes
+  watch(() => globalRoomId.value, (next) => {
+    if (next && next !== signalingRoom.value) {
+      initRoomKey(next)
+      addMessage(`🔐 ROOM ID updated: ${next}`)
+    }
+  })
 })
 
 onBeforeUnmount(() => {
   // Keep mesh running so other pages (Messaging) stay connected; just drop UI listeners.
   detachMeshEvents()
+  if (roomCheckInterval) {
+    clearInterval(roomCheckInterval)
+    roomCheckInterval = null
+  }
+  try { window.removeEventListener('room-switch', () => {}) } catch (e) {}
 })
 </script>
 
