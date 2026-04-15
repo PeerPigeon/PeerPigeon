@@ -1,15 +1,22 @@
 {
-  "name": "peerpigeon-webdht",
-  "version": "1.0.0",
-  "description": "WebDHT distributed hash table examples",
+  "name": "peerpigeon",
+  "version": "2.0.0",
+  "description": "PeerPigeon – browser P2P networking with DHT, gossip, and WebRTC signaling",
   "type": "module",
   "scripts": {
-    "example": "cd examples/vite && npm run dev",
-    "dev": "npm run example",
-    "build": "cd examples/vite && npm run build",
-    "preview": "cd examples/vite && npm run preview"
+    "dev": "vite examples/vue",
+    "build": "vite build examples/vue",
+    "preview": "vite preview examples/vue"
   },
   "dependencies": {
-    "webdht": "^2.0.1"
+    "@vueuse/core": "^10.9.0",
+    "gossip-protocol": "https://github.com/draeder/gossip-protocol#refactor",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.0",
+    "vue-router": "^4.3.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.3",
+    "vite": "^5.0.0"
   }
 }
