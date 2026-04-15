@@ -4,14 +4,15 @@
   "description": "PeerPigeon – browser P2P networking with DHT, gossip, and WebRTC signaling",
   "type": "module",
   "scripts": {
-    "dev": "vite examples/vue",
+    "dev": "vite examples/vue --force",
     "build": "vite build examples/vue",
     "preview": "vite preview examples/vue"
   },
   "dependencies": {
     "@vueuse/core": "^10.9.0",
-    "gossip-protocol": "https://github.com/draeder/gossip-protocol#refactor",
+    "gossip-protocol": "github:draeder/gossip-protocol#refactor",
     "pinia": "^2.1.7",
+    "unsea": "^1.1.2",
     "vue": "^3.4.0",
     "vue-router": "^4.3.0"
   },

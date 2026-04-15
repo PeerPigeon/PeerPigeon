@@ -6,11 +6,4 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ['gossip-protocol'],
   },
-  server: {
-    hmr: true,
-    watch: {
-      usePolling: true,
-      interval: 100,
-    },
-  },
 })
