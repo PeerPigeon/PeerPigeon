@@ -1,35 +1,33 @@
-# Node
+# Dependencies
 node_modules/
 
+# Build output
+dist/
+dist-ssr/
+
+# Vite
+.vite/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
 # Logs
+*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-pnpm-debug.log*
-*.log
-
-# Build outputs
-/build/
-/dist/
-/.cache/
-/.vite/
-/.parcel-cache/
-coverage/
-
-# Env
-.env
-.env.*
-
-# OS
-.DS_Store
 
 # Editor
 .vscode/
 .idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
 
-# Misc
-*.local
-
-# Vite per-example caches
-examples/**/node_modules/.vite/
-examples/**/dist/
+# OS
+.DS_Store
+Thumbs.db
