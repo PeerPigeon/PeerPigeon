@@ -244,8 +244,8 @@
             <h3>Mesh Snapshot</h3>
             <div class="network-kpis">
               <div class="network-kpi">
-                <span class="network-kpi__label">Connected</span>
-                <strong class="network-kpi__value">{{ connectedPeers.length }}</strong>
+                <span class="network-kpi__label">Connected (RTC)</span>
+                <strong class="network-kpi__value">{{ networkDirectCount }}</strong>
               </div>
               <div class="network-kpi">
                 <span class="network-kpi__label">Discovered</span>
@@ -272,10 +272,11 @@
                     <th>Peer</th>
                     <th>Disc</th>
                     <th>Conn</th>
-                    <th>Transport</th>
-                    <th>Channel</th>
-                    <th>Key</th>
                     <th>Browser</th>
+                    <th>Transport</th>
+                    <th title="RTCDataChannel.readyState (open/connecting/closing/closed/no-channel/—)">DC State</th>
+                    <th title="peerEntries entry.relayOnly flag">Relay Only</th>
+                    <th>Key</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -283,10 +284,11 @@
                     <td><code>{{ row.shortId }}</code></td>
                     <td>{{ row.discovered ? 'yes' : 'no' }}</td>
                     <td>{{ row.connected ? 'yes' : 'no' }}</td>
-                    <td>{{ row.transport }}</td>
-                    <td>{{ row.channelState }}</td>
-                    <td>{{ row.hasEpub ? 'yes' : 'no' }}</td>
                     <td>{{ row.browser }}</td>
+                    <td>{{ row.transport }}</td>
+                    <td>{{ row.dcState }}</td>
+                    <td>{{ row.relayOnly }}</td>
+                    <td>{{ row.hasEpub ? 'yes' : 'no' }}</td>
                   </tr>
                 </tbody>
               </table>
@@ -309,7 +311,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, reactive, watch } from 'vue'
 import { PartialMesh, GossipProtocol } from 'gossip-protocol'
 import { generateRandomPair, encryptMessageWithMeta, decryptMessageWithMeta } from 'unsea'
-import { DistributedStorage, STORAGE_SPACES } from '../../src/index.js'
+import { DistributedStorage, STORAGE_SPACES, collectPeerIds, getPeerDataChannelState } from '../../src/index.js'
 
 // ── State ────────────────────────────────────────────────────────────────────
 const activeTab = ref('connection')
@@ -429,39 +431,51 @@ const signalingLabel = computed(() => ({
   disconnected: 'Disconnected',
 }[signalingStatus.value] ?? 'Disconnected'))
 
-const TRANSPORT_ORDER = { relay: 0, 'relay-candidate': 1, direct: 2, connected: 3, 'rtc-candidate': 4, unknown: 5 }
+const TRANSPORT_ORDER = {
+  'ws-relay': 0,
+  'relay-candidate': 1,
+  webrtc: 2,
+  negotiating: 3,
+  discovered: 4,
+  unknown: 5,
+}
+
+function getNetworkTransport(entry, transportConnected, rtcConnected, discovered) {
+  if (rtcConnected) return 'webrtc'
+  if (transportConnected && entry?.relayOnly) return 'ws-relay'
+  if (entry) return 'negotiating'
+  if (discovered) return 'discovered'
+  return 'unknown'
+}
 
 const networkPeerRows = computed(() => {
   void tableRefreshTick.value // reactive dependency so readyState stays live
 
-  const idSet = new Set([
-    ...connectedPeers.value,
-    ...discoveredPeers.value,
-  ])
-
-  return Array.from(idSet)
+  return collectPeerIds({
+    connectedPeers: connectedPeers.value,
+    discoveredPeers: discoveredPeers.value,
+    mesh,
+  })
     .filter(Boolean)
     .map((peerId) => {
       const entry = getMeshConnectionEntry(peerId)
-      const relayOnly = Boolean(entry?.relayOnly)
-      const connected = connectedPeers.value.includes(peerId) || Boolean(entry?.connected)
+      const transportConnected = connectedPeers.value.includes(peerId) || Boolean(entry?.connected)
       const discovered = discoveredPeers.value.includes(peerId)
-      const channelState = entry?.channel?.readyState ?? (relayOnly ? 'ws' : 'none')
-
-      let transport = 'unknown'
-      if (connected && relayOnly) transport = 'relay'
-      else if (connected && channelState === 'open') transport = 'direct'
-      else if (connected) transport = 'connected'
-      else if (relayOnly) transport = 'relay-candidate'
-      else if (entry) transport = 'rtc-candidate'
+      // Raw values straight from the library — no formatting
+      const dcState = getPeerDataChannelState(mesh, peerId) // RTCDataChannel.readyState or null
+      const rtcConnected = dcState === 'open'
+      const transport = getNetworkTransport(entry, transportConnected, rtcConnected, discovered)
 
       return {
         peerId,
         shortId: peerId.length > 16 ? `${peerId.slice(0, 16)}…` : peerId,
         discovered,
-        connected,
+        connected: rtcConnected,
         transport,
-        channelState,
+        // Raw field: RTCDataChannel.readyState, 'no-channel' if entry exists but channel is null, '—' if no entry
+        dcState: entry ? (dcState ?? 'no-channel') : '—',
+        // Raw field: the relayOnly flag directly from peerEntries
+        relayOnly: entry ? (entry.relayOnly ? 'yes' : 'no') : '—',
         hasEpub: Boolean(peerEpubs[peerId]),
         browser: peerBrowsers[peerId] ?? '—',
       }
@@ -475,11 +489,11 @@ const networkPeerRows = computed(() => {
 })
 
 const networkDirectCount = computed(() =>
-  networkPeerRows.value.filter((row) => row.transport === 'direct').length
+  networkPeerRows.value.filter((row) => row.transport === 'webrtc').length
 )
 
 const networkRelayCount = computed(() =>
-  networkPeerRows.value.filter((row) => row.transport === 'relay' || row.transport === 'relay-candidate').length
+  networkPeerRows.value.filter((row) => row.transport === 'ws-relay' || row.transport === 'relay-candidate').length
 )
 
 function sanitizeStoredConfig(raw) {
@@ -742,7 +756,7 @@ async function doConnect() {
       autoDiscover: config.value.autoDiscover,
       iceServers: runtimeIceServers,
       trickleIce: !isFirefox,
-      signalRelayFallback: true,
+      signalRelayFallback: false,
       maxConcurrentDials: isFirefox ? 1 : isChrome ? 1 : 3,
       rtcCapacityBackoffMs: isChrome ? 20000 : 15000,
       relayRetryMs: isFirefox ? 120000 : 90000,
@@ -831,13 +845,10 @@ async function doConnect() {
 
     registerMeshHandler('peer:left', cleanupPeerState)
 
-    // Incoming gossip broadcasts
+    // Incoming gossip broadcasts (chat payloads ignored; chat is RTC-only)
     registerGossipHandler('messageReceived', async ({ message, local }) => {
       if (local) return
       const raw = message.data
-      const deliveryMs = getDeliveryMs(message.timestamp)
-      const hops = Number.isFinite(Number(message?.hops)) ? Number(message.hops) : null
-      const route = hops !== null && hops <= 1 ? 'direct' : 'gossip'
       try {
         const parsed = typeof raw === 'string' ? JSON.parse(raw) : null
         if (parsed?.__pp_key && parsed?.epub && message.sender) {
@@ -845,18 +856,11 @@ async function doConnect() {
           if (parsed.browser) peerBrowsers[message.sender] = parsed.browser
           return
         }
-        if (parsed?.__pp_enc_bc_u && parsed?.envelopes && myKeys?.epriv && clientId.value) {
-          const envelope = parsed.envelopes[clientId.value]
-          if (!envelope) return
-          const text = await decryptMessageWithMeta(envelope, myKeys.epriv)
-          pushMessage({ type: 'broadcast', from: parsed.from || message.sender, text, local: false, encrypted: true, deliveryMs, route })
-        }
       } catch { /* not our format, fall through */ }
     })
 
-    // Incoming direct messages via gossip routing
+    // Incoming direct messages via gossip routing (chat payloads ignored; chat is RTC-only)
     registerGossipHandler('directMessageReceived', async ({ message }) => {
-      const deliveryMs = getDeliveryMs(message.timestamp)
       try {
         const parsed = JSON.parse(message.data)
         if (parsed.__pp_key_req) {
@@ -869,14 +873,6 @@ async function doConnect() {
           if (parsed.browser) peerBrowsers[message.from] = parsed.browser
           announceLocalKey(message.from)
           return
-        }
-        if (parsed.__pp_direct_u && parsed.encrypted && myKeys?.epriv) {
-          const text = await decryptMessageWithMeta(parsed.encrypted, myKeys.epriv)
-          const sender = message.from || message.sender
-          if (!dmTarget.value) {
-            dmTarget.value = sender
-          }
-          pushMessage({ type: 'direct', from: sender, to: clientId.value, text, local: false, encrypted: true, deliveryMs, route: 'gossip' })
         }
       } catch {}
     })
@@ -899,14 +895,20 @@ async function doConnect() {
           return
         }
 
+        if (parsed.__pp_enc_bc_u && parsed.encrypted && myKeys?.epriv) {
+          const deliveryMs = getDeliveryMs(parsed.sentAt)
+          const text = await decryptMessageWithMeta(parsed.encrypted, myKeys.epriv)
+          pushMessage({ type: 'broadcast', from: parsed.from || peerId, text, local: false, encrypted: true, deliveryMs, route: 'direct' })
+          return
+        }
+
         if (parsed.__pp_direct_u && parsed.encrypted && myKeys?.epriv) {
           const deliveryMs = getDeliveryMs(parsed.sentAt)
-          const route = getMeshConnectionEntry(peerId)?.relayOnly ? 'gossip' : 'direct'
           const text = await decryptMessageWithMeta(parsed.encrypted, myKeys.epriv)
           if (!dmTarget.value) {
             dmTarget.value = peerId
           }
-          pushMessage({ type: 'direct', from: peerId, to: clientId.value, text, local: false, encrypted: true, deliveryMs, route })
+          pushMessage({ type: 'direct', from: peerId, to: clientId.value, text, local: false, encrypted: true, deliveryMs, route: 'direct' })
           return
         }
       } catch {
@@ -965,6 +967,22 @@ function startConnectionSyncTimer() {
   connectionSyncTimer = setInterval(syncConnectedPeers, 3000)
   stopTableRefreshTimer()
   tableRefreshTimer = setInterval(() => { tableRefreshTick.value++ }, 1000)
+  // Debug helper: window.__pp.dump() in browser console shows raw peerEntries state
+  if (typeof window !== 'undefined') {
+    window.__pp = {
+      entries: () => mesh?.signalingClient?.client?.mesh?.connections,
+      dump() {
+        const map = mesh?.signalingClient?.client?.mesh?.connections
+        if (!map) return console.log('[__pp] no peerEntries (mesh not ready)')
+        console.log(`[__pp] ${map.size} entries in peerEntries:`)
+        for (const [id, e] of map.entries()) {
+          console.log(
+            `  ${id.slice(0, 16)}… relayOnly=${e.relayOnly} channel=${e.channel?.readyState ?? 'null'} connected=${e.connected} state=${e.state}`
+          )
+        }
+      },
+    }
+  }
 }
 
 function syncPeerKeys() {
@@ -1043,7 +1061,7 @@ watch(() => storageView.space, () => {
 // ── Messaging ────────────────────────────────────────────────────────────────
 async function sendBroadcast() {
   const text = broadcastDraft.value.trim()
-  if (!text || !gossip) return
+  if (!text || !mesh) return
   if (!myKeys?.epub) {
     console.error('Broadcast blocked: local UnSEA key unavailable')
     return
@@ -1051,37 +1069,44 @@ async function sendBroadcast() {
 
   const recipients = Array.from(new Set(connectedPeers.value.filter(Boolean)))
     .filter((peerId) => peerId && peerId !== clientId.value)
+    .filter((peerId) => isDirectRtcConnected(peerId))
 
-  const envelopes = {}
   const missingKeyPeers = []
+  const sentPeers = []
   for (const peerId of recipients) {
     const epub = peerEpubs[peerId]
     if (!epub) {
       missingKeyPeers.push(peerId)
       continue
     }
-    envelopes[peerId] = await encryptMessageWithMeta(text, { epub })
+
+    const payload = JSON.stringify({
+      __pp_enc_bc_u: true,
+      from: clientId.value,
+      encrypted: await encryptMessageWithMeta(text, { epub }),
+      sentAt: Date.now(),
+    })
+    mesh.send(peerId, payload)
+    sentPeers.push(peerId)
   }
 
   if (missingKeyPeers.length > 0) {
     console.warn('Broadcast key-missing peers:', missingKeyPeers)
   }
 
-  if (Object.keys(envelopes).length === 0) {
-    console.error('Broadcast blocked: no UnSEA recipient keys available')
+  if (sentPeers.length === 0) {
+    console.error('Broadcast blocked: no RTC-open peers with UnSEA keys available')
     announceLocalKey()
     return
   }
-  const payload = JSON.stringify({ __pp_enc_bc_u: true, from: clientId.value, envelopes })
 
-  gossip.broadcast(payload)
   pushMessage({ type: 'broadcast', from: clientId.value, text, local: true, encrypted: true, route: 'local' })
   broadcastDraft.value = ''
 }
 
 async function sendDirect() {
   const text = dmDraft.value.trim()
-  if (!text || !dmTarget.value || !gossip) return
+  if (!text || !dmTarget.value || !mesh) return
   const epub = peerEpubs[dmTarget.value]
   if (!epub) {
     console.error('Direct send blocked: recipient UnSEA key unavailable')
@@ -1091,7 +1116,10 @@ async function sendDirect() {
   try {
     maybeUpgradePeerToRtc(dmTarget.value)
     const useDirectRtc = isDirectRtcConnected(dmTarget.value)
-    const route = useDirectRtc ? 'direct' : 'gossip'
+    if (!useDirectRtc) {
+      console.error('Direct send blocked: target peer has no open RTC data channel')
+      return
+    }
     const payloadObj = { __pp_direct_u: true }
     payloadObj.encrypted = await encryptMessageWithMeta(text, { epub })
 
@@ -1099,12 +1127,8 @@ async function sendDirect() {
     payloadObj.sentAt = Date.now()
 
     const payload = JSON.stringify(payloadObj)
-    if (useDirectRtc) {
-      mesh.send(dmTarget.value, payload)
-    } else {
-      gossip.sendDirect(dmTarget.value, payload)
-    }
-    pushMessage({ type: 'direct', from: clientId.value, text, local: true, to: dmTarget.value, encrypted: true, route })
+    mesh.send(dmTarget.value, payload)
+    pushMessage({ type: 'direct', from: clientId.value, text, local: true, to: dmTarget.value, encrypted: true, route: 'direct' })
     dmDraft.value = ''
   } catch (err) {
     console.error('Direct send failed:', err)
