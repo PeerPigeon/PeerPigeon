@@ -76,17 +76,18 @@
                 :class="['chat-message', msg.local ? 'chat-message--local' : 'chat-message--remote']"
               >
                 <div class="msg-meta">
-                  <span class="msg-badge badge--broadcast">Broadcast</span>
+                  <span class="msg-route">Route: {{ messageRouteLabel(msg) }}</span>
                   <span>{{ msg.local ? 'You' : (msg.from ? msg.from.slice(0, 16) + '…' : 'Unknown') }}</span>
                   <span v-if="msg.encrypted">🔒</span>
+                  <span v-if="!msg.local && Number.isFinite(msg.deliveryMs)">⏱ {{ msg.deliveryMs }} ms</span>
                 </div>
-                <div class="msg-text">{{ msg.text }}</div>
+                <div class="msg-text"><strong class="route-prefix">[{{ messageRouteLabel(msg).toUpperCase() }}]</strong> {{ msg.text }}</div>
               </div>
             </div>
             <div class="chat-input-row">
               <textarea v-model="broadcastDraft" rows="3" placeholder="Type your broadcast message…" :disabled="!connected" @keydown.enter.exact.prevent="sendBroadcast"></textarea>
               <div class="chat-actions">
-                <label class="checkbox-label"><input type="checkbox" v-model="encryptBroadcast" /> 🔒 Encrypt</label>
+                <span class="checkbox-label">🔒 Always encrypted</span>
                 <button class="btn primary" :disabled="!connected || !broadcastDraft.trim()" @click="sendBroadcast">📢 Send</button>
               </div>
             </div>
@@ -113,18 +114,19 @@
                 :class="['chat-message', msg.local ? 'chat-message--local' : 'chat-message--remote']"
               >
                 <div class="msg-meta">
-                  <span class="msg-badge badge--direct">Direct</span>
+                  <span class="msg-route">Route: {{ messageRouteLabel(msg) }}</span>
                   <span>{{ msg.local ? 'You' : (msg.from ? msg.from.slice(0, 16) + '…' : 'Unknown') }}</span>
                   <span v-if="msg.to">→ {{ msg.to.slice(0, 16) }}…</span>
                   <span v-if="msg.encrypted">🔒</span>
+                  <span v-if="!msg.local && Number.isFinite(msg.deliveryMs)">⏱ {{ msg.deliveryMs }} ms</span>
                 </div>
-                <div class="msg-text">{{ msg.text }}</div>
+                <div class="msg-text"><strong class="route-prefix">[{{ messageRouteLabel(msg).toUpperCase() }}]</strong> {{ msg.text }}</div>
               </div>
             </div>
             <div class="chat-input-row">
               <textarea v-model="dmDraft" rows="3" placeholder="Type your direct message…" :disabled="!connected || !dmTarget" @keydown.enter.exact.prevent="sendDirect"></textarea>
               <div class="chat-actions">
-                <button class="btn primary" :disabled="!connected || !dmTarget || !dmDraft.trim() || (dmTarget && !peerEpubs[dmTarget])" @click="sendDirect">📧 Send</button>
+                <button class="btn primary" :disabled="!connected || !dmTarget || !dmDraft.trim()" @click="sendDirect">📧 Send</button>
               </div>
             </div>
           </div>
@@ -187,7 +189,6 @@ const tabs = [
 ]
 
 const CONFIG_STORAGE_KEY = 'peerpigeon-config'
-const EPUBS_STORAGE_KEY  = 'peerpigeon-epubs'
 
 const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478' },
@@ -238,9 +239,7 @@ const dmTarget             = ref('')
 const dmDraft              = ref('')
 const broadcastHistoryEl   = ref(null)
 const directHistoryEl      = ref(null)
-const encryptBroadcast     = ref(true)
-const encryptDirect        = ref(true)
-const peerEpubs            = reactive({}) // peerId → epub JWK
+const peerEpubs            = reactive({})
 
 const broadcastMessages = computed(() =>
   messages.value.filter(m => m.type === 'broadcast')
@@ -290,19 +289,6 @@ function persistConfig(nextConfig) {
   } catch {}
 }
 
-function savePeerEpubs() {
-  try { globalThis.localStorage?.setItem(EPUBS_STORAGE_KEY, JSON.stringify({ ...peerEpubs })) } catch {}
-}
-
-function loadPeerEpubs() {
-  try {
-    const stored = globalThis.localStorage?.getItem(EPUBS_STORAGE_KEY)
-    if (!stored) return
-    const obj = JSON.parse(stored)
-    if (obj && typeof obj === 'object') Object.assign(peerEpubs, obj)
-  } catch {}
-}
-
 watch(config, (nextConfig) => {
   persistConfig(nextConfig)
 }, { deep: true })
@@ -310,44 +296,47 @@ watch(config, (nextConfig) => {
 // ── Mesh / Gossip ────────────────────────────────────────────────────────────
 let mesh           = null
 let gossip         = null
-let myKeys         = null  // { priv, pub, epriv, epub }
-let sessionSymKey  = null  // AES-GCM key derived from sessionId for broadcast encryption
+let myKeys         = null
 let meshEventHandlers = []
 let gossipEventHandlers = []
 let manuallyDisconnected = false
+const DEBUG_SIGNALING_LOGS = false
 
-async function deriveSessionKey(sessionId) {
-  const enc = new TextEncoder()
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw', enc.encode(sessionId), 'PBKDF2', false, ['deriveKey']
-  )
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt: enc.encode('peerpigeon-bc-v1'), iterations: 100000, hash: 'SHA-256' },
-    keyMaterial,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  )
-}
-
-async function symEncrypt(key, plaintext) {
-  const iv = crypto.getRandomValues(new Uint8Array(12))
-  const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    key,
-    new TextEncoder().encode(plaintext)
-  )
-  return {
-    iv: btoa(String.fromCharCode(...iv)),
-    ct: btoa(String.fromCharCode(...new Uint8Array(ct)))
+function announceLocalKey(peerId = null) {
+  if (!gossip || !myKeys?.epub) return
+  const payload = JSON.stringify({ __pp_key: true, epub: myKeys.epub })
+  if (peerId) {
+    gossip.sendDirect(peerId, payload)
+    return
   }
+  gossip.broadcast(payload)
 }
 
-async function symDecrypt(key, { iv, ct }) {
-  const ivBytes = Uint8Array.from(atob(iv), c => c.charCodeAt(0))
-  const ctBytes = Uint8Array.from(atob(ct), c => c.charCodeAt(0))
-  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, key, ctBytes)
-  return new TextDecoder().decode(pt)
+function getMeshConnectionEntry(peerId) {
+  return mesh?.signalingClient?.client?.mesh?.connections?.get?.(peerId) ?? null
+}
+
+function isDirectRtcConnected(peerId) {
+  const entry = getMeshConnectionEntry(peerId)
+  return Boolean(entry?.connected && !entry?.relayOnly && entry?.channel?.readyState === 'open')
+}
+
+function maybeUpgradePeerToRtc(peerId) {
+  if (!peerId || !mesh || isDirectRtcConnected(peerId)) return
+  try {
+    mesh.connectToPeer?.(peerId)
+  } catch {}
+}
+
+function getDeliveryMs(sentAt) {
+  return Number.isFinite(sentAt) ? Math.max(0, Date.now() - sentAt) : undefined
+}
+
+function messageRouteLabel(msg) {
+  if (msg?.route === 'local') return 'Local'
+  if (msg?.route === 'direct') return 'Direct'
+  if (msg?.route === 'gossip') return 'Gossip'
+  return msg?.type === 'direct' ? 'Direct' : 'Gossip'
 }
 
 async function doConnect() {
@@ -356,7 +345,6 @@ async function doConnect() {
 
   signalingStatus.value = 'connecting'
   myKeys = await generateRandomPair()
-  sessionSymKey = await deriveSessionKey(config.value.sessionId)
 
   try {
     const hardMaxPeers = Math.max(1, Number(config.value.maxPeers || 0))
@@ -408,6 +396,7 @@ async function doConnect() {
       if (!config.value.autoDiscover) {
         mesh.signalingClient?.joinSession(config.value.sessionId)
       }
+      announceLocalKey()
     }
     registerMeshHandler('signaling:connected', onSignalingConnected)
 
@@ -417,9 +406,11 @@ async function doConnect() {
       signalingStatus.value = 'disconnected'
     })
 
-    registerMeshHandler('signaling:log', ({ message }) => {
-      console.debug(message)
-    })
+    if (DEBUG_SIGNALING_LOGS) {
+      registerMeshHandler('signaling:log', ({ message }) => {
+        console.debug(message)
+      })
+    }
 
     registerMeshHandler('peer:error', ({ peerId, error }) => {
       console.error(`Peer error (${peerId}):`, error)
@@ -443,11 +434,7 @@ async function doConnect() {
       syncConnectedPeers()
       if (!discoveredPeers.value.includes(peerId))
         discoveredPeers.value = [...discoveredPeers.value, peerId]
-      // Send our epub directly and also broadcast so indirect peers learn our key
-      try {
-        mesh.send(peerId, JSON.stringify({ __pp_key: true, epub: myKeys.epub }))
-      } catch {}
-      if (gossip && myKeys) gossip.broadcast(JSON.stringify({ __pp_key: true, epub: myKeys.epub }))
+      announceLocalKey(peerId)
     })
 
     const cleanupPeerState = (peerId) => {
@@ -466,74 +453,67 @@ async function doConnect() {
     registerGossipHandler('messageReceived', async ({ message, local }) => {
       if (local) return
       const raw = message.data
+      const deliveryMs = getDeliveryMs(message.timestamp)
+      const hops = Number.isFinite(Number(message?.hops)) ? Number(message.hops) : null
+      const route = hops !== null && hops <= 1 ? 'direct' : 'gossip'
       try {
         const parsed = typeof raw === 'string' ? JSON.parse(raw) : null
-        if (parsed?.__pp_key) {
+        if (parsed?.__pp_key && parsed?.epub && message.sender) {
           peerEpubs[message.sender] = parsed.epub
-          savePeerEpubs()
           return
         }
-        if (parsed?.__pp_enc_bc && sessionSymKey) {
-          const text = await symDecrypt(sessionSymKey, parsed)
-          pushMessage({ type: 'broadcast', from: message.sender, text, local: false, encrypted: true })
-          return
+        if (parsed?.__pp_enc_bc_u && parsed?.envelopes && myKeys?.epriv && clientId.value) {
+          const envelope = parsed.envelopes[clientId.value]
+          if (!envelope) return
+          const text = await decryptMessageWithMeta(envelope, myKeys.epriv)
+          pushMessage({ type: 'broadcast', from: parsed.from || message.sender, text, local: false, encrypted: true, deliveryMs, route })
         }
       } catch { /* not our format, fall through */ }
-      pushMessage({ type: 'broadcast', from: message.sender, text: raw, local: false, encrypted: false })
     })
 
-    // Incoming direct messages and key negotiation via gossip routing
+    // Incoming direct messages via gossip routing
     registerGossipHandler('directMessageReceived', async ({ message }) => {
+      const deliveryMs = getDeliveryMs(message.timestamp)
       try {
         const parsed = JSON.parse(message.data)
-        if (parsed.__pp_key) {
+        if (parsed.__pp_key && parsed.epub && message.from) {
           peerEpubs[message.from] = parsed.epub
-          savePeerEpubs()
-          // respond with our epub
-          gossip.sendDirect(message.from, JSON.stringify({ __pp_keyack: true, epub: myKeys.epub }))
+          announceLocalKey(message.from)
           return
         }
-        if (parsed.__pp_keyack) {
-          peerEpubs[message.from] = parsed.epub
-          savePeerEpubs()
-          return
-        }
-        if (parsed.__pp_direct) {
-          let text = parsed.text
-          let encrypted = false
-          if (parsed.encrypted && myKeys) {
-            text = await decryptMessageWithMeta(parsed.encrypted, myKeys.epriv)
-            encrypted = true
-          }
+        if (parsed.__pp_direct_u && parsed.encrypted && myKeys?.epriv) {
+          const text = await decryptMessageWithMeta(parsed.encrypted, myKeys.epriv)
           const sender = message.from || message.sender
           if (!dmTarget.value) {
             dmTarget.value = sender
           }
-          pushMessage({ type: 'direct', from: sender, to: clientId.value, text, local: false, encrypted })
+          pushMessage({ type: 'direct', from: sender, to: clientId.value, text, local: false, encrypted: true, deliveryMs, route: 'gossip' })
         }
       } catch {}
     })
 
-    // Incoming peer:data — key exchange, direct messages, encrypted broadcasts
+    // Incoming peer:data — direct messages
     registerMeshHandler('peer:data', async ({ peerId, data }) => {
       try {
         const parsed = typeof data === 'string' ? JSON.parse(data) : data
         if (!parsed) return
 
-        if (parsed.__pp_key) {
+        if (parsed.__pp_key && parsed.epub) {
           peerEpubs[peerId] = parsed.epub
-          savePeerEpubs()
-          try { mesh.send(peerId, JSON.stringify({ __pp_keyack: true, epub: myKeys.epub })) } catch {}
+          announceLocalKey(peerId)
           return
         }
 
-        if (parsed.__pp_keyack) {
-          peerEpubs[peerId] = parsed.epub
-          savePeerEpubs()
+        if (parsed.__pp_direct_u && parsed.encrypted && myKeys?.epriv) {
+          const deliveryMs = getDeliveryMs(parsed.sentAt)
+          const route = getMeshConnectionEntry(peerId)?.relayOnly ? 'gossip' : 'direct'
+          const text = await decryptMessageWithMeta(parsed.encrypted, myKeys.epriv)
+          if (!dmTarget.value) {
+            dmTarget.value = peerId
+          }
+          pushMessage({ type: 'direct', from: peerId, to: clientId.value, text, local: false, encrypted: true, deliveryMs, route })
           return
         }
-
-        // direct messages and encrypted broadcasts are handled via gossip events
       } catch {
         // not our format — ignore
       }
@@ -595,13 +575,11 @@ function doDisconnect() {
   mesh?.destroy()
   mesh              = null
   myKeys            = null
-  sessionSymKey     = null
   connected.value   = false
   signalingStatus.value = 'disconnected'
   clientId.value    = null
   connectedPeers.value  = []
   discoveredPeers.value = []
-  // peerEpubs intentionally kept — persisted cache for reconnects
 }
 
 const unloadHandler = () => {
@@ -610,7 +588,6 @@ const unloadHandler = () => {
 
 onMounted(() => {
   loadStoredConfig()
-  loadPeerEpubs()
   window.addEventListener('beforeunload', unloadHandler)
   window.addEventListener('pagehide', unloadHandler)
   if (config.value.autoConnect) {
@@ -626,8 +603,11 @@ onUnmounted(() => {
 
 // Auto-request epub when selecting a peer we don't have a key for yet
 watch(dmTarget, (peerId) => {
-  if (peerId && !peerEpubs[peerId] && gossip && myKeys) {
-    gossip.sendDirect(peerId, JSON.stringify({ __pp_key: true, epub: myKeys.epub }))
+  if (peerId && !peerEpubs[peerId]) {
+    announceLocalKey(peerId)
+  }
+  if (peerId) {
+    maybeUpgradePeerToRtc(peerId)
   }
 })
 
@@ -635,19 +615,27 @@ watch(dmTarget, (peerId) => {
 async function sendBroadcast() {
   const text = broadcastDraft.value.trim()
   if (!text || !gossip) return
-
-  let payload
-  let encrypted = false
-  if (encryptBroadcast.value && sessionSymKey) {
-    const { iv, ct } = await symEncrypt(sessionSymKey, text)
-    payload = JSON.stringify({ __pp_enc_bc: true, iv, ct })
-    encrypted = true
-  } else {
-    payload = text
+  if (!myKeys?.epub) {
+    console.error('Broadcast blocked: local UnSEA key unavailable')
+    return
   }
 
+  const recipients = discoveredPeers.value.filter((peerId) => peerId && peerId !== clientId.value)
+  const envelopes = {}
+  for (const peerId of recipients) {
+    const epub = peerEpubs[peerId]
+    if (!epub) continue
+    envelopes[peerId] = await encryptMessageWithMeta(text, { epub })
+  }
+  if (Object.keys(envelopes).length === 0) {
+    console.error('Broadcast blocked: no UnSEA recipient keys available')
+    announceLocalKey()
+    return
+  }
+  const payload = JSON.stringify({ __pp_enc_bc_u: true, from: clientId.value, envelopes })
+
   gossip.broadcast(payload)
-  pushMessage({ type: 'broadcast', from: clientId.value, text, local: true, encrypted })
+  pushMessage({ type: 'broadcast', from: clientId.value, text, local: true, encrypted: true, route: 'local' })
   broadcastDraft.value = ''
 }
 
@@ -655,11 +643,28 @@ async function sendDirect() {
   const text = dmDraft.value.trim()
   if (!text || !dmTarget.value || !gossip) return
   const epub = peerEpubs[dmTarget.value]
-  if (!epub) return // button is disabled without epub — shouldn't reach here
+  if (!epub) {
+    console.error('Direct send blocked: recipient UnSEA key unavailable')
+    announceLocalKey(dmTarget.value)
+    return
+  }
   try {
-    const encrypted = await encryptMessageWithMeta(text, { epub })
-    gossip.sendDirect(dmTarget.value, JSON.stringify({ __pp_direct: true, encrypted }))
-    pushMessage({ type: 'direct', from: clientId.value, text, local: true, to: dmTarget.value, encrypted: true })
+    maybeUpgradePeerToRtc(dmTarget.value)
+    const useDirectRtc = isDirectRtcConnected(dmTarget.value)
+    const route = useDirectRtc ? 'direct' : 'gossip'
+    const payloadObj = { __pp_direct_u: true }
+    payloadObj.encrypted = await encryptMessageWithMeta(text, { epub })
+
+    // Stamp as late as possible so deliveryMs reflects network transit, not sender-side processing.
+    payloadObj.sentAt = Date.now()
+
+    const payload = JSON.stringify(payloadObj)
+    if (useDirectRtc) {
+      mesh.send(dmTarget.value, payload)
+    } else {
+      gossip.sendDirect(dmTarget.value, payload)
+    }
+    pushMessage({ type: 'direct', from: clientId.value, text, local: true, to: dmTarget.value, encrypted: true, route })
     dmDraft.value = ''
   } catch (err) {
     console.error('Direct send failed:', err)
@@ -842,9 +847,8 @@ header p { color: var(--text-muted); margin-bottom: 16px; }
 .msg-entry--local  { align-self: flex-end; align-items: flex-end; }
 .msg-entry--remote { align-self: flex-start; }
 .msg-meta { font-size: .75rem; color: var(--text-muted); margin-bottom: 2px; display: flex; align-items: center; gap: 6px; }
-.msg-badge { padding: 1px 6px; border-radius: 10px; font-size: .7rem; font-weight: 700; }
-.badge--broadcast { background: #dbeafe; color: var(--primary); }
-.badge--direct    { background: #fce7f3; color: #be185d; }
+.msg-route { color: var(--text); font-weight: 700; font-size: .78rem; }
+.route-prefix { display: inline-block; margin-right: 6px; font-size: .72rem; letter-spacing: .04em; }
 .msg-text {
   background: var(--surface);
   border: 1px solid var(--border);
