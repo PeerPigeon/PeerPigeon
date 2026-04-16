@@ -3,6 +3,10 @@
   "version": "2.0.0",
   "description": "PeerPigeon – browser P2P networking with DHT, gossip, and WebRTC signaling",
   "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
   "scripts": {
     "dev": "vite examples/vue --force",
     "build": "vite build examples/vue",

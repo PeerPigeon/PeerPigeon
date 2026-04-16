@@ -142,9 +142,91 @@
       </section>
 
       <section v-show="activeTab === 'dht'">
-        <h2>🗄️ WebDHT &amp; Storage</h2>
-        <div class="card stub-card">
-          <p>🚧 DHT features coming soon.</p>
+        <h2>🗄️ Distributed Storage</h2>
+        <div class="storage-grid">
+          <div class="card">
+            <h3>✍️ Write Record</h3>
+            <p class="description">{{ storageSpaceDescription }}</p>
+
+            <div class="input-group">
+              <label>Space</label>
+              <select v-model="storageDraft.space">
+                <option v-for="space in storageSpaceOptions" :key="space.id" :value="space.id">{{ space.label }}</option>
+              </select>
+            </div>
+
+            <div class="input-group">
+              <label>Key</label>
+              <input v-model="storageDraft.key" placeholder="profile/display-name" :disabled="!connected" />
+            </div>
+
+            <div class="input-group">
+              <label>Value</label>
+              <textarea v-model="storageDraft.value" rows="6" placeholder="Value to replicate through the mesh" :disabled="!connected"></textarea>
+              <small>Private values are replicated encrypted and only readable by the author.</small>
+            </div>
+
+            <div class="button-group">
+              <button class="btn primary" :disabled="!connected || !storageDraft.key.trim() || !storageDraft.value.trim()" @click="writeStorageRecord">
+                {{ storageDraft.space === STORAGE_SPACES.FROZEN ? 'Create Immutable Record' : 'Replicate Record' }}
+              </button>
+            </div>
+
+            <p v-if="storageNotice" class="storage-notice">{{ storageNotice }}</p>
+          </div>
+
+          <div class="card">
+            <h3>🔎 Browse Space</h3>
+            <p class="description">Records update live from local writes, gossip propagation, and late-join sync.</p>
+
+            <div class="storage-toolbar">
+              <select v-model="storageView.space">
+                <option v-for="space in storageSpaceOptions" :key="`view-${space.id}`" :value="space.id">{{ space.label }}</option>
+              </select>
+              <input v-model="storageView.key" placeholder="Optional key lookup" />
+              <button class="btn tertiary" :disabled="!connected || storageQuerying" @click="queryStorageRecords">
+                {{ storageView.key.trim() ? 'Query Key' : 'Query Space' }}
+              </button>
+            </div>
+
+            <div class="storage-records">
+              <p v-if="storageLookupRecord" class="storage-lookup-label">Selected key</p>
+              <div v-if="storageLookupRecord" class="storage-record">
+                <div class="storage-record__meta">
+                  <strong>{{ storageLookupRecord.key }}</strong>
+                  <span>{{ storageLookupRecord.space }}</span>
+                  <span>{{ storageLookupRecord.author?.peerId ? storageLookupRecord.author.peerId.slice(0, 16) + '…' : 'offline author' }}</span>
+                </div>
+                <pre>{{ storageLookupValue }}</pre>
+              </div>
+
+              <p v-if="storageRecords.length === 0" class="empty-state">No visible records in this space yet.</p>
+              <div v-for="record in storageRecords" :key="record.id" class="storage-record">
+                <div class="storage-record__meta">
+                  <strong>{{ record.key }}</strong>
+                  <span>{{ record.space }}</span>
+                  <span>{{ record.author?.peerId ? record.author.peerId.slice(0, 16) + '…' : 'offline author' }}</span>
+                </div>
+                <pre>{{ formatStorageRecordValue(record) }}</pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>📡 Subscriptions</h3>
+            <p class="description">Event-driven updates emitted by the storage runtime.</p>
+
+            <div class="storage-events">
+              <p v-if="storageEvents.length === 0" class="empty-state">No storage events yet.</p>
+              <div v-for="event in storageEvents" :key="event.id" class="storage-event">
+                <div class="storage-event__header">
+                  <strong>{{ event.label }}</strong>
+                  <span>{{ event.transport }}</span>
+                </div>
+                <p>{{ event.summary }}</p>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -176,6 +258,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, reactive, watch } from 'vue'
 import { PartialMesh, GossipProtocol } from 'gossip-protocol'
 import { generateRandomPair, encryptMessageWithMeta, decryptMessageWithMeta } from 'unsea'
+import { DistributedStorage, STORAGE_SPACES } from '../../src/index.js'
 
 // ── State ────────────────────────────────────────────────────────────────────
 const activeTab = ref('connection')
@@ -240,6 +323,26 @@ const dmDraft              = ref('')
 const broadcastHistoryEl   = ref(null)
 const directHistoryEl      = ref(null)
 const peerEpubs            = reactive({})
+const storageDraft         = reactive({ space: STORAGE_SPACES.PUBLIC, key: 'welcome', value: 'Hello from PeerPigeon storage' })
+const storageView          = reactive({ space: STORAGE_SPACES.PUBLIC, key: '' })
+const storageRecords       = ref([])
+const storageEvents        = ref([])
+const storageNotice        = ref('')
+const storageQuerying      = ref(false)
+
+const storageSpaceOptions = [
+  { id: STORAGE_SPACES.USER, label: 'user' },
+  { id: STORAGE_SPACES.PUBLIC, label: 'public' },
+  { id: STORAGE_SPACES.FROZEN, label: 'frozen' },
+  { id: STORAGE_SPACES.PRIVATE, label: 'private' },
+]
+
+const storageSpaceDescriptions = {
+  [STORAGE_SPACES.USER]: 'Readable by everyone, but once created only the author keypair can update it.',
+  [STORAGE_SPACES.PUBLIC]: 'Readable and writable by any peer in the mesh.',
+  [STORAGE_SPACES.FROZEN]: 'First-write-wins and stays immutable after replication converges.',
+  [STORAGE_SPACES.PRIVATE]: 'Replicated through the mesh as ciphertext; only the author can read or update it.',
+}
 
 const broadcastMessages = computed(() =>
   messages.value.filter(m => m.type === 'broadcast')
@@ -252,6 +355,18 @@ const directConversationMessages = computed(() =>
       )
     : []
 )
+
+const storageSpaceDescription = computed(() => storageSpaceDescriptions[storageDraft.space] ?? '')
+
+const storageLookupRecord = computed(() => {
+  if (!distributedStorage || !storageView.key.trim()) return null
+  return distributedStorage.get(storageView.space, storageView.key.trim(), { includeOpaque: true })
+})
+
+const storageLookupValue = computed(() => {
+  if (!storageLookupRecord.value) return ''
+  return formatStorageRecordValue(storageLookupRecord.value)
+})
 
 const signalingLabel = computed(() => ({
   connected: 'Connected',
@@ -297,8 +412,12 @@ watch(config, (nextConfig) => {
 let mesh           = null
 let gossip         = null
 let myKeys         = null
+let distributedStorage = null
 let meshEventHandlers = []
 let gossipEventHandlers = []
+let stopStorageChangeSubscription = null
+let stopStorageSyncSubscription = null
+let stopStorageQuerySubscription = null
 let manuallyDisconnected = false
 const DEBUG_SIGNALING_LOGS = false
 
@@ -330,6 +449,135 @@ function maybeUpgradePeerToRtc(peerId) {
 
 function getDeliveryMs(sentAt) {
   return Number.isFinite(sentAt) ? Math.max(0, Date.now() - sentAt) : undefined
+}
+
+function formatStorageRecordValue(record) {
+  if (!record) return ''
+  if (record.visibility === 'encrypted' && record.value == null) {
+    return '[encrypted payload replicated for author only]'
+  }
+  return record.value ?? ''
+}
+
+function pushStorageEvent(entry) {
+  storageEvents.value = [
+    { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, ...entry },
+    ...storageEvents.value,
+  ].slice(0, 40)
+}
+
+function refreshStorageRecords() {
+  storageRecords.value = distributedStorage
+    ? distributedStorage.list({ space: storageView.space, includeOpaque: true })
+    : []
+}
+
+function attachDistributedStorage() {
+  if (!mesh || !gossip || !myKeys) return
+  distributedStorage = new DistributedStorage({
+    mesh,
+    gossip,
+    authorKeys: myKeys,
+    getClientId: () => clientId.value,
+    logger: console,
+  }).attach()
+
+  stopStorageChangeSubscription = distributedStorage.subscribe({}, ({ record, transport, origin }) => {
+    refreshStorageRecords()
+    pushStorageEvent({
+      label: `${record.space}:${record.key}`,
+      transport,
+      summary: `${origin || 'local'} updated ${record.space}/${record.key}`,
+    })
+  })
+
+  stopStorageSyncSubscription = distributedStorage.on('sync', ({ peerId, recordCount }) => {
+    refreshStorageRecords()
+    pushStorageEvent({
+      label: 'sync',
+      transport: 'sync',
+      summary: `Received ${recordCount} record${recordCount === 1 ? '' : 's'} from ${peerId ? peerId.slice(0, 16) + '…' : 'peer'}`,
+    })
+  })
+
+  stopStorageQuerySubscription = distributedStorage.on('query', ({ peerId, space, key, recordCount }) => {
+    refreshStorageRecords()
+    pushStorageEvent({
+      label: key ? `${space}:${key}` : `${space}:*`,
+      transport: 'query',
+      summary: `${peerId ? peerId.slice(0, 16) + '…' : 'peer'} returned ${recordCount} record${recordCount === 1 ? '' : 's'}`,
+    })
+  })
+
+  refreshStorageRecords()
+}
+
+function teardownDistributedStorage() {
+  stopStorageChangeSubscription?.()
+  stopStorageSyncSubscription?.()
+  stopStorageQuerySubscription?.()
+  stopStorageChangeSubscription = null
+  stopStorageSyncSubscription = null
+  stopStorageQuerySubscription = null
+  distributedStorage?.destroy()
+  distributedStorage = null
+  storageRecords.value = []
+  storageEvents.value = []
+  storageNotice.value = ''
+  storageQuerying.value = false
+}
+
+async function writeStorageRecord() {
+  if (!distributedStorage) return
+  storageNotice.value = ''
+
+  try {
+    const key = storageDraft.key.trim()
+    await distributedStorage.put({
+      space: storageDraft.space,
+      key,
+      value: storageDraft.value,
+    })
+    storageView.space = storageDraft.space
+    storageView.key = key
+    storageNotice.value = `Replicated ${storageDraft.space}/${key}`
+    if (storageDraft.space !== STORAGE_SPACES.FROZEN) {
+      storageDraft.value = ''
+    }
+    refreshStorageRecords()
+  } catch (error) {
+    storageNotice.value = error instanceof Error ? error.message : 'Storage write failed'
+    pushStorageEvent({
+      label: 'error',
+      transport: 'local',
+      summary: storageNotice.value,
+    })
+  }
+}
+
+async function queryStorageRecords() {
+  if (!distributedStorage) return
+
+  storageQuerying.value = true
+  storageNotice.value = ''
+
+  try {
+    const key = storageView.key.trim() || null
+    const responses = await distributedStorage.query({
+      space: storageView.space,
+      key,
+    })
+    refreshStorageRecords()
+
+    const totalRecords = responses.reduce((sum, response) => sum + response.recordCount, 0)
+    storageNotice.value = totalRecords > 0
+      ? `Query returned ${totalRecords} record${totalRecords === 1 ? '' : 's'}`
+      : 'No peers returned matching records'
+  } catch (error) {
+    storageNotice.value = error instanceof Error ? error.message : 'Storage query failed'
+  } finally {
+    storageQuerying.value = false
+  }
 }
 
 function messageRouteLabel(msg) {
@@ -377,6 +625,7 @@ async function doConnect() {
     })
 
     gossip = new GossipProtocol(mesh)
+    attachDistributedStorage()
 
     const registerMeshHandler = (event, handler) => {
       mesh.on(event, handler)
@@ -558,6 +807,7 @@ function startConnectionSyncTimer() {
 
 function doDisconnect() {
   manuallyDisconnected = true
+  teardownDistributedStorage()
   if (gossip) {
     for (const [event, handler] of gossipEventHandlers) {
       gossip.off(event, handler)
@@ -609,6 +859,10 @@ watch(dmTarget, (peerId) => {
   if (peerId) {
     maybeUpgradePeerToRtc(peerId)
   }
+})
+
+watch(() => storageView.space, () => {
+  refreshStorageRecords()
 })
 
 // ── Messaging ────────────────────────────────────────────────────────────────
@@ -1059,6 +1313,82 @@ main h2 { font-size: 1.5rem; margin-bottom: 20px; }
   letter-spacing: .04em;
   color: var(--text-muted);
   margin-bottom: 10px;
+}
+
+.storage-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 20px;
+}
+
+.storage-toolbar {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.storage-toolbar select,
+.storage-toolbar input {
+  flex: 1;
+  min-width: 160px;
+  padding: 10px 12px;
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  font-family: inherit;
+}
+
+.storage-records,
+.storage-events {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 430px;
+  overflow-y: auto;
+}
+
+.storage-record,
+.storage-event {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--bg);
+}
+
+.storage-record__meta,
+.storage-event__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: .82rem;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.storage-record pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: .92rem;
+}
+
+.storage-event p {
+  font-size: .9rem;
+}
+
+.storage-notice {
+  margin-top: 12px;
+  font-size: .9rem;
+  color: var(--primary);
+}
+
+.storage-lookup-label {
+  font-size: .78rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--text-muted);
 }
 
 /* Utilities */
