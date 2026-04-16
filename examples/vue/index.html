@@ -7,6 +7,29 @@
   </head>
   <body>
     <div id="app"></div>
+    <script>
+      const isLocalDevHost =
+        window.location.hostname === 'localhost' ||
+        window.location.hostname === '127.0.0.1'
+
+      if (isLocalDevHost && 'serviceWorker' in navigator) {
+        const resetFlag = 'peerpigeon-dev-cache-reset'
+
+        if (!window.sessionStorage.getItem(resetFlag)) {
+          Promise.all([
+            navigator.serviceWorker.getRegistrations().then((registrations) =>
+              Promise.all(registrations.map((registration) => registration.unregister().catch(() => {})))
+            ),
+            'caches' in window
+              ? caches.keys().then((keys) => Promise.all(keys.map((key) => caches.delete(key)))).catch(() => {})
+              : Promise.resolve(),
+          ]).finally(() => {
+            window.sessionStorage.setItem(resetFlag, '1')
+            window.location.reload()
+          })
+        }
+      }
+    </script>
     <script type="module" src="./main.js"></script>
   </body>
 </html>
