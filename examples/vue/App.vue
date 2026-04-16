@@ -239,8 +239,59 @@
 
       <section v-show="activeTab === 'network'">
         <h2>📡 Network Info</h2>
-        <div class="card stub-card">
-          <p>🚧 Network info coming soon.</p>
+        <div class="network-grid">
+          <div class="card">
+            <h3>Mesh Snapshot</h3>
+            <div class="network-kpis">
+              <div class="network-kpi">
+                <span class="network-kpi__label">Connected</span>
+                <strong class="network-kpi__value">{{ connectedPeers.length }}</strong>
+              </div>
+              <div class="network-kpi">
+                <span class="network-kpi__label">Discovered</span>
+                <strong class="network-kpi__value">{{ discoveredPeers.length }}</strong>
+              </div>
+              <div class="network-kpi">
+                <span class="network-kpi__label">Direct RTC</span>
+                <strong class="network-kpi__value">{{ networkDirectCount }}</strong>
+              </div>
+              <div class="network-kpi">
+                <span class="network-kpi__label">Relay Only</span>
+                <strong class="network-kpi__value">{{ networkRelayCount }}</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>Peer Table</h3>
+            <p v-if="networkPeerRows.length === 0" class="empty-state">No peers discovered yet.</p>
+            <div v-else class="network-table-wrap">
+              <table class="network-table">
+                <thead>
+                  <tr>
+                    <th>Peer</th>
+                    <th>Disc</th>
+                    <th>Conn</th>
+                    <th>Transport</th>
+                    <th>Channel</th>
+                    <th>Key</th>
+                    <th>Browser</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in networkPeerRows" :key="row.peerId">
+                    <td><code>{{ row.shortId }}</code></td>
+                    <td>{{ row.discovered ? 'yes' : 'no' }}</td>
+                    <td>{{ row.connected ? 'yes' : 'no' }}</td>
+                    <td>{{ row.transport }}</td>
+                    <td>{{ row.channelState }}</td>
+                    <td>{{ row.hasEpub ? 'yes' : 'no' }}</td>
+                    <td>{{ row.browser }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -317,6 +368,10 @@ const discoveredPeers = ref([])
 const copiedPeer      = ref(null)
 const messages             = ref([])
 let connectionSyncTimer = null
+let keySyncTimer = null
+let tableRefreshTimer = null
+const tableRefreshTick     = ref(0)
+const peerBrowsers         = reactive({})
 const broadcastDraft       = ref('')
 const dmTarget             = ref('')
 const dmDraft              = ref('')
@@ -374,14 +429,65 @@ const signalingLabel = computed(() => ({
   disconnected: 'Disconnected',
 }[signalingStatus.value] ?? 'Disconnected'))
 
+const TRANSPORT_ORDER = { relay: 0, 'relay-candidate': 1, direct: 2, connected: 3, 'rtc-candidate': 4, unknown: 5 }
+
+const networkPeerRows = computed(() => {
+  void tableRefreshTick.value // reactive dependency so readyState stays live
+
+  const idSet = new Set([
+    ...connectedPeers.value,
+    ...discoveredPeers.value,
+  ])
+
+  return Array.from(idSet)
+    .filter(Boolean)
+    .map((peerId) => {
+      const entry = getMeshConnectionEntry(peerId)
+      const relayOnly = Boolean(entry?.relayOnly)
+      const connected = connectedPeers.value.includes(peerId) || Boolean(entry?.connected)
+      const discovered = discoveredPeers.value.includes(peerId)
+      const channelState = entry?.channel?.readyState ?? (relayOnly ? 'ws' : 'none')
+
+      let transport = 'unknown'
+      if (connected && relayOnly) transport = 'relay'
+      else if (connected && channelState === 'open') transport = 'direct'
+      else if (connected) transport = 'connected'
+      else if (relayOnly) transport = 'relay-candidate'
+      else if (entry) transport = 'rtc-candidate'
+
+      return {
+        peerId,
+        shortId: peerId.length > 16 ? `${peerId.slice(0, 16)}…` : peerId,
+        discovered,
+        connected,
+        transport,
+        channelState,
+        hasEpub: Boolean(peerEpubs[peerId]),
+        browser: peerBrowsers[peerId] ?? '—',
+      }
+    })
+    .sort((a, b) => {
+      const ta = TRANSPORT_ORDER[a.transport] ?? 99
+      const tb = TRANSPORT_ORDER[b.transport] ?? 99
+      if (ta !== tb) return ta - tb
+      return a.peerId.localeCompare(b.peerId)
+    })
+})
+
+const networkDirectCount = computed(() =>
+  networkPeerRows.value.filter((row) => row.transport === 'direct').length
+)
+
+const networkRelayCount = computed(() =>
+  networkPeerRows.value.filter((row) => row.transport === 'relay' || row.transport === 'relay-candidate').length
+)
+
 function sanitizeStoredConfig(raw) {
   return {
     sessionId: typeof raw?.sessionId === 'string' && raw.sessionId.trim() ? raw.sessionId : defaultConfig.sessionId,
-    signalingServer: typeof raw?.signalingServer === 'string' && raw.signalingServer.trim() && raw.signalingServer !== 'wss://peer-ooo-worker-devtest.draeder.workers.dev/ws'
-      ? raw.signalingServer
-      : defaultConfig.signalingServer,
-    minPeers: Number.isFinite(Number(raw?.minPeers)) ? Number(raw.minPeers) : defaultConfig.minPeers,
-    maxPeers: Number.isFinite(Number(raw?.maxPeers)) ? Number(raw.maxPeers) : defaultConfig.maxPeers,
+    signalingServer: typeof raw?.signalingServer === 'string' && raw.signalingServer.trim() ? raw.signalingServer : defaultConfig.signalingServer,
+    minPeers: Number.isFinite(raw?.minPeers) ? Math.max(1, Math.min(20, Number(raw.minPeers))) : defaultConfig.minPeers,
+    maxPeers: Number.isFinite(raw?.maxPeers) ? Math.max(1, Math.min(20, Number(raw.maxPeers))) : defaultConfig.maxPeers,
     autoConnect: typeof raw?.autoConnect === 'boolean' ? raw.autoConnect : defaultConfig.autoConnect,
     autoDiscover: typeof raw?.autoDiscover === 'boolean' ? raw.autoDiscover : defaultConfig.autoDiscover,
     iceServers: Array.isArray(raw?.iceServers) && raw.iceServers.length > 0 ? raw.iceServers : defaultConfig.iceServers,
@@ -390,12 +496,11 @@ function sanitizeStoredConfig(raw) {
 
 function loadStoredConfig() {
   try {
-    const stored = globalThis.localStorage?.getItem(CONFIG_STORAGE_KEY)
-    if (!stored) return
-    config.value = sanitizeStoredConfig(JSON.parse(stored))
-  } catch {
-    config.value = { ...defaultConfig }
-  }
+    const raw = globalThis.localStorage?.getItem(CONFIG_STORAGE_KEY)
+    if (!raw) return
+    const parsed = JSON.parse(raw)
+    config.value = sanitizeStoredConfig(parsed)
+  } catch {}
 }
 
 function persistConfig(nextConfig) {
@@ -421,14 +526,39 @@ let stopStorageQuerySubscription = null
 let manuallyDisconnected = false
 const DEBUG_SIGNALING_LOGS = false
 
+function detectBrowser() {
+  const ua = navigator.userAgent
+  if (/firefox/i.test(ua)) return 'Firefox'
+  if (/edg\//i.test(ua)) return 'Edge'
+  if (/opr\//i.test(ua)) return 'Opera'
+  if (/chrome|chromium/i.test(ua)) return 'Chrome'
+  if (/safari/i.test(ua)) return 'Safari'
+  return 'Unknown'
+}
+
 function announceLocalKey(peerId = null) {
   if (!gossip || !myKeys?.epub) return
-  const payload = JSON.stringify({ __pp_key: true, epub: myKeys.epub })
+  const payload = JSON.stringify({ __pp_key: true, epub: myKeys.epub, browser: detectBrowser() })
   if (peerId) {
     gossip.sendDirect(peerId, payload)
     return
   }
   gossip.broadcast(payload)
+}
+
+function requestPeerKey(peerId) {
+  if (!peerId || !gossip) return
+  try {
+    gossip.sendDirect(peerId, JSON.stringify({ __pp_key_req: true }))
+  } catch {}
+}
+
+function ensurePeerKey(peerId) {
+  if (!peerId) return
+  if (!peerEpubs[peerId]) {
+    requestPeerKey(peerId)
+  }
+  announceLocalKey(peerId)
 }
 
 function getMeshConnectionEntry(peerId) {
@@ -642,10 +772,12 @@ async function doConnect() {
       signalingStatus.value = 'connected'
       syncConnectedPeers()
       startConnectionSyncTimer()
+      startKeySyncTimer()
       if (!config.value.autoDiscover) {
         mesh.signalingClient?.joinSession(config.value.sessionId)
       }
       announceLocalKey()
+      syncPeerKeys()
     }
     registerMeshHandler('signaling:connected', onSignalingConnected)
 
@@ -683,11 +815,12 @@ async function doConnect() {
       syncConnectedPeers()
       if (!discoveredPeers.value.includes(peerId))
         discoveredPeers.value = [...discoveredPeers.value, peerId]
-      announceLocalKey(peerId)
+      ensurePeerKey(peerId)
     })
 
     const cleanupPeerState = (peerId) => {
       discoveredPeers.value = discoveredPeers.value.filter(id => id !== peerId)
+      delete peerBrowsers[peerId]
       if (dmTarget.value === peerId) {
         dmTarget.value = ''
       }
@@ -709,6 +842,7 @@ async function doConnect() {
         const parsed = typeof raw === 'string' ? JSON.parse(raw) : null
         if (parsed?.__pp_key && parsed?.epub && message.sender) {
           peerEpubs[message.sender] = parsed.epub
+          if (parsed.browser) peerBrowsers[message.sender] = parsed.browser
           return
         }
         if (parsed?.__pp_enc_bc_u && parsed?.envelopes && myKeys?.epriv && clientId.value) {
@@ -725,8 +859,14 @@ async function doConnect() {
       const deliveryMs = getDeliveryMs(message.timestamp)
       try {
         const parsed = JSON.parse(message.data)
+        if (parsed.__pp_key_req) {
+          const sender = message.from || message.sender
+          if (sender) announceLocalKey(sender)
+          return
+        }
         if (parsed.__pp_key && parsed.epub && message.from) {
           peerEpubs[message.from] = parsed.epub
+          if (parsed.browser) peerBrowsers[message.from] = parsed.browser
           announceLocalKey(message.from)
           return
         }
@@ -747,8 +887,14 @@ async function doConnect() {
         const parsed = typeof data === 'string' ? JSON.parse(data) : data
         if (!parsed) return
 
+        if (parsed.__pp_key_req) {
+          announceLocalKey(peerId)
+          return
+        }
+
         if (parsed.__pp_key && parsed.epub) {
           peerEpubs[peerId] = parsed.epub
+          if (parsed.browser) peerBrowsers[peerId] = parsed.browser
           announceLocalKey(peerId)
           return
         }
@@ -788,6 +934,13 @@ function stopConnectionSyncTimer() {
   }
 }
 
+function stopKeySyncTimer() {
+  if (keySyncTimer) {
+    clearInterval(keySyncTimer)
+    keySyncTimer = null
+  }
+}
+
 function syncConnectedPeers() {
   if (!mesh) {
     connectedPeers.value = []
@@ -800,9 +953,29 @@ function syncConnectedPeers() {
   }
 }
 
+function stopTableRefreshTimer() {
+  if (tableRefreshTimer) {
+    clearInterval(tableRefreshTimer)
+    tableRefreshTimer = null
+  }
+}
+
 function startConnectionSyncTimer() {
   stopConnectionSyncTimer()
   connectionSyncTimer = setInterval(syncConnectedPeers, 3000)
+  stopTableRefreshTimer()
+  tableRefreshTimer = setInterval(() => { tableRefreshTick.value++ }, 1000)
+}
+
+function syncPeerKeys() {
+  for (const peerId of connectedPeers.value) {
+    ensurePeerKey(peerId)
+  }
+}
+
+function startKeySyncTimer() {
+  stopKeySyncTimer()
+  keySyncTimer = setInterval(syncPeerKeys, 4000)
 }
 
 function doDisconnect() {
@@ -821,6 +994,8 @@ function doDisconnect() {
     meshEventHandlers = []
   }
   stopConnectionSyncTimer()
+  stopKeySyncTimer()
+  stopTableRefreshTimer()
   gossip = null
   mesh?.destroy()
   mesh              = null
@@ -854,7 +1029,7 @@ onUnmounted(() => {
 // Auto-request epub when selecting a peer we don't have a key for yet
 watch(dmTarget, (peerId) => {
   if (peerId && !peerEpubs[peerId]) {
-    announceLocalKey(peerId)
+    ensurePeerKey(peerId)
   }
   if (peerId) {
     maybeUpgradePeerToRtc(peerId)
@@ -874,13 +1049,24 @@ async function sendBroadcast() {
     return
   }
 
-  const recipients = discoveredPeers.value.filter((peerId) => peerId && peerId !== clientId.value)
+  const recipients = Array.from(new Set(connectedPeers.value.filter(Boolean)))
+    .filter((peerId) => peerId && peerId !== clientId.value)
+
   const envelopes = {}
+  const missingKeyPeers = []
   for (const peerId of recipients) {
     const epub = peerEpubs[peerId]
-    if (!epub) continue
+    if (!epub) {
+      missingKeyPeers.push(peerId)
+      continue
+    }
     envelopes[peerId] = await encryptMessageWithMeta(text, { epub })
   }
+
+  if (missingKeyPeers.length > 0) {
+    console.warn('Broadcast key-missing peers:', missingKeyPeers)
+  }
+
   if (Object.keys(envelopes).length === 0) {
     console.error('Broadcast blocked: no UnSEA recipient keys available')
     announceLocalKey()
@@ -1319,6 +1505,62 @@ main h2 { font-size: 1.5rem; margin-bottom: 20px; }
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 20px;
+}
+
+.network-grid {
+  display: grid;
+  gap: 20px;
+}
+
+.network-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+}
+
+.network-kpi {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  padding: 10px 12px;
+}
+
+.network-kpi__label {
+  display: block;
+  font-size: .78rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.network-kpi__value {
+  font-size: 1.25rem;
+}
+
+.network-table-wrap {
+  overflow-x: auto;
+}
+
+.network-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: .9rem;
+}
+
+.network-table th,
+.network-table td {
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  padding: 9px 8px;
+  white-space: nowrap;
+}
+
+.network-table th {
+  color: var(--text-muted);
+  font-size: .78rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
 }
 
 .storage-toolbar {
