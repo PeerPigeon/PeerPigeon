@@ -232,6 +232,7 @@ const connectedPeers  = ref([])
 const discoveredPeers = ref([])
 const copiedPeer      = ref(null)
 const messages             = ref([])
+let connectionSyncTimer = null
 const broadcastDraft       = ref('')
 const dmTarget             = ref('')
 const dmDraft              = ref('')
@@ -311,6 +312,9 @@ let mesh           = null
 let gossip         = null
 let myKeys         = null  // { priv, pub, epriv, epub }
 let sessionSymKey  = null  // AES-GCM key derived from sessionId for broadcast encryption
+let meshEventHandlers = []
+let gossipEventHandlers = []
+let manuallyDisconnected = false
 
 async function deriveSessionKey(sessionId) {
   const enc = new TextEncoder()
@@ -348,6 +352,7 @@ async function symDecrypt(key, { iv, ct }) {
 
 async function doConnect() {
   if (mesh || signalingStatus.value === 'connecting' || connected.value) return
+  manuallyDisconnected = false
 
   signalingStatus.value = 'connecting'
   myKeys = await generateRandomPair()
@@ -358,6 +363,7 @@ async function doConnect() {
     const softMaxPeers = Math.max(1, hardMaxPeers - 1)
     const effectiveMinPeers = Math.min(Number(config.value.minPeers || 0), hardMaxPeers)
     const isFirefox = /firefox/i.test(navigator.userAgent)
+    const isChrome = /chrome|chromium/i.test(navigator.userAgent) && !/edg|opr/i.test(navigator.userAgent)
     const runtimeIceServers = isFirefox ? FIREFOX_ICE_SERVERS : config.value.iceServers
 
     mesh = new PartialMesh({
@@ -370,10 +376,12 @@ async function doConnect() {
       autoDiscover: config.value.autoDiscover,
       iceServers: runtimeIceServers,
       trickleIce: !isFirefox,
-      signalRelayFallback: isFirefox,
-      maxConcurrentDials: isFirefox ? 1 : 3,
+      signalRelayFallback: true,
+      maxConcurrentDials: isFirefox ? 1 : isChrome ? 1 : 3,
+      rtcCapacityBackoffMs: isChrome ? 20000 : 15000,
+      relayRetryMs: isFirefox ? 120000 : 90000,
       connectionTimeoutMs: isFirefox ? 60000 : 45000,
-      maintenanceIntervalMs: isFirefox ? 4000 : 2000,
+      maintenanceIntervalMs: isFirefox ? 4000 : isChrome ? 3000 : 2000,
       rebalanceCooldownMs: isFirefox ? 90000 : 60000,
       rebalanceRetryMs: isFirefox ? 120000 : 90000,
       rebalanceMinConnectionAgeMs: isFirefox ? 60000 : 45000,
@@ -382,34 +390,42 @@ async function doConnect() {
 
     gossip = new GossipProtocol(mesh)
 
-    mesh.on('signaling:connected', ({ clientId: id }) => {
+    const registerMeshHandler = (event, handler) => {
+      mesh.on(event, handler)
+      meshEventHandlers.push([event, handler])
+    }
+    const registerGossipHandler = (event, handler) => {
+      gossip.on(event, handler)
+      gossipEventHandlers.push([event, handler])
+    }
+
+    const onSignalingConnected = ({ clientId: id }) => {
       clientId.value        = id
       connected.value       = true
       signalingStatus.value = 'connected'
+      syncConnectedPeers()
+      startConnectionSyncTimer()
       if (!config.value.autoDiscover) {
         mesh.signalingClient?.joinSession(config.value.sessionId)
       }
-      // Broadcast our epub so all peers (direct + indirect) can DM us
-      setTimeout(() => {
-        if (gossip && myKeys) gossip.broadcast(JSON.stringify({ __pp_key: true, epub: myKeys.epub }))
-      }, 800)
-    })
+    }
+    registerMeshHandler('signaling:connected', onSignalingConnected)
 
-    mesh.on('signaling:error', (error) => {
+    registerMeshHandler('signaling:error', (error) => {
       console.error('Signaling error:', error)
       connected.value = false
       signalingStatus.value = 'disconnected'
     })
 
-    mesh.on('signaling:log', ({ message }) => {
+    registerMeshHandler('signaling:log', ({ message }) => {
       console.debug(message)
     })
 
-    mesh.on('peer:error', ({ peerId, error }) => {
+    registerMeshHandler('peer:error', ({ peerId, error }) => {
       console.error(`Peer error (${peerId}):`, error)
     })
 
-    mesh.on('peer:discovered', (peerId) => {
+    registerMeshHandler('peer:discovered', (peerId) => {
       if (peerId && !discoveredPeers.value.includes(peerId))
         discoveredPeers.value = [...discoveredPeers.value, peerId]
       if (!config.value.autoConnect) {
@@ -417,30 +433,37 @@ async function doConnect() {
       }
     })
 
-    mesh.on('signaling:disconnected', () => {
+    registerMeshHandler('signaling:disconnected', () => {
       connected.value       = false
       signalingStatus.value = 'disconnected'
-      connectedPeers.value  = []
+      syncConnectedPeers()
     })
 
-    mesh.on('peer:connected', (peerId) => {
-      if (!connectedPeers.value.includes(peerId))
-        connectedPeers.value = [...connectedPeers.value, peerId]
+    registerMeshHandler('peer:connected', (peerId) => {
+      syncConnectedPeers()
       if (!discoveredPeers.value.includes(peerId))
         discoveredPeers.value = [...discoveredPeers.value, peerId]
-      // Send our epub directly (fast path for direct peers)
+      // Send our epub directly and also broadcast so indirect peers learn our key
       try {
         mesh.send(peerId, JSON.stringify({ __pp_key: true, epub: myKeys.epub }))
       } catch {}
+      if (gossip && myKeys) gossip.broadcast(JSON.stringify({ __pp_key: true, epub: myKeys.epub }))
     })
 
-    mesh.on('peer:disconnected', (peerId) => {
-      connectedPeers.value = connectedPeers.value.filter(id => id !== peerId)
-      // keep epub cached — peer may reconnect or be reachable indirectly
-    })
+    const cleanupPeerState = (peerId) => {
+      discoveredPeers.value = discoveredPeers.value.filter(id => id !== peerId)
+      if (dmTarget.value === peerId) {
+        dmTarget.value = ''
+      }
+      syncConnectedPeers()
+    }
+
+    registerMeshHandler('peer:disconnected', cleanupPeerState)
+
+    registerMeshHandler('peer:left', cleanupPeerState)
 
     // Incoming gossip broadcasts
-    gossip.on('messageReceived', async ({ message, local }) => {
+    registerGossipHandler('messageReceived', async ({ message, local }) => {
       if (local) return
       const raw = message.data
       try {
@@ -460,7 +483,7 @@ async function doConnect() {
     })
 
     // Incoming direct messages and key negotiation via gossip routing
-    gossip.on('directMessageReceived', async ({ message }) => {
+    registerGossipHandler('directMessageReceived', async ({ message }) => {
       try {
         const parsed = JSON.parse(message.data)
         if (parsed.__pp_key) {
@@ -492,7 +515,7 @@ async function doConnect() {
     })
 
     // Incoming peer:data — key exchange, direct messages, encrypted broadcasts
-    mesh.on('peer:data', async ({ peerId, data }) => {
+    registerMeshHandler('peer:data', async ({ peerId, data }) => {
       try {
         const parsed = typeof data === 'string' ? JSON.parse(data) : data
         if (!parsed) return
@@ -529,7 +552,45 @@ function copyPeer(id) {
   setTimeout(() => { if (copiedPeer.value === id) copiedPeer.value = null }, 1500)
 }
 
+function stopConnectionSyncTimer() {
+  if (connectionSyncTimer) {
+    clearInterval(connectionSyncTimer)
+    connectionSyncTimer = null
+  }
+}
+
+function syncConnectedPeers() {
+  if (!mesh) {
+    connectedPeers.value = []
+    return
+  }
+  try {
+    connectedPeers.value = mesh.getConnectedPeers()
+  } catch {
+    connectedPeers.value = []
+  }
+}
+
+function startConnectionSyncTimer() {
+  stopConnectionSyncTimer()
+  connectionSyncTimer = setInterval(syncConnectedPeers, 3000)
+}
+
 function doDisconnect() {
+  manuallyDisconnected = true
+  if (gossip) {
+    for (const [event, handler] of gossipEventHandlers) {
+      gossip.off(event, handler)
+    }
+    gossipEventHandlers = []
+  }
+  if (mesh) {
+    for (const [event, handler] of meshEventHandlers) {
+      mesh.off(event, handler)
+    }
+    meshEventHandlers = []
+  }
+  stopConnectionSyncTimer()
   gossip = null
   mesh?.destroy()
   mesh              = null
@@ -543,19 +604,30 @@ function doDisconnect() {
   // peerEpubs intentionally kept — persisted cache for reconnects
 }
 
-onUnmounted(doDisconnect)
-// Auto-request epub when selecting a peer we don't have a key for yet
-watch(dmTarget, (peerId) => {
-  if (peerId && !peerEpubs[peerId] && gossip && myKeys) {
-    gossip.sendDirect(peerId, JSON.stringify({ __pp_key: true, epub: myKeys.epub }))
-  }
-})
+const unloadHandler = () => {
+  doDisconnect()
+}
 
 onMounted(() => {
   loadStoredConfig()
   loadPeerEpubs()
+  window.addEventListener('beforeunload', unloadHandler)
+  window.addEventListener('pagehide', unloadHandler)
   if (config.value.autoConnect) {
-    doConnect()
+      doConnect()
+    }
+})
+
+onUnmounted(() => {
+  window.removeEventListener('beforeunload', unloadHandler)
+  window.removeEventListener('pagehide', unloadHandler)
+  doDisconnect()
+})
+
+// Auto-request epub when selecting a peer we don't have a key for yet
+watch(dmTarget, (peerId) => {
+  if (peerId && !peerEpubs[peerId] && gossip && myKeys) {
+    gossip.sendDirect(peerId, JSON.stringify({ __pp_key: true, epub: myKeys.epub }))
   }
 })
 
