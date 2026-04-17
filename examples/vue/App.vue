@@ -39,12 +39,12 @@
           <label class="conn-bar__check"><input type="checkbox" v-model="config.autoDiscover" /> Discover</label>
           <div class="conn-bar__sep"></div>
           <div class="conn-bar__peers-wrap" v-if="connected">
-            <span class="conn-bar__peers">👥 {{ connectedPeers.length }} peer{{ connectedPeers.length === 1 ? '' : 's' }}</span>
-            <div v-if="connectedPeers.length > 0" class="conn-bar__peers-popover">
+            <span class="conn-bar__peers">👥 {{ rtcConnectedPeerIds.length }} peer{{ rtcConnectedPeerIds.length === 1 ? '' : 's' }}</span>
+            <div v-if="rtcConnectedPeerIds.length > 0" class="conn-bar__peers-popover">
               <p class="conn-bar__peers-title">Connected peers</p>
-              <p v-if="connectedPeers.length === 0" class="empty-state">No peers connected</p>
+              <p v-if="rtcConnectedPeerIds.length === 0" class="empty-state">No peers connected</p>
               <div v-else class="peers-list">
-                <div v-for="id in connectedPeers" :key="id" class="peer-item">
+                <div v-for="id in rtcConnectedPeerIds" :key="id" class="peer-item">
                   <code>{{ id.slice(0, 16) }}…</code>
                   <button class="peer-copy-btn" :class="{ copied: copiedPeer === id }" @click.stop="copyPeer(id)" :title="'Copy full ID'">
                     {{ copiedPeer === id ? '✓' : '⎘' }}
@@ -102,7 +102,7 @@
               <label>Target Peer:</label>
               <select v-model="dmTarget">
                 <option value="">Select a peer to chat with…</option>
-                <option v-for="id in discoveredPeers" :key="id" :value="id">{{ id.slice(0, 16) }}… {{ connectedPeers.includes(id) ? '' : '(indirect)' }}</option>
+                <option v-for="id in discoveredPeers" :key="id" :value="id">{{ id.slice(0, 16) }}… {{ rtcConnectedPeerIds.includes(id) ? '' : '(indirect)' }}</option>
               </select>
             </div>
             <div ref="directHistoryEl" class="chat-messages">
@@ -294,6 +294,17 @@
               </table>
             </div>
           </div>
+
+          <div class="card">
+            <h3>Recent Signaling Logs</h3>
+            <p v-if="networkLogs.length === 0" class="empty-state">No signaling logs yet.</p>
+            <div v-else class="network-logs">
+              <div v-for="entry in networkLogs" :key="entry.id" class="network-log-entry">
+                <span class="network-log-entry__time">{{ entry.time }}</span>
+                <code>{{ entry.message }}</code>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -325,6 +336,142 @@ const tabs = [
 ]
 
 const CONFIG_STORAGE_KEY = 'peerpigeon-config'
+const DEFAULT_SESSION_STORAGE_KEY = 'peerpigeon-default-session-id'
+
+function getUrlSessionId() {
+  try {
+    const href = globalThis.location?.href
+    if (!href) return ''
+
+    const url = new URL(href)
+    const fromQuery = (url.searchParams.get('sessionId') || url.searchParams.get('session') || '').trim()
+    if (fromQuery) return fromQuery
+
+    const hash = String(url.hash || '')
+    const hashMatch = hash.match(/(?:^#|[?&])(sessionId|session)=([^&]+)/i)
+    if (hashMatch?.[2]) {
+      return decodeURIComponent(hashMatch[2]).trim()
+    }
+  } catch {}
+
+  return ''
+}
+
+function parseUrlBoolean(raw) {
+  if (raw == null) return undefined
+  const value = String(raw).trim().toLowerCase()
+  if (!value) return undefined
+  if (['1', 'true', 'yes', 'on'].includes(value)) return true
+  if (['0', 'false', 'no', 'off'].includes(value)) return false
+  return undefined
+}
+
+function parseUrlInteger(raw, min, max) {
+  if (raw == null) return undefined
+  const value = Number(String(raw).trim())
+  if (!Number.isFinite(value)) return undefined
+  return Math.max(min, Math.min(max, Math.floor(value)))
+}
+
+function getUrlConfigOverrides() {
+  try {
+    const href = globalThis.location?.href
+    if (!href) return {}
+
+    const url = new URL(href)
+    const params = url.searchParams
+    const overrides = {}
+
+    const sessionId = (params.get('sessionId') || params.get('session') || '').trim()
+    if (sessionId) {
+      overrides.sessionId = sessionId
+    }
+
+    const signalingServer = (params.get('signalingServer') || params.get('signal') || params.get('ws') || '').trim()
+    if (signalingServer) {
+      overrides.signalingServer = signalingServer
+    }
+
+    const minPeers = parseUrlInteger(params.get('minPeers') || params.get('min'), 1, 20)
+    if (minPeers !== undefined) {
+      overrides.minPeers = minPeers
+    }
+
+    const maxPeers = parseUrlInteger(params.get('maxPeers') || params.get('max'), 1, 20)
+    if (maxPeers !== undefined) {
+      overrides.maxPeers = maxPeers
+    }
+
+    const autoConnect = parseUrlBoolean(params.get('autoConnect') || params.get('auto'))
+    if (autoConnect !== undefined) {
+      overrides.autoConnect = autoConnect
+    }
+
+    const autoDiscover = parseUrlBoolean(params.get('autoDiscover') || params.get('discover'))
+    if (autoDiscover !== undefined) {
+      overrides.autoDiscover = autoDiscover
+    }
+
+    if (overrides.minPeers !== undefined && overrides.maxPeers !== undefined && overrides.minPeers > overrides.maxPeers) {
+      const swap = overrides.minPeers
+      overrides.minPeers = overrides.maxPeers
+      overrides.maxPeers = swap
+    }
+
+    return overrides
+  } catch {
+    return {}
+  }
+}
+
+function syncUrlWithConfig(currentConfig) {
+  try {
+    const href = globalThis.location?.href
+    if (!href || !globalThis.history?.replaceState) return
+
+    const url = new URL(href)
+    const params = url.searchParams
+
+    params.set('sessionId', String(currentConfig?.sessionId ?? ''))
+    params.set('signal', String(currentConfig?.signalingServer ?? ''))
+    params.set('min', String(Number(currentConfig?.minPeers ?? defaultConfig.minPeers)))
+    params.set('max', String(Number(currentConfig?.maxPeers ?? defaultConfig.maxPeers)))
+    params.set('auto', currentConfig?.autoConnect ? '1' : '0')
+    params.set('discover', currentConfig?.autoDiscover ? '1' : '0')
+
+    const nextUrl = `${url.pathname}?${params.toString()}${url.hash || ''}`
+    const currentUrl = `${globalThis.location.pathname}${globalThis.location.search}${globalThis.location.hash || ''}`
+    if (nextUrl !== currentUrl) {
+      globalThis.history.replaceState(null, '', nextUrl)
+    }
+  } catch {}
+}
+
+function getDefaultSessionId() {
+  const fallback = 'peerpigeon-demo'
+
+  try {
+    const existing = globalThis.localStorage?.getItem(DEFAULT_SESSION_STORAGE_KEY)
+    if (existing && typeof existing === 'string' && existing.trim()) {
+      return existing
+    }
+
+    let randomPart = ''
+    if (globalThis.crypto?.getRandomValues) {
+      const bytes = new Uint8Array(6)
+      globalThis.crypto.getRandomValues(bytes)
+      randomPart = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
+    } else {
+      randomPart = Math.random().toString(36).slice(2, 14)
+    }
+
+    const generated = `peerpigeon-${randomPart}`
+    globalThis.localStorage?.setItem(DEFAULT_SESSION_STORAGE_KEY, generated)
+    return generated
+  } catch {
+    return fallback
+  }
+}
 
 const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.cloudflare.com:3478' },
@@ -351,7 +498,7 @@ const FIREFOX_ICE_SERVERS = [
 ]
 
 const defaultConfig = {
-  sessionId: 'peerpigeon-demo',
+  sessionId: getUrlSessionId() || getDefaultSessionId(),
   signalingServer: 'wss://peer.ooo/ws',
   minPeers: 2,
   maxPeers: 5,
@@ -386,6 +533,7 @@ const storageRecords       = ref([])
 const storageEvents        = ref([])
 const storageNotice        = ref('')
 const storageQuerying      = ref(false)
+const networkLogs          = ref([])
 
 const storageSpaceOptions = [
   { id: STORAGE_SPACES.USER, label: 'user' },
@@ -496,9 +644,18 @@ const networkRelayCount = computed(() =>
   networkPeerRows.value.filter((row) => row.transport === 'ws-relay' || row.transport === 'relay-candidate').length
 )
 
+const rtcConnectedPeerIds = computed(() =>
+  connectedPeers.value.filter((peerId) => isDirectRtcConnected(peerId))
+)
+
 function sanitizeStoredConfig(raw) {
+  const storedSessionId = typeof raw?.sessionId === 'string' ? raw.sessionId.trim() : ''
+  const normalizedSessionId = (!storedSessionId || storedSessionId === 'peerpigeon-demo')
+    ? defaultConfig.sessionId
+    : storedSessionId
+
   return {
-    sessionId: typeof raw?.sessionId === 'string' && raw.sessionId.trim() ? raw.sessionId : defaultConfig.sessionId,
+    sessionId: normalizedSessionId,
     signalingServer: typeof raw?.signalingServer === 'string' && raw.signalingServer.trim() ? raw.signalingServer : defaultConfig.signalingServer,
     minPeers: Number.isFinite(raw?.minPeers) ? Math.max(1, Math.min(20, Number(raw.minPeers))) : defaultConfig.minPeers,
     maxPeers: Number.isFinite(raw?.maxPeers) ? Math.max(1, Math.min(20, Number(raw.maxPeers))) : defaultConfig.maxPeers,
@@ -510,10 +667,25 @@ function sanitizeStoredConfig(raw) {
 
 function loadStoredConfig() {
   try {
+    const urlOverrides = getUrlConfigOverrides()
+
     const raw = globalThis.localStorage?.getItem(CONFIG_STORAGE_KEY)
-    if (!raw) return
+    if (!raw) {
+      config.value = {
+        ...config.value,
+        ...urlOverrides,
+      }
+      syncUrlWithConfig(config.value)
+      return
+    }
+
     const parsed = JSON.parse(raw)
-    config.value = sanitizeStoredConfig(parsed)
+    config.value = {
+      ...sanitizeStoredConfig(parsed),
+      ...urlOverrides,
+    }
+
+    syncUrlWithConfig(config.value)
   } catch {}
 }
 
@@ -525,6 +697,7 @@ function persistConfig(nextConfig) {
 
 watch(config, (nextConfig) => {
   persistConfig(nextConfig)
+  syncUrlWithConfig(nextConfig)
 }, { deep: true })
 
 // ── Mesh / Gossip ────────────────────────────────────────────────────────────
@@ -610,6 +783,17 @@ function pushStorageEvent(entry) {
   ].slice(0, 40)
 }
 
+function pushNetworkLog(message) {
+  networkLogs.value = [
+    {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      time: new Date().toLocaleTimeString(),
+      message,
+    },
+    ...networkLogs.value,
+  ].slice(0, 80)
+}
+
 function refreshStorageRecords() {
   storageRecords.value = distributedStorage
     ? distributedStorage.list({ space: storageView.space, includeOpaque: true })
@@ -669,6 +853,7 @@ function teardownDistributedStorage() {
   storageEvents.value = []
   storageNotice.value = ''
   storageQuerying.value = false
+  networkLogs.value = []
 }
 
 async function writeStorageRecord() {
@@ -743,8 +928,21 @@ async function doConnect() {
     const softMaxPeers = Math.max(1, hardMaxPeers - 1)
     const effectiveMinPeers = Math.min(Number(config.value.minPeers || 0), hardMaxPeers)
     const isFirefox = /firefox/i.test(navigator.userAgent)
+    const isSafari = /safari/i.test(navigator.userAgent) && !/chrome|chromium|edg|opr/i.test(navigator.userAgent)
     const isChrome = /chrome|chromium/i.test(navigator.userAgent) && !/edg|opr/i.test(navigator.userAgent)
-    const runtimeIceServers = isFirefox ? FIREFOX_ICE_SERVERS : config.value.iceServers
+    const isSlowBrowser = isFirefox || isSafari
+    const runtimeIceServers = isFirefox
+      ? [
+          ...config.value.iceServers,
+          ...FIREFOX_ICE_SERVERS.filter((server) => {
+            const urls = Array.isArray(server?.urls) ? server.urls : [server?.urls]
+            return !config.value.iceServers.some((existing) => {
+              const existingUrls = Array.isArray(existing?.urls) ? existing.urls : [existing?.urls]
+              return urls.some((u) => existingUrls.includes(u))
+            })
+          }),
+        ]
+      : config.value.iceServers
 
     mesh = new PartialMesh({
       sessionId: config.value.sessionId,
@@ -755,13 +953,14 @@ async function doConnect() {
       autoConnect: config.value.autoConnect,
       autoDiscover: config.value.autoDiscover,
       iceServers: runtimeIceServers,
-      trickleIce: !isFirefox,
-      signalRelayFallback: false,
-      maxConcurrentDials: isFirefox ? 1 : isChrome ? 1 : 3,
-      rtcCapacityBackoffMs: isChrome ? 20000 : 15000,
-      relayRetryMs: isFirefox ? 120000 : 90000,
-      connectionTimeoutMs: isFirefox ? 60000 : 45000,
-      maintenanceIntervalMs: isFirefox ? 4000 : isChrome ? 3000 : 2000,
+      trickleIce: true,
+      signalRelayFallback: isFirefox,
+      maxConcurrentDials: isFirefox ? 2 : (isChrome ? 3 : 2),
+      rtcCapacityBackoffMs: isFirefox ? 5000 : (isChrome ? 20000 : 15000),
+      relayRetryMs: isFirefox ? 7000 : 90000,
+      connectionTimeoutMs: isFirefox ? 15000 : 20000,
+      underConnectedResetMs: isFirefox ? 15000 : isSafari ? 75000 : 30000,
+      maintenanceIntervalMs: isFirefox ? 2000 : isChrome ? 3000 : 2000,
       rebalanceCooldownMs: isFirefox ? 90000 : 60000,
       rebalanceRetryMs: isFirefox ? 120000 : 90000,
       rebalanceMinConnectionAgeMs: isFirefox ? 60000 : 45000,
@@ -797,18 +996,21 @@ async function doConnect() {
 
     registerMeshHandler('signaling:error', (error) => {
       console.error('Signaling error:', error)
+      pushNetworkLog(`[signal:error] ${error instanceof Error ? error.message : String(error)}`)
       connected.value = false
       signalingStatus.value = 'disconnected'
     })
 
-    if (DEBUG_SIGNALING_LOGS) {
-      registerMeshHandler('signaling:log', ({ message }) => {
+    registerMeshHandler('signaling:log', ({ message }) => {
+      pushNetworkLog(message)
+      if (DEBUG_SIGNALING_LOGS) {
         console.debug(message)
-      })
-    }
+      }
+    })
 
     registerMeshHandler('peer:error', ({ peerId, error }) => {
       console.error(`Peer error (${peerId}):`, error)
+      pushNetworkLog(`[peer:error] ${peerId?.slice(0, 16) ?? 'unknown'} ${error instanceof Error ? error.message : String(error)}`)
     })
 
     registerMeshHandler('peer:discovered', (peerId) => {
