@@ -335,9 +335,6 @@ const tabs = [
   { id: 'testing',    label: '🧪 API Testing' },
 ]
 
-const CONFIG_STORAGE_KEY = 'peerpigeon-config'
-const DEFAULT_SESSION_STORAGE_KEY = 'peerpigeon-default-session-id'
-
 function getUrlSessionId() {
   try {
     const href = globalThis.location?.href
@@ -451,11 +448,6 @@ function getDefaultSessionId() {
   const fallback = 'peerpigeon-demo'
 
   try {
-    const existing = globalThis.localStorage?.getItem(DEFAULT_SESSION_STORAGE_KEY)
-    if (existing && typeof existing === 'string' && existing.trim()) {
-      return existing
-    }
-
     let randomPart = ''
     if (globalThis.crypto?.getRandomValues) {
       const bytes = new Uint8Array(6)
@@ -465,9 +457,7 @@ function getDefaultSessionId() {
       randomPart = Math.random().toString(36).slice(2, 14)
     }
 
-    const generated = `peerpigeon-${randomPart}`
-    globalThis.localStorage?.setItem(DEFAULT_SESSION_STORAGE_KEY, generated)
-    return generated
+    return `peerpigeon-${randomPart}`
   } catch {
     return fallback
   }
@@ -497,17 +487,22 @@ const FIREFOX_ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
 ]
 
+const DEFAULT_SIGNALING_SERVER = 'wss://peer.ooo/ws'
+
 const defaultConfig = {
   sessionId: getUrlSessionId() || getDefaultSessionId(),
-  signalingServer: 'wss://peer.ooo/ws',
-  minPeers: 2,
+  signalingServer: DEFAULT_SIGNALING_SERVER,
+  minPeers: 1,
   maxPeers: 5,
   autoConnect: true,
   autoDiscover: true,
   iceServers: DEFAULT_ICE_SERVERS,
 }
 
-const config = ref({ ...defaultConfig })
+const config = ref({
+  ...defaultConfig,
+  ...getUrlConfigOverrides(),
+})
 
 const clientId        = ref(null)
 const connected       = ref(false)
@@ -648,55 +643,7 @@ const rtcConnectedPeerIds = computed(() =>
   connectedPeers.value.filter((peerId) => isDirectRtcConnected(peerId))
 )
 
-function sanitizeStoredConfig(raw) {
-  const storedSessionId = typeof raw?.sessionId === 'string' ? raw.sessionId.trim() : ''
-  const normalizedSessionId = (!storedSessionId || storedSessionId === 'peerpigeon-demo')
-    ? defaultConfig.sessionId
-    : storedSessionId
-
-  return {
-    sessionId: normalizedSessionId,
-    signalingServer: typeof raw?.signalingServer === 'string' && raw.signalingServer.trim() ? raw.signalingServer : defaultConfig.signalingServer,
-    minPeers: Number.isFinite(raw?.minPeers) ? Math.max(1, Math.min(20, Number(raw.minPeers))) : defaultConfig.minPeers,
-    maxPeers: Number.isFinite(raw?.maxPeers) ? Math.max(1, Math.min(20, Number(raw.maxPeers))) : defaultConfig.maxPeers,
-    autoConnect: typeof raw?.autoConnect === 'boolean' ? raw.autoConnect : defaultConfig.autoConnect,
-    autoDiscover: typeof raw?.autoDiscover === 'boolean' ? raw.autoDiscover : defaultConfig.autoDiscover,
-    iceServers: Array.isArray(raw?.iceServers) && raw.iceServers.length > 0 ? raw.iceServers : defaultConfig.iceServers,
-  }
-}
-
-function loadStoredConfig() {
-  try {
-    const urlOverrides = getUrlConfigOverrides()
-
-    const raw = globalThis.localStorage?.getItem(CONFIG_STORAGE_KEY)
-    if (!raw) {
-      config.value = {
-        ...config.value,
-        ...urlOverrides,
-      }
-      syncUrlWithConfig(config.value)
-      return
-    }
-
-    const parsed = JSON.parse(raw)
-    config.value = {
-      ...sanitizeStoredConfig(parsed),
-      ...urlOverrides,
-    }
-
-    syncUrlWithConfig(config.value)
-  } catch {}
-}
-
-function persistConfig(nextConfig) {
-  try {
-    globalThis.localStorage?.setItem(CONFIG_STORAGE_KEY, JSON.stringify(nextConfig))
-  } catch {}
-}
-
 watch(config, (nextConfig) => {
-  persistConfig(nextConfig)
   syncUrlWithConfig(nextConfig)
 }, { deep: true })
 
@@ -917,7 +864,10 @@ function messageRouteLabel(msg) {
 }
 
 async function doConnect() {
-  if (mesh || signalingStatus.value === 'connecting' || connected.value) return
+  if (signalingStatus.value === 'connecting' || connected.value) return
+  if (mesh) {
+    doDisconnect()
+  }
   manuallyDisconnected = false
 
   signalingStatus.value = 'connecting'
@@ -925,12 +875,9 @@ async function doConnect() {
 
   try {
     const hardMaxPeers = Math.max(1, Number(config.value.maxPeers || 0))
-    const softMaxPeers = Math.max(1, hardMaxPeers - 1)
     const effectiveMinPeers = Math.min(Number(config.value.minPeers || 0), hardMaxPeers)
     const isFirefox = /firefox/i.test(navigator.userAgent)
     const isSafari = /safari/i.test(navigator.userAgent) && !/chrome|chromium|edg|opr/i.test(navigator.userAgent)
-    const isChrome = /chrome|chromium/i.test(navigator.userAgent) && !/edg|opr/i.test(navigator.userAgent)
-    const isSlowBrowser = isFirefox || isSafari
     const runtimeIceServers = isFirefox
       ? [
           ...config.value.iceServers,
@@ -938,7 +885,7 @@ async function doConnect() {
             const urls = Array.isArray(server?.urls) ? server.urls : [server?.urls]
             return !config.value.iceServers.some((existing) => {
               const existingUrls = Array.isArray(existing?.urls) ? existing.urls : [existing?.urls]
-              return urls.some((u) => existingUrls.includes(u))
+              return urls.some((url) => existingUrls.includes(url))
             })
           }),
         ]
@@ -949,26 +896,17 @@ async function doConnect() {
       signalingServer: config.value.signalingServer,
       minPeers: effectiveMinPeers,
       maxPeers: hardMaxPeers,
-      softMaxPeers,
       autoConnect: config.value.autoConnect,
       autoDiscover: config.value.autoDiscover,
       iceServers: runtimeIceServers,
-      trickleIce: true,
-      signalRelayFallback: isFirefox,
-      maxConcurrentDials: isFirefox ? 2 : (isChrome ? 3 : 2),
-      rtcCapacityBackoffMs: isFirefox ? 5000 : (isChrome ? 20000 : 15000),
-      relayRetryMs: isFirefox ? 7000 : 90000,
-      connectionTimeoutMs: isFirefox ? 15000 : 20000,
-      underConnectedResetMs: isFirefox ? 15000 : isSafari ? 75000 : 30000,
-      maintenanceIntervalMs: isFirefox ? 2000 : isChrome ? 3000 : 2000,
-      rebalanceCooldownMs: isFirefox ? 90000 : 60000,
-      rebalanceRetryMs: isFirefox ? 120000 : 90000,
-      rebalanceMinConnectionAgeMs: isFirefox ? 60000 : 45000,
-      rebalanceMinCandidateAgeMs: isFirefox ? 20000 : 15000,
+      trickleIce: !isFirefox,
+      nonInitiatorFallbackDialMs: 0,
+      connectionTimeoutMs: isFirefox ? 60000 : 45000,
+      maintenanceIntervalMs: isFirefox ? 2000 : 3000,
+      underConnectedResetMs: isFirefox ? 15000 : (isSafari ? 75000 : 30000),
     })
 
     gossip = new GossipProtocol(mesh)
-    attachDistributedStorage()
 
     const registerMeshHandler = (event, handler) => {
       mesh.on(event, handler)
@@ -985,12 +923,9 @@ async function doConnect() {
       signalingStatus.value = 'connected'
       syncConnectedPeers()
       startConnectionSyncTimer()
-      startKeySyncTimer()
       if (!config.value.autoDiscover) {
         mesh.signalingClient?.joinSession(config.value.sessionId)
       }
-      announceLocalKey()
-      syncPeerKeys()
     }
     registerMeshHandler('signaling:connected', onSignalingConnected)
 
@@ -1016,9 +951,6 @@ async function doConnect() {
     registerMeshHandler('peer:discovered', (peerId) => {
       if (peerId && !discoveredPeers.value.includes(peerId))
         discoveredPeers.value = [...discoveredPeers.value, peerId]
-      if (!config.value.autoConnect) {
-        mesh.maintainPeerConnections?.()
-      }
     })
 
     registerMeshHandler('signaling:disconnected', () => {
@@ -1031,6 +963,7 @@ async function doConnect() {
       syncConnectedPeers()
       if (!discoveredPeers.value.includes(peerId))
         discoveredPeers.value = [...discoveredPeers.value, peerId]
+      startKeySyncTimer()
       ensurePeerKey(peerId)
     })
 
@@ -1041,6 +974,9 @@ async function doConnect() {
         dmTarget.value = ''
       }
       syncConnectedPeers()
+      if (connectedPeers.value.length === 0) {
+        stopKeySyncTimer()
+      }
     }
 
     registerMeshHandler('peer:disconnected', cleanupPeerState)
@@ -1119,6 +1055,7 @@ async function doConnect() {
     })
 
     await mesh.init()
+    attachDistributedStorage()
   } catch (err) {
     console.error('Connect failed:', err)
     doDisconnect()
@@ -1232,12 +1169,12 @@ const unloadHandler = () => {
 }
 
 onMounted(() => {
-  loadStoredConfig()
+  syncUrlWithConfig(config.value)
   window.addEventListener('beforeunload', unloadHandler)
   window.addEventListener('pagehide', unloadHandler)
   if (config.value.autoConnect) {
-      doConnect()
-    }
+    doConnect()
+  }
 })
 
 onUnmounted(() => {

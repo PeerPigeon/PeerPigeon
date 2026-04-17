@@ -4,6 +4,12 @@ import vue from '@vitejs/plugin-vue'
 export default defineConfig({
   plugins: [vue()],
   optimizeDeps: {
-    exclude: ['gossip-protocol'],
+    include: ['gossip-protocol', 'unsea'],
+    esbuildOptions: {
+      target: 'safari15',
+    },
+  },
+  build: {
+    target: 'safari15',
   },
 })
