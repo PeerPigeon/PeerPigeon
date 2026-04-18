@@ -1,23 +1,60 @@
 {
   "name": "peerpigeon",
-  "version": "2.0.0",
-  "description": "PeerPigeon – browser P2P networking with DHT, gossip, and WebRTC signaling",
+  "version": "1.0.0",
+  "description": "PeerPigeon: WebRTC partial-mesh networking with gossip broadcast and direct messaging",
   "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
-    "dev": "vite examples/vue --force",
-    "build": "vite build examples/vue",
-    "preview": "vite preview examples/vue"
+    "build": "tsup src/index.ts --format esm,cjs --dts",
+    "build:browser": "tsup --config tsup.browser.config.ts",
+    "dev": "cd examples/vue3 && npm run dev --",
+    "prepare": "npm run build",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build",
+    "example:basic": "cd examples/basic && npm run dev",
+    "example:vue3": "cd examples/vue3 && npm run dev",
+    "test": "node scripts/run-e2e-loop.mjs"
+  },
+  "keywords": [
+    "webrtc",
+    "p2p",
+    "peer-to-peer",
+    "mesh",
+    "networking",
+    "partial-mesh",
+    "signaling",
+    "auto-discovery",
+    "freertc"
+  ],
+  "author": "",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/draeder/peerpigeon.git"
   },
   "dependencies": {
-    "@vueuse/core": "^10.9.0",
-    "gossip-protocol": "github:draeder/gossip-protocol#refactor",
-    "pinia": "^2.1.7",
-    "unsea": "^1.1.2",
-    "vue": "^3.4.0",
-    "vue-router": "^4.3.0"
+    "freertc": "github:draeder/freertc",
+    "unsea": "^1.1.2"
   },
   "devDependencies": {
-    "@vitejs/plugin-vue": "^6.0.3",
-    "vite": "^5.0.0"
+    "@playwright/test": "^1.55.0",
+    "@types/node": "^25.0.3",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.0"
   }
 }
