@@ -319,24 +319,11 @@ export default {
       this.applyTopologyPreset(this.topology);
     }
 
-    // Only use localStorage sessionId if NO explicit URL param was provided
-    // This ensures test URLs (with __test_* sessionIds) are never overridden
+    // If URL does not provide a sessionId, use a fresh random room by default.
     if (hasExplicitSessionId) {
       this.roomSessionId = sessionIdParam;
     } else {
-      const storageKey = 'peerpigeon:room-session-id';
-      const ensureLocalRoomSessionId = () => {
-        try {
-          const existing = localStorage.getItem(storageKey);
-          if (existing && existing.trim()) return existing.trim();
-          const generated = `gp-${Math.random().toString(36).slice(2, 10)}`;
-          localStorage.setItem(storageKey, generated);
-          return generated;
-        } catch {
-          return `gp-${Math.random().toString(36).slice(2, 10)}`;
-        }
-      };
-      this.roomSessionId = ensureLocalRoomSessionId();
+      this.roomSessionId = this.generateRandomRoomSessionId();
     }
 
     const maxPeersParam = Number(params.get('maxPeers'));
@@ -432,6 +419,10 @@ export default {
     }
   },
   methods: {
+    generateRandomRoomSessionId() {
+      return `gp-${Math.random().toString(36).slice(2, 10)}`;
+    },
+
     topologyPresetBounds(topology) {
       switch (topology) {
         case 'token-ring':
@@ -527,17 +518,11 @@ export default {
         this.reconcileTopologyWithPeerBounds();
         this.networkName = String(this.networkName || '').trim();
         this.roomSessionId = String(this.roomSessionId || '').trim();
+        if (!this.roomSessionId) {
+          this.roomSessionId = this.generateRandomRoomSessionId();
+        }
         this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
         this.updateUrlState();
-
-        try {
-          localStorage.setItem('peerpigeon:room-session-id', this.roomSessionId || `pp-${Math.random().toString(36).slice(2, 10)}`);
-          if (!this.roomSessionId) {
-            this.roomSessionId = localStorage.getItem('peerpigeon:room-session-id') || '';
-          }
-        } catch {
-          // ignore storage errors
-        }
 
         this.updateUrlState();
 
