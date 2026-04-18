@@ -21,6 +21,7 @@
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts",
     "build:browser": "tsup --config tsup.browser.config.ts",
+    "dev:tls:generate": "node scripts/dev-with-mdns.mjs --generate-tls",
     "dev": "cd examples/vue3 && npm run dev --",
     "prepare": "npm run build",
     "prepack": "npm run build",
