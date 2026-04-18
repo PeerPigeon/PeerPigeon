@@ -186,7 +186,7 @@
             :key="idx"
             :class="['log-entry', entry.type, { local: entry.local }]"
           >
-            <div class="bubble" :class="entry.local ? 'me' : 'peer'">
+            <div class="bubble" :class="entryBubbleClass(entry)">
               <div class="bubble-meta">
                 <span class="sender">{{ entry.local ? 'You' : entry.sender.slice(0, 6) }}</span>
                 <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
@@ -198,19 +198,36 @@
         </div>
 
         <div class="message-input">
+          <div class="message-mode-controls">
+            <label class="mode-toggle">
+              <input v-model="directMode" type="checkbox" />
+              Direct
+            </label>
+            <select
+              v-if="directMode"
+              v-model="dmTarget"
+              class="input message-target-select"
+              data-testid="dm-target"
+            >
+              <option value="" disabled>{{ globalPeersList.length ? 'Select peer…' : 'Waiting for peers…' }}</option>
+              <option v-for="p in globalPeersList" :key="p" :value="p">{{ p.slice(0,8) }}…</option>
+            </select>
+          </div>
           <input 
             v-model="messageInput" 
             @keyup.enter="sendMessage"
             :disabled="!isRunning"
-            placeholder="Type a message..."
+            :placeholder="directMode ? 'Type a direct message…' : 'Type a message...'"
+            data-testid="dm-input"
             class="input"
           />
           <button 
             @click="sendMessage" 
-            :disabled="!isRunning || !messageInput.trim()"
+            :disabled="!isRunning || !messageInput.trim() || (directMode && !dmTarget)"
             class="btn btn-secondary"
+            data-testid="dm-send"
           >
-            Send
+            {{ directMode ? 'Send Direct' : 'Send' }}
           </button>
         </div>
       </section>
@@ -232,43 +249,6 @@
         </div>
       </section>
 
-      <!-- Direct Messages -->
-      <section class="chat dm-section" v-if="isRunning">
-        <h3>📩 Direct Message</h3>
-        <div class="dm-input-row">
-          <select v-model="dmTarget" class="input dm-select" data-testid="dm-target">
-            <option value="" disabled>{{ globalPeersList.length ? 'Select peer…' : 'Waiting for peers…' }}</option>
-            <option v-for="p in globalPeersList" :key="p" :value="p">{{ p.slice(0,8) }}…</option>
-          </select>
-          <input
-            v-model="dmInput"
-            @keyup.enter="sendDm"
-            :disabled="!dmTarget"
-            placeholder="Private message…"
-            class="input dm-text"
-            data-testid="dm-input"
-          />
-          <button
-            @click="sendDm"
-            :disabled="!dmTarget || !dmInput.trim()"
-            class="btn btn-dm"
-            data-testid="dm-send"
-          >
-            Send DM
-          </button>
-        </div>
-        <div ref="dmLogContainer" class="log-container chat-container dm-log">
-          <div v-for="(entry, idx) in dmMessages" :key="idx" class="log-entry">
-            <div class="bubble" :class="entry.local ? 'dm-me' : 'dm-peer'">
-              <div class="bubble-meta">
-                <span class="sender">{{ entry.local ? `You → ${entry.to.slice(0,6)}` : `${entry.from.slice(0,6)} → You` }}</span>
-                <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
-              </div>
-              <div class="bubble-text">{{ entry.text }}</div>
-            </div>
-          </div>
-        </div>
-      </section>
     </main>
   </div>
 </template>
@@ -288,13 +268,12 @@ export default {
       isRunning: false,
       isConnecting: false,
       messageInput: '',
-      dmInput: '',
+      directMode: false,
       dmTarget: '',
       clientId: '',
       connectedPeersList: [],
       discoveredPeersList: [],
       globalPeersList: [],
-      dmLog: [],
       messagesSeen: 0,
       maxPeers: 5,
       minPeers: 2,
@@ -438,9 +417,6 @@ export default {
     },
     diagnosticMessages() {
       return this.messageLog.filter(e => e.type !== 'sent' && e.type !== 'received');
-    },
-    dmMessages() {
-      return this.dmLog;
     }
   },
   watch: {
@@ -662,15 +638,11 @@ export default {
         });
 
         this.gossip.on('directMessageReceived', ({ message }) => {
-          this.dmLog.push({
-            local: false,
-            from: message.from,
-            to: message.to,
-            text: String(message.data),
-            timestamp: new Date(message.timestamp),
-          });
+          this.messagesSeen++;
+          const from = String(message.from || 'peer');
+          this.addLog('received', `📩 [DM] ${String(message.data)}`, from, 0, false, { direct: true });
           this.saveUiState();
-          this.$nextTick(() => this.scrollDmToBottom());
+          if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
         });
 
         await this.mesh.init();
@@ -705,9 +677,8 @@ export default {
       }
       this.isRunning = false;
       this.messageLog = [];
-      this.dmLog = [];
       this.dmTarget = '';
-      this.dmInput = '';
+      this.directMode = false;
       this.globalPeersList = [];
       this.saveUiState();
       this.addLog('info', 'Mesh stopped', 'System');
@@ -720,38 +691,31 @@ export default {
       const message = this.messageInput.trim();
       this.messageInput = '';
 
-      this.gossip.broadcast(message, {
-        sender: this.clientId,
-        timestamp: Date.now()
-      });
-      if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
-    },
+      if (this.directMode) {
+        const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+        const target = String(this.dmTarget || '').trim();
+        if (!target || (self && target === self)) {
+          this.addLog('info', 'Select a valid peer target for direct message', 'System');
+          return;
+        }
 
-    sendDm() {
-      if (!this.gossip || !this.dmInput.trim()) return;
-      const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-      const target = String(this.dmTarget || '').trim();
-      if (!target || (self && target === self)) {
-        this.addLog('info', 'Select a valid peer target for DM', 'System');
-        return;
+        const id = this.gossip.sendDirect(target, message);
+        if (!id) {
+          this.addLog('info', 'Direct message failed: local peer ID is not ready yet', 'System');
+          return;
+        }
+
+        this.messagesSeen++;
+        this.addLog('sent', `📨 [DM→${target.slice(0, 6)}] ${message}`, 'You', 0, true, { direct: true });
+      } else {
+        this.gossip.broadcast(message, {
+          sender: this.clientId,
+          timestamp: Date.now()
+        });
       }
 
-      const text = this.dmInput.trim();
-      this.dmInput = '';
-      const id = this.gossip.sendDirect(target, text);
-      if (!id) {
-        this.addLog('info', 'DM failed: local peer ID is not ready yet', 'System');
-        return;
-      }
-      this.dmLog.push({
-        local: true,
-        from: self || this.clientId,
-        to: target,
-        text,
-        timestamp: new Date(),
-      });
       this.saveUiState();
-      this.$nextTick(() => this.scrollDmToBottom());
+      if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
     },
 
     updateStats() {
@@ -800,14 +764,22 @@ export default {
       }
     },
 
-    addLog(type, text, sender = 'System', hops = 0, local = false) {
+    entryBubbleClass(entry) {
+      if (entry?.direct) {
+        return entry.local ? 'dm-me' : 'dm-peer';
+      }
+      return entry.local ? 'me' : 'peer';
+    },
+
+    addLog(type, text, sender = 'System', hops = 0, local = false, options = {}) {
       const entry = {
         type,
         text,
         sender,
         hops,
         timestamp: new Date(),
-        local
+        local,
+        direct: !!options.direct
       };
 
       this.messageLog.push(entry);
@@ -932,12 +904,6 @@ export default {
       container.scrollTop = container.scrollHeight;
     },
 
-    scrollDmToBottom() {
-      const container = this.$refs.dmLogContainer;
-      if (!container) return;
-      container.scrollTop = container.scrollHeight;
-    },
-
     scrollDiagToBottom() {
       const container = this.$refs.diagLogContainer;
       if (!container) return;
@@ -948,7 +914,7 @@ export default {
       try {
         sessionStorage.setItem(this.uiStateKey, JSON.stringify({
           dmTarget: this.dmTarget || '',
-          dmLog: this.dmLog.slice(-100)
+          directMode: !!this.directMode
         }));
       } catch {
         // ignore storage failures
@@ -960,11 +926,11 @@ export default {
         const raw = sessionStorage.getItem(this.uiStateKey);
         if (!raw) return;
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed.dmLog)) {
-          this.dmLog = parsed.dmLog;
-        }
         if (typeof parsed.dmTarget === 'string') {
           this.dmTarget = parsed.dmTarget;
+        }
+        if (typeof parsed.directMode === 'boolean') {
+          this.directMode = parsed.directMode;
         }
       } catch {
         // ignore storage failures
@@ -1187,6 +1153,27 @@ section {
 .message-input .input {
   flex: 1;
   min-width: 0;
+}
+
+.message-mode-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex: 0 0 auto;
+}
+
+.mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: #334155;
+  white-space: nowrap;
+}
+
+.message-target-select {
+  min-width: 150px;
+  max-width: 210px;
 }
 
 .message-input .btn {
@@ -1537,58 +1524,6 @@ section {
   color: #6b21a8 !important;
   border-bottom-left-radius: 4px;
   border: 1px solid #e9d5ff;
-}
-
-.dm-section {
-  border-top: 3px solid #e9d5ff;
-}
-
-.dm-input-row {
-  display: flex;
-  gap: 0.75rem;
-  width: 100%;
-  align-items: stretch;
-  margin-bottom: 0.75rem;
-}
-
-.dm-select {
-  flex: 0 0 160px;
-  cursor: pointer;
-}
-
-.dm-text {
-  flex: 1;
-  min-width: 0;
-}
-
-.btn-dm {
-  flex: 0 0 120px;
-  background: linear-gradient(135deg, #7c3aed 0%, #4f46e5 100%);
-  color: white;
-  border: none;
-  border-radius: 8px;
-  font-size: 1rem;
-  font-weight: 600;
-  cursor: pointer;
-  padding: 0.75rem 1rem;
-  transition: all 0.3s;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
-.btn-dm:hover:not(:disabled) {
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.4);
-}
-
-.btn-dm:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.dm-log {
-  height: 180px;
-  max-height: 30vh;
 }
 
 /* Ensure the chat section itself clips any inner overflow */
