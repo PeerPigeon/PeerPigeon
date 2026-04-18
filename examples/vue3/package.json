@@ -12,6 +12,7 @@
   "dependencies": {
     "peerpigeon": "file:../..",
     "freertc": "github:draeder/freertc",
+    "unsea": "^1.1.2",
     "vue": "^3.3.0"
   },
   "devDependencies": {

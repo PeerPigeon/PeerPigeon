@@ -8,6 +8,51 @@
     <main>
       <!-- Control Panel -->
       <section class="control-panel">
+        <div class="button-group">
+          <div class="effective-session-inline" :title="effectiveSessionId">
+            <span class="field-label">Effective Session</span>
+            <span class="effective-session-value">{{ effectiveSessionId }}</span>
+          </div>
+          <label class="field field-topology-inline">
+            <span class="field-label">Topology</span>
+            <select
+              v-model="topology"
+              @change="onTopologyChange"
+              :disabled="isConnecting"
+              class="input"
+              data-testid="topology"
+            >
+              <option value="token-ring">Token Ring (target 2, tolerant 1)</option>
+              <option value="star">Star (1-20)</option>
+              <option value="partial-mesh">Partial Mesh (2-5)</option>
+              <option value="dense-mesh">Dense Mesh (3-10)</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <div class="button-actions">
+            <button 
+              @click="startMesh" 
+              :disabled="isRunning || isConnecting"
+              class="btn btn-primary"
+              data-testid="start-mesh"
+            >
+              {{ isConnecting ? 'Connecting...' : 'Start Mesh' }}
+            </button>
+            <button 
+              @click="stopMesh" 
+              :disabled="!isRunning"
+              class="btn btn-danger"
+              data-testid="stop-mesh"
+            >
+              Stop Mesh
+            </button>
+          </div>
+
+          <div class="status-field" :class="`status-${status.type}`" data-testid="status-message">
+            {{ status.message || 'Idle' }}
+          </div>
+        </div>
+
         <div class="config-grid">
           <label class="field">
             <span class="field-label">Server</span>
@@ -86,51 +131,6 @@
 
         </div>
 
-        <div class="button-group">
-          <div class="effective-session-inline" :title="effectiveSessionId">
-            <span class="field-label">Effective Session</span>
-            <span class="effective-session-value">{{ effectiveSessionId }}</span>
-          </div>
-          <label class="field field-topology-inline">
-            <span class="field-label">Topology</span>
-            <select
-              v-model="topology"
-              @change="onTopologyChange"
-              :disabled="isConnecting"
-              class="input"
-              data-testid="topology"
-            >
-              <option value="token-ring">Token Ring (target 2, tolerant 1)</option>
-              <option value="star">Star (1-20)</option>
-              <option value="partial-mesh">Partial Mesh (2-5)</option>
-              <option value="dense-mesh">Dense Mesh (3-10)</option>
-              <option value="custom">Custom</option>
-            </select>
-          </label>
-          <div class="button-actions">
-            <button 
-              @click="startMesh" 
-              :disabled="isRunning || isConnecting"
-              class="btn btn-primary"
-              data-testid="start-mesh"
-            >
-              {{ isConnecting ? 'Connecting...' : 'Start Mesh' }}
-            </button>
-            <button 
-              @click="stopMesh" 
-              :disabled="!isRunning"
-              class="btn btn-danger"
-              data-testid="stop-mesh"
-            >
-              Stop Mesh
-            </button>
-          </div>
-
-          <div class="status-field" :class="`status-${status.type}`" data-testid="status-message">
-            {{ status.message || 'Idle' }}
-          </div>
-        </div>
-
         <div v-if="isRunning" class="control-stats-row">
           <div class="control-stat">
             <span class="control-stat-label">Peer ID</span>
@@ -149,18 +149,165 @@
             <span class="control-stat-value" data-testid="messages-seen">{{ messagesSeen }}</span>
           </div>
         </div>
+
+        <div class="workspace-tabs" v-if="isRunning">
+          <div class="tab-nav" role="tablist" aria-label="PeerPigeon panels">
+            <button
+              v-for="tab in uiTabs"
+              :key="tab.id"
+              type="button"
+              role="tab"
+              class="tab-btn"
+              :aria-selected="activeTab === tab.id"
+              :class="{ active: activeTab === tab.id }"
+              @click="activeTab = tab.id"
+            >
+              {{ tab.label }}
+            </button>
+          </div>
+
+          <div v-if="activeTab === 'message'" class="tab-panel chat" role="tabpanel" aria-label="Message panel">
+            <h3>💬 Message</h3>
+            <div class="log-controls">
+              <button @click="clearLog" class="btn btn-small">Clear</button>
+              <label>
+                <input v-model="autoScroll" type="checkbox" />
+                Auto-scroll
+              </label>
+            </div>
+            <div ref="logContainer" class="log-container chat-container">
+              <div
+                v-for="(entry, idx) in chatMessages"
+                :key="idx"
+                :class="['log-entry', entry.type, { local: entry.local }]"
+              >
+                <div class="bubble" :class="entryBubbleClass(entry)">
+                  <div class="bubble-meta">
+                    <span class="sender">{{ entry.local ? 'You' : entry.sender.slice(0, 6) }}</span>
+                    <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
+                  </div>
+                  <div class="bubble-text">{{ entry.text }}</div>
+                  <div v-if="entry.hops > 0" class="bubble-hops">{{ entry.hops === 1 ? '1 hop' : entry.hops + ' hops' }}</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="message-input">
+              <div class="message-mode-controls">
+                <label class="mode-toggle">
+                  <input v-model="directMode" type="checkbox" />
+                  Direct
+                </label>
+                <select
+                  v-if="directMode"
+                  v-model="dmTarget"
+                  class="input message-target-select"
+                  data-testid="dm-target"
+                >
+                  <option value="" disabled>{{ globalPeersList.length ? 'Select peer…' : 'Waiting for peers…' }}</option>
+                  <option v-for="p in globalPeersList" :key="p" :value="p">{{ p.slice(0,8) }}…</option>
+                </select>
+              </div>
+              <input
+                v-model="messageInput"
+                @keyup.enter="sendMessage"
+                :disabled="!isRunning"
+                :placeholder="directMode ? 'Type a direct message…' : 'Type a message...'"
+                data-testid="dm-input"
+                class="input"
+              />
+              <button
+                @click="sendMessage"
+                :disabled="!isRunning || !messageInput.trim() || (directMode && !dmTarget)"
+                class="btn btn-secondary"
+                data-testid="dm-send"
+              >
+                {{ directMode ? 'Send Direct' : 'Send' }}
+              </button>
+            </div>
+          </div>
+
+          <div v-else-if="activeTab === 'media'" class="tab-panel feature-panel" role="tabpanel" aria-label="Media panel">
+            <h3>🎬 Media</h3>
+            <p class="feature-copy">Media controls are scaffolded here for upcoming file and stream sharing workflows.</p>
+          </div>
+
+          <div v-else-if="activeTab === 'storage'" class="tab-panel feature-panel" role="tabpanel" aria-label="Storage panel">
+            <h3>🗄 Storage</h3>
+            <p class="feature-copy">Storage panel placeholder. Use this panel for cache, session, and persistence controls.</p>
+          </div>
+
+          <div v-else-if="activeTab === 'crypto'" class="tab-panel feature-panel" role="tabpanel" aria-label="Crypto panel">
+            <h3>🔐 Crypto</h3>
+            <p class="feature-copy">Broadcasts use room-scoped encryption. Direct messages use peer-targeted UNSEA envelopes.</p>
+
+            <div class="crypto-grid">
+              <div class="crypto-card">
+                <h4>Public Info</h4>
+                <div class="crypto-row">
+                  <span class="crypto-label">Peer ID</span>
+                  <span class="crypto-value mono">{{ clientId || (isRunning ? 'Reconnecting…' : 'Not connected') }}</span>
+                </div>
+                <div class="crypto-row">
+                  <span class="crypto-label">Sign Public</span>
+                  <span class="crypto-value mono">{{ localPublicCryptoInfo?.pub || 'Loading…' }}</span>
+                </div>
+                <div class="crypto-row">
+                  <span class="crypto-label">Encrypt Public</span>
+                  <span class="crypto-value mono">{{ localPublicCryptoInfo?.epub || 'Loading…' }}</span>
+                </div>
+              </div>
+
+              <div class="crypto-card">
+                <div class="crypto-private-head">
+                  <h4>Private Info</h4>
+                  <button
+                    type="button"
+                    class="btn btn-small crypto-visibility-btn"
+                    @click="showPrivateCrypto = !showPrivateCrypto"
+                    :aria-pressed="showPrivateCrypto"
+                  >
+                    <span class="icon-eye" aria-hidden="true">{{ showPrivateCrypto ? '🙈' : '👁' }}</span>
+                    <span>{{ showPrivateCrypto ? 'Hide' : 'Show' }}</span>
+                  </button>
+                </div>
+                <div class="crypto-row">
+                  <span class="crypto-label">Sign Private</span>
+                  <span class="crypto-value mono">{{ showPrivateCrypto ? (localPrivateCryptoInfo?.priv || 'Loading…') : maskSecret(localPrivateCryptoInfo?.priv) }}</span>
+                </div>
+                <div class="crypto-row">
+                  <span class="crypto-label">Encrypt Private</span>
+                  <span class="crypto-value mono">{{ showPrivateCrypto ? (localPrivateCryptoInfo?.epriv || 'Loading…') : maskSecret(localPrivateCryptoInfo?.epriv) }}</span>
+                </div>
+              </div>
+
+              <div class="crypto-card crypto-card-wide">
+                <h4>Known Peer Public Keys</h4>
+                <div v-if="remoteCryptoPeers.length === 0" class="crypto-empty">No remote public keys learned yet.</div>
+                <div v-else class="crypto-peer-list">
+                  <div v-for="([peerId, info], idx) in remoteCryptoPeers" :key="`${peerId}-${idx}`" class="crypto-peer-row">
+                    <span class="crypto-peer-id mono">{{ peerId }}</span>
+                    <span class="crypto-peer-key mono">pub: {{ info.pub }}</span>
+                    <span class="crypto-peer-key mono">epub: {{ info.epub }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
 
       <!-- Peer Network Visualization -->
       <section v-if="isRunning" class="network-viz">
         <h3>📊 Network Graph</h3>
+        <div v-if="!graphUnlocked" class="graph-stabilizing-note">Stabilizing initial connections...</div>
         <div class="peers-container">
           <div class="peer self">
             <div class="peer-id">{{ clientId.slice(0, 6) }}</div>
             <div class="peer-label">You</div>
           </div>
           <div
-            v-for="peerId in connectedPeersList"
+            v-for="peerId in displayedConnectedPeersList"
             :key="peerId"
             :class="['peer', tolerantPeerIdSet.has(peerId) ? 'tolerant' : 'connected']"
           >
@@ -168,67 +315,25 @@
             <div class="peer-label">{{ tolerantPeerIdSet.has(peerId) ? 'Tolerant' : 'Peer' }}</div>
           </div>
         </div>
-      </section>
 
-      <!-- Chat -->
-      <section class="chat" v-if="isRunning">
-        <h3>💬 Chat</h3>
-        <div class="log-controls">
-          <button @click="clearLog" class="btn btn-small">Clear</button>
-          <label>
-            <input v-model="autoScroll" type="checkbox" />
-            Auto-scroll
-          </label>
-        </div>
-        <div ref="logContainer" class="log-container chat-container">
-          <div 
-            v-for="(entry, idx) in chatMessages" 
-            :key="idx"
-            :class="['log-entry', entry.type, { local: entry.local }]"
-          >
-            <div class="bubble" :class="entryBubbleClass(entry)">
-              <div class="bubble-meta">
-                <span class="sender">{{ entry.local ? 'You' : entry.sender.slice(0, 6) }}</span>
-                <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
-              </div>
-              <div class="bubble-text">{{ entry.text }}</div>
-              <div v-if="entry.hops > 0" class="bubble-hops">{{ entry.hops === 1 ? '1 hop' : entry.hops + ' hops' }}</div>
-            </div>
-          </div>
-        </div>
+        <div class="mesh-visualizer" data-testid="mesh-visualizer">
+          <svg viewBox="0 0 100 100" role="img" aria-label="Connected mesh visualizer">
+            <line
+              v-for="edge in meshVisualizerEdges"
+              :key="edge.id"
+              :x1="edge.x1"
+              :y1="edge.y1"
+              :x2="edge.x2"
+              :y2="edge.y2"
+              :class="['mesh-edge', edge.tolerant ? 'tolerant' : 'connected']"
+            />
 
-        <div class="message-input">
-          <div class="message-mode-controls">
-            <label class="mode-toggle">
-              <input v-model="directMode" type="checkbox" />
-              Direct
-            </label>
-            <select
-              v-if="directMode"
-              v-model="dmTarget"
-              class="input message-target-select"
-              data-testid="dm-target"
-            >
-              <option value="" disabled>{{ globalPeersList.length ? 'Select peer…' : 'Waiting for peers…' }}</option>
-              <option v-for="p in globalPeersList" :key="p" :value="p">{{ p.slice(0,8) }}…</option>
-            </select>
-          </div>
-          <input 
-            v-model="messageInput" 
-            @keyup.enter="sendMessage"
-            :disabled="!isRunning"
-            :placeholder="directMode ? 'Type a direct message…' : 'Type a message...'"
-            data-testid="dm-input"
-            class="input"
-          />
-          <button 
-            @click="sendMessage" 
-            :disabled="!isRunning || !messageInput.trim() || (directMode && !dmTarget)"
-            class="btn btn-secondary"
-            data-testid="dm-send"
-          >
-            {{ directMode ? 'Send Direct' : 'Send' }}
-          </button>
+            <g v-for="node in meshVisualizerNodes" :key="node.id" class="mesh-node" :class="node.kind">
+              <circle :cx="node.x" :cy="node.y" r="4.8" class="mesh-node-dot" />
+              <text :x="node.x" :y="node.y + 1" class="mesh-node-label">{{ node.short }}</text>
+            </g>
+          </svg>
+          <div class="mesh-visualizer-caption">Connected links only</div>
         </div>
       </section>
 
@@ -256,8 +361,29 @@
 <script>
 import { PartialMesh } from 'peerpigeon';
 import { GossipProtocol } from 'peerpigeon';
+import { generateRandomPair, encryptMessageWithMeta, decryptMessageWithMeta } from 'unsea';
 
 const DEFAULT_TOPOLOGY = 'token-ring';
+const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
+const CRYPTO_PUBLIC_REQUEST_TYPE = 'pp-crypto-public-request-v1';
+const ENCRYPTED_BROADCAST_TYPE = 'pp-encrypted-broadcast-v1';
+const ENCRYPTED_DIRECT_TYPE = 'pp-encrypted-direct-v1';
+
+function toBase64Url(buffer) {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function fromBase64Url(base64url) {
+  const raw = String(base64url || '');
+  const padded = raw.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(raw.length / 4) * 4, '=');
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+  return out;
+}
 
 export default {
   name: 'PeerPigeonDemo',
@@ -267,9 +393,12 @@ export default {
       gossip: null,
       isRunning: false,
       isConnecting: false,
+      signalingConnected: false,
       messageInput: '',
       directMode: false,
+      activeTab: 'message',
       dmTarget: '',
+      showPrivateCrypto: false,
       clientId: '',
       connectedPeersList: [],
       discoveredPeersList: [],
@@ -289,7 +418,23 @@ export default {
         message: '',
         type: 'info'
       },
+      cryptoKeys: null,
+      cryptoPublicDirectory: {},
+      pendingDirectMessages: {},
+      cryptoStorageKey: 'peerpigeon:unsea:keypair:v1',
+      cryptoAnnounceTimer: null,
       uiStateKey: 'peerpigeon:ui-state',
+      uiTabs: [
+        { id: 'message', label: 'Message' },
+        { id: 'media', label: 'Media' },
+        { id: 'storage', label: 'Storage' },
+        { id: 'crypto', label: 'Crypto' }
+      ],
+      visualConnectedPeersList: [],
+      graphUnlocked: false,
+      graphCandidateSignature: '',
+      graphStabilizeTimer: null,
+      graphUpdateTimer: null,
       debugMonitorTimer: null,
       debugLastByPeer: {}
     };
@@ -391,19 +536,90 @@ export default {
     discoveredPeers() {
       return this.discoveredPeersList.length;
     },
+    displayedConnectedPeersList() {
+      return this.graphUnlocked ? this.visualConnectedPeersList : [];
+    },
     tolerantPeerIdSet() {
-      const overflow = Math.max(0, this.connectedPeersList.length - this.maxPeers);
+      const overflow = Math.max(0, this.displayedConnectedPeersList.length - this.maxPeers);
       if (!overflow) return new Set();
 
       // Treat newest connected entries as tolerance overflow for visualization.
-      const tolerant = this.connectedPeersList.slice(-overflow);
+      const tolerant = this.displayedConnectedPeersList.slice(-overflow);
       return new Set(tolerant);
+    },
+    meshVisualizerNodes() {
+      const center = { x: 50, y: 50 };
+      const peers = this.displayedConnectedPeersList.slice();
+      const count = peers.length;
+      const radius = count > 6 ? 34 : 30;
+
+      const nodes = [
+        {
+          id: 'self',
+          x: center.x,
+          y: center.y,
+          kind: 'self',
+          short: 'YOU'
+        }
+      ];
+
+      peers.forEach((peerId, index) => {
+        const angle = (Math.PI * 2 * index) / Math.max(count, 1) - Math.PI / 2;
+        const x = center.x + radius * Math.cos(angle);
+        const y = center.y + radius * Math.sin(angle);
+        const short = String(peerId || '').slice(0, 4).toUpperCase() || 'PEER';
+
+        nodes.push({
+          id: peerId,
+          x,
+          y,
+          kind: this.tolerantPeerIdSet.has(peerId) ? 'tolerant' : 'connected',
+          short
+        });
+      });
+
+      return nodes;
+    },
+    meshVisualizerEdges() {
+      const self = this.meshVisualizerNodes.find((node) => node.id === 'self');
+      if (!self) return [];
+
+      return this.meshVisualizerNodes
+        .filter((node) => node.id !== 'self')
+        .map((node) => ({
+          id: `edge-${node.id}`,
+          x1: self.x,
+          y1: self.y,
+          x2: node.x,
+          y2: node.y,
+          tolerant: node.kind === 'tolerant'
+        }));
     },
     chatMessages() {
       return this.messageLog.filter(e => e.type === 'sent' || e.type === 'received');
     },
     diagnosticMessages() {
       return this.messageLog.filter(e => e.type !== 'sent' && e.type !== 'received');
+    },
+    localPublicCryptoInfo() {
+      if (!this.cryptoKeys?.pub || !this.cryptoKeys?.epub) return null;
+      return {
+        pub: this.cryptoKeys.pub,
+        epub: this.cryptoKeys.epub
+      };
+    },
+    localPrivateCryptoInfo() {
+      if (!this.cryptoKeys?.priv || !this.cryptoKeys?.epriv) return null;
+      return {
+        priv: this.cryptoKeys.priv,
+        epriv: this.cryptoKeys.epriv
+      };
+    },
+    remoteCryptoPeers() {
+      const self = String(this.clientId || '').trim();
+      return Object.entries(this.cryptoPublicDirectory)
+        .filter(([peerId, info]) => peerId && peerId !== self && info?.pub && info?.epub)
+        .sort(([a], [b]) => a.localeCompare(b));
     }
   },
   watch: {
@@ -523,6 +739,7 @@ export default {
         }
         this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
         this.updateUrlState();
+        await this.ensureCryptoKeys();
 
         this.updateUrlState();
 
@@ -550,8 +767,18 @@ export default {
 
         // Mesh events
         this.mesh.on('signaling:connected', (data) => {
+          this.signalingConnected = true;
           this.clientId = (data.clientId || '').trim();
           this.addLog('signaling', `Connected to signaling server`, this.clientId);
+          this.registerLocalPublicCryptoInfo();
+          this.announceCryptoPublicInfo();
+          this.updateStats();
+        });
+
+        this.mesh.on('signaling:disconnected', () => {
+          this.signalingConnected = false;
+          this.addLog('info', 'Signaling disconnected, waiting to reconnect...', 'signal');
+          this.showStatus('Reconnecting', 'Signaling disconnected, attempting reconnect...', 'connecting');
           this.updateStats();
         });
 
@@ -570,6 +797,7 @@ export default {
 
         this.mesh.on('peer:connected', (peerId) => {
           this.addLog('connected', `Connected to peer`, peerId);
+          this.announceCryptoPublicInfo();
           this.updateStats();
         });
 
@@ -600,22 +828,20 @@ export default {
 
         // Gossip events
         this.gossip.on('messageReceived', ({ message, local, fromPeer }) => {
-          this.messagesSeen++;
-          const indicator = local ? '📤' : (fromPeer ? '📥' : '📡');
-          const source = local ? 'You' : fromPeer.slice(0, 6);
-          const hopLabel = message.hops === 1 ? 'hop' : 'hops';
-          this.addLog(
-            local ? 'sent' : 'received',
-            `${indicator} [${message.hops} ${hopLabel}] ${message.data}`,
-            source,
-            message.hops,
-            local
-          );
-          if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+          this.handleGossipPayload({ message, local, fromPeer }).catch((error) => {
+            this.addLog('info', `Failed to process gossip payload: ${String(error?.message || error || '')}`, 'crypto');
+          });
         });
 
         this.mesh.on('signaling:error', (error) => {
-          this.showStatus('Error', `${error.message || error}`, 'error');
+          const message = `${error?.message || error || 'unknown signaling error'}`;
+          this.addLog('info', `Signaling issue: ${message}`, 'signal');
+          if (this.isRunning) {
+            this.signalingConnected = false;
+            this.showStatus('Reconnecting', 'Temporary signaling issue, retrying...', 'connecting');
+          } else {
+            this.showStatus('Error', message, 'error');
+          }
         });
 
         this.mesh.on('signaling:log', ({ message }) => {
@@ -623,17 +849,17 @@ export default {
         });
 
         this.gossip.on('directMessageReceived', ({ message }) => {
-          this.messagesSeen++;
-          const from = String(message.from || 'peer');
-          this.addLog('received', `📩 [DM] ${String(message.data)}`, from, 0, false, { direct: true });
-          this.saveUiState();
-          if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+          this.handleDirectPayload(message).catch((error) => {
+            this.addLog('info', `Failed to process direct payload: ${String(error?.message || error || '')}`, 'crypto');
+          });
         });
 
         await this.mesh.init();
         this.isRunning = true;
         this.isConnecting = false;
         this.updateStats();
+        this.startCryptoAnnounceLoop();
+        this.announceCryptoPublicInfo();
         this.startDebugMonitor();
 
         // Best-effort warning only; do not hard-fail startup on transient signaling slowness.
@@ -651,7 +877,9 @@ export default {
     },
 
     stopMesh() {
+      this.stopCryptoAnnounceLoop();
       this.stopDebugMonitor();
+      this.resetGraphStabilization();
       if (this.mesh) {
         this.mesh.destroy();
         this.mesh = null;
@@ -661,6 +889,7 @@ export default {
         this.gossip = null;
       }
       this.isRunning = false;
+      this.signalingConnected = false;
       this.messageLog = [];
       this.dmTarget = '';
       this.directMode = false;
@@ -670,37 +899,525 @@ export default {
       this.showStatus('Idle', 'Idle', 'info');
     },
 
-    sendMessage() {
+    async sendMessage() {
       if (!this.gossip || !this.messageInput.trim()) return;
 
       const message = this.messageInput.trim();
       this.messageInput = '';
 
-      if (this.directMode) {
-        const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-        const target = String(this.dmTarget || '').trim();
-        if (!target || (self && target === self)) {
-          this.addLog('info', 'Select a valid peer target for direct message', 'System');
-          return;
+      try {
+        if (this.directMode) {
+          const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+          const target = String(this.dmTarget || '').trim();
+          if (!target || (self && target === self)) {
+            this.addLog('info', 'Select a valid peer target for direct message', 'System');
+            return;
+          }
+
+          if (!this.cryptoPublicDirectory[target]?.epub) {
+            this.queuePendingDirectMessage(target, message);
+            this.requestCryptoPublicInfo(target);
+            this.addLog('info', `Queued DM for ${target.slice(0, 6)} until its direct key arrives`, 'crypto');
+            return;
+          }
+
+          const encryptedDirectPayload = await this.buildEncryptedDirectPayload(target, message);
+          const id = this.gossip.sendDirect(target, encryptedDirectPayload);
+          if (!id) {
+            this.addLog('info', 'Direct message failed: local peer ID is not ready yet', 'System');
+            return;
+          }
+
+          this.messagesSeen++;
+          this.addLog('sent', `📨 [DM→${target.slice(0, 6)}] ${message}`, 'You', 0, true, { direct: true });
+        } else {
+          const encryptedBroadcastPayload = await this.buildEncryptedBroadcastPayload(message);
+          this.gossip.broadcast(encryptedBroadcastPayload, {
+            sender: this.clientId,
+            timestamp: Date.now(),
+            encrypted: true
+          });
+
+          // Local history should not depend on decrypting our own echo envelope.
+          this.messagesSeen++;
+          this.addLog('sent', `📤 [0 hops] ${message}`, 'You', 0, true);
         }
 
-        const id = this.gossip.sendDirect(target, message);
+        this.saveUiState();
+        if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+      } catch (error) {
+        const reason = String(error?.message || error || 'unknown error');
+        this.addLog('sent', `⚠️ Send failed: ${reason}`, 'System', 0, true);
+      }
+    },
+
+    async ensureCryptoKeys() {
+      const parseStored = (raw) => {
+        if (!raw) return null;
+        try {
+          const parsed = JSON.parse(raw);
+          if (
+            parsed &&
+            typeof parsed.pub === 'string' &&
+            typeof parsed.priv === 'string' &&
+            typeof parsed.epub === 'string' &&
+            typeof parsed.epriv === 'string'
+          ) {
+            return parsed;
+          }
+          return null;
+        } catch {
+          return null;
+        }
+      };
+
+      let keys = parseStored(sessionStorage.getItem(this.cryptoStorageKey));
+      if (!keys) {
+        keys = await generateRandomPair();
+        try {
+          sessionStorage.setItem(this.cryptoStorageKey, JSON.stringify(keys));
+        } catch {
+          // ignore storage failures
+        }
+      }
+
+      this.cryptoKeys = keys;
+      this.registerLocalPublicCryptoInfo();
+    },
+
+    registerLocalPublicCryptoInfo() {
+      const self = String(this.clientId || '').trim();
+      if (!self || !this.localPublicCryptoInfo) return;
+      this.cryptoPublicDirectory = {
+        ...this.cryptoPublicDirectory,
+        [self]: {
+          pub: this.localPublicCryptoInfo.pub,
+          epub: this.localPublicCryptoInfo.epub,
+          updatedAt: Date.now(),
+          source: 'local'
+        }
+      };
+    },
+
+    startCryptoAnnounceLoop() {
+      this.stopCryptoAnnounceLoop();
+      this.cryptoAnnounceTimer = setInterval(() => {
+        this.announceCryptoPublicInfo();
+      }, 10_000);
+    },
+
+    stopCryptoAnnounceLoop() {
+      if (this.cryptoAnnounceTimer) {
+        clearInterval(this.cryptoAnnounceTimer);
+        this.cryptoAnnounceTimer = null;
+      }
+    },
+
+    announceCryptoPublicInfo() {
+      if (!this.gossip || !this.localPublicCryptoInfo) return;
+      const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      if (!self) return;
+
+      const payload = this.buildLocalCryptoPublicPayload();
+      if (!payload) return;
+
+      this.gossip.broadcast(payload, {
+        sender: self,
+        timestamp: Date.now(),
+        internal: true
+      });
+
+      // Also push key info over direct routing to currently connected peers.
+      // This avoids key-exchange stalls when gossip membership is still converging.
+      const connectedPeers = this.mesh?.getConnectedPeers?.() || [];
+      for (const peerId of connectedPeers) {
+        if (!peerId || peerId === self) continue;
+        try {
+          this.gossip.sendDirect(peerId, payload);
+        } catch {
+          // best-effort only
+        }
+      }
+    },
+
+    isCryptoPublicInfoPayload(data) {
+      return !!(
+        data &&
+        typeof data === 'object' &&
+        data.__ppType === CRYPTO_PUBLIC_INFO_TYPE &&
+        typeof data.pub === 'string' &&
+        typeof data.epub === 'string'
+      );
+    },
+
+    isCryptoPublicRequestPayload(data) {
+      return !!(
+        data &&
+        typeof data === 'object' &&
+        data.__ppType === CRYPTO_PUBLIC_REQUEST_TYPE &&
+        typeof data.to === 'string'
+      );
+    },
+
+    isEncryptedBroadcastPayload(data) {
+      return !!(
+        data &&
+        typeof data === 'object' &&
+        data.__ppType === ENCRYPTED_BROADCAST_TYPE &&
+        (
+          (data.roomCipher && typeof data.roomCipher === 'object') ||
+          (data.recipients && typeof data.recipients === 'object')
+        )
+      );
+    },
+
+    isEncryptedDirectPayload(data) {
+      return !!(
+        data &&
+        typeof data === 'object' &&
+        data.__ppType === ENCRYPTED_DIRECT_TYPE &&
+        data.cipher &&
+        typeof data.cipher === 'object'
+      );
+    },
+
+    upsertRemoteCryptoInfo(peerId, payload) {
+      const id = String(peerId || '').trim();
+      if (!id) return;
+
+      this.cryptoPublicDirectory = {
+        ...this.cryptoPublicDirectory,
+        [id]: {
+          pub: payload.pub,
+          epub: payload.epub,
+          updatedAt: Date.now(),
+          source: 'remote'
+        }
+      };
+
+      this.flushPendingDirectMessages(id).catch((error) => {
+        this.addLog('info', `Failed to flush queued DM: ${String(error?.message || error || '')}`, 'crypto');
+      });
+    },
+
+    buildLocalCryptoPublicPayload() {
+      const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      if (!self || !this.localPublicCryptoInfo) return null;
+
+      return {
+        __ppType: CRYPTO_PUBLIC_INFO_TYPE,
+        from: self,
+        pub: this.localPublicCryptoInfo.pub,
+        epub: this.localPublicCryptoInfo.epub,
+        timestamp: Date.now()
+      };
+    },
+
+    requestCryptoPublicInfo(targetPeerId) {
+      if (!this.gossip) return;
+
+      const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      const target = String(targetPeerId || '').trim();
+      if (!self || !target || self === target) return;
+
+      const payload = {
+        __ppType: CRYPTO_PUBLIC_REQUEST_TYPE,
+        from: self,
+        to: target,
+        timestamp: Date.now()
+      };
+
+      try {
+        this.gossip.sendDirect(target, payload);
+      } catch {
+        // best-effort only
+      }
+
+      try {
+        this.gossip.broadcast(payload, {
+          sender: self,
+          timestamp: Date.now(),
+          internal: true
+        });
+      } catch {
+        // best-effort only
+      }
+    },
+
+    queuePendingDirectMessage(targetPeerId, plaintext) {
+      const target = String(targetPeerId || '').trim();
+      if (!target) return;
+
+      const pending = Array.isArray(this.pendingDirectMessages[target])
+        ? this.pendingDirectMessages[target].slice()
+        : [];
+      pending.push(String(plaintext));
+      this.pendingDirectMessages = {
+        ...this.pendingDirectMessages,
+        [target]: pending
+      };
+    },
+
+    async flushPendingDirectMessages(targetPeerId) {
+      const target = String(targetPeerId || '').trim();
+      if (!target || !this.gossip || !this.cryptoPublicDirectory[target]?.epub) return;
+
+      const pending = Array.isArray(this.pendingDirectMessages[target])
+        ? this.pendingDirectMessages[target].slice()
+        : [];
+      if (!pending.length) return;
+
+      const nextPending = { ...this.pendingDirectMessages };
+      delete nextPending[target];
+      this.pendingDirectMessages = nextPending;
+
+      for (const message of pending) {
+        const encryptedDirectPayload = await this.buildEncryptedDirectPayload(target, message);
+        const id = this.gossip.sendDirect(target, encryptedDirectPayload);
         if (!id) {
-          this.addLog('info', 'Direct message failed: local peer ID is not ready yet', 'System');
-          return;
+          this.queuePendingDirectMessage(target, message);
+          throw new Error('Direct route is not ready yet');
         }
 
         this.messagesSeen++;
         this.addLog('sent', `📨 [DM→${target.slice(0, 6)}] ${message}`, 'You', 0, true, { direct: true });
-      } else {
-        this.gossip.broadcast(message, {
-          sender: this.clientId,
-          timestamp: Date.now()
-        });
+      }
+    },
+
+    async deriveRoomBroadcastKey() {
+      const roomScope = String(this.effectiveSessionId || '').trim();
+      if (!roomScope) {
+        throw new Error('Missing room scope for broadcast encryption');
+      }
+      if (!globalThis.crypto?.subtle) {
+        throw new Error('WebCrypto is unavailable for room encryption');
       }
 
+      const seedText = `peerpigeon:room-broadcast:v1:${roomScope}`;
+      const seedBytes = new TextEncoder().encode(seedText);
+      const hash = await globalThis.crypto.subtle.digest('SHA-256', seedBytes);
+      return await globalThis.crypto.subtle.importKey(
+        'raw',
+        hash,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    },
+
+    async encryptBroadcastForRoom(plaintext) {
+      const key = await this.deriveRoomBroadcastKey();
+      const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+      const plainBytes = new TextEncoder().encode(String(plaintext));
+      const cipherBuffer = await globalThis.crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        plainBytes
+      );
+
+      return {
+        alg: 'A256GCM',
+        iv: toBase64Url(iv),
+        ct: toBase64Url(new Uint8Array(cipherBuffer))
+      };
+    },
+
+    async decryptBroadcastFromRoom(roomCipher) {
+      if (!roomCipher || typeof roomCipher !== 'object') {
+        throw new Error('Missing room cipher payload');
+      }
+      const iv = fromBase64Url(roomCipher.iv);
+      const cipherBytes = fromBase64Url(roomCipher.ct);
+      const key = await this.deriveRoomBroadcastKey();
+      const plainBuffer = await globalThis.crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv },
+        key,
+        cipherBytes
+      );
+      return new TextDecoder().decode(plainBuffer);
+    },
+
+    async buildEncryptedBroadcastPayload(plaintext) {
+      const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      const roomCipher = await this.encryptBroadcastForRoom(String(plaintext));
+
+      return {
+        __ppType: ENCRYPTED_BROADCAST_TYPE,
+        from: self,
+        roomCipher,
+        timestamp: Date.now()
+      };
+    },
+
+    async buildEncryptedDirectPayload(targetPeerId, plaintext) {
+      if (!this.localPublicCryptoInfo || !this.localPrivateCryptoInfo) {
+        throw new Error('Local crypto keys are not ready yet');
+      }
+
+      const target = String(targetPeerId || '').trim();
+      if (!target) {
+        throw new Error('Direct target is required');
+      }
+
+      const targetCrypto = this.cryptoPublicDirectory[target];
+      if (!targetCrypto?.epub) {
+        throw new Error('Direct message key for target is not available yet');
+      }
+
+      const cipher = await encryptMessageWithMeta(String(plaintext), {
+        epub: targetCrypto.epub
+      });
+
+      return {
+        __ppType: ENCRYPTED_DIRECT_TYPE,
+        from: String(this.clientId || '').trim(),
+        to: target,
+        cipher,
+        timestamp: Date.now()
+      };
+    },
+
+    async decryptCipherText(cipher) {
+      if (!this.localPrivateCryptoInfo?.epriv) {
+        throw new Error('Local decrypt key is missing');
+      }
+      return await decryptMessageWithMeta(cipher, this.localPrivateCryptoInfo.epriv);
+    },
+
+    displayPayloadText(value) {
+      if (typeof value === 'string') return value;
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
+      }
+    },
+
+    async handleGossipPayload({ message, local, fromPeer }) {
+      const sourcePeer = String(fromPeer || message?.sender || 'peer');
+
+      if (this.isCryptoPublicInfoPayload(message?.data)) {
+        const from = String(message.data.from || sourcePeer || '').trim();
+        if (from) {
+          this.upsertRemoteCryptoInfo(from, message.data);
+        }
+        return;
+      }
+
+      if (this.isCryptoPublicRequestPayload(message?.data)) {
+        const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+        const target = String(message.data.to || '').trim();
+        const requester = String(message.data.from || '').trim();
+        if (self && target === self && requester) {
+          const response = this.buildLocalCryptoPublicPayload();
+          if (response) {
+            try {
+              this.gossip.sendDirect(requester, response);
+            } catch {
+              // best-effort only
+            }
+          }
+          this.announceCryptoPublicInfo();
+        }
+        return;
+      }
+
+      if (this.isEncryptedBroadcastPayload(message?.data)) {
+        // Sender already logs local broadcast on send(); only decrypt remote deliveries.
+        if (local) return;
+
+        let decrypted = null;
+        if (message?.data?.roomCipher) {
+          decrypted = await this.decryptBroadcastFromRoom(message.data.roomCipher);
+        } else {
+          // Backward compatibility for legacy per-peer broadcast envelopes.
+          const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+          const myCipher = message?.data?.recipients?.[self];
+          if (!myCipher) return;
+          decrypted = await this.decryptCipherText(myCipher);
+        }
+
+        this.messagesSeen++;
+        const indicator = local ? '📤' : (sourcePeer ? '📥' : '📡');
+        const source = local ? 'You' : sourcePeer.slice(0, 6);
+        const hopLabel = message.hops === 1 ? 'hop' : 'hops';
+        this.addLog(
+          local ? 'sent' : 'received',
+          `${indicator} [${message.hops} ${hopLabel}] ${decrypted}`,
+          source,
+          message.hops,
+          local
+        );
+        if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+        return;
+      }
+
+      // Backward-compatible path for plaintext messages.
+      this.messagesSeen++;
+      const indicator = local ? '📤' : (sourcePeer ? '📥' : '📡');
+      const source = local ? 'You' : sourcePeer.slice(0, 6);
+      const hopLabel = message.hops === 1 ? 'hop' : 'hops';
+      this.addLog(
+        local ? 'sent' : 'received',
+        `${indicator} [${message.hops} ${hopLabel}] ${this.displayPayloadText(message.data)}`,
+        source,
+        message.hops,
+        local
+      );
+      if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+    },
+
+    async handleDirectPayload(message) {
+      const from = String(message.from || 'peer');
+      const payload = message?.data;
+
+      if (this.isCryptoPublicInfoPayload(payload)) {
+        const sender = String(payload.from || from || '').trim();
+        if (sender) {
+          this.upsertRemoteCryptoInfo(sender, payload);
+        }
+        return;
+      }
+
+      if (this.isCryptoPublicRequestPayload(payload)) {
+        const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+        const target = String(payload.to || '').trim();
+        const requester = String(payload.from || from || '').trim();
+        if (self && target === self && requester) {
+          const response = this.buildLocalCryptoPublicPayload();
+          if (response) {
+            try {
+              this.gossip.sendDirect(requester, response);
+            } catch {
+              // best-effort only
+            }
+          }
+          this.announceCryptoPublicInfo();
+        }
+        return;
+      }
+
+      if (this.isEncryptedDirectPayload(payload)) {
+        const decrypted = await this.decryptCipherText(payload.cipher);
+        this.messagesSeen++;
+        this.addLog('received', `📩 [DM] ${decrypted}`, from, 0, false, { direct: true });
+        this.saveUiState();
+        if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+        return;
+      }
+
+      // Backward-compatible path for plaintext direct payloads.
+      this.messagesSeen++;
+      this.addLog('received', `📩 [DM] ${this.displayPayloadText(payload)}`, from, 0, false, { direct: true });
       this.saveUiState();
       if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+    },
+
+    maskSecret(value) {
+      const text = String(value || '');
+      if (!text) return '';
+      if (text.length <= 12) return '************';
+      return `${text.slice(0, 6)}********${text.slice(-6)}`;
     },
 
     updateStats() {
@@ -719,6 +1436,7 @@ export default {
           ...this.connectedPeersList,
           ...this.discoveredPeersList,
         ])].filter(p => p && p !== self);
+        this.scheduleGraphUpdate();
 
         // Keep DM target valid as the membership view converges.
         if (!this.globalPeersList.includes(this.dmTarget) || this.dmTarget === self) {
@@ -731,13 +1449,77 @@ export default {
       this.syncGossipStatus();
     },
 
+    normalizedGraphPeers() {
+      return [...this.connectedPeersList].sort((a, b) => String(a).localeCompare(String(b)));
+    },
+
+    graphMinPeersToUnlock() {
+      const minPeers = Number(this.minPeers);
+      if (!Number.isFinite(minPeers)) return 1;
+      return Math.max(1, Math.floor(minPeers));
+    },
+
+    scheduleGraphUpdate() {
+      const nextPeers = this.normalizedGraphPeers();
+      const nextSignature = nextPeers.join('|');
+      const threshold = this.graphMinPeersToUnlock();
+
+      clearTimeout(this.graphStabilizeTimer);
+      clearTimeout(this.graphUpdateTimer);
+
+      // Below the configured minimum, update immediately.
+      if (nextPeers.length < threshold) {
+        this.graphUnlocked = true;
+        this.graphCandidateSignature = '';
+        this.visualConnectedPeersList = nextPeers;
+        return;
+      }
+
+      if (!this.graphUnlocked) {
+        this.graphCandidateSignature = nextSignature;
+        this.graphStabilizeTimer = setTimeout(() => {
+          const currentPeers = this.normalizedGraphPeers();
+          const currentSignature = currentPeers.join('|');
+          if (currentSignature !== this.graphCandidateSignature) return;
+          if (currentPeers.length < threshold) return;
+
+          this.graphUnlocked = true;
+          this.visualConnectedPeersList = currentPeers;
+        }, 1500);
+        return;
+      }
+
+      this.graphCandidateSignature = nextSignature;
+      this.graphUpdateTimer = setTimeout(() => {
+        const currentPeers = this.normalizedGraphPeers();
+        const currentSignature = currentPeers.join('|');
+        if (currentSignature !== this.graphCandidateSignature) return;
+        if (currentPeers.length < threshold) return;
+        this.visualConnectedPeersList = currentPeers;
+      }, 1500);
+    },
+
+    resetGraphStabilization() {
+      clearTimeout(this.graphStabilizeTimer);
+      clearTimeout(this.graphUpdateTimer);
+      this.graphStabilizeTimer = null;
+      this.graphUpdateTimer = null;
+      this.graphUnlocked = false;
+      this.graphCandidateSignature = '';
+      this.visualConnectedPeersList = [];
+    },
+
     requiredConnectedPeersForGossip() {
       return this.maxPeers <= 1 ? 1 : 2;
     },
 
     syncGossipStatus() {
       if (!this.isRunning) return;
-      if (this.status.type === 'error') return;
+
+      if (!this.signalingConnected) {
+        this.showStatus('Reconnecting', 'Signaling reconnect in progress...', 'connecting');
+        return;
+      }
 
       const connected = this.connectedPeersList.length;
       const required = this.requiredConnectedPeersForGossip();
@@ -898,8 +1680,10 @@ export default {
     saveUiState() {
       try {
         sessionStorage.setItem(this.uiStateKey, JSON.stringify({
+          activeTab: this.activeTab || 'message',
           dmTarget: this.dmTarget || '',
-          directMode: !!this.directMode
+          directMode: !!this.directMode,
+          showPrivateCrypto: !!this.showPrivateCrypto
         }));
       } catch {
         // ignore storage failures
@@ -911,11 +1695,18 @@ export default {
         const raw = sessionStorage.getItem(this.uiStateKey);
         if (!raw) return;
         const parsed = JSON.parse(raw);
+        const allowedTabs = new Set(this.uiTabs.map((tab) => tab.id));
+        if (typeof parsed.activeTab === 'string' && allowedTabs.has(parsed.activeTab)) {
+          this.activeTab = parsed.activeTab;
+        }
         if (typeof parsed.dmTarget === 'string') {
           this.dmTarget = parsed.dmTarget;
         }
         if (typeof parsed.directMode === 'boolean') {
           this.directMode = parsed.directMode;
+        }
+        if (typeof parsed.showPrivateCrypto === 'boolean') {
+          this.showPrivateCrypto = parsed.showPrivateCrypto;
         }
       } catch {
         // ignore storage failures
@@ -924,7 +1715,9 @@ export default {
   },
 
   beforeUnmount() {
+    this.stopCryptoAnnounceLoop();
     this.stopDebugMonitor();
+    this.resetGraphStabilization();
     this.stopMesh();
   }
 };
@@ -977,6 +1770,172 @@ section {
   padding: 1.1rem;
   margin-bottom: 1rem;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+.workspace-tabs {
+  padding-top: 0.85rem;
+}
+
+.tab-nav {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.3rem;
+  margin-bottom: 0.8rem;
+  border-bottom: 1px solid #cfd7e7;
+}
+
+.tab-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #475569;
+  border-radius: 8px 8px 0 0;
+  padding: 0.45rem 0.78rem;
+  font-size: 0.84rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+.tab-btn:hover {
+  background: #f3f6ff;
+  color: #334155;
+}
+
+.tab-btn.active {
+  background: #ffffff;
+  color: #1f2937;
+  border-color: #cfd7e7;
+  border-bottom-color: #ffffff;
+}
+
+.tab-panel {
+  min-height: 330px;
+}
+
+.feature-panel {
+  border: 1px dashed #c7d1f0;
+  border-radius: 10px;
+  padding: 1rem;
+  background: linear-gradient(180deg, #f8faff 0%, #ffffff 100%);
+}
+
+.feature-copy {
+  margin-top: 0.45rem;
+  color: #4b5563;
+  font-size: 0.95rem;
+  line-height: 1.45;
+}
+
+.crypto-grid {
+  margin-top: 0.75rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 0.7rem;
+}
+
+.crypto-card {
+  border: 1px solid #d6def6;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 0.7rem;
+}
+
+.crypto-card h4 {
+  font-size: 0.9rem;
+  color: #1f2937;
+  margin-bottom: 0.55rem;
+}
+
+.crypto-card-wide {
+  grid-column: 1 / -1;
+}
+
+.crypto-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  margin-bottom: 0.45rem;
+}
+
+.crypto-row:last-child {
+  margin-bottom: 0;
+}
+
+.crypto-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #475569;
+}
+
+.crypto-value {
+  font-size: 0.78rem;
+  color: #1e293b;
+  word-break: break-all;
+}
+
+.crypto-private-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.55rem;
+}
+
+.crypto-private-head h4 {
+  margin-bottom: 0;
+}
+
+.crypto-visibility-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  text-transform: none;
+  letter-spacing: 0;
+  background: #334155;
+  color: #ffffff;
+}
+
+.icon-eye {
+  font-size: 0.92rem;
+  line-height: 1;
+}
+
+.crypto-empty {
+  font-size: 0.84rem;
+  color: #64748b;
+}
+
+.crypto-peer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.crypto-peer-row {
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  padding: 0.45rem;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+}
+
+.crypto-peer-id {
+  font-size: 0.8rem;
+  color: #1e293b;
+  word-break: break-all;
+}
+
+.crypto-peer-key {
+  font-size: 0.74rem;
+  color: #334155;
+  word-break: break-all;
 }
 
 /* Control Panel */
@@ -1338,6 +2297,12 @@ section {
   margin-bottom: 0.6rem;
 }
 
+.graph-stabilizing-note {
+  margin-bottom: 0.55rem;
+  color: #4b5563;
+  font-size: 0.84rem;
+}
+
 .peers-container {
   display: flex;
   justify-content: center;
@@ -1403,6 +2368,89 @@ section {
 .peer-label {
   font-size: 0.7rem;
   opacity: 0.7;
+}
+
+.mesh-visualizer {
+  margin: 1rem auto 0;
+  max-width: 520px;
+  background: radial-gradient(circle at 50% 50%, rgba(102, 126, 234, 0.08), rgba(10, 12, 18, 0.02));
+  border: 1px solid #d8def5;
+  border-radius: 12px;
+  padding: 0.7rem 0.7rem 0.45rem;
+}
+
+.mesh-visualizer svg {
+  width: 100%;
+  height: 220px;
+  display: block;
+}
+
+.mesh-edge {
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-dasharray: 4 4;
+  animation: mesh-edge-flow 1.9s linear infinite;
+  opacity: 0.9;
+}
+
+.mesh-edge.connected {
+  stroke: #0ea5a3;
+}
+
+.mesh-edge.tolerant {
+  stroke: #f59e0b;
+}
+
+.mesh-node-dot {
+  stroke-width: 1.6;
+  animation: mesh-node-pulse 2.3s ease-in-out infinite;
+}
+
+.mesh-node.self .mesh-node-dot {
+  fill: #5b67d8;
+  stroke: #3f4fb8;
+}
+
+.mesh-node.connected .mesh-node-dot {
+  fill: #12b886;
+  stroke: #0e9a71;
+}
+
+.mesh-node.tolerant .mesh-node-dot {
+  fill: #f59e0b;
+  stroke: #d97706;
+}
+
+.mesh-node-label {
+  text-anchor: middle;
+  dominant-baseline: middle;
+  fill: #ffffff;
+  font-size: 3.2px;
+  font-weight: 700;
+  letter-spacing: 0.22px;
+  pointer-events: none;
+}
+
+.mesh-visualizer-caption {
+  margin-top: 0.15rem;
+  font-size: 0.78rem;
+  color: #475569;
+}
+
+@keyframes mesh-edge-flow {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+@keyframes mesh-node-pulse {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 0 rgba(14, 165, 163, 0.15));
+  }
+  50% {
+    filter: drop-shadow(0 0 7px rgba(14, 165, 163, 0.35));
+  }
 }
 
 /* Chat */
@@ -1557,6 +2605,10 @@ section {
     width: 80px;
     height: 80px;
     font-size: 0.9rem;
+  }
+
+  .mesh-visualizer svg {
+    height: 190px;
   }
 
   .field-topology,
