@@ -6,7 +6,6 @@ import { spawn } from 'node:child_process'
 
 const DEV_PORT_DEFAULT = 5173
 const PUBLIC_HTTP_PORT = 80
-const COMPAT_HTTP_PORT = 5173
 const DEV_HOSTNAME = 'peer.local'
 const MDNS_SERVICE_NAME = 'PeerPigeon Dev'
 
@@ -111,23 +110,11 @@ function createHttpBridge(targetPort) {
       res.end(`Upstream connection failed: ${error.message}`)
     })
 
-    // Avoid hanging sockets from taking down the bridge process.
-    req.on('aborted', () => {
-      upstream.destroy()
-    })
-    res.on('close', () => {
-      upstream.destroy()
-    })
-
     req.pipe(upstream)
   })
 
   // Support Vite websocket upgrades (HMR) via raw TCP tunneling.
   server.on('upgrade', (req, clientSocket, head) => {
-    clientSocket.on('error', () => {
-      if (!clientSocket.destroyed) clientSocket.destroy()
-    })
-
     const upstreamSocket = net.connect(targetPort, '127.0.0.1', () => {
       const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`]
       for (const [key, value] of Object.entries(req.headers)) {
@@ -146,14 +133,7 @@ function createHttpBridge(targetPort) {
     })
 
     upstreamSocket.on('error', () => {
-      if (!clientSocket.destroyed) clientSocket.destroy()
-    })
-
-    clientSocket.on('close', () => {
-      if (!upstreamSocket.destroyed) upstreamSocket.destroy()
-    })
-    upstreamSocket.on('close', () => {
-      if (!clientSocket.destroyed) clientSocket.destroy()
+      clientSocket.destroy()
     })
   })
 
@@ -165,7 +145,6 @@ async function main() {
   const devProc = spawnLogged('npm', ['run', 'dev:raw', '--', '--port', String(vitePort)])
 
   let httpBridgeServer = null
-  let compatBridgeServer = null
   let publicPort = vitePort
 
   try {
@@ -179,20 +158,6 @@ async function main() {
   } catch (error) {
     console.warn(`[bridge] Could not bind public port ${PUBLIC_HTTP_PORT} (${error.code || error.message}).`)
     console.warn(`[bridge] Access requires explicit port: http://${DEV_HOSTNAME}:${vitePort}`)
-  }
-
-  // Keep peer.local:5173 working even if Vite had to move to another port.
-  if (vitePort !== COMPAT_HTTP_PORT) {
-    try {
-      compatBridgeServer = createHttpBridge(vitePort)
-      await new Promise((resolve, reject) => {
-        compatBridgeServer.on('error', reject)
-        compatBridgeServer.listen(COMPAT_HTTP_PORT, '0.0.0.0', () => resolve())
-      })
-      console.log(`[bridge] Compatibility bridge listening on ${COMPAT_HTTP_PORT} -> Vite ${vitePort}`)
-    } catch (error) {
-      console.warn(`[bridge] Could not bind compatibility port ${COMPAT_HTTP_PORT} (${error.code || error.message}).`)
-    }
   }
 
   let mdnsProc = null
@@ -228,9 +193,6 @@ async function main() {
     if (httpBridgeServer) {
       httpBridgeServer.close()
     }
-    if (compatBridgeServer) {
-      compatBridgeServer.close()
-    }
     if (!devProc.killed) {
       devProc.kill('SIGTERM')
     }
@@ -246,9 +208,6 @@ async function main() {
     }
     if (httpBridgeServer) {
       httpBridgeServer.close()
-    }
-    if (compatBridgeServer) {
-      compatBridgeServer.close()
     }
 
     if (signal) {
