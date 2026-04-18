@@ -1146,6 +1146,699 @@ var GossipProtocol = class {
   }
 };
 
+// src/storage.ts
+var MemoryStorageDriver = class {
+  constructor() {
+    this.map = /* @__PURE__ */ new Map();
+  }
+  async get(pk) {
+    return this.map.get(pk) ?? null;
+  }
+  async put(record) {
+    this.map.set(record.pk, record);
+  }
+  async delete(pk) {
+    this.map.delete(pk);
+  }
+  async listBySpace(space) {
+    const out = [];
+    for (const value of this.map.values()) {
+      if (value.space === space) out.push(value);
+    }
+    out.sort((a, b) => a.key.localeCompare(b.key));
+    return out;
+  }
+  close() {
+  }
+};
+var IndexedDbStorageDriver = class _IndexedDbStorageDriver {
+  constructor(db, storeName) {
+    this.db = db;
+    this.storeName = storeName;
+  }
+  static async create(dbName, storeName) {
+    const db = await new Promise((resolve, reject) => {
+      const req = indexedDB.open(dbName, 1);
+      req.onupgradeneeded = () => {
+        const next = req.result;
+        if (!next.objectStoreNames.contains(storeName)) {
+          const store = next.createObjectStore(storeName, { keyPath: "pk" });
+          store.createIndex("space", "space", { unique: false });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error ?? new Error("Failed to open IndexedDB"));
+    });
+    return new _IndexedDbStorageDriver(db, storeName);
+  }
+  async get(pk) {
+    return await this.runRead((store) => store.get(pk)).then((value) => value ?? null);
+  }
+  async put(record) {
+    await this.runWrite((store) => store.put(record));
+  }
+  async delete(pk) {
+    await this.runWrite((store) => store.delete(pk));
+  }
+  async listBySpace(space) {
+    return await this.runRead((store) => {
+      const index = store.index("space");
+      const request = index.getAll(space);
+      return request;
+    });
+  }
+  close() {
+    this.db.close();
+  }
+  runRead(factory) {
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction(this.storeName, "readonly");
+      const store = tx.objectStore(this.storeName);
+      const req = factory(store);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error ?? new Error("IndexedDB read failed"));
+    });
+  }
+  runWrite(factory) {
+    return new Promise((resolve, reject) => {
+      const tx = this.db.transaction(this.storeName, "readwrite");
+      const store = tx.objectStore(this.storeName);
+      const req = factory(store);
+      req.onerror = () => reject(req.error ?? new Error("IndexedDB write failed"));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("IndexedDB transaction failed"));
+      tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted"));
+    });
+  }
+};
+var _PeerPigeonStorage = class _PeerPigeonStorage {
+  constructor(options) {
+    this.storeName = "records";
+    this.driver = null;
+    this.seenMutationIds = /* @__PURE__ */ new Set();
+    this.listeners = /* @__PURE__ */ new Set();
+    this.pendingRetrieveRequests = /* @__PURE__ */ new Map();
+    this.closed = false;
+    const userId = String(options.userId ?? "").trim();
+    if (!userId) {
+      throw new Error("PeerPigeonStorage requires a non-empty userId");
+    }
+    this.userId = userId;
+    this.gossip = options.gossip ?? null;
+    this.sessionId = String(options.sessionId ?? "default-session").trim() || "default-session";
+    this.syncSecret = String(options.syncSecret ?? "").trim();
+    this.syncFilter = typeof options.syncFilter === "function" ? options.syncFilter : null;
+    this.dbName = String(options.dbName ?? "peerpigeon-storage-v1").trim() || "peerpigeon-storage-v1";
+    this.onGossipMessageBound = (data) => {
+      this.handleGossipMessage(data).catch(() => {
+      });
+    };
+  }
+  async init() {
+    if (this.closed) {
+      throw new Error("PeerPigeonStorage is closed");
+    }
+    if (this.driver) return;
+    this.driver = await this.createDriver();
+    if (this.gossip) {
+      this.gossip.on("messageReceived", this.onGossipMessageBound);
+    }
+  }
+  on(event, listener) {
+    if (event !== "change") return;
+    this.listeners.add(listener);
+  }
+  subscribe(listener) {
+    this.on("change", listener);
+    return () => {
+      this.off("change", listener);
+    };
+  }
+  off(event, listener) {
+    if (event !== "change") return;
+    this.listeners.delete(listener);
+  }
+  async put(space, key, value, options = {}) {
+    const mutation = await this.applyLocalUpsert(space, key, value, options);
+    if (space !== "private") {
+      await this.broadcastMutation(mutation);
+    }
+    return await this.get(space, key);
+  }
+  async get(space, key) {
+    const driver = this.requireDriver();
+    const pk = this.makePk(space, key);
+    const persisted = await driver.get(pk);
+    if (!persisted) return null;
+    let value;
+    try {
+      value = await this.decodeValueForRead(persisted, this.userId);
+    } catch {
+      if (space === "private") return null;
+      throw new Error("Failed to decode storage value");
+    }
+    return {
+      space: persisted.space,
+      key: persisted.key,
+      value,
+      ownerId: persisted.ownerId,
+      createdAt: persisted.createdAt,
+      updatedAt: persisted.updatedAt,
+      version: persisted.version
+    };
+  }
+  async retrieve(space, key, options = {}) {
+    const normalizedKey = this.normalizeKey(key);
+    const existing = await this.get(space, normalizedKey);
+    if (space === "private") return existing;
+    if (!this.gossip) return existing;
+    const reqId = `${this.makeMutationId(this.userId)}-req`;
+    const request = {
+      __ppType: "pp-storage-req-v1",
+      reqId,
+      space,
+      key: normalizedKey,
+      actorId: this.userId,
+      timestamp: Date.now()
+    };
+    const timeoutMs = Math.max(100, Math.floor(Number(options.timeoutMs ?? 2e3)));
+    return await new Promise(async (resolve) => {
+      const timeout = setTimeout(async () => {
+        this.pendingRetrieveRequests.delete(reqId);
+        const latest = await this.get(space, normalizedKey);
+        resolve(latest);
+      }, timeoutMs);
+      this.pendingRetrieveRequests.set(reqId, {
+        resolve: (value) => resolve(value),
+        timeout
+      });
+      await this.broadcastSyncPayload(request);
+    });
+  }
+  async delete(space, key) {
+    const mutation = await this.applyLocalDelete(space, key);
+    if (!mutation) return false;
+    if (space !== "private") {
+      await this.broadcastMutation(mutation);
+    }
+    return true;
+  }
+  async list(space) {
+    const driver = this.requireDriver();
+    const persisted = await driver.listBySpace(space);
+    const out = [];
+    for (const record of persisted) {
+      let value;
+      try {
+        value = await this.decodeValueForRead(record, this.userId);
+      } catch {
+        if (record.space === "private") continue;
+        throw new Error("Failed to decode storage value");
+      }
+      out.push({
+        space: record.space,
+        key: record.key,
+        value,
+        ownerId: record.ownerId,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        version: record.version
+      });
+    }
+    out.sort((a, b) => a.key.localeCompare(b.key));
+    return out;
+  }
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.gossip) {
+      this.gossip.off("messageReceived", this.onGossipMessageBound);
+    }
+    this.driver?.close();
+    this.driver = null;
+    this.listeners.clear();
+    this.seenMutationIds.clear();
+    for (const pending of this.pendingRetrieveRequests.values()) {
+      clearTimeout(pending.timeout);
+      pending.resolve(null);
+    }
+    this.pendingRetrieveRequests.clear();
+  }
+  async applyLocalUpsert(space, key, value, options) {
+    const normalizedKey = this.normalizeKey(key);
+    const actorId = this.userId;
+    const driver = this.requireDriver();
+    const pk = this.makePk(space, normalizedKey);
+    const existing = await driver.get(pk);
+    const now = Date.now();
+    this.assertCanWrite(space, existing, actorId, options.ownerId);
+    const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
+    const nextVersion = (existing?.version ?? 0) + 1;
+    const encoded = await this.encodeValueForStore(space, value);
+    const persisted = {
+      pk,
+      space,
+      key: normalizedKey,
+      ownerId,
+      value: encoded.value,
+      valueCipher: encoded.valueCipher,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      version: nextVersion
+    };
+    await driver.put(persisted);
+    const opId = this.makeMutationId(actorId);
+    const mutation = {
+      __ppType: "pp-storage-op-v1",
+      opId,
+      op: "upsert",
+      space,
+      key: normalizedKey,
+      actorId,
+      timestamp: now,
+      record: persisted
+    };
+    this.seenMutationIds.add(opId);
+    this.emitChange({
+      origin: "local",
+      op: "upsert",
+      record: {
+        space,
+        key: normalizedKey,
+        value,
+        ownerId,
+        createdAt: persisted.createdAt,
+        updatedAt: persisted.updatedAt,
+        version: persisted.version
+      },
+      space,
+      key: normalizedKey,
+      actorId
+    });
+    return mutation;
+  }
+  async applyLocalDelete(space, key) {
+    const normalizedKey = this.normalizeKey(key);
+    const actorId = this.userId;
+    const driver = this.requireDriver();
+    const pk = this.makePk(space, normalizedKey);
+    const existing = await driver.get(pk);
+    if (!existing) return null;
+    this.assertCanDelete(space, existing, actorId);
+    await driver.delete(pk);
+    const opId = this.makeMutationId(actorId);
+    const mutation = {
+      __ppType: "pp-storage-op-v1",
+      opId,
+      op: "delete",
+      space,
+      key: normalizedKey,
+      actorId,
+      timestamp: Date.now(),
+      record: null
+    };
+    this.seenMutationIds.add(opId);
+    this.emitChange({
+      origin: "local",
+      op: "delete",
+      record: null,
+      space,
+      key: normalizedKey,
+      actorId
+    });
+    return mutation;
+  }
+  async handleGossipMessage(data) {
+    if (data.local) return;
+    const payload = data.message?.data;
+    if (!this.isSyncEnvelope(payload)) return;
+    const decrypted = await this.decryptSyncEnvelope(payload.cipher);
+    if (!decrypted) return;
+    if (this.isStorageMutation(decrypted)) {
+      if (this.seenMutationIds.has(decrypted.opId)) return;
+      if (decrypted.space === "private") return;
+      this.seenMutationIds.add(decrypted.opId);
+      await this.applyRemoteMutation(decrypted);
+      return;
+    }
+    if (this.isStorageRetrieveRequest(decrypted)) {
+      await this.handleRetrieveRequest(decrypted);
+      return;
+    }
+    if (this.isStorageRetrieveResponse(decrypted)) {
+      await this.handleRetrieveResponse(decrypted);
+    }
+  }
+  async applyRemoteMutation(mutation) {
+    const driver = this.requireDriver();
+    const pk = this.makePk(mutation.space, mutation.key);
+    const existing = await driver.get(pk);
+    if (mutation.op === "delete") {
+      if (!existing) return;
+      if (mutation.timestamp <= existing.updatedAt) return;
+      if (!this.canDelete(mutation.space, existing, mutation.actorId)) return;
+      await driver.delete(pk);
+      this.emitChange({
+        origin: "remote",
+        op: "delete",
+        record: null,
+        space: mutation.space,
+        key: mutation.key,
+        actorId: mutation.actorId
+      });
+      return;
+    }
+    if (!mutation.record) return;
+    if (existing) {
+      const existingVersion = Number(existing.version ?? 0);
+      const incomingVersion = Number(mutation.record.version ?? 0);
+      const existingUpdatedAt = Number(existing.updatedAt ?? 0);
+      const incomingUpdatedAt = Number(mutation.timestamp ?? 0);
+      const existingAgeMs = Math.max(0, Date.now() - existingUpdatedAt);
+      if (incomingVersion < existingVersion) {
+        if (mutation.space === "public" && existingAgeMs > _PeerPigeonStorage.STALE_LOCAL_MAX_AGE_MS) {
+        } else if (incomingUpdatedAt <= existingUpdatedAt + _PeerPigeonStorage.STALE_VERSION_OVERRIDE_MS) {
+          return;
+        }
+      }
+      if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return;
+    }
+    if (!this.canWrite(mutation.space, existing, mutation.actorId)) return;
+    if (mutation.space === "user" && !existing) {
+      const incomingOwner = String(mutation.record.ownerId ?? "").trim();
+      if (incomingOwner && incomingOwner !== mutation.actorId) {
+        return;
+      }
+    }
+    const incoming = {
+      ...mutation.record,
+      pk,
+      ownerId: mutation.space === "user" ? existing?.ownerId ?? mutation.record.ownerId ?? mutation.actorId : mutation.record.ownerId,
+      updatedAt: mutation.timestamp,
+      createdAt: existing?.createdAt ?? mutation.record.createdAt,
+      version: Math.max(existing?.version ?? 0, mutation.record.version)
+    };
+    await driver.put(incoming);
+    const value = await this.decodeValueForRead(incoming, this.userId);
+    this.emitChange({
+      origin: "remote",
+      op: "upsert",
+      record: {
+        space: incoming.space,
+        key: incoming.key,
+        value,
+        ownerId: incoming.ownerId,
+        createdAt: incoming.createdAt,
+        updatedAt: incoming.updatedAt,
+        version: incoming.version
+      },
+      space: incoming.space,
+      key: incoming.key,
+      actorId: mutation.actorId
+    });
+  }
+  async broadcastMutation(mutation) {
+    await this.broadcastSyncPayload(mutation);
+  }
+  async broadcastSyncPayload(payload) {
+    if (!this.gossip) return;
+    const cipher = await this.encryptSyncPayload(payload);
+    const envelope = {
+      __ppType: "pp-storage-sync-v1",
+      from: this.userId,
+      timestamp: Date.now(),
+      cipher
+    };
+    this.gossip.broadcast(envelope, { storageSync: true, encrypted: true });
+  }
+  async handleRetrieveRequest(request) {
+    if (request.actorId === this.userId) return;
+    if (request.space === "private") return;
+    const driver = this.requireDriver();
+    const pk = this.makePk(request.space, request.key);
+    const existing = await driver.get(pk);
+    if (!existing) return;
+    const response = {
+      __ppType: "pp-storage-res-v1",
+      reqId: request.reqId,
+      space: request.space,
+      key: request.key,
+      actorId: this.userId,
+      timestamp: Date.now(),
+      record: existing
+    };
+    await this.broadcastSyncPayload(response);
+  }
+  async handleRetrieveResponse(response) {
+    const pending = this.pendingRetrieveRequests.get(response.reqId);
+    if (!pending) return;
+    this.pendingRetrieveRequests.delete(response.reqId);
+    clearTimeout(pending.timeout);
+    if (response.record && response.space !== "private") {
+      const mutation = {
+        __ppType: "pp-storage-op-v1",
+        opId: `retrieve-${response.reqId}-${response.actorId}`,
+        op: "upsert",
+        space: response.space,
+        key: response.key,
+        actorId: response.actorId,
+        timestamp: response.timestamp,
+        record: response.record
+      };
+      await this.applyRemoteMutation(mutation);
+    }
+    const latest = await this.get(response.space, response.key);
+    pending.resolve(latest);
+  }
+  async createDriver() {
+    if (typeof indexedDB === "undefined") {
+      return new MemoryStorageDriver();
+    }
+    try {
+      return await IndexedDbStorageDriver.create(this.dbName, this.storeName);
+    } catch {
+      return new MemoryStorageDriver();
+    }
+  }
+  emitChange(event) {
+    if (event.origin === "remote" && !this.shouldSyncKey(event.space, event.key)) {
+      return;
+    }
+    for (const listener of this.listeners) {
+      try {
+        listener(event);
+      } catch {
+      }
+    }
+  }
+  requireDriver() {
+    if (!this.driver) {
+      throw new Error("PeerPigeonStorage.init() must be called before use");
+    }
+    return this.driver;
+  }
+  normalizeKey(key) {
+    const normalized = String(key ?? "").trim();
+    if (!normalized) throw new Error("Storage key must be a non-empty string");
+    return normalized;
+  }
+  makePk(space, key) {
+    if (space === "private") {
+      return `${space}:${this.userId}:${key}`;
+    }
+    return `${space}:${key}`;
+  }
+  makeMutationId(actorId) {
+    return `${actorId}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  }
+  shouldSyncKey(space, key) {
+    if (!this.syncFilter) return true;
+    try {
+      return this.syncFilter(space, key);
+    } catch {
+      return false;
+    }
+  }
+  resolveOwnerId(space, existing, actorId, ownerOverride) {
+    if (space === "user") {
+      if (existing?.ownerId) {
+        if (this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
+          return actorId;
+        }
+        return existing.ownerId;
+      }
+      const requested = String(ownerOverride ?? "").trim();
+      return requested || actorId;
+    }
+    return existing?.ownerId ?? null;
+  }
+  assertCanWrite(space, existing, actorId, ownerOverride) {
+    if (!this.canWrite(space, existing, actorId, ownerOverride)) {
+      throw new Error(`Write denied for ${space} space key`);
+    }
+  }
+  canWrite(space, existing, actorId, ownerOverride) {
+    if (space === "public") return true;
+    if (space === "private") return actorId === this.userId;
+    if (space === "user") {
+      if (!existing) return true;
+      if (existing.ownerId === actorId) return true;
+      if (ownerOverride && String(ownerOverride).trim()) return true;
+      if (this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
+        return true;
+      }
+      return false;
+    }
+    if (space === "frozen") {
+      return !existing;
+    }
+    return false;
+  }
+  isPeerIdFormat(id) {
+    if (!id) return false;
+    const str = String(id).trim();
+    return /^[0-9a-f]{64}$/i.test(str);
+  }
+  assertCanDelete(space, existing, actorId) {
+    if (!this.canDelete(space, existing, actorId)) {
+      throw new Error(`Delete denied for ${space} space key`);
+    }
+  }
+  canDelete(space, existing, actorId) {
+    if (space === "public") return true;
+    if (space === "private") return actorId === this.userId;
+    if (space === "user") return existing.ownerId === actorId;
+    if (space === "frozen") return false;
+    return false;
+  }
+  async encodeValueForStore(space, value) {
+    if (space !== "private") {
+      return { value, valueCipher: null };
+    }
+    const cipher = await this.encryptPrivateValue(value);
+    return { value: null, valueCipher: cipher };
+  }
+  async decodeValueForRead(record, readerId) {
+    if (record.space !== "private") {
+      return record.value;
+    }
+    if (readerId !== this.userId) {
+      throw new Error("Read denied for private space key");
+    }
+    if (!record.valueCipher) {
+      throw new Error("Missing cipher for private value");
+    }
+    return await this.decryptPrivateValue(record.valueCipher);
+  }
+  isSyncEnvelope(value) {
+    const maybe = value;
+    return !!maybe && maybe.__ppType === "pp-storage-sync-v1" && typeof maybe.from === "string" && typeof maybe.timestamp === "number" && this.isCipherPayload(maybe.cipher);
+  }
+  isStorageMutation(value) {
+    const maybe = value;
+    return !!maybe && maybe.__ppType === "pp-storage-op-v1" && typeof maybe.opId === "string" && (maybe.op === "upsert" || maybe.op === "delete") && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number";
+  }
+  isStorageRetrieveRequest(value) {
+    const maybe = value;
+    return !!maybe && maybe.__ppType === "pp-storage-req-v1" && typeof maybe.reqId === "string" && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number";
+  }
+  isStorageRetrieveResponse(value) {
+    const maybe = value;
+    return !!maybe && maybe.__ppType === "pp-storage-res-v1" && typeof maybe.reqId === "string" && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number" && (maybe.record === null || typeof maybe.record === "object");
+  }
+  isCipherPayload(value) {
+    const maybe = value;
+    return !!maybe && maybe.alg === "A256GCM" && typeof maybe.iv === "string" && typeof maybe.ct === "string";
+  }
+  async encryptSyncPayload(payload) {
+    const key = await this.deriveAesKey(`peerpigeon:storage-sync:v1:${this.sessionId}:${this.syncSecret}`);
+    return await this.encryptJson(payload, key);
+  }
+  async decryptSyncEnvelope(cipher) {
+    try {
+      const key = await this.deriveAesKey(`peerpigeon:storage-sync:v1:${this.sessionId}:${this.syncSecret}`);
+      return await this.decryptJson(cipher, key);
+    } catch {
+      return null;
+    }
+  }
+  async encryptPrivateValue(value) {
+    const key = await this.deriveAesKey(`peerpigeon:storage-private:v1:${this.userId}:${this.sessionId}:${this.syncSecret}`);
+    return await this.encryptJson(value, key);
+  }
+  async decryptPrivateValue(cipher) {
+    const key = await this.deriveAesKey(`peerpigeon:storage-private:v1:${this.userId}:${this.sessionId}:${this.syncSecret}`);
+    return await this.decryptJson(cipher, key);
+  }
+  async deriveAesKey(seed) {
+    if (!globalThis.crypto?.subtle) {
+      throw new Error("WebCrypto subtle API is required for encrypted storage sync");
+    }
+    const seedBytes = new TextEncoder().encode(seed);
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", seedBytes);
+    return await globalThis.crypto.subtle.importKey(
+      "raw",
+      digest,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
+  }
+  async encryptJson(value, key) {
+    const ivBuffer = new ArrayBuffer(12);
+    const ivView = new Uint8Array(ivBuffer);
+    globalThis.crypto.getRandomValues(ivView);
+    const plainBytes = new TextEncoder().encode(JSON.stringify(value));
+    const cipherBuffer = await globalThis.crypto.subtle.encrypt(
+      { name: "AES-GCM", iv: ivBuffer },
+      key,
+      plainBytes
+    );
+    return {
+      alg: "A256GCM",
+      iv: this.toBase64Url(ivView),
+      ct: this.toBase64Url(new Uint8Array(cipherBuffer))
+    };
+  }
+  async decryptJson(cipher, key) {
+    const iv = this.fromBase64Url(cipher.iv);
+    const ivCopy = new Uint8Array(new ArrayBuffer(iv.byteLength));
+    ivCopy.set(iv);
+    const data = this.fromBase64Url(cipher.ct);
+    const cipherCopy = new Uint8Array(new ArrayBuffer(data.byteLength));
+    cipherCopy.set(data);
+    const plainBuffer = await globalThis.crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: ivCopy },
+      key,
+      cipherCopy
+    );
+    const text = new TextDecoder().decode(plainBuffer);
+    return JSON.parse(text);
+  }
+  toBase64Url(buffer) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+  fromBase64Url(text) {
+    const raw = String(text ?? "");
+    const normalized = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const binary = atob(padded);
+    const out = new Uint8Array(new ArrayBuffer(binary.length));
+    for (let i = 0; i < binary.length; i++) {
+      out[i] = binary.charCodeAt(i);
+    }
+    return out;
+  }
+};
+_PeerPigeonStorage.STALE_VERSION_OVERRIDE_MS = 3e4;
+_PeerPigeonStorage.STALE_LOCAL_MAX_AGE_MS = 5 * 6e4;
+var PeerPigeonStorage = _PeerPigeonStorage;
+
 // src/index.ts
 var PartialMesh = class {
   constructor(config = {}) {
@@ -2121,5 +2814,6 @@ var index_default = PartialMesh;
 export {
   GossipProtocol,
   PartialMesh,
+  PeerPigeonStorage,
   index_default as default
 };
