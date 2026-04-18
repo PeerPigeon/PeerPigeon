@@ -149,6 +149,156 @@ declare class GossipProtocol {
     private generateMessageId;
 }
 
+type StorageSpace = 'public' | 'user' | 'frozen' | 'private';
+type StorageChangeOrigin = 'local' | 'remote';
+interface StorageRecord<T = unknown> {
+    space: StorageSpace;
+    key: string;
+    value: T;
+    ownerId: string | null;
+    createdAt: number;
+    updatedAt: number;
+    version: number;
+}
+interface StoragePutOptions {
+    /**
+     * Override owner for first write in user-space records.
+     */
+    ownerId?: string;
+}
+interface StorageSyncOptions {
+    /**
+     * Shared room scope used to derive sync encryption keys.
+     */
+    sessionId?: string;
+    /**
+     * Optional secret mixed into key derivation for stronger room privacy.
+     */
+    syncSecret?: string;
+    /**
+     * Optional per-key interest filter for gossip sync.
+     * Return true to allow this key to sync over gossip.
+     */
+    syncFilter?: (space: StorageSpace, key: string) => boolean;
+}
+interface StorageRetrieveOptions {
+    timeoutMs?: number;
+}
+interface StorageOptions extends StorageSyncOptions {
+    /**
+     * Local user identity used by ACL checks.
+     */
+    userId: string;
+    /**
+     * Optional mesh gossip helper.
+     */
+    gossip?: GossipLike;
+    /**
+     * Optional IndexedDB name (default: peerpigeon-storage-v1).
+     */
+    dbName?: string;
+}
+type StorageEvents = {
+    change: (event: {
+        origin: StorageChangeOrigin;
+        op: 'upsert' | 'delete';
+        record: StorageRecord | null;
+        space: StorageSpace;
+        key: string;
+        actorId: string;
+    }) => void;
+};
+type StorageUnsubscribe = () => void;
+interface GossipLike {
+    broadcast(data: unknown, metadata?: Record<string, unknown>): string;
+    on(event: 'messageReceived', callback: (data: {
+        message: {
+            data: unknown;
+        };
+        local: boolean;
+        fromPeer?: string;
+    }) => void): void;
+    off(event: 'messageReceived', callback: (data: {
+        message: {
+            data: unknown;
+        };
+        local: boolean;
+        fromPeer?: string;
+    }) => void): void;
+}
+/**
+ * PeerPigeonStorage
+ *
+ * - Persists records in IndexedDB (fallback: in-memory)
+ * - Syncs non-private spaces over encrypted gossip envelopes
+ * - Enforces four built-in ACL spaces: public, user, frozen, private
+ */
+declare class PeerPigeonStorage {
+    private static readonly STALE_VERSION_OVERRIDE_MS;
+    private static readonly STALE_LOCAL_MAX_AGE_MS;
+    private readonly userId;
+    private readonly gossip;
+    private readonly sessionId;
+    private readonly syncSecret;
+    private readonly syncFilter;
+    private readonly dbName;
+    private readonly storeName;
+    private driver;
+    private readonly seenMutationIds;
+    private readonly listeners;
+    private readonly pendingRetrieveRequests;
+    private closed;
+    private readonly onGossipMessageBound;
+    constructor(options: StorageOptions);
+    init(): Promise<void>;
+    on(event: 'change', listener: StorageEvents['change']): void;
+    subscribe(listener: StorageEvents['change']): StorageUnsubscribe;
+    off(event: 'change', listener: StorageEvents['change']): void;
+    put<T = unknown>(space: StorageSpace, key: string, value: T, options?: StoragePutOptions): Promise<StorageRecord<T>>;
+    get<T = unknown>(space: StorageSpace, key: string): Promise<StorageRecord<T> | null>;
+    retrieve<T = unknown>(space: StorageSpace, key: string, options?: StorageRetrieveOptions): Promise<StorageRecord<T> | null>;
+    delete(space: StorageSpace, key: string): Promise<boolean>;
+    list(space: StorageSpace): Promise<StorageRecord[]>;
+    close(): Promise<void>;
+    private applyLocalUpsert;
+    private applyLocalDelete;
+    private handleGossipMessage;
+    private applyRemoteMutation;
+    private broadcastMutation;
+    private broadcastSyncPayload;
+    private handleRetrieveRequest;
+    private handleRetrieveResponse;
+    private createDriver;
+    private emitChange;
+    private requireDriver;
+    private normalizeKey;
+    private makePk;
+    private makeMutationId;
+    private shouldSyncKey;
+    private resolveOwnerId;
+    private assertCanWrite;
+    private canWrite;
+    private isPeerIdFormat;
+    private assertCanDelete;
+    private canDelete;
+    private encodeValueForStore;
+    private decodeValueForRead;
+    private isSyncEnvelope;
+    private isStorageMutation;
+    private isStorageRetrieveRequest;
+    private isStorageRetrieveResponse;
+    private isCipherPayload;
+    private encryptSyncPayload;
+    private decryptSyncEnvelope;
+    private encryptPrivateValue;
+    private decryptPrivateValue;
+    private deriveAesKey;
+    private encryptJson;
+    private decryptJson;
+    private toBase64Url;
+    private fromBase64Url;
+}
+
 interface PartialMeshConfig {
     /**
      * Minimum number of peers to maintain connections with
@@ -376,4 +526,4 @@ declare class PartialMesh {
     destroy(): void;
 }
 
-export { type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PeerConnection, PartialMesh as default };
+export { type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PeerConnection, PeerPigeonStorage, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };

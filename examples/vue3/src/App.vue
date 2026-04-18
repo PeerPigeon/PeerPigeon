@@ -234,7 +234,107 @@
 
           <div v-else-if="activeTab === 'storage'" class="tab-panel feature-panel" role="tabpanel" aria-label="Storage panel">
             <h3>🗄 Storage</h3>
-            <p class="feature-copy">Storage panel placeholder. Use this panel for cache, session, and persistence controls.</p>
+            <p class="feature-copy">IndexedDB-backed, encrypted gossip-sync storage with space ACLs.</p>
+
+            <div class="storage-head">
+              <div class="storage-badge" :class="storageReady ? 'ready' : 'idle'">
+                {{ storageReady ? 'Synced' : 'Waiting for mesh identity' }}
+              </div>
+              <div class="storage-help">Session: <span class="mono">{{ effectiveSessionId }}</span></div>
+            </div>
+
+            <div class="storage-controls">
+              <label class="field storage-space-field">
+                <span class="field-label">Space</span>
+                <select v-model="storageActiveSpace" class="input" @change="refreshStorageList">
+                  <option value="public">public</option>
+                  <option value="user">user</option>
+                  <option value="frozen">frozen</option>
+                  <option value="private">private</option>
+                </select>
+              </label>
+
+              <label class="field storage-key-field">
+                <span class="field-label">Key</span>
+                <input v-model="storageFormKey" class="input" placeholder="e.g. profile.theme" />
+              </label>
+
+              <label class="field storage-interest-toggle">
+                <span class="field-label">Sync This Key</span>
+                <input
+                  type="checkbox"
+                  :checked="isStorageKeyInterested(storageActiveSpace, storageFormKey)"
+                  :disabled="!storageFormKey.trim()"
+                  @change="setStorageKeyInterest(storageActiveSpace, storageFormKey, $event.target.checked)"
+                />
+              </label>
+
+              <label class="field storage-value-field">
+                <span class="field-label">Value (JSON or text)</span>
+                <input v-model="storageFormValue" class="input" placeholder='{"darkMode":true}' />
+              </label>
+
+              <div class="storage-actions">
+                <button class="btn btn-secondary" :disabled="!isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="saveStorageEntry">
+                  Save
+                </button>
+                <button class="btn btn-danger" :disabled="!isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="deleteStorageEntry">
+                  Delete
+                </button>
+                <button class="btn" :disabled="!isRunning || !storageReady || storageBusy" @click="refreshStorageList">
+                  Refresh
+                </button>
+              </div>
+            </div>
+
+            <div class="storage-space-note">{{ storageSpaceDescription }}</div>
+
+            <div class="storage-interest-list" v-if="interestedKeysForSpace(storageActiveSpace).length">
+              <div class="storage-interest-head">
+                <span class="storage-interest-title">Interested keys ({{ storageActiveSpace }})</span>
+                <button class="btn btn-small" @click="clearStorageKeyInterestForSpace(storageActiveSpace)">Clear all</button>
+              </div>
+              <div class="storage-interest-chips">
+                <button
+                  v-for="interestKey in interestedKeysForSpace(storageActiveSpace)"
+                  :key="`${storageActiveSpace}:${interestKey}`"
+                  class="storage-interest-chip"
+                  @click="setStorageKeyInterest(storageActiveSpace, interestKey, false)"
+                  :title="`Stop syncing ${interestKey}`"
+                >
+                  <span class="mono">{{ interestKey }}</span>
+                  <span aria-hidden="true">×</span>
+                </button>
+              </div>
+            </div>
+
+            <div v-if="storageError" class="storage-error">{{ storageError }}</div>
+
+            <div class="storage-table-wrap">
+              <table class="storage-table">
+                <thead>
+                  <tr>
+                    <th>Key</th>
+                    <th>Value</th>
+                    <th>Owner</th>
+                    <th>Ver</th>
+                    <th>Updated</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-if="storageRecords.length === 0">
+                    <td colspan="5" class="storage-empty">No records in {{ storageActiveSpace }} space.</td>
+                  </tr>
+                  <tr v-for="record in storageRecords" :key="`${record.space}:${record.key}`" @click="selectStorageRecord(record)">
+                    <td class="mono">{{ record.key }}</td>
+                    <td class="mono storage-value-cell">{{ storageRecordPreview(record.value) }}</td>
+                    <td class="mono">{{ record.ownerId === storageUserId() ? 'You' : (record.ownerId || '-') }}</td>
+                    <td>{{ record.version }}</td>
+                    <td>{{ formatTime(record.updatedAt) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
 
           <div v-else-if="activeTab === 'crypto'" class="tab-panel feature-panel" role="tabpanel" aria-label="Crypto panel">
@@ -361,6 +461,7 @@
 <script>
 import { PartialMesh } from 'peerpigeon';
 import { GossipProtocol } from 'peerpigeon';
+import { PeerPigeonStorage } from 'peerpigeon';
 import { generateRandomPair, encryptMessageWithMeta, decryptMessageWithMeta } from 'unsea';
 
 const DEFAULT_TOPOLOGY = 'token-ring';
@@ -368,6 +469,8 @@ const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
 const CRYPTO_PUBLIC_REQUEST_TYPE = 'pp-crypto-public-request-v1';
 const ENCRYPTED_BROADCAST_TYPE = 'pp-encrypted-broadcast-v1';
 const ENCRYPTED_DIRECT_TYPE = 'pp-encrypted-direct-v1';
+const STORAGE_SYNC_TYPE = 'pp-storage-sync-v1';
+const STORAGE_OP_TYPE = 'pp-storage-op-v1';
 
 function toBase64Url(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -423,6 +526,20 @@ export default {
       pendingDirectMessages: {},
       cryptoStorageKey: 'peerpigeon:unsea:keypair:v1',
       cryptoAnnounceTimer: null,
+      storage: null,
+      storageReady: false,
+      storageBusy: false,
+      storageError: '',
+      storageActiveSpace: 'public',
+      storageFormKey: '',
+      storageFormValue: '',
+      storageRecords: [],
+      storageUnsubscribe: null,
+      storageLastUserId: '',
+      storageInterestedKeys: {},
+      storageRefreshInFlight: false,
+      storageRefreshQueued: false,
+      storageNetworkReconcileTimer: null,
       uiStateKey: 'peerpigeon:ui-state',
       uiTabs: [
         { id: 'message', label: 'Message' },
@@ -620,6 +737,18 @@ export default {
       return Object.entries(this.cryptoPublicDirectory)
         .filter(([peerId, info]) => peerId && peerId !== self && info?.pub && info?.epub)
         .sort(([a], [b]) => a.localeCompare(b));
+    },
+    storageSpaceDescription() {
+      if (this.storageActiveSpace === 'public') {
+        return 'public: anyone can read and mutate.';
+      }
+      if (this.storageActiveSpace === 'user') {
+        return 'user: public read, only owning user can mutate.';
+      }
+      if (this.storageActiveSpace === 'frozen') {
+        return 'frozen: public read, immutable after first write.';
+      }
+      return 'private: only local user can read/mutate; value is locally encrypted.';
     }
   },
   watch: {
@@ -632,9 +761,342 @@ export default {
       if ((last.type !== 'sent' && last.type !== 'received') && this.autoScroll) {
         this.$nextTick(() => this.scrollDiagToBottom());
       }
+    },
+    activeTab(nextTab) {
+      if (nextTab === 'storage') {
+        this.ensureStorageReady().catch((error) => {
+          this.storageError = String(error?.message || error || 'Failed to initialize storage');
+        });
+      }
     }
   },
   methods: {
+    storageInterestPk(space, key) {
+      const normalizedSpace = String(space || '').trim();
+      const normalizedKey = String(key || '').trim();
+      if (!normalizedSpace || !normalizedKey) return '';
+      return `${normalizedSpace}:${normalizedKey}`;
+    },
+
+    isStorageKeyInterested(space, key) {
+      const pk = this.storageInterestPk(space, key);
+      if (!pk) return false;
+      return this.storageInterestedKeys[pk] === true;
+    },
+
+    interestedKeysForSpace(space) {
+      const normalizedSpace = String(space || '').trim();
+      if (!normalizedSpace) return [];
+
+      const out = [];
+      for (const [pk, enabled] of Object.entries(this.storageInterestedKeys)) {
+        if (!enabled) continue;
+        const prefix = `${normalizedSpace}:`;
+        if (!pk.startsWith(prefix)) continue;
+        const key = pk.slice(prefix.length);
+        if (key) out.push(key);
+      }
+
+      out.sort((a, b) => a.localeCompare(b));
+      return out;
+    },
+
+    setStorageKeyInterest(space, key, enabled) {
+      const pk = this.storageInterestPk(space, key);
+      if (!pk) return;
+
+      this.storageInterestedKeys = {
+        ...this.storageInterestedKeys,
+        [pk]: Boolean(enabled),
+      };
+      this.saveUiState();
+
+      if (enabled) {
+        this.ensureStorageReady().catch((error) => {
+          this.storageError = String(error?.message || error || 'Failed to initialize storage');
+        });
+
+        if (this.storage && this.storageReady) {
+          this.storage.retrieve(space, key).catch(() => {
+            // best-effort fetch from interested peers
+          });
+        }
+      }
+
+      if (this.activeTab === 'storage') {
+        this.refreshStorageList();
+      }
+    },
+
+    clearStorageKeyInterestForSpace(space) {
+      const normalizedSpace = String(space || '').trim();
+      if (!normalizedSpace) return;
+
+      const next = { ...this.storageInterestedKeys };
+      const prefix = `${normalizedSpace}:`;
+      for (const pk of Object.keys(next)) {
+        if (pk.startsWith(prefix)) {
+          delete next[pk];
+        }
+      }
+
+      this.storageInterestedKeys = next;
+      this.saveUiState();
+
+      if (this.activeTab === 'storage') {
+        this.refreshStorageList();
+      }
+    },
+
+    parseStorageInput(text) {
+      const raw = String(text ?? '').trim();
+      if (!raw) return '';
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return raw;
+      }
+    },
+
+    storageRecordPreview(value) {
+      if (typeof value === 'string') {
+        return value.length > 140 ? `${value.slice(0, 137)}...` : value;
+      }
+      try {
+        const json = JSON.stringify(value);
+        return json.length > 140 ? `${json.slice(0, 137)}...` : json;
+      } catch {
+        return String(value);
+      }
+    },
+
+    storageUserId() {
+      // Use epub (ECDH public key) as stable user identity for storage,
+      // not peer ID which can change during session.
+      return String(this.cryptoKeys?.epub || '').trim();
+    },
+
+    teardownStorage() {
+      if (this.storageNetworkReconcileTimer) {
+        clearTimeout(this.storageNetworkReconcileTimer);
+        this.storageNetworkReconcileTimer = null;
+      }
+
+      if (this.storageUnsubscribe) {
+        this.storageUnsubscribe();
+        this.storageUnsubscribe = null;
+      }
+
+      if (this.storage) {
+        this.storage.close().catch(() => {
+          // ignore close failures
+        });
+        this.storage = null;
+      }
+
+      this.storageReady = false;
+      this.storageBusy = false;
+      this.storageRecords = [];
+      this.storageLastUserId = '';
+      this.storageRefreshInFlight = false;
+      this.storageRefreshQueued = false;
+    },
+
+    applyStorageChangeEvent(event) {
+      if (!event || event.space !== this.storageActiveSpace) return;
+      if (!this.isStorageKeyInterested(event.space, event.key)) return;
+
+      if (event.op === 'delete') {
+        this.storageRecords = this.storageRecords.filter((record) => record.key !== event.key);
+        return;
+      }
+
+      const nextRecord = event.record;
+      if (!nextRecord) return;
+
+      const next = this.storageRecords.slice();
+      const existingIndex = next.findIndex((record) => record.key === nextRecord.key);
+      if (existingIndex >= 0) {
+        next.splice(existingIndex, 1, nextRecord);
+      } else {
+        next.push(nextRecord);
+      }
+      next.sort((a, b) => String(a.key).localeCompare(String(b.key)));
+      this.storageRecords = next;
+    },
+
+    scheduleStorageNetworkReconcile() {
+      if (this.storageNetworkReconcileTimer) {
+        clearTimeout(this.storageNetworkReconcileTimer);
+      }
+
+      // Topology can churn quickly; debounce to a single reconcile burst.
+      this.storageNetworkReconcileTimer = setTimeout(() => {
+        this.storageNetworkReconcileTimer = null;
+        this.reconcileInterestedStorageFromNetwork().catch(() => {
+          // best-effort on topology changes
+        });
+      }, 180);
+    },
+
+    async reconcileInterestedStorageFromNetwork() {
+      if (!this.gossip) return;
+      await this.ensureStorageReady();
+      if (!this.storage || !this.storageReady) return;
+
+      const entries = Object.entries(this.storageInterestedKeys || {});
+      for (const [pk, enabled] of entries) {
+        if (!enabled) continue;
+        const idx = pk.indexOf(':');
+        if (idx <= 0 || idx >= pk.length - 1) continue;
+        const space = pk.slice(0, idx);
+        const key = pk.slice(idx + 1);
+        if (!space || !key) continue;
+
+        await this.storage.retrieve(space, key, { timeoutMs: 1200 }).catch(() => {
+          // best-effort per key
+        });
+      }
+    },
+
+    async ensureStorageReady() {
+      const userId = this.storageUserId();
+      if (!userId || !this.gossip) return;
+
+      if (this.storage && this.storageLastUserId === userId) {
+        this.storageReady = true;
+        return;
+      }
+
+      if (this.storage) {
+        if (this.storageUnsubscribe) {
+          this.storageUnsubscribe();
+          this.storageUnsubscribe = null;
+        }
+        try {
+          await this.storage.close();
+        } catch {
+          // ignore close errors
+        }
+        this.storage = null;
+      }
+
+      const next = new PeerPigeonStorage({
+        userId,
+        gossip: this.gossip,
+        sessionId: this.effectiveSessionId,
+        dbName: `peerpigeon-demo-storage:${this.effectiveSessionId}`,
+        syncFilter: (space, key) => this.isStorageKeyInterested(space, key),
+      });
+
+      await next.init();
+      this.storageUnsubscribe = next.subscribe((event) => {
+        this.applyStorageChangeEvent(event);
+      });
+
+      this.storage = next;
+      this.storageLastUserId = userId;
+      this.storageReady = true;
+      this.storageError = '';
+      await this.refreshStorageList();
+    },
+
+    async refreshStorageList(options = {}) {
+      if (!this.storage || !this.storageReady) {
+        this.storageRecords = [];
+        return;
+      }
+
+      const silent = options && options.silent === true;
+
+      if (this.storageRefreshInFlight) {
+        this.storageRefreshQueued = true;
+        return;
+      }
+
+      this.storageRefreshInFlight = true;
+      if (!silent) {
+        this.storageBusy = true;
+      }
+      this.storageError = '';
+
+      try {
+        do {
+          this.storageRefreshQueued = false;
+          const keys = this.interestedKeysForSpace(this.storageActiveSpace);
+          const records = [];
+          for (const key of keys) {
+            // Per-key lookups are network-aware so interested keys reconcile
+            // from peers instead of sticking to stale local IndexedDB values.
+            const record = await this.storage.retrieve(this.storageActiveSpace, key, { timeoutMs: 1200 });
+            if (record) records.push(record);
+          }
+          this.storageRecords = records;
+        } while (this.storageRefreshQueued);
+      } catch (error) {
+        this.storageError = String(error?.message || error || 'Failed to load storage');
+      } finally {
+        this.storageRefreshInFlight = false;
+        if (!silent) {
+          this.storageBusy = false;
+        }
+      }
+    },
+
+    selectStorageRecord(record) {
+      this.storageFormKey = String(record?.key || '');
+      try {
+        this.storageFormValue = typeof record?.value === 'string'
+          ? record.value
+          : JSON.stringify(record?.value);
+      } catch {
+        this.storageFormValue = String(record?.value ?? '');
+      }
+    },
+
+    async saveStorageEntry() {
+      if (!this.storage || !this.storageReady) return;
+      const key = String(this.storageFormKey || '').trim();
+      if (!key) return;
+
+      if (!this.isStorageKeyInterested(this.storageActiveSpace, key)) {
+        this.setStorageKeyInterest(this.storageActiveSpace, key, true);
+      }
+
+      this.storageBusy = true;
+      this.storageError = '';
+      try {
+        const value = this.parseStorageInput(this.storageFormValue);
+        await this.storage.put(this.storageActiveSpace, key, value);
+        await this.refreshStorageList();
+      } catch (error) {
+        this.storageError = String(error?.message || error || 'Failed to save storage key');
+      } finally {
+        this.storageBusy = false;
+      }
+    },
+
+    async deleteStorageEntry() {
+      if (!this.storage || !this.storageReady) return;
+      const key = String(this.storageFormKey || '').trim();
+      if (!key) return;
+
+      if (!this.isStorageKeyInterested(this.storageActiveSpace, key)) {
+        this.setStorageKeyInterest(this.storageActiveSpace, key, true);
+      }
+
+      this.storageBusy = true;
+      this.storageError = '';
+      try {
+        await this.storage.delete(this.storageActiveSpace, key);
+        await this.refreshStorageList();
+      } catch (error) {
+        this.storageError = String(error?.message || error || 'Failed to delete storage key');
+      } finally {
+        this.storageBusy = false;
+      }
+    },
+
     generateRandomRoomSessionId() {
       return `gp-${Math.random().toString(36).slice(2, 10)}`;
     },
@@ -772,6 +1234,9 @@ export default {
           this.addLog('signaling', `Connected to signaling server`, this.clientId);
           this.registerLocalPublicCryptoInfo();
           this.announceCryptoPublicInfo();
+          this.ensureStorageReady().catch((error) => {
+            this.storageError = String(error?.message || error || 'Failed to initialize storage');
+          });
           this.updateStats();
         });
 
@@ -798,11 +1263,13 @@ export default {
         this.mesh.on('peer:connected', (peerId) => {
           this.addLog('connected', `Connected to peer`, peerId);
           this.announceCryptoPublicInfo();
+          this.scheduleStorageNetworkReconcile();
           this.updateStats();
         });
 
         this.mesh.on('peer:disconnected', (peerId) => {
           this.addLog('disconnected', `Disconnected from peer`, peerId);
+          this.scheduleStorageNetworkReconcile();
           this.updateStats();
         });
 
@@ -819,6 +1286,7 @@ export default {
         });
 
         this.mesh.on('mesh:membership', () => {
+          this.scheduleStorageNetworkReconcile();
           this.updateStats();
         });
 
@@ -880,6 +1348,7 @@ export default {
       this.stopCryptoAnnounceLoop();
       this.stopDebugMonitor();
       this.resetGraphStabilization();
+      this.teardownStorage();
       if (this.mesh) {
         this.mesh.destroy();
         this.mesh = null;
@@ -1078,6 +1547,14 @@ export default {
         data.__ppType === ENCRYPTED_DIRECT_TYPE &&
         data.cipher &&
         typeof data.cipher === 'object'
+      );
+    },
+
+    isStorageInternalPayload(data) {
+      return !!(
+        data &&
+        typeof data === 'object' &&
+        (data.__ppType === STORAGE_SYNC_TYPE || data.__ppType === STORAGE_OP_TYPE)
       );
     },
 
@@ -1295,6 +1772,12 @@ export default {
 
     async handleGossipPayload({ message, local, fromPeer }) {
       const sourcePeer = String(fromPeer || message?.sender || 'peer');
+
+      // Storage sync traffic is handled by PeerPigeonStorage and should never
+      // appear in chat or diagnostics.
+      if (this.isStorageInternalPayload(message?.data)) {
+        return;
+      }
 
       if (this.isCryptoPublicInfoPayload(message?.data)) {
         const from = String(message.data.from || sourcePeer || '').trim();
@@ -1679,11 +2162,18 @@ export default {
 
     saveUiState() {
       try {
+        const interested = Object.fromEntries(
+          Object.entries(this.storageInterestedKeys || {}).filter(([pk, enabled]) => {
+            return typeof pk === 'string' && pk.length > 0 && enabled === true;
+          })
+        );
+
         sessionStorage.setItem(this.uiStateKey, JSON.stringify({
           activeTab: this.activeTab || 'message',
           dmTarget: this.dmTarget || '',
           directMode: !!this.directMode,
-          showPrivateCrypto: !!this.showPrivateCrypto
+          showPrivateCrypto: !!this.showPrivateCrypto,
+          storageInterestedKeys: interested,
         }));
       } catch {
         // ignore storage failures
@@ -1707,6 +2197,16 @@ export default {
         }
         if (typeof parsed.showPrivateCrypto === 'boolean') {
           this.showPrivateCrypto = parsed.showPrivateCrypto;
+        }
+        if (parsed.storageInterestedKeys && typeof parsed.storageInterestedKeys === 'object') {
+          const next = {};
+          for (const [pk, enabled] of Object.entries(parsed.storageInterestedKeys)) {
+            if (typeof pk !== 'string' || !pk) continue;
+            if (enabled === true) {
+              next[pk] = true;
+            }
+          }
+          this.storageInterestedKeys = next;
         }
       } catch {
         // ignore storage failures
@@ -1825,6 +2325,201 @@ section {
   color: #4b5563;
   font-size: 0.95rem;
   line-height: 1.45;
+}
+
+.storage-head {
+  margin-top: 0.7rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.storage-badge {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.25rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid #d1d5db;
+  color: #374151;
+  background: #f3f4f6;
+}
+
+.storage-badge.ready {
+  color: #065f46;
+  background: #ecfdf5;
+  border-color: #a7f3d0;
+}
+
+.storage-badge.idle {
+  color: #1e40af;
+  background: #eff6ff;
+  border-color: #bfdbfe;
+}
+
+.storage-help {
+  font-size: 0.8rem;
+  color: #475569;
+}
+
+.storage-controls {
+  margin-top: 0.75rem;
+  display: grid;
+  grid-template-columns: minmax(170px, 0.9fr) minmax(170px, 0.9fr) minmax(130px, 0.55fr) minmax(260px, 1.4fr) auto;
+  gap: 0.55rem;
+  align-items: stretch;
+}
+
+.storage-controls .field {
+  justify-content: flex-start;
+}
+
+.storage-controls .field-label {
+  min-height: 1rem;
+  display: flex;
+  align-items: center;
+}
+
+.storage-space-field,
+.storage-key-field,
+.storage-interest-toggle,
+.storage-value-field {
+  min-width: 0;
+}
+
+.storage-interest-toggle {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 0.3rem;
+  font-size: 0.82rem;
+  color: #334155;
+}
+
+.storage-actions {
+  display: flex;
+  gap: 0.45rem;
+  align-items: center;
+  align-self: end;
+}
+
+.storage-space-note {
+  margin-top: 0.65rem;
+  font-size: 0.82rem;
+  color: #334155;
+}
+
+.storage-interest-list {
+  margin-top: 0.6rem;
+  border: 1px solid #dbe3f6;
+  border-radius: 8px;
+  background: #f8fbff;
+  padding: 0.45rem 0.55rem;
+}
+
+.storage-interest-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.45rem;
+}
+
+.storage-interest-title {
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #334155;
+}
+
+.storage-interest-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.storage-interest-chip {
+  border: 1px solid #bfd5fb;
+  background: #ffffff;
+  color: #1e293b;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  padding: 0.18rem 0.48rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  cursor: pointer;
+}
+
+.storage-interest-chip:hover {
+  background: #eff6ff;
+}
+
+.storage-error {
+  margin-top: 0.45rem;
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  padding: 0.4rem 0.55rem;
+}
+
+.storage-table-wrap {
+  margin-top: 0.7rem;
+  max-height: 240px;
+  overflow: auto;
+  border: 1px solid #dbe3f6;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.storage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.storage-table th,
+.storage-table td {
+  border-bottom: 1px solid #edf1fb;
+  padding: 0.42rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.storage-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #f8faff;
+  color: #334155;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.storage-table tbody tr {
+  cursor: pointer;
+}
+
+.storage-table tbody tr:hover {
+  background: #f8fbff;
+}
+
+.storage-value-cell {
+  max-width: 320px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.storage-empty {
+  text-align: center;
+  color: #64748b;
+  padding: 0.8rem;
 }
 
 .crypto-grid {
@@ -2615,6 +3310,20 @@ section {
   .field-topology .input {
     min-width: 0;
     width: 100%;
+  }
+
+  .storage-head {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .storage-controls {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .storage-actions {
+    flex-wrap: wrap;
   }
 }
 </style>

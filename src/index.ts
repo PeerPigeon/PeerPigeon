@@ -1338,3 +1338,15 @@ export default PartialMesh;
 
 export { GossipProtocol } from './gossip.js';
 export type { GossipMessage, GossipProtocolOptions, GossipStats } from './gossip.js';
+export { PeerPigeonStorage } from './storage.js';
+export type {
+  StorageSpace,
+  StorageRecord,
+  StoragePutOptions,
+  StorageRetrieveOptions,
+  StorageOptions,
+  StorageSyncOptions,
+  StorageChangeOrigin,
+  StorageUnsubscribe,
+  StorageEvents,
+} from './storage.js';
