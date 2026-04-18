@@ -518,6 +518,7 @@ export default {
       ],
       graphStabilizeTimer: null,
       graphUpdateTimer: null,
+      graphLastSignature: '',
       meshPeersMap: {},
       networkGraphState: null,
       networkGraphResizeHandler: null,
@@ -602,7 +603,7 @@ export default {
 
     this.loadUiState();
     this.networkGraphResizeHandler = () => {
-      this.renderNetworkGraph();
+      this.scheduleNetworkGraphRender({ immediate: true, reason: 'resize' });
     };
     window.addEventListener('resize', this.networkGraphResizeHandler);
   },
@@ -687,7 +688,16 @@ export default {
     meshPeersMap: {
       deep: false,
       handler() {
-        this.$nextTick(() => this.renderNetworkGraph());
+        this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'storage' }));
+      }
+    },
+    clientId() {
+      this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'client' }));
+    },
+    connectedPeersList: {
+      deep: false,
+      handler() {
+        this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'connected' }));
       }
     },
     roomSessionId(nextRoom) {
@@ -903,7 +913,6 @@ export default {
 
       const epub = String(this.cryptoKeys?.epub || '').trim();
       const connected = (this.mesh?.getConnectedPeers?.() || []).slice();
-      const discovered = (this.mesh?.getDiscoveredPeers?.() || []).slice();
       const network = String(this.effectiveSessionId || '').trim();
       const now = Date.now();
 
@@ -922,7 +931,6 @@ export default {
         peerId: self,
         epub: epub || null,
         connectedTo: connected,
-        discovered: discovered,
         network,
         seenAt: now,
       };
@@ -1969,11 +1977,37 @@ export default {
       const now = Date.now();
       const activeNetwork = String(this.effectiveSessionId || '').trim();
       const staleMs = 75_000;
+
+      // Primary local source: live mesh state (what drives the "Connected X/Y" counter).
+      const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      const localConnected = (this.mesh?.getConnectedPeers?.() || this.connectedPeersList || [])
+        .map((p) => String(p || '').trim())
+        .filter(Boolean);
+
       const peers = {};
 
+      if (localSelf) {
+        peers[localSelf] = {
+          id: localSelf,
+          seenAt: now,
+          connectedTo: localConnected,
+        };
+      }
+
+      for (const peerId of localConnected) {
+        if (!peers[peerId]) {
+          peers[peerId] = {
+            id: peerId,
+            seenAt: now,
+            connectedTo: [],
+          };
+        }
+      }
+
+      // Supplement with full room topology from storage, but only real connections (`connectedTo`).
       for (const [peerId, rawInfo] of Object.entries(this.meshPeersMap || {})) {
         const id = String(peerId || '').trim();
-        if (!id) continue;
+        if (!id || id === localSelf) continue;
 
         const info = rawInfo && typeof rawInfo === 'object' ? rawInfo : {};
         const network = String(info.network || '').trim();
@@ -1985,23 +2019,26 @@ export default {
         peers[id] = {
           id,
           seenAt: Number.isFinite(seenAt) ? seenAt : 0,
-          connectedTo: Array.isArray(info.connectedTo) ? info.connectedTo.map((p) => String(p || '').trim()).filter(Boolean) : [],
+          connectedTo: Array.isArray(info.connectedTo)
+            ? info.connectedTo
+              .map((p) => String(p || '').trim())
+              .filter(Boolean)
+            : [],
         };
       }
 
-      // Seed immediate local topology using the same fields we publish to mesh:peers.
-      const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-      if (localSelf) {
-        const localConnected = (this.mesh?.getConnectedPeers?.() || this.connectedPeersList || [])
-          .map((peerId) => String(peerId || '').trim())
-          .filter(Boolean);
-        const existing = peers[localSelf];
-
-        peers[localSelf] = {
-          id: localSelf,
-          seenAt: now,
-          connectedTo: [...new Set([...(existing?.connectedTo || []), ...localConnected])],
-        };
+      // Include connected targets as nodes even if their own entry has not arrived yet.
+      for (const info of Object.values(peers)) {
+        if (!info || !Array.isArray(info.connectedTo)) continue;
+        for (const target of info.connectedTo) {
+          const targetId = String(target || '').trim();
+          if (!targetId || peers[targetId]) continue;
+          peers[targetId] = {
+            id: targetId,
+            seenAt: 0,
+            connectedTo: [],
+          };
+        }
       }
 
       const nodes = Object.keys(peers)
@@ -2019,6 +2056,7 @@ export default {
 
       for (const node of nodes) {
         const info = peers[node.id];
+        if (!info) continue;
         for (const target of info.connectedTo) {
           const normalizedTarget = String(target || '').trim();
           if (!normalizedTarget || normalizedTarget === node.id) continue;
@@ -2042,7 +2080,43 @@ export default {
       return { nodes, links };
     },
 
-    renderNetworkGraph() {
+    networkGraphSignature(nodes, links) {
+      const nodeIds = nodes.map((node) => String(node.id || '')).sort();
+      const edgeIds = links
+        .map((link) => {
+          const source = String(typeof link.source === 'object' ? link.source?.id : link.source || '').trim();
+          const target = String(typeof link.target === 'object' ? link.target?.id : link.target || '').trim();
+          if (!source || !target) return '';
+          return [source, target].sort().join('|');
+        })
+        .filter(Boolean)
+        .sort();
+
+      return `${nodeIds.join(',')}::${edgeIds.join(',')}`;
+    },
+
+    scheduleNetworkGraphRender(options = {}) {
+      const { immediate = false, reason = 'update' } = options;
+      const delayMs = reason === 'resize' ? 0 : 120;
+
+      clearTimeout(this.graphUpdateTimer);
+      this.graphUpdateTimer = null;
+
+      const run = () => {
+        this.graphUpdateTimer = null;
+        this.renderNetworkGraph({ reason });
+      };
+
+      if (immediate || delayMs === 0) {
+        run();
+        return;
+      }
+
+      this.graphUpdateTimer = setTimeout(run, delayMs);
+    },
+
+    renderNetworkGraph(options = {}) {
+      const { reason = 'update' } = options;
       const svgEl = this.$refs.networkGraphSvg;
       const container = this.$refs.networkGraphContainer;
       if (!svgEl || !container) return;
@@ -2050,6 +2124,16 @@ export default {
       const width = Math.max(320, Math.floor(container.clientWidth || 320));
       const height = Math.max(280, Math.floor(container.clientHeight || 280));
       const { nodes, links } = this.networkGraphData();
+      const signature = this.networkGraphSignature(nodes, links);
+
+      const prevState = this.networkGraphState;
+      const sameTopology = this.graphLastSignature && signature === this.graphLastSignature;
+      const sameSize = prevState && prevState.width === width && prevState.height === height;
+      if (sameTopology && sameSize && reason !== 'resize') {
+        return;
+      }
+
+      this.graphLastSignature = signature;
 
       const svg = d3.select(svgEl)
         .attr('viewBox', `0 0 ${width} ${height}`)
@@ -2059,7 +2143,21 @@ export default {
       svg.selectAll('*').remove();
 
       if (!nodes.length) {
+        clearTimeout(this.graphStabilizeTimer);
+        this.graphStabilizeTimer = null;
+        if (prevState?.simulation) prevState.simulation.stop();
+        this.networkGraphState = null;
         return;
+      }
+
+      const priorPositions = prevState?.positions || {};
+      for (const node of nodes) {
+        const prior = priorPositions[node.id];
+        if (!prior) continue;
+        node.x = prior.x;
+        node.y = prior.y;
+        node.vx = 0;
+        node.vy = 0;
       }
 
       const defs = svg.append('defs');
@@ -2105,7 +2203,8 @@ export default {
         .force('link', d3.forceLink(links).id((d) => d.id).distance(95).strength(0.42))
         .force('charge', d3.forceManyBody().strength(-340))
         .force('center', d3.forceCenter(width / 2, height / 2))
-        .force('collision', d3.forceCollide().radius(34));
+        .force('collision', d3.forceCollide().radius(34))
+        .alphaDecay(0.08);
 
       const drag = d3.drag()
         .on('start', (event, d) => {
@@ -2137,12 +2236,55 @@ export default {
           const y = Math.max(20, Math.min(height - 20, d.y));
           return `translate(${x},${y})`;
         });
+
+        if (this.networkGraphState?.simulation === simulation) {
+          this.networkGraphState.positions = Object.fromEntries(
+            nodes.map((n) => [
+              n.id,
+              {
+                x: Number.isFinite(n.x) ? n.x : width / 2,
+                y: Number.isFinite(n.y) ? n.y : height / 2,
+              },
+            ])
+          );
+        }
       });
 
-      if (this.networkGraphState?.simulation) {
-        this.networkGraphState.simulation.stop();
+      clearTimeout(this.graphStabilizeTimer);
+      this.graphStabilizeTimer = setTimeout(() => {
+        simulation.stop();
+      }, 1300);
+
+      if (prevState?.simulation) {
+        prevState.simulation.stop();
       }
-      this.networkGraphState = { simulation };
+      this.networkGraphState = {
+        simulation,
+        width,
+        height,
+        positions: Object.fromEntries(
+          nodes.map((n) => [
+            n.id,
+            {
+              x: Number.isFinite(n.x) ? n.x : width / 2,
+              y: Number.isFinite(n.y) ? n.y : height / 2,
+            },
+          ])
+        ),
+      };
+
+      simulation.on('end', () => {
+        if (!this.networkGraphState || this.networkGraphState.simulation !== simulation) return;
+        this.networkGraphState.positions = Object.fromEntries(
+          nodes.map((n) => [
+            n.id,
+            {
+              x: Number.isFinite(n.x) ? n.x : width / 2,
+              y: Number.isFinite(n.y) ? n.y : height / 2,
+            },
+          ])
+        );
+      });
     },
 
     destroyNetworkGraph() {
@@ -2162,6 +2304,7 @@ export default {
       clearTimeout(this.graphUpdateTimer);
       this.graphStabilizeTimer = null;
       this.graphUpdateTimer = null;
+      this.graphLastSignature = '';
       this.destroyNetworkGraph();
     },
 
