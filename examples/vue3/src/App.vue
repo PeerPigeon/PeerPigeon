@@ -401,7 +401,7 @@
         <div ref="networkGraphContainer" class="network-graph-container" data-testid="mesh-visualizer">
           <svg ref="networkGraphSvg" class="network-graph-svg"></svg>
         </div>
-        <div class="mesh-visualizer-caption">Live from <code>mesh:peers</code> — all known peers and their connections</div>
+        <div class="mesh-visualizer-caption">Live connected topology from <code>mesh:peers</code> with per-peer audits</div>
       </section>
 
       <!-- Diagnostics -->
@@ -2142,24 +2142,37 @@ export default {
       const container = this.$refs.networkGraphContainer;
       if (!svgEl || !container) return;
 
+      const layoutVersion = 2;
+
       const width = Math.max(320, Math.floor(container.clientWidth || 320));
       const height = Math.max(280, Math.floor(container.clientHeight || 280));
       const { nodes, links } = this.networkGraphData();
       const signature = this.networkGraphSignature(nodes, links);
 
       const prevState = this.networkGraphState;
+      const versionMismatch = Boolean(prevState) && prevState.layoutVersion !== layoutVersion;
       const sameTopology = this.graphLastSignature && signature === this.graphLastSignature;
       const sameSize = prevState && prevState.width === width && prevState.height === height;
-      if (sameTopology && sameSize && reason !== 'resize') {
-        return;
-      }
-
-      this.graphLastSignature = signature;
 
       const svg = d3.select(svgEl)
         .attr('viewBox', `0 0 ${width} ${height}`)
         .attr('width', width)
         .attr('height', height);
+
+      if (sameTopology && sameSize && !versionMismatch) {
+        return;
+      }
+
+      if (sameTopology && reason === 'resize' && prevState && !versionMismatch) {
+        this.networkGraphState = {
+          ...prevState,
+          width,
+          height,
+        };
+        return;
+      }
+
+      this.graphLastSignature = signature;
 
       svg.selectAll('*').remove();
 
@@ -2171,20 +2184,235 @@ export default {
         return;
       }
 
+      const nodeRadius = 16;
+      const boxPadding = nodeRadius + 8;
+      const clampX = (x) => Math.max(boxPadding, Math.min(width - boxPadding, Number.isFinite(x) ? x : width / 2));
+      const clampY = (y) => Math.max(boxPadding, Math.min(height - boxPadding, Number.isFinite(y) ? y : height / 2));
+      const minNodeGap = 58;
+
+      const enforceNodeSpacing = (iterations = 1) => {
+        for (let pass = 0; pass < iterations; pass += 1) {
+          for (let i = 0; i < nodes.length; i += 1) {
+            for (let j = i + 1; j < nodes.length; j += 1) {
+              const a = nodes[i];
+              const b = nodes[j];
+              const dx = (b.x ?? width / 2) - (a.x ?? width / 2);
+              const dy = (b.y ?? height / 2) - (a.y ?? height / 2);
+              const dist = Math.hypot(dx, dy) || 0.001;
+              if (dist >= minNodeGap) continue;
+
+              const overlap = (minNodeGap - dist) / 2;
+              const ux = dx / dist;
+              const uy = dy / dist;
+              const aFixed = Number.isFinite(a.fx) && Number.isFinite(a.fy);
+              const bFixed = Number.isFinite(b.fx) && Number.isFinite(b.fy);
+
+              if (aFixed && bFixed) continue;
+
+              if (aFixed) {
+                b.x = clampX((b.x ?? width / 2) + ux * overlap * 2);
+                b.y = clampY((b.y ?? height / 2) + uy * overlap * 2);
+              } else if (bFixed) {
+                a.x = clampX((a.x ?? width / 2) - ux * overlap * 2);
+                a.y = clampY((a.y ?? height / 2) - uy * overlap * 2);
+              } else {
+                a.x = clampX((a.x ?? width / 2) - ux * overlap);
+                a.y = clampY((a.y ?? height / 2) - uy * overlap);
+                b.x = clampX((b.x ?? width / 2) + ux * overlap);
+                b.y = clampY((b.y ?? height / 2) + uy * overlap);
+              }
+            }
+          }
+        }
+      };
+
+      const enforceNodesInBox = () => {
+        for (const n of nodes) {
+          const clampedX = clampX(n.x);
+          const clampedY = clampY(n.y);
+
+          if (clampedX !== n.x && Number.isFinite(n.vx)) {
+            n.vx *= 0.25;
+          }
+          if (clampedY !== n.y && Number.isFinite(n.vy)) {
+            n.vy *= 0.25;
+          }
+
+          n.x = clampedX;
+          n.y = clampedY;
+          if (Number.isFinite(n.fx)) n.fx = clampX(n.fx);
+          if (Number.isFinite(n.fy)) n.fy = clampY(n.fy);
+        }
+      };
+
       const priorPositions = prevState?.positions || {};
+      const previousIds = nodes.map((n) => n.id);
+      const priorPoints = previousIds
+        .map((id) => priorPositions[id])
+        .filter((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y));
+      const cornerCrowd = priorPoints.filter((point) => point.x < width * 0.3 && point.y < height * 0.3).length;
+      const collapsedPriorLayout = priorPoints.length >= 3 && cornerCrowd / priorPoints.length >= 0.68;
+      const ignorePriorPositions = versionMismatch || collapsedPriorLayout;
+      const missingPriorNodes = [];
+
       for (const node of nodes) {
+        if (ignorePriorPositions) break;
         const prior = priorPositions[node.id];
-        if (!prior) continue;
-        node.x = prior.x;
-        node.y = prior.y;
+        if (!prior) {
+          missingPriorNodes.push(node);
+          continue;
+        }
+
+        node.x = clampX(prior.x);
+        node.y = clampY(prior.y);
         node.vx = 0;
         node.vy = 0;
       }
 
+      if (ignorePriorPositions) {
+        const cx = width / 2;
+        const cy = height / 2;
+        const spreadX = Math.max(40, width * 0.22);
+        const spreadY = Math.max(36, height * 0.2);
+
+        nodes.forEach((node) => {
+          const jitterX = (Math.random() - 0.5) * spreadX;
+          const jitterY = (Math.random() - 0.5) * spreadY;
+          node.x = clampX(cx + jitterX);
+          node.y = clampY(cy + jitterY);
+          node.vx = 0;
+          node.vy = 0;
+        });
+      }
+
+      // New nodes with no saved coordinates should spawn near neighbors or center, not (0,0).
+      if (!ignorePriorPositions && missingPriorNodes.length) {
+        const cx = width / 2;
+        const cy = height / 2;
+        const idToNode = new Map(nodes.map((node) => [node.id, node]));
+        const neighborsById = new Map(nodes.map((node) => [node.id, []]));
+
+        for (const link of links) {
+          const sourceId = String(typeof link.source === 'object' ? link.source?.id : link.source || '').trim();
+          const targetId = String(typeof link.target === 'object' ? link.target?.id : link.target || '').trim();
+          if (!sourceId || !targetId || sourceId === targetId) continue;
+          if (neighborsById.has(sourceId)) neighborsById.get(sourceId).push(targetId);
+          if (neighborsById.has(targetId)) neighborsById.get(targetId).push(sourceId);
+        }
+
+        for (const node of missingPriorNodes) {
+          const neighbors = neighborsById.get(node.id) || [];
+          const anchored = neighbors
+            .map((peerId) => idToNode.get(peerId))
+            .filter((peer) => peer && Number.isFinite(peer.x) && Number.isFinite(peer.y));
+
+          const tryPlace = (baseX, baseY, spreadX, spreadY) => {
+            let candidateX = baseX;
+            let candidateY = baseY;
+            for (let attempt = 0; attempt < 14; attempt += 1) {
+              const jitterX = (Math.random() - 0.5) * spreadX;
+              const jitterY = (Math.random() - 0.5) * spreadY;
+              candidateX = clampX(baseX + jitterX);
+              candidateY = clampY(baseY + jitterY);
+
+              const overlapsExisting = nodes.some((peer) => {
+                if (peer === node) return false;
+                if (!Number.isFinite(peer.x) || !Number.isFinite(peer.y)) return false;
+                return Math.hypot(peer.x - candidateX, peer.y - candidateY) < minNodeGap;
+              });
+
+              if (!overlapsExisting) break;
+            }
+
+            return { x: candidateX, y: candidateY };
+          };
+
+          if (anchored.length > 0) {
+            const avgX = anchored.reduce((sum, peer) => sum + peer.x, 0) / anchored.length;
+            const avgY = anchored.reduce((sum, peer) => sum + peer.y, 0) / anchored.length;
+            const placed = tryPlace(avgX, avgY, 44, 40);
+            node.x = placed.x;
+            node.y = placed.y;
+          } else {
+            const placed = tryPlace(cx, cy, Math.max(76, width * 0.28), Math.max(70, height * 0.24));
+            node.x = placed.x;
+            node.y = placed.y;
+          }
+
+          node.vx = 0;
+          node.vy = 0;
+        }
+      }
+
+      const prevNodeIds = new Set(prevState?.nodeIds || []);
+      const prevEdgeIds = new Set(prevState?.edgeIds || []);
+      const currentNodeIds = nodes.map((node) => node.id);
+      const currentEdgeIds = links
+        .map((link) => [String(link.source || ''), String(link.target || '')].sort().join('|'))
+        .sort();
+
+      const addedNodes = currentNodeIds.filter((id) => !prevNodeIds.has(id)).length;
+      const removedNodes = [...prevNodeIds].filter((id) => !currentNodeIds.includes(id)).length;
+      const addedEdges = currentEdgeIds.filter((id) => !prevEdgeIds.has(id)).length;
+      const removedEdges = [...prevEdgeIds].filter((id) => !currentEdgeIds.includes(id)).length;
+      const topologyDelta = addedNodes + removedNodes + addedEdges + removedEdges;
+      const lockExistingNodes = Boolean(prevState) && reason !== 'resize' && topologyDelta > 0 && topologyDelta <= 4;
+
+      if (lockExistingNodes) {
+        for (const node of nodes) {
+          const prior = priorPositions[node.id];
+          if (!prior) continue;
+          node.fx = clampX(prior.x);
+          node.fy = clampY(prior.y);
+        }
+      }
+
+      enforceNodeSpacing(2);
+      enforceNodesInBox();
+
       const defs = svg.append('defs');
+
+      const linkGradient = defs.append('linearGradient')
+        .attr('id', 'network-link-gradient')
+        .attr('x1', '0%')
+        .attr('y1', '0%')
+        .attr('x2', '100%')
+        .attr('y2', '100%');
+      linkGradient.append('stop').attr('offset', '0%').attr('stop-color', '#22d3ee').attr('stop-opacity', 0.42);
+      linkGradient.append('stop').attr('offset', '50%').attr('stop-color', '#60a5fa').attr('stop-opacity', 0.88);
+      linkGradient.append('stop').attr('offset', '100%').attr('stop-color', '#22d3ee').attr('stop-opacity', 0.42);
+
+      const linkGlow = defs.append('filter')
+        .attr('id', 'network-link-glow')
+        .attr('x', '-40%')
+        .attr('y', '-40%')
+        .attr('width', '180%')
+        .attr('height', '180%');
+      linkGlow.append('feGaussianBlur').attr('stdDeviation', 1.7).attr('result', 'blur');
+      linkGlow.append('feMerge')
+        .selectAll('feMergeNode')
+        .data(['blur', 'SourceGraphic'])
+        .enter()
+        .append('feMergeNode')
+        .attr('in', (d) => d);
+
+      const nodeGlow = defs.append('filter')
+        .attr('id', 'network-node-glow')
+        .attr('x', '-60%')
+        .attr('y', '-60%')
+        .attr('width', '220%')
+        .attr('height', '220%');
+      nodeGlow.append('feGaussianBlur').attr('stdDeviation', 2.1).attr('result', 'glow');
+      nodeGlow.append('feMerge')
+        .selectAll('feMergeNode')
+        .data(['glow', 'SourceGraphic'])
+        .enter()
+        .append('feMergeNode')
+        .attr('in', (d) => d);
+
       const selfFill = defs.append('radialGradient').attr('id', 'network-self-fill');
-      selfFill.append('stop').attr('offset', '0%').attr('stop-color', '#eef2ff');
-      selfFill.append('stop').attr('offset', '100%').attr('stop-color', '#c7d2fe');
+      selfFill.append('stop').attr('offset', '0%').attr('stop-color', '#f0f9ff');
+      selfFill.append('stop').attr('offset', '100%').attr('stop-color', '#38bdf8');
 
       const root = svg.append('g').attr('class', 'network-root');
 
@@ -2196,8 +2424,10 @@ export default {
         .enter()
         .append('line')
         .attr('class', 'network-link')
-        .attr('stroke', '#94a3b8')
-        .attr('stroke-width', 2);
+        .attr('stroke', 'url(#network-link-gradient)')
+        .attr('stroke-width', 2.2)
+        .attr('stroke-opacity', 0.95)
+        .attr('filter', 'url(#network-link-glow)');
 
       const node = root
         .append('g')
@@ -2209,23 +2439,30 @@ export default {
         .attr('class', (d) => `network-node${d.isSelf ? ' self' : ''}`);
 
       node.append('circle')
+        .attr('class', 'network-node-core')
         .attr('r', 16)
-        .attr('stroke', (d) => `hsl(${d.hue}, 100%, 46%)`)
-        .attr('fill', (d) => (d.isSelf ? 'url(#network-self-fill)' : '#ffffff'))
-        .attr('stroke-width', (d) => (d.isSelf ? 4 : 3));
+        .attr('stroke', (d) => `hsl(${d.hue}, 96%, 62%)`)
+        .attr('fill', (d) => (d.isSelf ? 'url(#network-self-fill)' : '#0f172a'))
+        .attr('stroke-width', (d) => (d.isSelf ? 3.8 : 2.7))
+        .attr('filter', 'url(#network-node-glow)');
 
       node.append('text')
         .attr('class', 'network-node-label')
         .attr('text-anchor', 'middle')
         .attr('dy', '0.35em')
+        .attr('fill', (d) => (d.isSelf ? '#0b1222' : '#f8fafc'))
+        .attr('stroke', (d) => (d.isSelf ? 'rgba(248,250,252,0.66)' : 'rgba(11,18,34,0.72)'))
+        .attr('stroke-width', 1.2)
+        .attr('paint-order', 'stroke')
         .text((d) => d.short);
 
       const simulation = d3.forceSimulation(nodes)
-        .force('link', d3.forceLink(links).id((d) => d.id).distance(95).strength(0.42))
-        .force('charge', d3.forceManyBody().strength(-340))
+        .force('link', d3.forceLink(links).id((d) => d.id).distance(lockExistingNodes ? 100 : 118).strength(lockExistingNodes ? 0.26 : 0.38))
+        .force('charge', d3.forceManyBody().strength(lockExistingNodes ? -300 : -470))
         .force('center', d3.forceCenter(width / 2, height / 2))
-        .force('collision', d3.forceCollide().radius(34))
-        .alphaDecay(0.08);
+        .force('collision', d3.forceCollide().radius(minNodeGap / 2 + 4).iterations(4))
+        .alphaDecay(lockExistingNodes ? 0.16 : 0.08)
+        .alpha(lockExistingNodes ? 0.22 : 0.85);
 
       const drag = d3.drag()
         .on('start', (event, d) => {
@@ -2234,8 +2471,8 @@ export default {
           d.fy = d.y;
         })
         .on('drag', (event, d) => {
-          d.fx = event.x;
-          d.fy = event.y;
+          d.fx = clampX(event.x);
+          d.fy = clampY(event.y);
         })
         .on('end', (event, d) => {
           if (!event.active) simulation.alphaTarget(0);
@@ -2246,15 +2483,20 @@ export default {
       node.call(drag);
 
       simulation.on('tick', () => {
+        enforceNodeSpacing(2);
+        enforceNodesInBox();
+
         link
-          .attr('x1', (d) => d.source.x)
-          .attr('y1', (d) => d.source.y)
-          .attr('x2', (d) => d.target.x)
-          .attr('y2', (d) => d.target.y);
+          .attr('x1', (d) => clampX(d.source.x))
+          .attr('y1', (d) => clampY(d.source.y))
+          .attr('x2', (d) => clampX(d.target.x))
+          .attr('y2', (d) => clampY(d.target.y));
 
         node.attr('transform', (d) => {
-          const x = Math.max(20, Math.min(width - 20, d.x));
-          const y = Math.max(20, Math.min(height - 20, d.y));
+          const x = clampX(d.x);
+          const y = clampY(d.y);
+          d.x = x;
+          d.y = y;
           return `translate(${x},${y})`;
         });
 
@@ -2263,8 +2505,8 @@ export default {
             nodes.map((n) => [
               n.id,
               {
-                x: Number.isFinite(n.x) ? n.x : width / 2,
-                y: Number.isFinite(n.y) ? n.y : height / 2,
+                x: clampX(n.x),
+                y: clampY(n.y),
               },
             ])
           );
@@ -2273,22 +2515,29 @@ export default {
 
       clearTimeout(this.graphStabilizeTimer);
       this.graphStabilizeTimer = setTimeout(() => {
+        for (const n of nodes) {
+          n.fx = null;
+          n.fy = null;
+        }
         simulation.stop();
-      }, 1300);
+      }, lockExistingNodes ? 550 : 1300);
 
       if (prevState?.simulation) {
         prevState.simulation.stop();
       }
       this.networkGraphState = {
         simulation,
+        layoutVersion,
         width,
         height,
+        nodeIds: currentNodeIds,
+        edgeIds: currentEdgeIds,
         positions: Object.fromEntries(
           nodes.map((n) => [
             n.id,
             {
-              x: Number.isFinite(n.x) ? n.x : width / 2,
-              y: Number.isFinite(n.y) ? n.y : height / 2,
+              x: clampX(n.x),
+              y: clampY(n.y),
             },
           ])
         ),
@@ -2300,8 +2549,8 @@ export default {
           nodes.map((n) => [
             n.id,
             {
-              x: Number.isFinite(n.x) ? n.x : width / 2,
-              y: Number.isFinite(n.y) ? n.y : height / 2,
+              x: clampX(n.x),
+              y: clampY(n.y),
             },
           ])
         );
@@ -3365,20 +3614,35 @@ section {
 
 .network-viz h3 {
   margin-bottom: 0.6rem;
+  color: #dbeafe;
+  letter-spacing: 0.02em;
 }
 
 .network-graph-container {
   position: relative;
   margin: 0.9rem auto 0;
-  max-width: 860px;
+  max-width: 920px;
   min-height: 340px;
-  border: 1px solid #d8def5;
-  border-radius: 12px;
+  border: 1px solid rgba(96, 165, 250, 0.32);
+  border-radius: 14px;
+  box-shadow: 0 20px 40px rgba(2, 6, 23, 0.35), inset 0 1px 0 rgba(186, 230, 253, 0.08);
   background:
-    radial-gradient(circle at 14% 16%, rgba(46, 144, 250, 0.12), rgba(46, 144, 250, 0) 28%),
-    radial-gradient(circle at 88% 84%, rgba(16, 185, 129, 0.11), rgba(16, 185, 129, 0) 32%),
-    linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%);
+    radial-gradient(circle at 14% 16%, rgba(56, 189, 248, 0.22), rgba(56, 189, 248, 0) 30%),
+    radial-gradient(circle at 88% 84%, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0) 34%),
+    linear-gradient(180deg, #0b1222 0%, #0a1328 100%);
   overflow: hidden;
+}
+
+.network-graph-container::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(96, 165, 250, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(96, 165, 250, 0.06) 1px, transparent 1px);
+  background-size: 22px 22px;
+  mask-image: radial-gradient(circle at 50% 52%, rgba(0, 0, 0, 0.92) 0%, rgba(0, 0, 0, 0.28) 100%);
 }
 
 .network-graph-svg {
@@ -3388,9 +3652,8 @@ section {
 }
 
 .network-link {
-  stroke: #94a3b8;
   stroke-width: 2px;
-  opacity: 1;
+  opacity: 0.95;
 }
 
 .network-node {
@@ -3403,15 +3666,18 @@ section {
 
 .network-node-label {
   font-family: 'Monaco', 'Courier New', monospace;
-  font-size: 10px;
-  font-weight: 700;
-  fill: #0f172a;
+  font-size: 11.5px;
+  font-weight: 800;
   pointer-events: none;
   user-select: none;
 }
 
+.network-node.self .network-node-core {
+  animation: self-node-pulse 1.8s ease-in-out infinite;
+}
+
 .network-empty {
-  fill: #475569;
+  fill: #93c5fd;
   font-size: 14px;
   font-family: 'Monaco', 'Courier New', monospace;
 }
@@ -3419,13 +3685,23 @@ section {
 .mesh-visualizer-caption {
   margin-top: 0.35rem;
   font-size: 0.8rem;
-  color: #475569;
+  color: #93c5fd;
 }
 
 .mesh-visualizer-caption code {
   font-family: 'Monaco', 'Courier New', monospace;
   font-weight: 700;
-  color: #334155;
+  color: #bfdbfe;
+}
+
+@keyframes self-node-pulse {
+  0%,
+  100% {
+    filter: url(#network-node-glow);
+  }
+  50% {
+    filter: url(#network-node-glow) brightness(1.14);
+  }
 }
 
 /* Chat */
