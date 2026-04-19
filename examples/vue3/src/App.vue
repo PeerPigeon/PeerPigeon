@@ -509,6 +509,7 @@ export default {
       storageRefreshQueued: false,
       storageNetworkReconcileTimer: null,
       meshDemographicsTimer: null,
+      meshDemographicsAuditTimer: null,
       uiStateKey: 'peerpigeon:ui-state',
       uiTabs: [
         { id: 'message', label: 'Message' },
@@ -906,13 +907,31 @@ export default {
       }, 400);
     },
 
+    startMeshDemographicsAuditLoop() {
+      this.stopMeshDemographicsAuditLoop();
+      this.meshDemographicsAuditTimer = setInterval(() => {
+        if (!this.isRunning) return;
+        this.publishMeshDemographics().catch(() => {});
+      }, 2500);
+    },
+
+    stopMeshDemographicsAuditLoop() {
+      if (this.meshDemographicsAuditTimer) {
+        clearInterval(this.meshDemographicsAuditTimer);
+        this.meshDemographicsAuditTimer = null;
+      }
+    },
+
     async publishMeshDemographics() {
       if (!this.storage || !this.storageReady) return;
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
       if (!self) return;
 
       const epub = String(this.cryptoKeys?.epub || '').trim();
-      const connected = (this.mesh?.getConnectedPeers?.() || []).slice();
+      const connected = [...new Set((this.mesh?.getConnectedPeers?.() || [])
+        .map((peerId) => String(peerId || '').trim())
+        .filter((peerId) => peerId && peerId !== self))]
+        .sort((a, b) => a.localeCompare(b));
       const network = String(this.effectiveSessionId || '').trim();
       const now = Date.now();
 
@@ -935,6 +954,7 @@ export default {
         seenAt: now,
       };
 
+      // Each peer audits/corrects only its own mesh:peers entry.
       await this.storage.put('public', 'mesh:peers', current).catch(() => {});
     },
 
@@ -1269,6 +1289,7 @@ export default {
           this.ensureStorageReady().catch((error) => {
             this.storageError = String(error?.message || error || 'Failed to initialize storage');
           });
+          this.scheduleMeshDemographicsUpdate();
           this.updateStats();
         });
 
@@ -1362,6 +1383,8 @@ export default {
         this.isConnecting = false;
         this.updateStats();
         this.startCryptoAnnounceLoop();
+        this.startMeshDemographicsAuditLoop();
+        this.scheduleMeshDemographicsUpdate();
         this.announceCryptoPublicInfo();
         this.startDebugMonitor();
 
@@ -1381,6 +1404,7 @@ export default {
 
     stopMesh() {
       this.stopCryptoAnnounceLoop();
+      this.stopMeshDemographicsAuditLoop();
       this.stopDebugMonitor();
       this.resetGraphStabilization();
       this.teardownStorage();
@@ -1976,35 +2000,26 @@ export default {
     networkGraphData() {
       const now = Date.now();
       const activeNetwork = String(this.effectiveSessionId || '').trim();
-      const staleMs = 75_000;
+      const staleMs = 12_000;
 
-      // Primary local source: live mesh state (what drives the "Connected X/Y" counter).
+      // Local live truth for immediate correctness.
       const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
       const localConnected = (this.mesh?.getConnectedPeers?.() || this.connectedPeersList || [])
         .map((p) => String(p || '').trim())
         .filter(Boolean);
+      const uniqueLocalConnected = [...new Set(localConnected)];
 
       const peers = {};
 
       if (localSelf) {
         peers[localSelf] = {
           id: localSelf,
+          connectedTo: uniqueLocalConnected,
           seenAt: now,
-          connectedTo: localConnected,
         };
       }
 
-      for (const peerId of localConnected) {
-        if (!peers[peerId]) {
-          peers[peerId] = {
-            id: peerId,
-            seenAt: now,
-            connectedTo: [],
-          };
-        }
-      }
-
-      // Supplement with full room topology from storage, but only real connections (`connectedTo`).
+      // Storage-backed room topology: connectedTo only (never discovered list).
       for (const [peerId, rawInfo] of Object.entries(this.meshPeersMap || {})) {
         const id = String(peerId || '').trim();
         if (!id || id === localSelf) continue;
@@ -2016,32 +2031,65 @@ export default {
         const seenAt = Number(info.seenAt || 0);
         if (Number.isFinite(seenAt) && seenAt > 0 && now - seenAt > staleMs) continue;
 
+        const connectedTo = Array.isArray(info.connectedTo)
+          ? [...new Set(info.connectedTo
+            .map((p) => String(p || '').trim())
+            .filter((p) => p && p !== id))]
+          : [];
+
+        if (connectedTo.length === 0) continue;
+
         peers[id] = {
           id,
+          connectedTo,
           seenAt: Number.isFinite(seenAt) ? seenAt : 0,
-          connectedTo: Array.isArray(info.connectedTo)
-            ? info.connectedTo
-              .map((p) => String(p || '').trim())
-              .filter(Boolean)
-            : [],
         };
       }
 
-      // Include connected targets as nodes even if their own entry has not arrived yet.
-      for (const info of Object.values(peers)) {
-        if (!info || !Array.isArray(info.connectedTo)) continue;
-        for (const target of info.connectedTo) {
-          const targetId = String(target || '').trim();
-          if (!targetId || peers[targetId]) continue;
-          peers[targetId] = {
-            id: targetId,
-            seenAt: 0,
-            connectedTo: [],
-          };
+      const links = [];
+      const edgeSeen = new Set();
+      const participants = new Set();
+
+      // Always show local live edges from the connected-status source.
+      if (localSelf) {
+        for (const target of uniqueLocalConnected) {
+          const edgeId = [localSelf, target].sort().join('|');
+          if (edgeSeen.has(edgeId)) continue;
+          edgeSeen.add(edgeId);
+          participants.add(localSelf);
+          participants.add(target);
+          links.push({ source: localSelf, target });
         }
       }
 
-      const nodes = Object.keys(peers)
+      // For remote edges, require reciprocal connectedTo confirmation.
+      for (const [peerId, info] of Object.entries(peers)) {
+        if (!Array.isArray(info?.connectedTo)) continue;
+        for (const target of info.connectedTo) {
+          const targetId = String(target || '').trim();
+          if (!targetId || targetId === peerId) continue;
+          if (peerId === localSelf || targetId === localSelf) continue;
+
+          const targetInfo = peers[targetId];
+          const reciprocal = Array.isArray(targetInfo?.connectedTo)
+            && targetInfo.connectedTo.includes(peerId);
+          if (!reciprocal) continue;
+
+          const edgeId = [peerId, targetId].sort().join('|');
+          if (edgeSeen.has(edgeId)) continue;
+          edgeSeen.add(edgeId);
+          participants.add(peerId);
+          participants.add(targetId);
+          links.push({ source: peerId, target: targetId });
+        }
+      }
+
+      const nodeIds = [...participants];
+      if (localSelf && !nodeIds.includes(localSelf)) {
+        nodeIds.push(localSelf);
+      }
+
+      const nodes = nodeIds
         .sort((a, b) => a.localeCompare(b))
         .map((peerId) => ({
           id: peerId,
@@ -2049,33 +2097,6 @@ export default {
           isSelf: peerId === this.clientId,
           hue: this.networkNodeHue(peerId),
         }));
-
-      const known = new Set(nodes.map((node) => node.id));
-      const edgeSeen = new Set();
-      const links = [];
-
-      for (const node of nodes) {
-        const info = peers[node.id];
-        if (!info) continue;
-        for (const target of info.connectedTo) {
-          const normalizedTarget = String(target || '').trim();
-          if (!normalizedTarget || normalizedTarget === node.id) continue;
-          if (!known.has(normalizedTarget)) {
-            known.add(normalizedTarget);
-            nodes.push({
-              id: normalizedTarget,
-              short: normalizedTarget.slice(0, 4).toUpperCase(),
-              isSelf: normalizedTarget === this.clientId,
-              hue: this.networkNodeHue(normalizedTarget),
-            });
-          }
-
-          const edgeId = [node.id, normalizedTarget].sort().join('|');
-          if (edgeSeen.has(edgeId)) continue;
-          edgeSeen.add(edgeId);
-          links.push({ source: node.id, target: normalizedTarget });
-        }
-      }
 
       return { nodes, links };
     },
@@ -2309,7 +2330,9 @@ export default {
     },
 
     requiredConnectedPeersForGossip() {
-      return this.maxPeers <= 1 ? 1 : 2;
+      const min = Number.isFinite(this.minPeers) ? this.minPeers : 1;
+      const tolerant = Number.isFinite(this.tolerantPeers) ? this.tolerantPeers : 0;
+      return Math.max(1, min - tolerant);
     },
 
     syncGossipStatus() {
@@ -2321,10 +2344,17 @@ export default {
       }
 
       const connected = this.connectedPeersList.length;
+      const minPeers = Number.isFinite(this.minPeers) ? this.minPeers : 1;
       const required = this.requiredConnectedPeersForGossip();
 
-      if (connected >= required) {
-        this.showStatus('Ready', `Gossip OK (${connected}/${required} connected)`, 'success');
+      if (connected >= minPeers) {
+        this.showStatus('Ready', `Gossip OK (${connected}/${minPeers} connected)`, 'success');
+      } else if (connected >= required) {
+        this.showStatus(
+          'Ready (Degraded)',
+          `Gossip active but under-connected (${connected}/${minPeers} connected, tolerant ${this.tolerantPeers})`,
+          'success'
+        );
       } else {
         this.showStatus('Connecting', `Waiting for peers (${connected}/${required} connected)`, 'connecting');
       }
@@ -2377,6 +2407,14 @@ export default {
     },
 
     showStatus(title, message, type = 'info') {
+      if (
+        this.status.title === title &&
+        this.status.message === message &&
+        this.status.type === type
+      ) {
+        return;
+      }
+
       this.status = { title, message, type };
     },
 
