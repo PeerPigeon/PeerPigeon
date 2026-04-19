@@ -2046,23 +2046,20 @@ export default {
         };
       }
 
-      const links = [];
-      const edgeSeen = new Set();
+      const edgeMap = new Map();
       const participants = new Set();
 
       // Always show local live edges from the connected-status source.
       if (localSelf) {
         for (const target of uniqueLocalConnected) {
           const edgeId = [localSelf, target].sort().join('|');
-          if (edgeSeen.has(edgeId)) continue;
-          edgeSeen.add(edgeId);
+          edgeMap.set(edgeId, { source: localSelf, target, halfDuplex: false });
           participants.add(localSelf);
           participants.add(target);
-          links.push({ source: localSelf, target });
         }
       }
 
-      // For remote edges, require reciprocal connectedTo confirmation.
+      // For remote edges, render one-way links too; reciprocal links are marked full.
       for (const [peerId, info] of Object.entries(peers)) {
         if (!Array.isArray(info?.connectedTo)) continue;
         for (const target of info.connectedTo) {
@@ -2073,16 +2070,23 @@ export default {
           const targetInfo = peers[targetId];
           const reciprocal = Array.isArray(targetInfo?.connectedTo)
             && targetInfo.connectedTo.includes(peerId);
-          if (!reciprocal) continue;
 
           const edgeId = [peerId, targetId].sort().join('|');
-          if (edgeSeen.has(edgeId)) continue;
-          edgeSeen.add(edgeId);
+          const existing = edgeMap.get(edgeId);
+          if (existing) {
+            if (reciprocal && existing.halfDuplex) {
+              existing.halfDuplex = false;
+            }
+          } else {
+            edgeMap.set(edgeId, { source: peerId, target: targetId, halfDuplex: !reciprocal });
+          }
+
           participants.add(peerId);
           participants.add(targetId);
-          links.push({ source: peerId, target: targetId });
         }
       }
+
+      const links = Array.from(edgeMap.values());
 
       const nodeIds = [...participants];
       if (localSelf && !nodeIds.includes(localSelf)) {
@@ -2108,7 +2112,8 @@ export default {
           const source = String(typeof link.source === 'object' ? link.source?.id : link.source || '').trim();
           const target = String(typeof link.target === 'object' ? link.target?.id : link.target || '').trim();
           if (!source || !target) return '';
-          return [source, target].sort().join('|');
+          const mode = link.halfDuplex ? 'half' : 'full';
+          return `${[source, target].sort().join('|')}:${mode}`;
         })
         .filter(Boolean)
         .sort();
@@ -2426,7 +2431,8 @@ export default {
         .attr('class', 'network-link')
         .attr('stroke', 'url(#network-link-gradient)')
         .attr('stroke-width', 2.2)
-        .attr('stroke-opacity', 0.95)
+        .attr('stroke-opacity', (d) => (d.halfDuplex ? 0.5 : 0.95))
+        .attr('stroke-dasharray', (d) => (d.halfDuplex ? '6 4' : null))
         .attr('filter', 'url(#network-link-glow)');
 
       const node = root
@@ -3614,7 +3620,7 @@ section {
 
 .network-viz h3 {
   margin-bottom: 0.6rem;
-  color: #dbeafe;
+  color: #000000;
   letter-spacing: 0.02em;
 }
 
