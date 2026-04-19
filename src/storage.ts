@@ -595,22 +595,13 @@ export class PeerPigeonStorage {
       const existingVersion = Number(existing.version ?? 0);
       const incomingVersion = Number(mutation.record.version ?? 0);
       const existingUpdatedAt = Number(existing.updatedAt ?? 0);
-      const incomingUpdatedAt = Number(mutation.timestamp ?? 0);
-      const existingAgeMs = Math.max(0, Date.now() - existingUpdatedAt);
+      const incomingUpdatedAt = Number(mutation.timestamp ?? mutation.record.updatedAt ?? 0);
 
-      // Prefer higher logical version over wall-clock time in normal operation,
-      // but allow clearly newer remote writes to replace stale local records
-      // (e.g. very old IndexedDB values with inflated version counters).
-      if (incomingVersion < existingVersion) {
-        if (mutation.space === 'public' && existingAgeMs > PeerPigeonStorage.STALE_LOCAL_MAX_AGE_MS) {
-          // Treat very old local state as stale for public space so gossip can
-          // re-converge peers after long offline periods or old persisted data.
-        } else
-        if (incomingUpdatedAt <= (existingUpdatedAt + PeerPigeonStorage.STALE_VERSION_OVERRIDE_MS)) {
-          return;
-        }
-      }
+      // Convergence order is version-first so higher logical versions always
+      // override lower versions, even when peer clocks are skewed.
+      if (incomingVersion < existingVersion) return;
 
+      // Same-version conflicts fall back to wall-clock recency.
       if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return;
     }
 
@@ -732,12 +723,6 @@ export class PeerPigeonStorage {
   }
 
   private emitChange(event: Parameters<StorageEvents['change']>[0]): void {
-    // Subscription gating: keep remote transport/apply unconditional,
-    // but only notify listeners for keys this instance is interested in.
-    if (event.origin === 'remote' && !this.shouldSyncKey(event.space, event.key)) {
-      return;
-    }
-
     for (const listener of this.listeners) {
       try {
         listener(event);

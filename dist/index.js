@@ -1231,7 +1231,7 @@ var IndexedDbStorageDriver = class _IndexedDbStorageDriver {
     });
   }
 };
-var _PeerPigeonStorage = class _PeerPigeonStorage {
+var PeerPigeonStorage = class {
   constructor(options) {
     this.storeName = "records";
     this.driver = null;
@@ -1513,14 +1513,8 @@ var _PeerPigeonStorage = class _PeerPigeonStorage {
       const existingVersion = Number(existing.version ?? 0);
       const incomingVersion = Number(mutation.record.version ?? 0);
       const existingUpdatedAt = Number(existing.updatedAt ?? 0);
-      const incomingUpdatedAt = Number(mutation.timestamp ?? 0);
-      const existingAgeMs = Math.max(0, Date.now() - existingUpdatedAt);
-      if (incomingVersion < existingVersion) {
-        if (mutation.space === "public" && existingAgeMs > _PeerPigeonStorage.STALE_LOCAL_MAX_AGE_MS) {
-        } else if (incomingUpdatedAt <= existingUpdatedAt + _PeerPigeonStorage.STALE_VERSION_OVERRIDE_MS) {
-          return;
-        }
-      }
+      const incomingUpdatedAt = Number(mutation.timestamp ?? mutation.record.updatedAt ?? 0);
+      if (incomingVersion < existingVersion) return;
       if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return;
     }
     if (!this.canWrite(mutation.space, existing, mutation.actorId)) return;
@@ -1621,9 +1615,6 @@ var _PeerPigeonStorage = class _PeerPigeonStorage {
     }
   }
   emitChange(event) {
-    if (event.origin === "remote" && !this.shouldSyncKey(event.space, event.key)) {
-      return;
-    }
     for (const listener of this.listeners) {
       try {
         listener(event);
@@ -1835,9 +1826,8 @@ var _PeerPigeonStorage = class _PeerPigeonStorage {
     return out;
   }
 };
-_PeerPigeonStorage.STALE_VERSION_OVERRIDE_MS = 3e4;
-_PeerPigeonStorage.STALE_LOCAL_MAX_AGE_MS = 5 * 6e4;
-var PeerPigeonStorage = _PeerPigeonStorage;
+PeerPigeonStorage.STALE_VERSION_OVERRIDE_MS = 3e4;
+PeerPigeonStorage.STALE_LOCAL_MAX_AGE_MS = 5 * 6e4;
 
 // src/index.ts
 var PartialMesh = class {
