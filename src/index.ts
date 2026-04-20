@@ -1346,6 +1346,7 @@ export type {
   StorageRetrieveOptions,
   StorageOptions,
   StorageSyncOptions,
+  StorageSyncFilterContext,
   StorageChangeOrigin,
   StorageUnsubscribe,
   StorageEvents,

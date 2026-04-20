@@ -175,14 +175,13 @@ interface StorageSyncOptions {
      * Optional secret mixed into key derivation for stronger room privacy.
      */
     syncSecret?: string;
-    /**
-     * Optional per-key interest filter for gossip sync.
-     * Return true to allow this key to sync over gossip.
-     */
-    syncFilter?: (space: StorageSpace, key: string) => boolean;
 }
 interface StorageRetrieveOptions {
     timeoutMs?: number;
+}
+interface StorageSyncFilterContext {
+    kind: 'mutation' | 'retrieve-request' | 'retrieve-response';
+    actorId: string;
 }
 interface StorageOptions extends StorageSyncOptions {
     /**
@@ -197,6 +196,11 @@ interface StorageOptions extends StorageSyncOptions {
      * Optional IndexedDB name (default: peerpigeon-storage-v1).
      */
     dbName?: string;
+    /**
+     * Optional local gate for remote sync payloads.
+     * Returning false drops remote storage updates for the given key.
+     */
+    syncFilter?: (space: StorageSpace, key: string, context: StorageSyncFilterContext) => boolean;
 }
 type StorageEvents = {
     change: (event: {
@@ -234,17 +238,14 @@ interface GossipLike {
  * - Enforces four built-in ACL spaces: public, user, frozen, private
  */
 declare class PeerPigeonStorage {
-    private static readonly STALE_VERSION_OVERRIDE_MS;
-    private static readonly STALE_LOCAL_MAX_AGE_MS;
     private readonly userId;
     private readonly gossip;
     private readonly sessionId;
     private readonly syncSecret;
-    private readonly syncFilter;
     private readonly dbName;
+    private readonly syncFilter;
     private readonly storeName;
     private driver;
-    private readonly seenMutationIds;
     private readonly listeners;
     private readonly pendingRetrieveRequests;
     private closed;
@@ -268,13 +269,13 @@ declare class PeerPigeonStorage {
     private broadcastSyncPayload;
     private handleRetrieveRequest;
     private handleRetrieveResponse;
+    private shouldAcceptRemoteSync;
     private createDriver;
     private emitChange;
     private requireDriver;
     private normalizeKey;
     private makePk;
     private makeMutationId;
-    private shouldSyncKey;
     private resolveOwnerId;
     private assertCanWrite;
     private canWrite;
@@ -526,4 +527,4 @@ declare class PartialMesh {
     destroy(): void;
 }
 
-export { type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PeerConnection, PeerPigeonStorage, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };
+export { type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PeerConnection, PeerPigeonStorage, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };

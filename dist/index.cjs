@@ -1264,7 +1264,6 @@ var PeerPigeonStorage = class {
   constructor(options) {
     this.storeName = "records";
     this.driver = null;
-    this.seenMutationIds = /* @__PURE__ */ new Set();
     this.listeners = /* @__PURE__ */ new Set();
     this.pendingRetrieveRequests = /* @__PURE__ */ new Map();
     this.closed = false;
@@ -1276,8 +1275,8 @@ var PeerPigeonStorage = class {
     this.gossip = options.gossip ?? null;
     this.sessionId = String(options.sessionId ?? "default-session").trim() || "default-session";
     this.syncSecret = String(options.syncSecret ?? "").trim();
-    this.syncFilter = typeof options.syncFilter === "function" ? options.syncFilter : null;
     this.dbName = String(options.dbName ?? "peerpigeon-storage-v1").trim() || "peerpigeon-storage-v1";
+    this.syncFilter = typeof options.syncFilter === "function" ? options.syncFilter : null;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
       });
@@ -1406,7 +1405,6 @@ var PeerPigeonStorage = class {
     this.driver?.close();
     this.driver = null;
     this.listeners.clear();
-    this.seenMutationIds.clear();
     for (const pending of this.pendingRetrieveRequests.values()) {
       clearTimeout(pending.timeout);
       pending.resolve(null);
@@ -1447,7 +1445,6 @@ var PeerPigeonStorage = class {
       timestamp: now,
       record: persisted
     };
-    this.seenMutationIds.add(opId);
     this.emitChange({
       origin: "local",
       op: "upsert",
@@ -1486,7 +1483,6 @@ var PeerPigeonStorage = class {
       timestamp: Date.now(),
       record: null
     };
-    this.seenMutationIds.add(opId);
     this.emitChange({
       origin: "local",
       op: "delete",
@@ -1504,13 +1500,23 @@ var PeerPigeonStorage = class {
     const decrypted = await this.decryptSyncEnvelope(payload.cipher);
     if (!decrypted) return;
     if (this.isStorageMutation(decrypted)) {
-      if (this.seenMutationIds.has(decrypted.opId)) return;
       if (decrypted.space === "private") return;
-      this.seenMutationIds.add(decrypted.opId);
+      if (!this.shouldAcceptRemoteSync(decrypted.space, decrypted.key, {
+        kind: "mutation",
+        actorId: decrypted.actorId
+      })) {
+        return;
+      }
       await this.applyRemoteMutation(decrypted);
       return;
     }
     if (this.isStorageRetrieveRequest(decrypted)) {
+      if (!this.shouldAcceptRemoteSync(decrypted.space, decrypted.key, {
+        kind: "retrieve-request",
+        actorId: decrypted.actorId
+      })) {
+        return;
+      }
       await this.handleRetrieveRequest(decrypted);
       return;
     }
@@ -1523,9 +1529,9 @@ var PeerPigeonStorage = class {
     const pk = this.makePk(mutation.space, mutation.key);
     const existing = await driver.get(pk);
     if (mutation.op === "delete") {
-      if (!existing) return;
-      if (mutation.timestamp <= existing.updatedAt) return;
-      if (!this.canDelete(mutation.space, existing, mutation.actorId)) return;
+      if (!existing) return false;
+      if (mutation.timestamp <= existing.updatedAt) return false;
+      if (!this.canDelete(mutation.space, existing, mutation.actorId)) return false;
       await driver.delete(pk);
       this.emitChange({
         origin: "remote",
@@ -1535,22 +1541,22 @@ var PeerPigeonStorage = class {
         key: mutation.key,
         actorId: mutation.actorId
       });
-      return;
+      return true;
     }
-    if (!mutation.record) return;
+    if (!mutation.record) return false;
     if (existing) {
       const existingVersion = Number(existing.version ?? 0);
       const incomingVersion = Number(mutation.record.version ?? 0);
       const existingUpdatedAt = Number(existing.updatedAt ?? 0);
       const incomingUpdatedAt = Number(mutation.timestamp ?? mutation.record.updatedAt ?? 0);
-      if (incomingVersion < existingVersion) return;
-      if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return;
+      if (incomingVersion < existingVersion) return false;
+      if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return false;
     }
-    if (!this.canWrite(mutation.space, existing, mutation.actorId)) return;
+    if (!this.canWrite(mutation.space, existing, mutation.actorId)) return false;
     if (mutation.space === "user" && !existing) {
       const incomingOwner = String(mutation.record.ownerId ?? "").trim();
       if (incomingOwner && incomingOwner !== mutation.actorId) {
-        return;
+        return false;
       }
     }
     const incoming = {
@@ -1579,6 +1585,7 @@ var PeerPigeonStorage = class {
       key: incoming.key,
       actorId: mutation.actorId
     });
+    return true;
   }
   async broadcastMutation(mutation) {
     await this.broadcastSyncPayload(mutation);
@@ -1592,7 +1599,7 @@ var PeerPigeonStorage = class {
       timestamp: Date.now(),
       cipher
     };
-    this.gossip.broadcast(envelope, { storageSync: true, encrypted: true });
+    this.gossip.broadcast(envelope);
   }
   async handleRetrieveRequest(request) {
     if (request.actorId === this.userId) return;
@@ -1618,6 +1625,14 @@ var PeerPigeonStorage = class {
     this.pendingRetrieveRequests.delete(response.reqId);
     clearTimeout(pending.timeout);
     if (response.record && response.space !== "private") {
+      if (!this.shouldAcceptRemoteSync(response.space, response.key, {
+        kind: "retrieve-response",
+        actorId: response.actorId
+      })) {
+        const latest2 = await this.get(response.space, response.key);
+        pending.resolve(latest2);
+        return;
+      }
       const mutation = {
         __ppType: "pp-storage-op-v1",
         opId: `retrieve-${response.reqId}-${response.actorId}`,
@@ -1632,6 +1647,15 @@ var PeerPigeonStorage = class {
     }
     const latest = await this.get(response.space, response.key);
     pending.resolve(latest);
+  }
+  shouldAcceptRemoteSync(space, key, context) {
+    if (space === "private") return false;
+    if (!this.syncFilter) return true;
+    try {
+      return this.syncFilter(space, key, context) !== false;
+    } catch {
+      return false;
+    }
   }
   async createDriver() {
     if (typeof indexedDB === "undefined") {
@@ -1670,14 +1694,6 @@ var PeerPigeonStorage = class {
   }
   makeMutationId(actorId) {
     return `${actorId}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-  }
-  shouldSyncKey(space, key) {
-    if (!this.syncFilter) return true;
-    try {
-      return this.syncFilter(space, key);
-    } catch {
-      return false;
-    }
   }
   resolveOwnerId(space, existing, actorId, ownerOverride) {
     if (space === "user") {
@@ -1855,8 +1871,6 @@ var PeerPigeonStorage = class {
     return out;
   }
 };
-PeerPigeonStorage.STALE_VERSION_OVERRIDE_MS = 3e4;
-PeerPigeonStorage.STALE_LOCAL_MAX_AGE_MS = 5 * 6e4;
 
 // src/index.ts
 var PartialMesh = class {

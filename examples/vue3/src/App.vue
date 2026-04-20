@@ -234,7 +234,7 @@
 
           <div v-else-if="activeTab === 'storage'" class="tab-panel feature-panel" role="tabpanel" aria-label="Storage panel">
             <h3>🗄 Storage</h3>
-            <p class="feature-copy">IndexedDB-backed, encrypted gossip-sync storage with space ACLs.</p>
+            <p class="feature-copy">Key/value storage synced across peers over gossip.</p>
 
             <div class="storage-head">
               <div class="storage-badge" :class="storageReady ? 'ready' : 'idle'">
@@ -247,11 +247,21 @@
               <label class="field storage-space-field">
                 <span class="field-label">Space</span>
                 <select v-model="storageActiveSpace" class="input" @change="refreshStorageList">
-                  <option value="public">public</option>
                   <option value="user">user</option>
-                  <option value="frozen">frozen</option>
                   <option value="private">private</option>
+                  <option value="public">public</option>
+                  <option value="frozen">frozen</option>
                 </select>
+              </label>
+
+              <label v-if="storageActiveSpace === 'user'" class="field storage-owner-field">
+                <span class="field-label">Lookup owner pub key</span>
+                <input
+                  v-model="storageLookupOwnerId"
+                  class="input"
+                  placeholder="blank = your pub key"
+                  @input="refreshStorageList"
+                />
               </label>
 
               <label class="field storage-key-field">
@@ -279,7 +289,7 @@
                 <button class="btn btn-danger" :disabled="!isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="deleteStorageEntry">
                   Delete
                 </button>
-                <button class="btn" :disabled="!isRunning || !storageReady || storageBusy" @click="refreshStorageList">
+                <button class="btn" :disabled="!isRunning || storageBusy" @click="refreshStorageList">
                   Refresh
                 </button>
               </div>
@@ -326,7 +336,7 @@
                   <tr v-for="record in storageRecords" :key="`${record.space}:${record.key}`" @click="selectStorageRecord(record)">
                     <td class="mono">{{ record.key }}</td>
                     <td class="mono storage-value-cell">{{ storageRecordPreview(record.value) }}</td>
-                    <td class="mono">{{ record.ownerId === storageUserId() ? 'You' : (record.ownerId || '-') }}</td>
+                    <td class="mono">{{ record.ownerId ? `${record.ownerId}${record.ownerId === storageUserId() ? ' (You)' : ''}` : '-' }}</td>
                     <td>{{ record.version }}</td>
                     <td>{{ formatTime(record.updatedAt) }}</td>
                   </tr>
@@ -437,8 +447,9 @@ const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
 const CRYPTO_PUBLIC_REQUEST_TYPE = 'pp-crypto-public-request-v1';
 const ENCRYPTED_BROADCAST_TYPE = 'pp-encrypted-broadcast-v1';
 const ENCRYPTED_DIRECT_TYPE = 'pp-encrypted-direct-v1';
-const STORAGE_SYNC_TYPE = 'pp-storage-sync-v1';
-const STORAGE_OP_TYPE = 'pp-storage-op-v1';
+const STORAGE_SYNC_ENVELOPE_TYPE = 'pp-storage-sync-v1';
+const MESH_PEERS_STORAGE_KEY = 'mesh:peers';
+const MESH_PEERS_HEARTBEAT_MS = 12_000;
 
 function toBase64Url(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -495,21 +506,24 @@ export default {
       cryptoStorageKey: 'peerpigeon:unsea:keypair:v1',
       cryptoAnnounceTimer: null,
       storage: null,
+      storageIdentity: '',
       storageReady: false,
       storageBusy: false,
       storageError: '',
-      storageActiveSpace: 'public',
+      storageActiveSpace: 'user',
+      storageLookupOwnerId: '',
       storageFormKey: '',
       storageFormValue: '',
       storageRecords: [],
-      storageUnsubscribe: null,
-      storageLastUserId: '',
+      storageChangeUnsubscribe: null,
       storageInterestedKeys: {},
-      storageRefreshInFlight: false,
-      storageRefreshQueued: false,
-      storageNetworkReconcileTimer: null,
-      meshDemographicsTimer: null,
-      meshDemographicsAuditTimer: null,
+      meshPeersStorageKey: MESH_PEERS_STORAGE_KEY,
+      sharedMeshPeerSnapshots: {},
+      meshPeersPublishTimer: null,
+      meshPeersRetrieveTimer: null,
+      meshPeersPublishInFlight: false,
+      meshPeersLastLocalSignature: '',
+      meshPeersLastPublishedAt: 0,
       uiStateKey: 'peerpigeon:ui-state',
       uiTabs: [
         { id: 'message', label: 'Message' },
@@ -520,7 +534,6 @@ export default {
       graphStabilizeTimer: null,
       graphUpdateTimer: null,
       graphLastSignature: '',
-      meshPeersMap: {},
       networkGraphState: null,
       networkGraphResizeHandler: null,
       debugMonitorTimer: null,
@@ -532,7 +545,7 @@ export default {
     const params = new URLSearchParams(window.location.search);
 
     // ==== IMPORTANT: URL params take ABSOLUTE priority for test isolation ====
-    // Check for explicit sessionId param FIRST (before any localStorage fallback)
+    // Check for explicit sessionId param FIRST (before any session-state fallback)
     const sessionIdParam = params.get('sessionId') || params.get('roomSessionId') || params.get('room');
     const hasExplicitSessionId = sessionIdParam != null;
 
@@ -686,12 +699,6 @@ export default {
       }
       this.saveUiState();
     },
-    meshPeersMap: {
-      deep: false,
-      handler() {
-        this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'storage' }));
-      }
-    },
     clientId() {
       this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'client' }));
     },
@@ -715,27 +722,78 @@ export default {
     }
   },
   methods: {
-    storageInterestPk(space, key) {
+    storageNormalizeUserKey(ownerId, key) {
+      const owner = String(ownerId || '').trim();
+      let out = String(key || '').trim();
+      if (!owner || !out) return out;
+      const prefix = `${owner}::`;
+      while (out.startsWith(prefix)) {
+        out = out.slice(prefix.length);
+      }
+      return out;
+    },
+
+    storageLogicalKey(space, storeKey, record = null) {
+      const normalizedSpace = String(space || '').trim();
+      if (normalizedSpace !== 'user') {
+        const key = String(record?.key || storeKey || '').trim();
+        return key;
+      }
+
+      const owner = String(record?.ownerId || '').trim();
+      const candidate = String(record?.key || '').trim() || String(storeKey || '').trim();
+      if (!candidate) return '';
+      return this.storageNormalizeUserKey(owner, candidate);
+    },
+
+    storageRecordPk(space, key, ownerId = null) {
       const normalizedSpace = String(space || '').trim();
       const normalizedKey = String(key || '').trim();
       if (!normalizedSpace || !normalizedKey) return '';
+      if (normalizedSpace !== 'user') return normalizedKey;
+
+      const owner = String(ownerId ?? this.storageUserId() ?? '').trim();
+      if (!owner) return '';
+      return `${owner}::${normalizedKey}`;
+    },
+
+    storageLookupUserId() {
+      const lookup = String(this.storageLookupOwnerId || '').trim();
+      if (lookup) return lookup;
+      return this.storageUserId();
+    },
+
+    storageInterestPk(space, key, ownerId = null) {
+      const normalizedSpace = String(space || '').trim();
+      const normalizedKey = String(key || '').trim();
+      if (!normalizedSpace || !normalizedKey) return '';
+      if (normalizedSpace === 'user') {
+        const owner = String(ownerId ?? this.storageLookupUserId() ?? '').trim();
+        if (!owner) return '';
+        return `${normalizedSpace}:${owner}:${normalizedKey}`;
+      }
       return `${normalizedSpace}:${normalizedKey}`;
     },
 
-    isStorageKeyInterested(space, key) {
-      const pk = this.storageInterestPk(space, key);
+    isStorageKeyInterested(space, key, ownerId = null) {
+      const pk = this.storageInterestPk(space, key, ownerId);
       if (!pk) return false;
       return this.storageInterestedKeys[pk] === true;
     },
 
-    interestedKeysForSpace(space) {
+    interestedKeysForSpace(space, ownerId = null) {
       const normalizedSpace = String(space || '').trim();
       if (!normalizedSpace) return [];
 
       const out = [];
+      const userOwner = normalizedSpace === 'user'
+        ? String(ownerId ?? this.storageLookupUserId() ?? '').trim()
+        : '';
       for (const [pk, enabled] of Object.entries(this.storageInterestedKeys)) {
         if (!enabled) continue;
-        const prefix = `${normalizedSpace}:`;
+        const prefix = normalizedSpace === 'user'
+          ? `${normalizedSpace}:${userOwner}:`
+          : `${normalizedSpace}:`;
         if (!pk.startsWith(prefix)) continue;
         const key = pk.slice(prefix.length);
         if (key) out.push(key);
@@ -745,8 +803,8 @@ export default {
       return out;
     },
 
-    setStorageKeyInterest(space, key, enabled) {
-      const pk = this.storageInterestPk(space, key);
+    setStorageKeyInterest(space, key, enabled, ownerId = null) {
+      const pk = this.storageInterestPk(space, key, ownerId);
       if (!pk) return;
 
       this.storageInterestedKeys = {
@@ -755,43 +813,43 @@ export default {
       };
       this.saveUiState();
 
-      if (enabled) {
-        this.ensureStorageReady().catch((error) => {
-          this.storageError = String(error?.message || error || 'Failed to initialize storage');
-        });
-
-        if (this.storage && this.storageReady) {
-          this.storage.retrieve(space, key).catch(() => {
-            // best-effort fetch from interested peers
-          });
-        }
-      }
-
       if (this.activeTab === 'storage') {
         this.refreshStorageList();
       }
     },
 
     getSyncStorageKey() {
+      if (!this.storage) return;
       const space = this.storageActiveSpace;
       const key = String(this.storageFormKey || '').trim();
       if (!key) return;
 
-      const wasInterested = this.isStorageKeyInterested(space, key);
+      const ownerId = this.storageActiveSpace === 'user'
+        ? this.storageLookupUserId()
+        : null;
+
+      const wasInterested = this.isStorageKeyInterested(space, key, ownerId);
       if (!wasInterested) {
-        this.setStorageKeyInterest(space, key, true);
-      } else if (this.storage && this.storageReady) {
-        this.storage.retrieve(space, key).catch(() => {});
-        this.refreshStorageList();
+        this.setStorageKeyInterest(space, key, true, ownerId);
       }
+
+      const wireKey = this.storageWireKey(space, key, ownerId);
+      if (!wireKey) return;
+      this.storage.retrieve(space, wireKey, { timeoutMs: 2500 })
+        .then(() => this.refreshStorageList({ silent: true }))
+        .catch((error) => {
+          this.storageError = String(error?.message || error || 'Failed to sync storage key');
+        });
     },
 
-    clearStorageKeyInterestForSpace(space) {
+    clearStorageKeyInterestForSpace(space, ownerId = null) {
       const normalizedSpace = String(space || '').trim();
       if (!normalizedSpace) return;
 
       const next = { ...this.storageInterestedKeys };
-      const prefix = `${normalizedSpace}:`;
+      const prefix = normalizedSpace === 'user'
+        ? `${normalizedSpace}:${String(ownerId ?? this.storageLookupUserId() ?? '').trim()}:`
+        : `${normalizedSpace}:`;
       for (const pk of Object.keys(next)) {
         if (pk.startsWith(prefix)) {
           delete next[pk];
@@ -834,264 +892,363 @@ export default {
       return String(this.cryptoKeys?.epub || '').trim();
     },
 
-    teardownStorage() {
-      if (this.storageNetworkReconcileTimer) {
-        clearTimeout(this.storageNetworkReconcileTimer);
-        this.storageNetworkReconcileTimer = null;
-      }
-
-      if (this.meshDemographicsTimer) {
-        clearTimeout(this.meshDemographicsTimer);
-        this.meshDemographicsTimer = null;
-      }
-
-      if (this.storageUnsubscribe) {
-        this.storageUnsubscribe();
-        this.storageUnsubscribe = null;
-      }
-
-      if (this.storage) {
-        this.storage.close().catch(() => {
-          // ignore close failures
-        });
-        this.storage = null;
-      }
-
-      this.storageReady = false;
-      this.storageBusy = false;
-      this.storageRecords = [];
-      this.meshPeersMap = {};
-      this.storageLastUserId = '';
-      this.storageRefreshInFlight = false;
-      this.storageRefreshQueued = false;
+    storageOpId() {
+      return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
     },
 
-    applyStorageChangeEvent(event) {
-      if (!event) return;
-
-      if (event.space === 'public' && event.key === 'mesh:peers') {
-        if (event.op === 'delete') {
-          this.meshPeersMap = {};
-        } else if (event.record && typeof event.record.value === 'object' && event.record.value !== null) {
-          this.meshPeersMap = { ...event.record.value };
-        }
-      }
-
-      if (event.space !== this.storageActiveSpace) return;
-      if (!this.isStorageKeyInterested(event.space, event.key)) return;
-
-      if (event.op === 'delete') {
-        this.storageRecords = this.storageRecords.filter((record) => record.key !== event.key);
-        return;
-      }
-
-      const nextRecord = event.record;
-      if (!nextRecord) return;
-
-      const next = this.storageRecords.slice();
-      const existingIndex = next.findIndex((record) => record.key === nextRecord.key);
-      if (existingIndex >= 0) {
-        next.splice(existingIndex, 1, nextRecord);
-      } else {
-        next.push(nextRecord);
-      }
-      next.sort((a, b) => String(a.key).localeCompare(String(b.key)));
-      this.storageRecords = next;
+    isKnownStorageSpace(space) {
+      return space === 'user' || space === 'private' || space === 'public' || space === 'frozen';
     },
 
-    scheduleMeshDemographicsUpdate() {
-      if (this.meshDemographicsTimer) clearTimeout(this.meshDemographicsTimer);
-      this.meshDemographicsTimer = setTimeout(() => {
-        this.meshDemographicsTimer = null;
-        this.publishMeshDemographics().catch(() => {});
-      }, 400);
+    storageWireKey(space, key, ownerId = null) {
+      const normalizedSpace = String(space || '').trim();
+      const logicalKey = String(key || '').trim();
+      if (!this.isKnownStorageSpace(normalizedSpace) || !logicalKey) return '';
+      if (normalizedSpace !== 'user') return logicalKey;
+      const owner = String(ownerId || '').trim();
+      if (!owner) return '';
+      return this.storageRecordPk('user', logicalKey, owner);
     },
 
-    startMeshDemographicsAuditLoop() {
-      this.stopMeshDemographicsAuditLoop();
-      this.meshDemographicsAuditTimer = setInterval(() => {
-        if (!this.isRunning) return;
-        this.publishMeshDemographics().catch(() => {});
-      }, 2500);
-    },
-
-    stopMeshDemographicsAuditLoop() {
-      if (this.meshDemographicsAuditTimer) {
-        clearInterval(this.meshDemographicsAuditTimer);
-        this.meshDemographicsAuditTimer = null;
-      }
-    },
-
-    async publishMeshDemographics() {
-      if (!this.storage || !this.storageReady) return;
-      const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-      if (!self) return;
-
-      const epub = String(this.cryptoKeys?.epub || '').trim();
-      const connected = [...new Set((this.mesh?.getConnectedPeers?.() || [])
-        .map((peerId) => String(peerId || '').trim())
-        .filter((peerId) => peerId && peerId !== self))]
-        .sort((a, b) => a.localeCompare(b));
-      const network = String(this.effectiveSessionId || '').trim();
-      const now = Date.now();
-
-      // Read-then-merge: fetch current network map, inject our entry, write back.
-      let current = {};
-      try {
-        const existing = await this.storage.get('public', 'mesh:peers');
-        if (existing && typeof existing.value === 'object' && existing.value !== null) {
-          current = { ...existing.value };
-        }
-      } catch {
-        // treat as empty on read failure
-      }
-
-      current[self] = {
-        peerId: self,
-        epub: epub || null,
-        connectedTo: connected,
-        network,
-        seenAt: now,
-      };
-
-      // Each peer audits/corrects only its own mesh:peers entry.
-      await this.storage.put('public', 'mesh:peers', current).catch(() => {});
-    },
-
-    scheduleStorageNetworkReconcile() {
-      if (this.storageNetworkReconcileTimer) {
-        clearTimeout(this.storageNetworkReconcileTimer);
-      }
-
-      // Topology can churn quickly; debounce to a single reconcile burst.
-      this.storageNetworkReconcileTimer = setTimeout(() => {
-        this.storageNetworkReconcileTimer = null;
-        this.reconcileInterestedStorageFromNetwork().catch(() => {
-          // best-effort on topology changes
-        });
-      }, 180);
-    },
-
-    async reconcileInterestedStorageFromNetwork() {
-      if (!this.gossip) return;
-      await this.ensureStorageReady();
-      if (!this.storage || !this.storageReady) return;
-
-      const entries = Object.entries(this.storageInterestedKeys || {});
-      for (const [pk, enabled] of entries) {
-        if (!enabled) continue;
-        const idx = pk.indexOf(':');
-        if (idx <= 0 || idx >= pk.length - 1) continue;
-        const space = pk.slice(0, idx);
-        const key = pk.slice(idx + 1);
-        if (!space || !key) continue;
-
-        await this.storage.retrieve(space, key, { timeoutMs: 1200 }).catch(() => {
-          // best-effort per key
-        });
-      }
+    shouldReplaceStorageRecord(existing, incoming) {
+      if (!existing) return true;
+      const incomingVersion = Number(incoming?.version ?? 0);
+      const existingVersion = Number(existing?.version ?? 0);
+      if (incomingVersion > existingVersion) return true;
+      if (incomingVersion < existingVersion) return false;
+      const incomingUpdatedAt = Number(incoming?.updatedAt ?? 0);
+      const existingUpdatedAt = Number(existing?.updatedAt ?? 0);
+      return incomingUpdatedAt > existingUpdatedAt;
     },
 
     async ensureStorageReady() {
       const userId = this.storageUserId();
       if (!userId || !this.gossip) return;
 
-      if (this.storage && this.storageLastUserId === userId) {
-        this.storageReady = true;
+      const nextIdentity = `${this.effectiveSessionId}::${userId}`;
+      if (this.storageReady && this.storage && this.storageIdentity === nextIdentity) {
+        await this.syncMeshPeersFromNetwork('storage-ready');
+        await this.refreshStorageList({ silent: true });
         return;
       }
 
+      if (this.storageChangeUnsubscribe) {
+        this.storageChangeUnsubscribe();
+        this.storageChangeUnsubscribe = null;
+      }
       if (this.storage) {
-        if (this.storageUnsubscribe) {
-          this.storageUnsubscribe();
-          this.storageUnsubscribe = null;
-        }
         try {
           await this.storage.close();
         } catch {
-          // ignore close errors
+          // ignore close failures
         }
-        this.storage = null;
       }
 
-      const next = new PeerPigeonStorage({
+      const dbName = `peerpigeon-storage-v2:${this.effectiveSessionId}`;
+      this.storage = new PeerPigeonStorage({
         userId,
         gossip: this.gossip,
         sessionId: this.effectiveSessionId,
-        dbName: `peerpigeon-demo-storage:${this.effectiveSessionId}`,
-        syncFilter: (space, key) => this.isStorageKeyInterested(space, key),
+        dbName,
+      });
+      await this.storage.init();
+      this.storageIdentity = nextIdentity;
+      this.storageChangeUnsubscribe = this.storage.subscribe((event) => {
+        if (event?.space === 'public' && event?.key === this.meshPeersStorageKey) {
+          this.refreshMeshPeersFromStorage();
+        }
+        if (this.activeTab === 'storage') {
+          this.refreshStorageList({ silent: true });
+        }
       });
 
-      await next.init();
-      this.storageUnsubscribe = next.subscribe((event) => {
-        this.applyStorageChangeEvent(event);
-      });
-
-      this.storage = next;
-      this.storageLastUserId = userId;
       this.storageReady = true;
       this.storageError = '';
-      this.setStorageKeyInterest('public', 'mesh:peers', true);
-      await this.refreshMeshPeersFromStorage();
-      await this.refreshStorageList();
+      await this.syncMeshPeersFromNetwork('storage-ready');
+      this.scheduleMeshPeersPublish('storage-ready');
+      await this.refreshStorageList({ silent: true });
     },
 
-    async refreshMeshPeersFromStorage() {
-      if (!this.storage || !this.storageReady) {
-        this.meshPeersMap = {};
-        return;
+    teardownStorage() {
+      this.storageReady = false;
+      this.storageBusy = false;
+      this.storageRecords = [];
+      this.storageIdentity = '';
+      clearTimeout(this.meshPeersPublishTimer);
+      this.meshPeersPublishTimer = null;
+      clearTimeout(this.meshPeersRetrieveTimer);
+      this.meshPeersRetrieveTimer = null;
+      this.meshPeersPublishInFlight = false;
+      this.meshPeersLastLocalSignature = '';
+      this.meshPeersLastPublishedAt = 0;
+      this.sharedMeshPeerSnapshots = {};
+      if (this.storageChangeUnsubscribe) {
+        this.storageChangeUnsubscribe();
+        this.storageChangeUnsubscribe = null;
       }
-
-      try {
-        const record = await this.storage.get('public', 'mesh:peers');
-        const value = record && typeof record.value === 'object' && record.value !== null
-          ? record.value
-          : {};
-        this.meshPeersMap = { ...value };
-      } catch {
-        this.meshPeersMap = {};
+      if (this.storage) {
+        this.storage.close().catch(() => {
+          // ignore close failures
+        });
       }
+      this.storage = null;
     },
 
     async refreshStorageList(options = {}) {
-      if (!this.storage || !this.storageReady) {
-        this.storageRecords = [];
-        return;
-      }
-
       const silent = options && options.silent === true;
-
-      if (this.storageRefreshInFlight) {
-        this.storageRefreshQueued = true;
-        return;
-      }
-
-      this.storageRefreshInFlight = true;
-      if (!silent) {
-        this.storageBusy = true;
-      }
+      if (!silent) this.storageBusy = true;
       this.storageError = '';
-
       try {
-        do {
-          this.storageRefreshQueued = false;
-          const keys = this.interestedKeysForSpace(this.storageActiveSpace);
-          const records = [];
-          for (const key of keys) {
-            // Per-key lookups are network-aware so interested keys reconcile
-            // from peers instead of sticking to stale local IndexedDB values.
-            const record = await this.storage.retrieve(this.storageActiveSpace, key, { timeoutMs: 1200 });
-            if (record) records.push(record);
+        if (!this.storage) {
+          this.storageRecords = [];
+          return;
+        }
+
+        const allRecords = await this.storage.list(this.storageActiveSpace);
+        const selfOwner = this.storageUserId();
+        const lookupOwner = this.storageActiveSpace === 'user' ? this.storageLookupUserId() : '';
+        const userOwner = lookupOwner;
+        const isRemoteUserLookup = this.storageActiveSpace === 'user'
+          && String(userOwner || '').trim()
+          && String(userOwner || '').trim() !== String(selfOwner || '').trim();
+        const records = allRecords
+          .filter((record) => {
+            if (!record || record.deleted === true) return false;
+            if (this.storageActiveSpace !== 'user') return true;
+            // If own identity not loaded yet, show nothing rather than leaking
+            if (!selfOwner) return false;
+            if (String(record.ownerId || '').trim() !== String(userOwner || '').trim()) return false;
+
+            const logicalKey = this.storageLogicalKey('user', record.key, record);
+            if (!logicalKey) return false;
+
+            if (isRemoteUserLookup && !this.isStorageKeyInterested('user', logicalKey, userOwner)) {
+              return false;
+            }
+            return true;
+          })
+          .map((record) => ({
+            space: this.storageActiveSpace,
+            key: this.storageLogicalKey(this.storageActiveSpace, record.key, record),
+            value: record.value,
+            ownerId: record.ownerId ?? null,
+            createdAt: Number(record.createdAt ?? 0),
+            updatedAt: Number(record.updatedAt ?? 0),
+            version: Number(record.version ?? 0),
+          }));
+
+        const byLogicalKey = new Map();
+        for (const record of records) {
+          const key = String(record?.key || '').trim();
+          if (!key) continue;
+          const existing = byLogicalKey.get(key);
+          if (!existing || this.shouldReplaceStorageRecord(existing, record)) {
+            byLogicalKey.set(key, record);
           }
-          this.storageRecords = records;
-        } while (this.storageRefreshQueued);
+        }
+
+        this.storageRecords = Array.from(byLogicalKey.values())
+          .sort((a, b) => String(a.key).localeCompare(String(b.key)));
       } catch (error) {
         this.storageError = String(error?.message || error || 'Failed to load storage');
       } finally {
-        this.storageRefreshInFlight = false;
-        if (!silent) {
-          this.storageBusy = false;
+        if (!silent) this.storageBusy = false;
+      }
+    },
+
+    normalizeMeshPeersPayload(value) {
+      const out = {};
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
+
+      for (const [rawPeerId, rawSnapshot] of Object.entries(value)) {
+        const peerId = String(rawPeerId || rawSnapshot?.peerId || '').trim();
+        if (!peerId) continue;
+
+        const connectedPeers = [...new Set(
+          (Array.isArray(rawSnapshot?.connectedPeers) ? rawSnapshot.connectedPeers : [])
+            .map((peer) => String(peer || '').trim())
+            .filter((peer) => peer && peer !== peerId)
+        )].sort((a, b) => a.localeCompare(b));
+
+        const updatedAtRaw = Number(rawSnapshot?.updatedAt ?? rawSnapshot?.seenAt ?? 0);
+        const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0
+          ? Math.floor(updatedAtRaw)
+          : 0;
+
+        out[peerId] = {
+          peerId,
+          ownerId: String(rawSnapshot?.ownerId || '').trim() || null,
+          connectedPeers,
+          updatedAt,
+        };
+      }
+
+      return out;
+    },
+
+    pruneStaleMeshPeerSnapshots(snapshots) {
+      const out = {};
+      for (const [peerId, snapshot] of Object.entries(snapshots || {})) {
+        const normalizedPeerId = String(peerId || snapshot?.peerId || '').trim();
+        const updatedAt = Number(snapshot?.updatedAt || 0);
+        if (!normalizedPeerId) continue;
+        if (!updatedAt) continue;
+
+        out[normalizedPeerId] = {
+          peerId: normalizedPeerId,
+          ownerId: String(snapshot?.ownerId || '').trim() || null,
+          connectedPeers: [...new Set((snapshot?.connectedPeers || []).map((peer) => String(peer || '').trim()).filter(Boolean))],
+          updatedAt,
+        };
+      }
+      return out;
+    },
+
+    activeMeshPeerSnapshots() {
+      const out = {};
+
+      for (const [peerId, snapshot] of Object.entries(this.sharedMeshPeerSnapshots || {})) {
+        const updatedAt = Number(snapshot?.updatedAt || 0);
+        if (!updatedAt) continue;
+        out[peerId] = {
+          peerId,
+          ownerId: String(snapshot?.ownerId || '').trim() || null,
+          connectedPeers: [...new Set((snapshot?.connectedPeers || []).map((peer) => String(peer || '').trim()).filter(Boolean))],
+          updatedAt,
+        };
+      }
+
+      return out;
+    },
+
+    localMeshPeerSnapshot() {
+      const peerId = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      if (!peerId) return null;
+
+      const connectedPeers = [...new Set(
+        (Array.isArray(this.mesh?.getConnectedPeers?.()) ? this.mesh.getConnectedPeers() : [])
+          .map((peer) => String(peer || '').trim())
+          .filter((peer) => peer && peer !== peerId)
+      )].sort((a, b) => a.localeCompare(b));
+
+      return {
+        peerId,
+        ownerId: this.storageUserId() || null,
+        connectedPeers,
+        updatedAt: Date.now(),
+      };
+    },
+
+    meshPeerSnapshotSignature(snapshot) {
+      const peerId = String(snapshot?.peerId || '').trim();
+      if (!peerId) return '';
+      const connectedPeers = Array.isArray(snapshot?.connectedPeers) ? snapshot.connectedPeers : [];
+      return `${peerId}|${connectedPeers.join(',')}`;
+    },
+
+    scheduleMeshPeersPublish(reason = 'update') {
+      if (!this.isRunning) return;
+
+      clearTimeout(this.meshPeersPublishTimer);
+      this.meshPeersPublishTimer = setTimeout(() => {
+        this.meshPeersPublishTimer = null;
+        this.publishMeshPeersToStorage(reason);
+      }, 140);
+    },
+
+    scheduleMeshPeersRetrieve(reason = 'update') {
+      if (!this.isRunning || !this.storageReady || !this.storage) return;
+
+      clearTimeout(this.meshPeersRetrieveTimer);
+      this.meshPeersRetrieveTimer = setTimeout(() => {
+        this.meshPeersRetrieveTimer = null;
+        this.syncMeshPeersFromNetwork(reason).catch(() => {
+          // ignore mesh snapshot retrieval failures
+        });
+      }, 120);
+    },
+
+    onMeshConnectionsChanged(reason = 'connection-change') {
+      this.scheduleMeshPeersRetrieve(reason);
+      this.scheduleMeshPeersPublish(reason);
+    },
+
+    async syncMeshPeersFromNetwork(_reason = 'update') {
+      if (!this.storageReady || !this.storage) return;
+      try {
+        await this.storage.retrieve('public', this.meshPeersStorageKey, { timeoutMs: 1800 });
+      } catch {
+        // best-effort network retrieval; fall back to local state
+      }
+
+      await this.refreshMeshPeersFromStorage();
+    },
+
+    async refreshMeshPeersFromStorage() {
+      if (!this.storageReady || !this.storage) return;
+
+      try {
+        const record = await this.storage.get('public', this.meshPeersStorageKey);
+        const snapshots = this.pruneStaleMeshPeerSnapshots(this.normalizeMeshPeersPayload(record?.value));
+        this.sharedMeshPeerSnapshots = snapshots;
+        this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'mesh-storage' }));
+      } catch {
+        // ignore mesh snapshot sync failures
+      }
+    },
+
+    async publishMeshPeersToStorage(reason = 'update') {
+      if (!this.storageReady || !this.storage || !this.isRunning) return;
+      if (this.meshPeersPublishInFlight) return;
+
+      const localSnapshot = this.localMeshPeerSnapshot();
+      if (!localSnapshot) return;
+
+      const localSignature = this.meshPeerSnapshotSignature(localSnapshot);
+      if (!localSignature) return;
+
+      const now = Date.now();
+      const publishAgeMs = now - Number(this.meshPeersLastPublishedAt || 0);
+      const shouldHeartbeat = publishAgeMs >= MESH_PEERS_HEARTBEAT_MS;
+      if (localSignature === this.meshPeersLastLocalSignature && reason !== 'storage-ready' && !shouldHeartbeat) {
+        return;
+      }
+
+      this.meshPeersPublishInFlight = true;
+      try {
+        const existing = await this.storage.get('public', this.meshPeersStorageKey);
+        const snapshots = this.pruneStaleMeshPeerSnapshots(this.normalizeMeshPeersPayload(existing?.value));
+
+        // Peer ID can rotate on reload/reconnect; keep only newest entry per stable owner identity.
+        const localOwnerId = String(localSnapshot.ownerId || '').trim();
+        if (localOwnerId) {
+          for (const [peerId, snapshot] of Object.entries(snapshots)) {
+            if (peerId === localSnapshot.peerId) continue;
+            const ownerId = String(snapshot?.ownerId || '').trim();
+            if (ownerId && ownerId === localOwnerId) {
+              delete snapshots[peerId];
+            }
+          }
         }
+
+        const prior = snapshots[localSnapshot.peerId];
+        const priorSignature = this.meshPeerSnapshotSignature(prior);
+        const priorUpdatedAt = Number(prior?.updatedAt || 0);
+
+        snapshots[localSnapshot.peerId] = localSnapshot;
+        this.sharedMeshPeerSnapshots = snapshots;
+        this.meshPeersLastLocalSignature = localSignature;
+
+        const shouldRefreshTimestamp = now - priorUpdatedAt > MESH_PEERS_HEARTBEAT_MS;
+        const needsWrite = priorSignature !== localSignature || !priorUpdatedAt || shouldRefreshTimestamp;
+        if (!needsWrite) return;
+
+        await this.storage.put('public', this.meshPeersStorageKey, snapshots);
+        this.meshPeersLastPublishedAt = now;
+      } catch {
+        // ignore mesh snapshot publish failures
+      } finally {
+        this.meshPeersPublishInFlight = false;
       }
     },
 
@@ -1107,19 +1264,34 @@ export default {
     },
 
     async saveStorageEntry() {
-      if (!this.storage || !this.storageReady) return;
-      const key = String(this.storageFormKey || '').trim();
+      if (!this.storage) return;
+      const initialKey = String(this.storageFormKey || '').trim();
+      const key = this.storageActiveSpace === 'user'
+        ? this.storageNormalizeUserKey(this.storageUserId(), initialKey)
+        : initialKey;
       if (!key) return;
-
-      if (!this.isStorageKeyInterested(this.storageActiveSpace, key)) {
-        this.setStorageKeyInterest(this.storageActiveSpace, key, true);
-      }
 
       this.storageBusy = true;
       this.storageError = '';
       try {
         const value = this.parseStorageInput(this.storageFormValue);
-        await this.storage.put(this.storageActiveSpace, key, value);
+        const space = this.storageActiveSpace;
+        const ownerId = this.storageUserId() || null;
+        const storeKey = this.storageWireKey(space, key, ownerId);
+        if (!storeKey) {
+          throw new Error('missing owner public key for user space record');
+        }
+
+        const existing = await this.storage.get(space, storeKey);
+        if (space === 'frozen' && existing && existing.deleted !== true) {
+          throw new Error('frozen space keys are immutable once set');
+        }
+
+        if (space === 'user' && existing && existing.ownerId && existing.ownerId !== ownerId) {
+          throw new Error('user space key is owned by another user');
+        }
+
+        await this.storage.put(space, storeKey, value, { ownerId: ownerId || undefined });
         await this.refreshStorageList();
       } catch (error) {
         this.storageError = String(error?.message || error || 'Failed to save storage key');
@@ -1129,18 +1301,30 @@ export default {
     },
 
     async deleteStorageEntry() {
-      if (!this.storage || !this.storageReady) return;
-      const key = String(this.storageFormKey || '').trim();
+      if (!this.storage) return;
+      const initialKey = String(this.storageFormKey || '').trim();
+      const key = this.storageActiveSpace === 'user'
+        ? this.storageNormalizeUserKey(this.storageUserId(), initialKey)
+        : initialKey;
       if (!key) return;
-
-      if (!this.isStorageKeyInterested(this.storageActiveSpace, key)) {
-        this.setStorageKeyInterest(this.storageActiveSpace, key, true);
-      }
 
       this.storageBusy = true;
       this.storageError = '';
       try {
-        await this.storage.delete(this.storageActiveSpace, key);
+        const space = this.storageActiveSpace;
+        const ownerId = this.storageUserId() || null;
+        const storeKey = this.storageWireKey(space, key, ownerId);
+        if (!storeKey) {
+          throw new Error('missing owner public key for user space record');
+        }
+
+        const existing = await this.storage.get(space, storeKey);
+
+        if (space === 'user' && existing && existing.ownerId && existing.ownerId !== ownerId) {
+          throw new Error('cannot delete user space key owned by another user');
+        }
+
+        await this.storage.delete(space, storeKey);
         await this.refreshStorageList();
       } catch (error) {
         this.storageError = String(error?.message || error || 'Failed to delete storage key');
@@ -1289,7 +1473,6 @@ export default {
           this.ensureStorageReady().catch((error) => {
             this.storageError = String(error?.message || error || 'Failed to initialize storage');
           });
-          this.scheduleMeshDemographicsUpdate();
           this.updateStats();
         });
 
@@ -1316,16 +1499,14 @@ export default {
         this.mesh.on('peer:connected', (peerId) => {
           this.addLog('connected', `Connected to peer`, peerId);
           this.announceCryptoPublicInfo();
-          this.scheduleStorageNetworkReconcile();
-          this.scheduleMeshDemographicsUpdate();
           this.updateStats();
+          this.onMeshConnectionsChanged('peer:connected');
         });
 
         this.mesh.on('peer:disconnected', (peerId) => {
           this.addLog('disconnected', `Disconnected from peer`, peerId);
-          this.scheduleStorageNetworkReconcile();
-          this.scheduleMeshDemographicsUpdate();
           this.updateStats();
+          this.onMeshConnectionsChanged('peer:disconnected');
         });
 
         this.mesh.on('peer:error', ({ peerId, error }) => {
@@ -1341,8 +1522,6 @@ export default {
         });
 
         this.mesh.on('mesh:membership', () => {
-          this.scheduleStorageNetworkReconcile();
-          this.scheduleMeshDemographicsUpdate();
           this.updateStats();
         });
 
@@ -1383,8 +1562,6 @@ export default {
         this.isConnecting = false;
         this.updateStats();
         this.startCryptoAnnounceLoop();
-        this.startMeshDemographicsAuditLoop();
-        this.scheduleMeshDemographicsUpdate();
         this.announceCryptoPublicInfo();
         this.startDebugMonitor();
 
@@ -1404,9 +1581,16 @@ export default {
 
     stopMesh() {
       this.stopCryptoAnnounceLoop();
-      this.stopMeshDemographicsAuditLoop();
       this.stopDebugMonitor();
       this.resetGraphStabilization();
+      clearTimeout(this.meshPeersPublishTimer);
+      this.meshPeersPublishTimer = null;
+      clearTimeout(this.meshPeersRetrieveTimer);
+      this.meshPeersRetrieveTimer = null;
+      this.meshPeersPublishInFlight = false;
+      this.meshPeersLastLocalSignature = '';
+      this.meshPeersLastPublishedAt = 0;
+      this.sharedMeshPeerSnapshots = {};
       this.teardownStorage();
       if (this.mesh) {
         this.mesh.destroy();
@@ -1499,11 +1683,12 @@ export default {
         }
       };
 
-      let keys = parseStored(localStorage.getItem(this.cryptoStorageKey));
+      const sessionCryptoKey = `${this.cryptoStorageKey}:${this.effectiveSessionId}`;
+      let keys = parseStored(sessionStorage.getItem(sessionCryptoKey));
       if (!keys) {
         keys = await generateRandomPair();
         try {
-          localStorage.setItem(this.cryptoStorageKey, JSON.stringify(keys));
+          sessionStorage.setItem(sessionCryptoKey, JSON.stringify(keys));
         } catch {
           // ignore storage failures
         }
@@ -1613,7 +1798,7 @@ export default {
       return !!(
         data &&
         typeof data === 'object' &&
-        (data.__ppType === STORAGE_SYNC_TYPE || data.__ppType === STORAGE_OP_TYPE)
+        data.__ppType === STORAGE_SYNC_ENVELOPE_TYPE
       );
     },
 
@@ -1832,8 +2017,6 @@ export default {
     async handleGossipPayload({ message, local, fromPeer }) {
       const sourcePeer = String(fromPeer || message?.sender || 'peer');
 
-      // Storage sync traffic is handled by PeerPigeonStorage and should never
-      // appear in chat or diagnostics.
       if (this.isStorageInternalPayload(message?.data)) {
         return;
       }
@@ -1997,101 +2180,117 @@ export default {
       return Math.round(percent * 360);
     },
 
+    networkTolerantPeerIds(connectedPeerIds) {
+      const peers = [...new Set((connectedPeerIds || []).map((peerId) => String(peerId || '').trim()).filter(Boolean))];
+      const maxPeers = Math.max(0, Math.floor(Number(this.maxPeers) || 0));
+      if (!maxPeers || peers.length <= maxPeers) return new Set();
+
+      const overflow = peers.length - maxPeers;
+      const sortedPeers = peers.slice().sort((a, b) => a.localeCompare(b));
+      return new Set(sortedPeers.slice(-overflow));
+    },
+
     networkGraphData() {
-      const now = Date.now();
-      const activeNetwork = String(this.effectiveSessionId || '').trim();
-      const staleMs = 12_000;
-
-      // Local live truth for immediate correctness.
       const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-      const localConnected = (this.mesh?.getConnectedPeers?.() || this.connectedPeersList || [])
-        .map((p) => String(p || '').trim())
-        .filter(Boolean);
-      const uniqueLocalConnected = [...new Set(localConnected)];
-
-      const peers = {};
-
-      if (localSelf) {
-        peers[localSelf] = {
-          id: localSelf,
-          connectedTo: uniqueLocalConnected,
-          seenAt: now,
-        };
-      }
-
-      // Storage-backed room topology: connectedTo only (never discovered list).
-      for (const [peerId, rawInfo] of Object.entries(this.meshPeersMap || {})) {
-        const id = String(peerId || '').trim();
-        if (!id || id === localSelf) continue;
-
-        const info = rawInfo && typeof rawInfo === 'object' ? rawInfo : {};
-        const network = String(info.network || '').trim();
-        if (network && activeNetwork && network !== activeNetwork) continue;
-
-        const seenAt = Number(info.seenAt || 0);
-        if (Number.isFinite(seenAt) && seenAt > 0 && now - seenAt > staleMs) continue;
-
-        const connectedTo = Array.isArray(info.connectedTo)
-          ? [...new Set(info.connectedTo
-            .map((p) => String(p || '').trim())
-            .filter((p) => p && p !== id))]
-          : [];
-
-        if (connectedTo.length === 0) continue;
-
-        peers[id] = {
-          id,
-          connectedTo,
-          seenAt: Number.isFinite(seenAt) ? seenAt : 0,
-        };
-      }
-
       const edgeMap = new Map();
       const participants = new Set();
 
-      // Always show local live edges from the connected-status source.
-      if (localSelf) {
-        for (const target of uniqueLocalConnected) {
-          const edgeId = [localSelf, target].sort().join('|');
-          edgeMap.set(edgeId, { source: localSelf, target, halfDuplex: false });
-          participants.add(localSelf);
+      const snapshots = this.activeMeshPeerSnapshots();
+      const localSnapshot = this.localMeshPeerSnapshot();
+      if (localSnapshot) {
+        snapshots[localSnapshot.peerId] = localSnapshot;
+      }
+      const knownSnapshotPeers = new Set(Object.keys(snapshots).map((peerId) => String(peerId || '').trim()).filter(Boolean));
+
+      const tolerantPeerIds = this.networkTolerantPeerIds(localSnapshot?.connectedPeers || []);
+
+      for (const [sourcePeerId, snapshot] of Object.entries(snapshots)) {
+        const source = String(sourcePeerId || '').trim();
+        if (!source) continue;
+
+        const connectedPeers = Array.isArray(snapshot?.connectedPeers) ? snapshot.connectedPeers : [];
+        for (const peerId of connectedPeers) {
+          const target = String(peerId || '').trim();
+          if (!target || target === source) continue;
+
+          // Local validation: render only edges to peers that have their own snapshot entry.
+          if (!knownSnapshotPeers.has(target)) continue;
+
+          participants.add(source);
           participants.add(target);
-        }
-      }
 
-      // For remote edges, render one-way links too; reciprocal links are marked full.
-      for (const [peerId, info] of Object.entries(peers)) {
-        if (!Array.isArray(info?.connectedTo)) continue;
-        for (const target of info.connectedTo) {
-          const targetId = String(target || '').trim();
-          if (!targetId || targetId === peerId) continue;
-          if (peerId === localSelf || targetId === localSelf) continue;
+          const edgeId = [source, target].sort().join('|');
+          const direction = `${source}>${target}`;
+          const reverse = `${target}>${source}`;
 
-          const targetInfo = peers[targetId];
-          const reciprocal = Array.isArray(targetInfo?.connectedTo)
-            && targetInfo.connectedTo.includes(peerId);
-
-          const edgeId = [peerId, targetId].sort().join('|');
-          const existing = edgeMap.get(edgeId);
-          if (existing) {
-            if (reciprocal && existing.halfDuplex) {
-              existing.halfDuplex = false;
-            }
-          } else {
-            edgeMap.set(edgeId, { source: peerId, target: targetId, halfDuplex: !reciprocal });
+          const entry = edgeMap.get(edgeId) || {
+            source: [source, target].sort()[0],
+            target: [source, target].sort()[1],
+            halfDuplex: true,
+            directions: new Set(),
+          };
+          entry.directions.add(direction);
+          if (entry.directions.has(reverse)) {
+            entry.halfDuplex = false;
           }
-
-          participants.add(peerId);
-          participants.add(targetId);
+          edgeMap.set(edgeId, entry);
         }
       }
 
-      const links = Array.from(edgeMap.values());
+      let links = Array.from(edgeMap.values()).map((entry) => ({
+        source: entry.source,
+        target: entry.target,
+        halfDuplex: Boolean(entry.halfDuplex),
+      }));
+
+      // Render only the mesh component that is connected to local self.
+      // This hides detached islands from stale/foreign snapshot groups.
+      if (localSelf && participants.has(localSelf)) {
+        const adjacency = new Map();
+        for (const peerId of participants) {
+          adjacency.set(peerId, new Set());
+        }
+
+        for (const link of links) {
+          const source = String(link.source || '').trim();
+          const target = String(link.target || '').trim();
+          if (!source || !target || source === target) continue;
+          if (!adjacency.has(source)) adjacency.set(source, new Set());
+          if (!adjacency.has(target)) adjacency.set(target, new Set());
+          adjacency.get(source).add(target);
+          adjacency.get(target).add(source);
+        }
+
+        const component = new Set([localSelf]);
+        const queue = [localSelf];
+        while (queue.length) {
+          const current = queue.shift();
+          const neighbors = adjacency.get(current) || new Set();
+          for (const neighbor of neighbors) {
+            if (component.has(neighbor)) continue;
+            component.add(neighbor);
+            queue.push(neighbor);
+          }
+        }
+
+        links = links.filter((link) => {
+          const source = String(link.source || '').trim();
+          const target = String(link.target || '').trim();
+          return component.has(source) && component.has(target);
+        });
+
+        participants.clear();
+        for (const peerId of component) {
+          participants.add(peerId);
+        }
+      }
+
+      // Always include local self so the graph never disappears when isolated.
+      if (localSelf) {
+        participants.add(localSelf);
+      }
 
       const nodeIds = [...participants];
-      if (localSelf && !nodeIds.includes(localSelf)) {
-        nodeIds.push(localSelf);
-      }
 
       const nodes = nodeIds
         .sort((a, b) => a.localeCompare(b))
@@ -2099,6 +2298,7 @@ export default {
           id: peerId,
           short: peerId.slice(0, 4).toUpperCase(),
           isSelf: peerId === this.clientId,
+          isTolerant: tolerantPeerIds.has(peerId),
           hue: this.networkNodeHue(peerId),
         }));
 
@@ -2419,6 +2619,10 @@ export default {
       selfFill.append('stop').attr('offset', '0%').attr('stop-color', '#f0f9ff');
       selfFill.append('stop').attr('offset', '100%').attr('stop-color', '#38bdf8');
 
+      const tolerantFill = defs.append('radialGradient').attr('id', 'network-tolerant-fill');
+      tolerantFill.append('stop').attr('offset', '0%').attr('stop-color', '#fff8bf');
+      tolerantFill.append('stop').attr('offset', '100%').attr('stop-color', '#facc15');
+
       const root = svg.append('g').attr('class', 'network-root');
 
       const link = root
@@ -2442,22 +2646,26 @@ export default {
         .data(nodes)
         .enter()
         .append('g')
-        .attr('class', (d) => `network-node${d.isSelf ? ' self' : ''}`);
+        .attr('class', (d) => `network-node${d.isSelf ? ' self' : ''}${d.isTolerant ? ' tolerant' : ''}`);
 
       node.append('circle')
         .attr('class', 'network-node-core')
         .attr('r', 16)
-        .attr('stroke', (d) => `hsl(${d.hue}, 96%, 62%)`)
-        .attr('fill', (d) => (d.isSelf ? 'url(#network-self-fill)' : '#0f172a'))
-        .attr('stroke-width', (d) => (d.isSelf ? 3.8 : 2.7))
+        .attr('stroke', (d) => (d.isTolerant ? '#f59e0b' : `hsl(${d.hue}, 96%, 62%)`))
+        .attr('fill', (d) => {
+          if (d.isSelf) return 'url(#network-self-fill)';
+          if (d.isTolerant) return 'url(#network-tolerant-fill)';
+          return `hsl(${d.hue}, 68%, 20%)`;
+        })
+        .attr('stroke-width', 1)
         .attr('filter', 'url(#network-node-glow)');
 
       node.append('text')
         .attr('class', 'network-node-label')
         .attr('text-anchor', 'middle')
         .attr('dy', '0.35em')
-        .attr('fill', (d) => (d.isSelf ? '#0b1222' : '#f8fafc'))
-        .attr('stroke', (d) => (d.isSelf ? 'rgba(248,250,252,0.66)' : 'rgba(11,18,34,0.72)'))
+        .attr('fill', (d) => (d.isSelf || d.isTolerant ? '#0b1222' : '#f8fafc'))
+        .attr('stroke', (d) => (d.isSelf || d.isTolerant ? 'rgba(248,250,252,0.66)' : 'rgba(11,18,34,0.72)'))
         .attr('stroke-width', 1.2)
         .attr('paint-order', 'stroke')
         .text((d) => d.short);
@@ -2777,7 +2985,7 @@ export default {
           })
         );
 
-        localStorage.setItem(this.uiStateKey, JSON.stringify({
+        sessionStorage.setItem(this.uiStateKey, JSON.stringify({
           activeTab: this.activeTab || 'message',
           dmTarget: this.dmTarget || '',
           directMode: !!this.directMode,
@@ -2792,7 +3000,7 @@ export default {
 
     loadUiState() {
       try {
-        const raw = localStorage.getItem(this.uiStateKey);
+        const raw = sessionStorage.getItem(this.uiStateKey);
         if (!raw) return;
         const parsed = JSON.parse(raw);
         const allowedTabs = new Set(this.uiTabs.map((tab) => tab.id));
