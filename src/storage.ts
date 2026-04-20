@@ -28,15 +28,15 @@ export interface StorageSyncOptions {
    * Optional secret mixed into key derivation for stronger room privacy.
    */
   syncSecret?: string;
-  /**
-   * Optional per-key interest filter for gossip sync.
-   * Return true to allow this key to sync over gossip.
-   */
-  syncFilter?: (space: StorageSpace, key: string) => boolean;
 }
 
 export interface StorageRetrieveOptions {
   timeoutMs?: number;
+}
+
+export interface StorageSyncFilterContext {
+  kind: 'mutation' | 'retrieve-request' | 'retrieve-response';
+  actorId: string;
 }
 
 export interface StorageOptions extends StorageSyncOptions {
@@ -52,6 +52,11 @@ export interface StorageOptions extends StorageSyncOptions {
    * Optional IndexedDB name (default: peerpigeon-storage-v1).
    */
   dbName?: string;
+  /**
+   * Optional local gate for remote sync payloads.
+   * Returning false drops remote storage updates for the given key.
+   */
+  syncFilter?: (space: StorageSpace, key: string, context: StorageSyncFilterContext) => boolean;
 }
 
 export type StorageEvents = {
@@ -250,18 +255,14 @@ class IndexedDbStorageDriver implements StorageDriver {
  * - Enforces four built-in ACL spaces: public, user, frozen, private
  */
 export class PeerPigeonStorage {
-  private static readonly STALE_VERSION_OVERRIDE_MS = 30_000;
-  private static readonly STALE_LOCAL_MAX_AGE_MS = 5 * 60_000;
-
   private readonly userId: string;
   private readonly gossip: GossipLike | null;
   private readonly sessionId: string;
   private readonly syncSecret: string;
-  private readonly syncFilter: ((space: StorageSpace, key: string) => boolean) | null;
   private readonly dbName: string;
+  private readonly syncFilter: ((space: StorageSpace, key: string, context: StorageSyncFilterContext) => boolean) | null;
   private readonly storeName = 'records';
   private driver: StorageDriver | null = null;
-  private readonly seenMutationIds = new Set<string>();
   private readonly listeners = new Set<ChangeListener>();
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
@@ -277,8 +278,8 @@ export class PeerPigeonStorage {
     this.gossip = options.gossip ?? null;
     this.sessionId = String(options.sessionId ?? 'default-session').trim() || 'default-session';
     this.syncSecret = String(options.syncSecret ?? '').trim();
-    this.syncFilter = typeof options.syncFilter === 'function' ? options.syncFilter : null;
     this.dbName = String(options.dbName ?? 'peerpigeon-storage-v1').trim() || 'peerpigeon-storage-v1';
+    this.syncFilter = typeof options.syncFilter === 'function' ? options.syncFilter : null;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
         // ignore malformed or undecryptable sync messages
@@ -436,7 +437,6 @@ export class PeerPigeonStorage {
     this.driver?.close();
     this.driver = null;
     this.listeners.clear();
-    this.seenMutationIds.clear();
     for (const pending of this.pendingRetrieveRequests.values()) {
       clearTimeout(pending.timeout);
       pending.resolve(null);
@@ -484,7 +484,6 @@ export class PeerPigeonStorage {
       record: persisted,
     };
 
-    this.seenMutationIds.add(opId);
     this.emitChange({
       origin: 'local',
       op: 'upsert',
@@ -528,7 +527,6 @@ export class PeerPigeonStorage {
       record: null,
     };
 
-    this.seenMutationIds.add(opId);
     this.emitChange({
       origin: 'local',
       op: 'delete',
@@ -550,15 +548,27 @@ export class PeerPigeonStorage {
     if (!decrypted) return;
 
     if (this.isStorageMutation(decrypted)) {
-      if (this.seenMutationIds.has(decrypted.opId)) return;
       if (decrypted.space === 'private') return;
+      if (!this.shouldAcceptRemoteSync(decrypted.space, decrypted.key, {
+        kind: 'mutation',
+        actorId: decrypted.actorId,
+      })) {
+        return;
+      }
 
-      this.seenMutationIds.add(decrypted.opId);
+      // Treat every arrived mutation as a candidate update and resolve conflicts
+      // at apply-time (newer version/timestamp wins).
       await this.applyRemoteMutation(decrypted);
       return;
     }
 
     if (this.isStorageRetrieveRequest(decrypted)) {
+      if (!this.shouldAcceptRemoteSync(decrypted.space, decrypted.key, {
+        kind: 'retrieve-request',
+        actorId: decrypted.actorId,
+      })) {
+        return;
+      }
       await this.handleRetrieveRequest(decrypted);
       return;
     }
@@ -568,15 +578,15 @@ export class PeerPigeonStorage {
     }
   }
 
-  private async applyRemoteMutation(mutation: StorageMutation): Promise<void> {
+  private async applyRemoteMutation(mutation: StorageMutation): Promise<boolean> {
     const driver = this.requireDriver();
     const pk = this.makePk(mutation.space, mutation.key);
     const existing = await driver.get(pk);
 
     if (mutation.op === 'delete') {
-      if (!existing) return;
-      if (mutation.timestamp <= existing.updatedAt) return;
-      if (!this.canDelete(mutation.space, existing, mutation.actorId)) return;
+      if (!existing) return false;
+      if (mutation.timestamp <= existing.updatedAt) return false;
+      if (!this.canDelete(mutation.space, existing, mutation.actorId)) return false;
       await driver.delete(pk);
       this.emitChange({
         origin: 'remote',
@@ -586,10 +596,10 @@ export class PeerPigeonStorage {
         key: mutation.key,
         actorId: mutation.actorId,
       });
-      return;
+      return true;
     }
 
-    if (!mutation.record) return;
+    if (!mutation.record) return false;
 
     if (existing) {
       const existingVersion = Number(existing.version ?? 0);
@@ -597,20 +607,18 @@ export class PeerPigeonStorage {
       const existingUpdatedAt = Number(existing.updatedAt ?? 0);
       const incomingUpdatedAt = Number(mutation.timestamp ?? mutation.record.updatedAt ?? 0);
 
-      // Convergence order is version-first so higher logical versions always
-      // override lower versions, even when peer clocks are skewed.
-      if (incomingVersion < existingVersion) return;
-
-      // Same-version conflicts fall back to wall-clock recency.
-      if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return;
+      // Arrival-time conflict resolution: accept newer version; if equal version,
+      // accept only newer wall-clock value.
+      if (incomingVersion < existingVersion) return false;
+      if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return false;
     }
 
-    if (!this.canWrite(mutation.space, existing, mutation.actorId)) return;
+    if (!this.canWrite(mutation.space, existing, mutation.actorId)) return false;
 
     if (mutation.space === 'user' && !existing) {
       const incomingOwner = String(mutation.record.ownerId ?? '').trim();
       if (incomingOwner && incomingOwner !== mutation.actorId) {
-        return;
+        return false;
       }
     }
 
@@ -644,6 +652,7 @@ export class PeerPigeonStorage {
       key: incoming.key,
       actorId: mutation.actorId,
     });
+    return true;
   }
 
   private async broadcastMutation(mutation: StorageMutation): Promise<void> {
@@ -660,7 +669,7 @@ export class PeerPigeonStorage {
       cipher,
     };
 
-    this.gossip.broadcast(envelope, { storageSync: true, encrypted: true });
+    this.gossip.broadcast(envelope);
   }
 
   private async handleRetrieveRequest(request: StorageRetrieveRequest): Promise<void> {
@@ -693,6 +702,15 @@ export class PeerPigeonStorage {
     clearTimeout(pending.timeout);
 
     if (response.record && response.space !== 'private') {
+      if (!this.shouldAcceptRemoteSync(response.space, response.key, {
+        kind: 'retrieve-response',
+        actorId: response.actorId,
+      })) {
+        const latest = await this.get(response.space, response.key);
+        pending.resolve(latest);
+        return;
+      }
+
       const mutation: StorageMutation = {
         __ppType: 'pp-storage-op-v1',
         opId: `retrieve-${response.reqId}-${response.actorId}`,
@@ -708,6 +726,16 @@ export class PeerPigeonStorage {
 
     const latest = await this.get(response.space, response.key);
     pending.resolve(latest);
+  }
+
+  private shouldAcceptRemoteSync(space: StorageSpace, key: string, context: StorageSyncFilterContext): boolean {
+    if (space === 'private') return false;
+    if (!this.syncFilter) return true;
+    try {
+      return this.syncFilter(space, key, context) !== false;
+    } catch {
+      return false;
+    }
   }
 
   private async createDriver(): Promise<StorageDriver> {
@@ -756,15 +784,6 @@ export class PeerPigeonStorage {
 
   private makeMutationId(actorId: string): string {
     return `${actorId}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-  }
-
-  private shouldSyncKey(space: StorageSpace, key: string): boolean {
-    if (!this.syncFilter) return true;
-    try {
-      return this.syncFilter(space, key);
-    } catch {
-      return false;
-    }
   }
 
   private resolveOwnerId(space: StorageSpace, existing: PersistedRecord | null, actorId: string, ownerOverride?: string): string | null {
