@@ -4,26 +4,23 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node ../../scripts/dev-with-mdns.mjs",
-    "dev:raw": "vite --host 0.0.0.0",
+    "dev": "vite --host 0.0.0.0 --port 5173 --strictPort",
     "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
-    "d3": "^7.9.0",
-    "freertc": "github:draeder/freertc",
     "peerpigeon": "file:../..",
-    "unsea": "^1.1.2",
+    "freertc": "github:draeder/freertc",
     "vue": "^3.3.0"
   },
   "devDependencies": {
-    "@rollup/plugin-inject": "^5.0.5",
+    "vite": "^5.0.0",
     "@vitejs/plugin-vue": "^5.0.0",
+    "@rollup/plugin-inject": "^5.0.5",
     "buffer": "^6.0.3",
     "events": "^3.3.0",
     "process": "^0.11.10",
     "stream-browserify": "^3.0.0",
-    "util": "^0.12.5",
-    "vite": "^5.0.0"
+    "util": "^0.12.5"
   }
 }

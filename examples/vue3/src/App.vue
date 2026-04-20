@@ -2213,8 +2213,8 @@ export default {
           const target = String(peerId || '').trim();
           if (!target || target === source) continue;
 
-          // Local validation: render only edges to peers that have their own snapshot entry.
-          if (!knownSnapshotPeers.has(target)) continue;
+          // Trust connectedPeers edges even if target snapshot hasn't arrived yet.
+          // This prevents temporary gaps where connections show as missing nodes.
 
           participants.add(source);
           participants.add(target);
