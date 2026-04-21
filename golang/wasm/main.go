@@ -161,11 +161,11 @@ func (a *gossipAdapter) OnMessageReceived(fn func(data interface{}, local bool, 
 }
 
 type wasmNode struct {
-	id          int
-	mesh        *jsMesh
-	gossip      *gossip.GossipProtocol
-	storage     *storage.PeerPigeonStorage
-	bridge      js.Value
+	id           int
+	mesh         *jsMesh
+	gossip       *gossip.GossipProtocol
+	storage      *storage.PeerPigeonStorage
+	bridge       js.Value
 	storageUnsub func()
 }
 
@@ -185,10 +185,10 @@ func (n *wasmNode) close() {
 }
 
 var (
-	nodesMu     sync.Mutex
-	nodes       = make(map[int]*wasmNode)
-	nextNodeID  = 1
-	registered  []js.Func
+	nodesMu    sync.Mutex
+	nodes      = make(map[int]*wasmNode)
+	nextNodeID = 1
+	registered []js.Func
 )
 
 func main() {
@@ -266,10 +266,10 @@ func jsCreateNode(_ js.Value, args []js.Value) interface{} {
 	node := &wasmNode{mesh: mesh, gossip: g, storage: st, bridge: bridge}
 	node.storageUnsub = st.OnChange(func(ev storage.ChangeEvent) {
 		notifyBridgeEvent(node.bridge, "onStorageChange", map[string]interface{}{
-			"origin": string(ev.Origin),
-			"op":     ev.Op,
-			"space":  string(ev.Space),
-			"key":    ev.Key,
+			"origin":  string(ev.Origin),
+			"op":      ev.Op,
+			"space":   string(ev.Space),
+			"key":     ev.Key,
 			"actorId": ev.ActorID,
 		})
 	})
