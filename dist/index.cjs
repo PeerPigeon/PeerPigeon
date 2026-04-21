@@ -243,6 +243,24 @@ var FreeRTCClientAdapter = class {
       peerId: this.requestedPeerId,
       isRegistered: true
     };
+    this._pageUnloadHandler = () => {
+      this._sendWithdraw();
+      this.intentionallyDisconnected = true;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      this.stopLoops();
+      try {
+        this.socket?.close(1e3, "page_unload");
+      } catch {
+      }
+      this.socket = null;
+    };
+    if (typeof window !== "undefined") {
+      window.addEventListener("beforeunload", this._pageUnloadHandler);
+      window.addEventListener("pagehide", this._pageUnloadHandler);
+    }
   }
   on(event, handler) {
     this.emitter.on(event, handler);
@@ -592,6 +610,11 @@ var FreeRTCClientAdapter = class {
     }
   }
   disconnect() {
+    if (typeof window !== "undefined") {
+      window.removeEventListener("beforeunload", this._pageUnloadHandler);
+      window.removeEventListener("pagehide", this._pageUnloadHandler);
+    }
+    this._sendWithdraw();
     this.intentionallyDisconnected = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -608,6 +631,11 @@ var FreeRTCClientAdapter = class {
     this.closeAllPeerEntries();
     this.joinedOnce = false;
     this.knownPeers.clear();
+  }
+  _sendWithdraw() {
+    this.sendEnvelope("withdraw", {
+      body: { reason: "shutdown" }
+    });
   }
   isConnected() {
     return !!this.socket && this.socket.readyState === WebSocket.OPEN;
@@ -1317,10 +1345,18 @@ var PeerPigeonStorage = class {
     this.listeners.delete(listener);
   }
   async put(space, key, value, options = {}) {
-    const mutation = await this.applyLocalUpsert(space, key, value, options);
+    const mutation = await this.applyLocalUpsert(space, key, value, options, false);
     if (space !== "private") {
       await this.broadcastMutation(mutation);
     }
+    return await this.get(space, key);
+  }
+  async putSystem(space, key, value, options = {}) {
+    if (space !== "epublic") {
+      throw new Error("putSystem is only allowed for epublic space");
+    }
+    const mutation = await this.applyLocalUpsert(space, key, value, options, true);
+    await this.broadcastMutation(mutation);
     return await this.get(space, key);
   }
   async get(space, key) {
@@ -1374,11 +1410,20 @@ var PeerPigeonStorage = class {
     });
   }
   async delete(space, key) {
-    const mutation = await this.applyLocalDelete(space, key);
+    const mutation = await this.applyLocalDelete(space, key, false);
     if (!mutation) return false;
     if (space !== "private") {
       await this.broadcastMutation(mutation);
     }
+    return true;
+  }
+  async deleteSystem(space, key) {
+    if (space !== "epublic") {
+      throw new Error("deleteSystem is only allowed for epublic space");
+    }
+    const mutation = await this.applyLocalDelete(space, key, true);
+    if (!mutation) return false;
+    await this.broadcastMutation(mutation);
     return true;
   }
   async list(space) {
@@ -1422,14 +1467,14 @@ var PeerPigeonStorage = class {
     }
     this.pendingRetrieveRequests.clear();
   }
-  async applyLocalUpsert(space, key, value, options) {
+  async applyLocalUpsert(space, key, value, options, allowSystemWrite = false) {
     const normalizedKey = this.normalizeKey(key);
     const actorId = this.userId;
     const driver = this.requireDriver();
     const pk = this.makePk(space, normalizedKey);
     const existing = await driver.get(pk);
     const now = Date.now();
-    this.assertCanWrite(space, existing, actorId, options.ownerId);
+    this.assertCanWrite(space, existing, actorId, options.ownerId, allowSystemWrite);
     const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
     const nextVersion = (existing?.version ?? 0) + 1;
     const encoded = await this.encodeValueForStore(space, value);
@@ -1484,14 +1529,14 @@ var PeerPigeonStorage = class {
     });
     return mutation;
   }
-  async applyLocalDelete(space, key) {
+  async applyLocalDelete(space, key, allowSystemWrite = false) {
     const normalizedKey = this.normalizeKey(key);
     const actorId = this.userId;
     const driver = this.requireDriver();
     const pk = this.makePk(space, normalizedKey);
     const existing = await driver.get(pk);
     if (!existing) return null;
-    this.assertCanDelete(space, existing, actorId);
+    this.assertCanDelete(space, existing, actorId, allowSystemWrite);
     await driver.delete(pk);
     const opId = this.makeMutationId(actorId);
     const mutation = {
@@ -1562,7 +1607,7 @@ var PeerPigeonStorage = class {
     if (mutation.op === "delete") {
       if (!existing) return false;
       if (mutation.timestamp <= existing.updatedAt) return false;
-      if (!this.canDelete(mutation.space, existing, mutation.actorId)) return false;
+      if (!this.canDelete(mutation.space, existing, mutation.actorId, mutation.space === "epublic")) return false;
       await driver.delete(pk);
       this.emitChange({
         origin: "remote",
@@ -1593,7 +1638,7 @@ var PeerPigeonStorage = class {
       if (incomingVersion < existingVersion) return false;
       if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return false;
     }
-    if (!this.canWrite(mutation.space, existing, mutation.actorId)) return false;
+    if (!this.canWrite(mutation.space, existing, mutation.actorId, void 0, mutation.space === "epublic")) return false;
     if (mutation.space === "user" && !existing) {
       const incomingOwner = String(mutation.record.ownerId ?? "").trim();
       if (incomingOwner && incomingOwner !== mutation.actorId) {
@@ -1790,17 +1835,20 @@ var PeerPigeonStorage = class {
     await this.broadcastSyncPayload(response);
   }
   async handleRetrieveResponse(response) {
-    const pending = this.pendingRetrieveRequests.get(response.reqId);
-    if (!pending) return;
-    this.pendingRetrieveRequests.delete(response.reqId);
-    clearTimeout(pending.timeout);
+    const pending = this.pendingRetrieveRequests.get(response.reqId) ?? null;
+    if (pending) {
+      this.pendingRetrieveRequests.delete(response.reqId);
+      clearTimeout(pending.timeout);
+    }
     if (response.record && response.space !== "private") {
       if (!this.shouldAcceptRemoteSync(response.space, response.key, {
         kind: "retrieve-response",
         actorId: response.actorId
       })) {
-        const latest2 = await this.get(response.space, response.key);
-        pending.resolve(latest2);
+        if (pending) {
+          const latest = await this.get(response.space, response.key);
+          pending.resolve(latest);
+        }
         return;
       }
       const mutation = {
@@ -1815,8 +1863,10 @@ var PeerPigeonStorage = class {
       };
       await this.applyRemoteMutation(mutation);
     }
-    const latest = await this.get(response.space, response.key);
-    pending.resolve(latest);
+    if (pending) {
+      const latest = await this.get(response.space, response.key);
+      pending.resolve(latest);
+    }
   }
   shouldAcceptRemoteSync(space, key, context) {
     if (space === "private") return false;
@@ -1878,13 +1928,14 @@ var PeerPigeonStorage = class {
     }
     return existing?.ownerId ?? null;
   }
-  assertCanWrite(space, existing, actorId, ownerOverride) {
-    if (!this.canWrite(space, existing, actorId, ownerOverride)) {
+  assertCanWrite(space, existing, actorId, ownerOverride, allowSystemWrite = false) {
+    if (!this.canWrite(space, existing, actorId, ownerOverride, allowSystemWrite)) {
       throw new Error(`Write denied for ${space} space key`);
     }
   }
-  canWrite(space, existing, actorId, ownerOverride) {
+  canWrite(space, existing, actorId, ownerOverride, allowSystemWrite = false) {
     if (space === "public") return true;
+    if (space === "epublic") return allowSystemWrite === true;
     if (space === "private") return actorId === this.userId;
     if (space === "user") {
       if (!existing) return true;
@@ -1905,13 +1956,14 @@ var PeerPigeonStorage = class {
     const str = String(id).trim();
     return /^[0-9a-f]{64}$/i.test(str);
   }
-  assertCanDelete(space, existing, actorId) {
-    if (!this.canDelete(space, existing, actorId)) {
+  assertCanDelete(space, existing, actorId, allowSystemWrite = false) {
+    if (!this.canDelete(space, existing, actorId, allowSystemWrite)) {
       throw new Error(`Delete denied for ${space} space key`);
     }
   }
-  canDelete(space, existing, actorId) {
+  canDelete(space, existing, actorId, allowSystemWrite = false) {
     if (space === "public") return true;
+    if (space === "epublic") return allowSystemWrite === true;
     if (space === "private") return actorId === this.userId;
     if (space === "user") return existing.ownerId === actorId;
     if (space === "frozen") return false;
@@ -1942,15 +1994,15 @@ var PeerPigeonStorage = class {
   }
   isStorageMutation(value) {
     const maybe = value;
-    return !!maybe && maybe.__ppType === "pp-storage-op-v1" && typeof maybe.opId === "string" && (maybe.op === "upsert" || maybe.op === "delete") && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number";
+    return !!maybe && maybe.__ppType === "pp-storage-op-v1" && typeof maybe.opId === "string" && (maybe.op === "upsert" || maybe.op === "delete") && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private" || maybe.space === "epublic") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number";
   }
   isStorageRetrieveRequest(value) {
     const maybe = value;
-    return !!maybe && maybe.__ppType === "pp-storage-req-v1" && typeof maybe.reqId === "string" && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number";
+    return !!maybe && maybe.__ppType === "pp-storage-req-v1" && typeof maybe.reqId === "string" && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private" || maybe.space === "epublic") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number";
   }
   isStorageRetrieveResponse(value) {
     const maybe = value;
-    return !!maybe && maybe.__ppType === "pp-storage-res-v1" && typeof maybe.reqId === "string" && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number" && (maybe.record === null || typeof maybe.record === "object");
+    return !!maybe && maybe.__ppType === "pp-storage-res-v1" && typeof maybe.reqId === "string" && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private" || maybe.space === "epublic") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number" && (maybe.record === null || typeof maybe.record === "object");
   }
   isCrossTabNotice(value) {
     const maybe = value;
@@ -2023,7 +2075,11 @@ var PeerPigeonStorage = class {
       cipherCopy
     );
     const text = new TextDecoder().decode(plainBuffer);
-    return JSON.parse(text);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error("storage decrypt produced non-JSON payload");
+    }
   }
   toBase64Url(buffer) {
     const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);

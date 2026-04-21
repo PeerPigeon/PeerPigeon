@@ -66,20 +66,6 @@
 
         <div class="config-grid">
           <label class="field">
-            <span class="field-label">Session Source</span>
-            <select
-              v-model="sessionSource"
-              @change="onSessionSourceChange"
-              :disabled="isRunning || isConnecting"
-              class="input"
-              data-testid="session-source"
-            >
-              <option value="manual">Manual</option>
-              <option value="page-url">Page URL</option>
-            </select>
-          </label>
-
-          <label class="field">
             <span class="field-label">Server</span>
             <input
               v-model.trim="signalingServer"
@@ -94,7 +80,7 @@
             <span class="field-label">Network Name</span>
             <input
               v-model.trim="networkName"
-              :disabled="isRunning || isConnecting || sessionSource === 'page-url'"
+              :disabled="isRunning || isConnecting"
               class="input"
               data-testid="network-name"
               placeholder="peerpigeon"
@@ -105,19 +91,12 @@
             <span class="field-label">Room / Session ID</span>
             <input
               v-model.trim="roomSessionId"
-              :disabled="isRunning || isConnecting || sessionSource === 'page-url'"
+              :disabled="isRunning || isConnecting"
               class="input"
               data-testid="room-session-id"
               placeholder="my-room"
             />
           </label>
-
-          <div v-if="sessionSource === 'page-url'" class="field field-session-derived">
-            <span class="field-label">Derived Session</span>
-            <div class="session-derived-preview mono" :title="pageUrlSessionPreview">
-              {{ pageUrlSessionPreview }}
-            </div>
-          </div>
 
           <label class="field field-number">
             <span class="field-label">Min Peers</span>
@@ -283,6 +262,7 @@
                   <option value="private">private</option>
                   <option value="public">public</option>
                   <option value="frozen">frozen</option>
+                  <option value="epublic">epublic (read-only)</option>
                 </select>
               </label>
 
@@ -311,14 +291,14 @@
 
               <label class="field storage-value-field">
                 <span class="field-label">Value (JSON or text)</span>
-                <input v-model="storageFormValue" class="input" placeholder='{"darkMode":true}' />
+                <input v-model="storageFormValue" class="input" placeholder='{"darkMode":true}' :disabled="storageActiveSpace === 'epublic'" />
               </label>
 
               <div class="storage-actions">
-                <button class="btn btn-secondary" :disabled="!isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="saveStorageEntry">
+                <button class="btn btn-secondary" :disabled="storageActiveSpace === 'epublic' || !isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="saveStorageEntry">
                   Save
                 </button>
-                <button class="btn btn-danger" :disabled="!isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="deleteStorageEntry">
+                <button class="btn btn-danger" :disabled="storageActiveSpace === 'epublic' || !isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="deleteStorageEntry">
                   Delete
                 </button>
                 <button class="btn" :disabled="!isRunning || storageBusy" @click="refreshStorageList">
@@ -336,13 +316,13 @@
               </div>
               <div class="storage-interest-chips">
                 <button
-                  v-for="interestKey in interestedKeysForSpace(storageActiveSpace)"
-                  :key="`${storageActiveSpace}:${interestKey}`"
+                  v-for="interest in interestedKeysForSpace(storageActiveSpace)"
+                  :key="interest.pk"
                   class="storage-interest-chip"
-                  @click="setStorageKeyInterest(storageActiveSpace, interestKey, false)"
-                  :title="`Stop syncing ${interestKey}`"
+                  @click="setStorageKeyInterest(storageActiveSpace, interest.key, false, interest.ownerId)"
+                  :title="`Stop syncing ${interest.key}`"
                 >
-                  <span class="mono">{{ interestKey }}</span>
+                  <span class="mono">{{ interest.key }}</span>
                   <span aria-hidden="true">×</span>
                 </button>
               </div>
@@ -443,7 +423,7 @@
         <div ref="networkGraphContainer" class="network-graph-container" data-testid="mesh-visualizer">
           <svg ref="networkGraphSvg" class="network-graph-svg"></svg>
         </div>
-        <div class="mesh-visualizer-caption">Live connected topology from <code>mesh:peers</code> with per-peer audits</div>
+        <div class="mesh-visualizer-caption">Live connected topology from <code>epublic/mesh:peers</code> with per-peer audits</div>
       </section>
 
       <!-- Diagnostics -->
@@ -481,6 +461,7 @@ const ENCRYPTED_BROADCAST_TYPE = 'pp-encrypted-broadcast-v1';
 const ENCRYPTED_DIRECT_TYPE = 'pp-encrypted-direct-v1';
 const STORAGE_SYNC_ENVELOPE_TYPE = 'pp-storage-sync-v1';
 const MESH_PEERS_STORAGE_KEY = 'mesh:peers';
+const MESH_PEERS_STORAGE_SPACE = 'epublic';
 const MESH_PEERS_HEARTBEAT_MS = 12_000;
 
 function toBase64Url(buffer) {
@@ -522,7 +503,6 @@ export default {
       minPeers: 2,
       tolerantPeers: 1,
       topology: DEFAULT_TOPOLOGY,
-      sessionSource: 'manual',
       networkName: 'peerpigeon',
       roomSessionId: '',
       signalingServer: 'wss://peer.ooo/ws',
@@ -550,6 +530,10 @@ export default {
       storageRecords: [],
       storageChangeUnsubscribe: null,
       storageInterestedKeys: {},
+      storageInterestSyncInFlight: false,
+      storageInterestSyncQueued: false,
+      storageInterestSyncPendingSpaces: new Set(),
+      meshPeersStorageSpace: MESH_PEERS_STORAGE_SPACE,
       meshPeersStorageKey: MESH_PEERS_STORAGE_KEY,
       sharedMeshPeerSnapshots: {},
       meshPeersPublishTimer: null,
@@ -570,16 +554,26 @@ export default {
       networkGraphState: null,
       networkGraphResizeHandler: null,
       debugMonitorTimer: null,
-      debugLastByPeer: {}
+      debugLastByPeer: {},
+      runtimeMode: 'go-wasm',
+      goWasmNodeId: null,
+      goWasmHandlers: {
+        messageReceived: new Set(),
+        directMessageReceived: new Set(),
+      },
+      goWasmStorageNotify: null,
+      goWasmLoadPromise: null,
+      goWasmStarted: false,
     };
   },
   mounted() {
     window.__app = this;
     const params = new URLSearchParams(window.location.search);
-    const sessionSourceParam = String(params.get('sessionSource') || '').trim().toLowerCase();
-    const deriveSessionFromUrl = String(params.get('deriveSessionFromUrl') || '').trim().toLowerCase();
-    if (sessionSourceParam === 'page-url' || sessionSourceParam === 'url' || deriveSessionFromUrl === '1' || deriveSessionFromUrl === 'true' || deriveSessionFromUrl === 'yes') {
-      this.sessionSource = 'page-url';
+    const runtimeParam = String(params.get('runtime') || params.get('engine') || '').trim().toLowerCase();
+    if (runtimeParam === 'js' || runtimeParam === 'javascript') {
+      this.runtimeMode = 'js';
+    } else if (runtimeParam === 'go' || runtimeParam === 'go-wasm' || runtimeParam === 'wasm') {
+      this.runtimeMode = 'go-wasm';
     }
 
     // ==== IMPORTANT: URL params take ABSOLUTE priority for test isolation ====
@@ -604,9 +598,9 @@ export default {
     }
 
     // If URL does not provide a sessionId, use a fresh random room by default.
-    if (this.sessionSource === 'manual' && hasExplicitSessionId) {
+    if (hasExplicitSessionId) {
       this.roomSessionId = sessionIdParam;
-    } else if (this.sessionSource === 'manual') {
+    } else {
       this.roomSessionId = this.generateRandomRoomSessionId();
     }
 
@@ -635,7 +629,7 @@ export default {
     this.reconcileTopologyWithPeerBounds();
 
     const networkNameParam = params.get('networkName') || params.get('network');
-    if (this.sessionSource === 'manual' && networkNameParam) {
+    if (networkNameParam) {
       this.networkName = networkNameParam;
     }
 
@@ -643,6 +637,9 @@ export default {
     if (signalingServerParam) {
       this.signalingServer = signalingServerParam;
     }
+
+    // Restore persisted UI state before any autostart/network events can write defaults.
+    this.loadUiState();
 
     const autostart = (params.get('autostart') || '1').toLowerCase();
     if (autostart === '1' || autostart === 'true' || autostart === 'yes') {
@@ -652,8 +649,6 @@ export default {
     // Normalize/shareable URL immediately on load so defaults are explicit
     // and subsequent topology changes reuse the same URL state.
     this.updateUrlState();
-
-    this.loadUiState();
     this.networkGraphResizeHandler = () => {
       this.scheduleNetworkGraphRender({ immediate: true, reason: 'resize' });
     };
@@ -668,20 +663,10 @@ export default {
       return network || room || 'default';
     },
     activeNetworkName() {
-      if (this.sessionSource === 'page-url') {
-        return this.deriveSessionFromPageUrl().networkName;
-      }
       return String(this.networkName || '').trim();
     },
     activeRoomSessionId() {
-      if (this.sessionSource === 'page-url') {
-        return this.deriveSessionFromPageUrl().roomSessionId;
-      }
       return String(this.roomSessionId || '').trim();
-    },
-    pageUrlSessionPreview() {
-      const derived = this.deriveSessionFromPageUrl();
-      return `${derived.networkName}:${derived.roomSessionId}`;
     },
     connectedPeers() {
       return this.connectedPeersList.length;
@@ -722,6 +707,9 @@ export default {
         .sort(([a], [b]) => a.localeCompare(b));
     },
     storageSpaceDescription() {
+      if (this.storageActiveSpace === 'epublic') {
+        return 'epublic: shared internal/system space. Read-only in UI.';
+      }
       if (this.storageActiveSpace === 'public') {
         return 'public: anyone can read and mutate.';
       }
@@ -747,7 +735,7 @@ export default {
     },
     activeTab(nextTab) {
       if (nextTab === 'storage') {
-        this.ensureStorageReady().catch((error) => {
+        this.ensureStorageReady({ fastPath: true }).catch((error) => {
           this.storageError = String(error?.message || error || 'Failed to initialize storage');
         });
       }
@@ -762,60 +750,14 @@ export default {
         this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'connected' }));
       }
     },
-    sessionSource() {
+    networkName() {
       this.updateUrlState();
     },
-    networkName() {
-      if (this.sessionSource === 'manual') {
-        this.updateUrlState();
-      }
-    },
     roomSessionId() {
-      if (this.sessionSource === 'manual') {
-        this.updateUrlState();
-      }
+      this.updateUrlState();
     }
   },
   methods: {
-    sanitizeSessionPart(value, fallback) {
-      const normalized = String(value || '')
-        .trim()
-        .toLowerCase()
-        .replace(/^www\./, '')
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '');
-      return normalized || fallback;
-    },
-
-    deriveSessionFromPageUrl() {
-      try {
-        const url = new URL(window.location.href);
-        const hostname = this.sanitizeSessionPart(url.hostname, 'peerpigeon');
-        const port = this.sanitizeSessionPart(url.port, '');
-        const pathSegments = url.pathname
-          .split('/')
-          .map((segment) => this.sanitizeSessionPart(segment, ''))
-          .filter(Boolean);
-
-        return {
-          networkName: port ? `${hostname}-${port}` : hostname,
-          roomSessionId: pathSegments.length ? pathSegments.join('-') : 'root'
-        };
-      } catch {
-        return {
-          networkName: 'peerpigeon',
-          roomSessionId: 'root'
-        };
-      }
-    },
-
-    onSessionSourceChange() {
-      if (this.sessionSource === 'manual' && !String(this.roomSessionId || '').trim()) {
-        this.roomSessionId = this.generateRandomRoomSessionId();
-      }
-      this.updateUrlState();
-    },
-
     async copyShareLink() {
       this.updateUrlState();
       try {
@@ -867,6 +809,23 @@ export default {
       return this.storageUserId();
     },
 
+    inferInterestedUserOwner() {
+      const owners = new Set();
+      for (const [pk, enabled] of Object.entries(this.storageInterestedKeys || {})) {
+        if (enabled !== true || typeof pk !== 'string') continue;
+        if (!pk.startsWith('user:')) continue;
+        const rest = pk.slice('user:'.length);
+        const splitAt = rest.indexOf(':');
+        if (splitAt <= 0) continue;
+        const owner = rest.slice(0, splitAt).trim();
+        if (owner) owners.add(owner);
+      }
+      if (owners.size === 1) {
+        return Array.from(owners)[0];
+      }
+      return '';
+    },
+
     storageInterestPk(space, key, ownerId = null) {
       const normalizedSpace = String(space || '').trim();
       const normalizedKey = String(key || '').trim();
@@ -895,15 +854,37 @@ export default {
         : '';
       for (const [pk, enabled] of Object.entries(this.storageInterestedKeys)) {
         if (!enabled) continue;
-        const prefix = normalizedSpace === 'user'
-          ? `${normalizedSpace}:${userOwner}:`
-          : `${normalizedSpace}:`;
-        if (!pk.startsWith(prefix)) continue;
-        const key = pk.slice(prefix.length);
-        if (key) out.push(key);
+        if (normalizedSpace !== 'user') {
+          const prefix = `${normalizedSpace}:`;
+          if (!pk.startsWith(prefix)) continue;
+          const key = pk.slice(prefix.length);
+          if (key) {
+            out.push({ pk, key, ownerId: null });
+          }
+          continue;
+        }
+
+        if (!pk.startsWith('user:')) continue;
+        const rest = pk.slice('user:'.length);
+        const splitAt = rest.indexOf(':');
+
+        // Backward-compatible handling for legacy persisted keys: "user:<key>"
+        if (splitAt < 0) {
+          const legacyKey = rest.trim();
+          if (!legacyKey) continue;
+          out.push({ pk, key: legacyKey, ownerId: userOwner || null });
+          continue;
+        }
+
+        const owner = rest.slice(0, splitAt).trim();
+        const key = rest.slice(splitAt + 1);
+        if (!key) continue;
+        if (userOwner && owner && owner !== userOwner) continue;
+        if (userOwner && !owner) continue;
+        out.push({ pk, key, ownerId: owner || null });
       }
 
-      out.sort((a, b) => a.localeCompare(b));
+      out.sort((a, b) => a.key.localeCompare(b.key));
       return out;
     },
 
@@ -916,6 +897,9 @@ export default {
         [pk]: Boolean(enabled),
       };
       this.saveUiState();
+      if (enabled === true) {
+        this.requestInterestedKeySync('interest-added', [space]);
+      }
 
       if (this.activeTab === 'storage') {
         this.refreshStorageList();
@@ -946,22 +930,118 @@ export default {
         });
     },
 
+    async syncInterestedKeysForSpace(space, options = {}) {
+      if (!this.storage || !this.storageReady) return;
+
+      const normalizedSpace = String(space || '').trim();
+      if (!this.isKnownStorageSpace(normalizedSpace)) return;
+
+      const timeoutMs = Number(options?.timeoutMs ?? 1200);
+      const interested = this.interestedKeysForSpace(normalizedSpace);
+      if (!interested.length) return;
+
+      const requests = [];
+      for (const interest of interested) {
+        const key = String(interest?.key || '').trim();
+        if (!key) continue;
+        const ownerId = normalizedSpace === 'user'
+          ? String(interest?.ownerId || this.storageLookupUserId() || '').trim()
+          : null;
+        const wireKey = this.storageWireKey(normalizedSpace, key, ownerId);
+        if (!wireKey) continue;
+        requests.push(this.storage.retrieve(normalizedSpace, wireKey, { timeoutMs }));
+      }
+
+      if (!requests.length) return;
+      await Promise.allSettled(requests);
+    },
+
+    async syncInterestedKeysForAllSpaces(options = {}) {
+      if (!this.storage || !this.storageReady) return;
+      const spaces = ['public', 'user', 'frozen', 'private', 'epublic']
+        .filter((space) => this.interestedKeysForSpace(space).length > 0);
+      if (!spaces.length) return;
+      for (const space of spaces) {
+        try {
+          await this.syncInterestedKeysForSpace(space, options);
+        } catch {
+          // best-effort sync per space
+        }
+      }
+    },
+
+    requestInterestedKeySync(_reason = 'update', spaces = null, options = {}) {
+      if (!this.storage || !this.storageReady) return;
+      const requestedSpaces = Array.isArray(spaces)
+        ? spaces
+        : ['public', 'user', 'frozen', 'private', 'epublic'];
+      for (const space of requestedSpaces) {
+        if (!this.isKnownStorageSpace(space)) continue;
+        this.storageInterestSyncPendingSpaces.add(space);
+      }
+      this.processInterestedKeySyncQueue(options).catch(() => {
+        // best-effort background sync
+      });
+    },
+
+    async processInterestedKeySyncQueue(options = {}) {
+      if (!this.storage || !this.storageReady) return;
+      if (this.storageInterestSyncInFlight) {
+        this.storageInterestSyncQueued = true;
+        return;
+      }
+
+      this.storageInterestSyncInFlight = true;
+      try {
+        const timeoutMs = Number(options?.timeoutMs ?? 1200);
+        while (this.storageInterestSyncPendingSpaces.size > 0) {
+          const [space] = Array.from(this.storageInterestSyncPendingSpaces);
+          this.storageInterestSyncPendingSpaces.delete(space);
+          await this.syncInterestedKeysForSpace(space, { timeoutMs });
+        }
+        if (this.activeTab === 'storage') {
+          await this.refreshStorageList({ silent: true, syncInterested: false });
+        }
+      } finally {
+        this.storageInterestSyncInFlight = false;
+        if (this.storageInterestSyncQueued) {
+          this.storageInterestSyncQueued = false;
+          this.processInterestedKeySyncQueue(options).catch(() => {
+            // best-effort background sync
+          });
+        }
+      }
+    },
+
     clearStorageKeyInterestForSpace(space, ownerId = null) {
       const normalizedSpace = String(space || '').trim();
       if (!normalizedSpace) return;
 
       const next = { ...this.storageInterestedKeys };
-      const prefix = normalizedSpace === 'user'
-        ? `${normalizedSpace}:${String(ownerId ?? this.storageLookupUserId() ?? '').trim()}:`
-        : `${normalizedSpace}:`;
-      for (const pk of Object.keys(next)) {
-        if (pk.startsWith(prefix)) {
-          delete next[pk];
+      if (normalizedSpace === 'user') {
+        const owner = String(ownerId ?? this.storageLookupUserId() ?? '').trim();
+        for (const pk of Object.keys(next)) {
+          if (!pk.startsWith('user:')) continue;
+          if (!owner) {
+            delete next[pk];
+            continue;
+          }
+          if (pk.startsWith(`user:${owner}:`)) {
+            delete next[pk];
+          }
+        }
+      } else {
+        const prefix = `${normalizedSpace}:`;
+        for (const pk of Object.keys(next)) {
+          if (pk.startsWith(prefix)) {
+            delete next[pk];
+          }
         }
       }
 
       this.storageInterestedKeys = next;
       this.saveUiState();
+      this.requestInterestedKeySync('interest-cleared', [normalizedSpace], { timeoutMs: 1000 });
 
       if (this.activeTab === 'storage') {
         this.refreshStorageList();
@@ -1001,7 +1081,7 @@ export default {
     },
 
     isKnownStorageSpace(space) {
-      return space === 'user' || space === 'private' || space === 'public' || space === 'frozen';
+      return space === 'user' || space === 'private' || space === 'public' || space === 'frozen' || space === 'epublic';
     },
 
     storageWireKey(space, key, ownerId = null) {
@@ -1025,14 +1105,22 @@ export default {
       return incomingUpdatedAt > existingUpdatedAt;
     },
 
-    async ensureStorageReady() {
+    async ensureStorageReady(options = {}) {
+      const fastPath = options && options.fastPath === true;
       const userId = this.storageUserId();
       if (!userId || !this.gossip) return;
 
       const nextIdentity = `${this.effectiveSessionId}::${userId}`;
       if (this.storageReady && this.storage && this.storageIdentity === nextIdentity) {
-        await this.syncMeshPeersFromNetwork('storage-ready');
-        await this.refreshStorageList({ silent: true });
+        if (!fastPath) {
+          this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
+            // background best-effort network sync
+          });
+        } else {
+          this.scheduleMeshPeersRetrieve('storage-tab');
+        }
+        await this.refreshStorageList({ silent: true, syncInterested: false });
+        this.requestInterestedKeySync('storage-ready-existing');
         return;
       }
 
@@ -1058,7 +1146,7 @@ export default {
       await this.storage.init();
       this.storageIdentity = nextIdentity;
       this.storageChangeUnsubscribe = this.storage.subscribe((event) => {
-        if (event?.space === 'public' && event?.key === this.meshPeersStorageKey) {
+        if (event?.space === this.meshPeersStorageSpace && event?.key === this.meshPeersStorageKey) {
           this.refreshMeshPeersFromStorage();
         }
         if (this.activeTab === 'storage') {
@@ -1068,9 +1156,18 @@ export default {
 
       this.storageReady = true;
       this.storageError = '';
-      await this.syncMeshPeersFromNetwork('storage-ready');
+      // Local-first: render from IndexedDB immediately.
+      await this.refreshStorageList({ silent: true, syncInterested: false });
+
+      if (!fastPath) {
+        this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
+          // background best-effort network sync
+        });
+      } else {
+        this.scheduleMeshPeersRetrieve('storage-tab-init');
+      }
       this.scheduleMeshPeersPublish('storage-ready');
-      await this.refreshStorageList({ silent: true });
+      this.requestInterestedKeySync('storage-ready-init');
     },
 
     teardownStorage() {
@@ -1078,6 +1175,9 @@ export default {
       this.storageBusy = false;
       this.storageRecords = [];
       this.storageIdentity = '';
+      this.storageInterestSyncInFlight = false;
+      this.storageInterestSyncQueued = false;
+      this.storageInterestSyncPendingSpaces = new Set();
       clearTimeout(this.meshPeersPublishTimer);
       this.meshPeersPublishTimer = null;
       clearTimeout(this.meshPeersRetrieveTimer);
@@ -1148,6 +1248,41 @@ export default {
           const existing = byLogicalKey.get(key);
           if (!existing || this.shouldReplaceStorageRecord(existing, record)) {
             byLogicalKey.set(key, record);
+          }
+        }
+
+        // Ensure interested keys are hydrated from local IndexedDB even when
+        // no peers are connected (eventual remote sync is separate).
+        const interested = this.interestedKeysForSpace(this.storageActiveSpace);
+        if (interested.length > 0) {
+          for (const interest of interested) {
+            const logicalKey = String(interest?.key || '').trim();
+            if (!logicalKey) continue;
+            const ownerId = this.storageActiveSpace === 'user'
+              ? String(interest?.ownerId || this.storageLookupUserId() || '').trim()
+              : null;
+            const storeKey = this.storageWireKey(this.storageActiveSpace, logicalKey, ownerId);
+            if (!storeKey) continue;
+
+            const localRecord = await this.storage.get(this.storageActiveSpace, storeKey);
+            if (!localRecord || localRecord.deleted === true) continue;
+
+            const merged = {
+              space: this.storageActiveSpace,
+              key: this.storageLogicalKey(this.storageActiveSpace, localRecord.key, localRecord),
+              value: localRecord.value,
+              ownerId: localRecord.ownerId ?? null,
+              createdAt: Number(localRecord.createdAt ?? 0),
+              updatedAt: Number(localRecord.updatedAt ?? 0),
+              version: Number(localRecord.version ?? 0),
+            };
+            const outKey = String(merged.key || '').trim();
+            if (!outKey) continue;
+
+            const existing = byLogicalKey.get(outKey);
+            if (!existing || this.shouldReplaceStorageRecord(existing, merged)) {
+              byLogicalKey.set(outKey, merged);
+            }
           }
         }
 
@@ -1280,7 +1415,7 @@ export default {
     async syncMeshPeersFromNetwork(_reason = 'update') {
       if (!this.storageReady || !this.storage) return;
       try {
-        await this.storage.retrieve('public', this.meshPeersStorageKey, { timeoutMs: 1800 });
+        await this.storage.retrieve(this.meshPeersStorageSpace, this.meshPeersStorageKey, { timeoutMs: 1800 });
       } catch {
         // best-effort network retrieval; fall back to local state
       }
@@ -1292,7 +1427,7 @@ export default {
       if (!this.storageReady || !this.storage) return;
 
       try {
-        const record = await this.storage.get('public', this.meshPeersStorageKey);
+        const record = await this.storage.get(this.meshPeersStorageSpace, this.meshPeersStorageKey);
         const snapshots = this.pruneStaleMeshPeerSnapshots(this.normalizeMeshPeersPayload(record?.value));
         this.sharedMeshPeerSnapshots = snapshots;
         this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'mesh-storage' }));
@@ -1320,7 +1455,7 @@ export default {
 
       this.meshPeersPublishInFlight = true;
       try {
-        const existing = await this.storage.get('public', this.meshPeersStorageKey);
+        const existing = await this.storage.get(this.meshPeersStorageSpace, this.meshPeersStorageKey);
         const snapshots = this.pruneStaleMeshPeerSnapshots(this.normalizeMeshPeersPayload(existing?.value));
 
         // Peer ID can rotate on reload/reconnect; keep only newest entry per stable owner identity.
@@ -1347,7 +1482,11 @@ export default {
         const needsWrite = priorSignature !== localSignature || !priorUpdatedAt || shouldRefreshTimestamp;
         if (!needsWrite) return;
 
-        await this.storage.put('public', this.meshPeersStorageKey, snapshots);
+        if (typeof this.storage.putSystem === 'function') {
+          await this.storage.putSystem(this.meshPeersStorageSpace, this.meshPeersStorageKey, snapshots);
+        } else {
+          await this.storage.put(this.meshPeersStorageSpace, this.meshPeersStorageKey, snapshots);
+        }
         this.meshPeersLastPublishedAt = now;
       } catch {
         // ignore mesh snapshot publish failures
@@ -1369,6 +1508,10 @@ export default {
 
     async saveStorageEntry() {
       if (!this.storage) return;
+      if (this.storageActiveSpace === 'epublic') {
+        this.storageError = 'epublic is read-only in UI';
+        return;
+      }
       const initialKey = String(this.storageFormKey || '').trim();
       const key = this.storageActiveSpace === 'user'
         ? this.storageNormalizeUserKey(this.storageUserId(), initialKey)
@@ -1406,6 +1549,10 @@ export default {
 
     async deleteStorageEntry() {
       if (!this.storage) return;
+      if (this.storageActiveSpace === 'epublic') {
+        this.storageError = 'epublic is read-only in UI';
+        return;
+      }
       const initialKey = String(this.storageFormKey || '').trim();
       const key = this.storageActiveSpace === 'user'
         ? this.storageNormalizeUserKey(this.storageUserId(), initialKey)
@@ -1527,6 +1674,227 @@ export default {
       this.updateUrlState();
     },
 
+    noteGoWasmRuntimeExited(errorLike) {
+      const message = String(errorLike?.message || errorLike || 'Go program has already exited');
+      if (!message.includes('Go program has already exited')) {
+        return false;
+      }
+
+      this.goWasmNodeId = null;
+      this.goWasmStarted = false;
+      this.goWasmLoadPromise = null;
+      this.goWasmStorageNotify = null;
+      this.storageReady = false;
+      this.storage = null;
+      this.storageError = 'Go runtime exited. Reload page to restart wasm runtime.';
+      this.addLog('info', 'Go runtime exited; blocked further wasm calls until reload.', 'wasm');
+      this.showStatus('Runtime exited', 'Go runtime exited. Reload page to continue.', 'error');
+      return true;
+    },
+
+    callGoWasm(fnName, ...args) {
+      if (this.runtimeMode !== 'go-wasm') return null;
+      const fn = window[fnName];
+      if (typeof fn !== 'function') {
+        return null;
+      }
+
+      try {
+        return fn(...args);
+      } catch (error) {
+        if (!this.noteGoWasmRuntimeExited(error)) {
+          this.addLog('info', `WASM bridge error (${fnName}): ${String(error?.message || error || 'unknown')}`, 'wasm');
+        }
+        return null;
+      }
+    },
+
+    async ensureGoWasmRuntimeLoaded() {
+      if (this.runtimeMode !== 'go-wasm') return;
+      if (typeof window.peerpigeonCreateNode === 'function') return;
+      if (this.goWasmLoadPromise) {
+        await this.goWasmLoadPromise;
+        return;
+      }
+
+      this.goWasmLoadPromise = (async () => {
+        if (!window.Go) {
+          await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = '/wasm_exec.js';
+            script.async = true;
+            script.onload = () => resolve();
+            script.onerror = () => reject(new Error('Failed to load wasm_exec.js'));
+            document.head.appendChild(script);
+          });
+        }
+
+        const go = new window.Go();
+        let result;
+        try {
+          result = await WebAssembly.instantiateStreaming(fetch('/peerpigeon.wasm'), go.importObject);
+        } catch {
+          const resp = await fetch('/peerpigeon.wasm');
+          if (!resp.ok) {
+            throw new Error('Failed to fetch /peerpigeon.wasm');
+          }
+          const bytes = await resp.arrayBuffer();
+          result = await WebAssembly.instantiate(bytes, go.importObject);
+        }
+
+        this.goWasmStarted = true;
+        go.run(result.instance);
+
+        const timeoutAt = Date.now() + 10_000;
+        while (typeof window.peerpigeonCreateNode !== 'function') {
+          if (Date.now() > timeoutAt) {
+            throw new Error('peerpigeon wasm runtime did not initialize');
+          }
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+      })();
+
+      await this.goWasmLoadPromise;
+    },
+
+    toPeerDataUint8Array(data) {
+      if (data instanceof Uint8Array) return data;
+      if (data instanceof ArrayBuffer) return new Uint8Array(data);
+      if (ArrayBuffer.isView(data)) {
+        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+      }
+      if (typeof data === 'string') {
+        return new TextEncoder().encode(data);
+      }
+      try {
+        return new TextEncoder().encode(JSON.stringify(data));
+      } catch {
+        return new Uint8Array();
+      }
+    },
+
+    createGoWasmGossipAdapter() {
+      const invokeHandlers = (name, payload) => {
+        for (const fn of this.goWasmHandlers[name]) {
+          try {
+            fn(payload);
+          } catch {
+            // keep bridge robust against handler errors
+          }
+        }
+      };
+
+      const bridge = {
+        send: (peerId, payload) => {
+          if (!this.mesh || typeof this.mesh.send !== 'function') return;
+          try {
+            this.mesh.send(peerId, payload);
+          } catch {
+            // Never throw into Go runtime from JS bridge callbacks.
+          }
+        },
+        onMessageReceived: (event) => {
+          invokeHandlers('messageReceived', {
+            message: {
+              data: event?.data,
+              hops: Number(event?.hops || 0),
+              sender: String(event?.sender || ''),
+            },
+            local: Boolean(event?.local),
+            fromPeer: String(event?.fromPeer || ''),
+          });
+        },
+        onDirectMessageReceived: (event) => {
+          invokeHandlers('directMessageReceived', {
+            message: event?.message || null,
+          });
+        },
+        onStorageChange: (event) => {
+          if (typeof this.goWasmStorageNotify === 'function') {
+            this.goWasmStorageNotify(event || {});
+          }
+        },
+      };
+
+      const nextNodeId = this.callGoWasm('peerpigeonCreateNode', {
+        clientId: this.clientId,
+        sessionId: this.effectiveSessionId,
+        userId: String(this.cryptoKeys?.epub || 'wasm-user').trim() || 'wasm-user',
+        maxHops: 6,
+      }, bridge);
+      if (nextNodeId == null) {
+        throw new Error('failed to create go-wasm node');
+      }
+      this.goWasmNodeId = nextNodeId;
+
+      return {
+        on: (name, fn) => {
+          if (!this.goWasmHandlers[name]) return;
+          this.goWasmHandlers[name].add(fn);
+        },
+        broadcast: (data, metadata) => {
+          return this.callGoWasm('peerpigeonBroadcast', this.goWasmNodeId, data, metadata || null);
+        },
+        sendDirect: (peerId, data) => {
+          return this.callGoWasm('peerpigeonSendDirect', this.goWasmNodeId, peerId, data);
+        },
+        destroy: () => {
+          if (this.goWasmNodeId != null) {
+            this.callGoWasm('peerpigeonDestroyNode', this.goWasmNodeId);
+          }
+          this.goWasmNodeId = null;
+          this.goWasmHandlers.messageReceived.clear();
+          this.goWasmHandlers.directMessageReceived.clear();
+        }
+      };
+    },
+
+    createGoWasmStorageAdapter() {
+      const subscribers = new Set();
+      this.goWasmStorageNotify = (event) => {
+        for (const fn of subscribers) {
+          try {
+            fn(event || {});
+          } catch {
+            // ignore storage subscriber errors
+          }
+        }
+      };
+
+      return {
+        init: async () => {},
+        close: async () => {
+          subscribers.clear();
+          this.goWasmStorageNotify = null;
+        },
+        subscribe: (fn) => {
+          subscribers.add(fn);
+          return () => subscribers.delete(fn);
+        },
+        list: async (space) => {
+          return this.callGoWasm('peerpigeonStorageList', this.goWasmNodeId, space) || [];
+        },
+        get: async (space, key) => {
+          return this.callGoWasm('peerpigeonStorageGet', this.goWasmNodeId, space, key);
+        },
+        retrieve: async (space, key, options = {}) => {
+          return this.callGoWasm('peerpigeonStorageRetrieve', this.goWasmNodeId, space, key, options || {});
+        },
+        put: async (space, key, value, _options = {}) => {
+          return this.callGoWasm('peerpigeonStoragePut', this.goWasmNodeId, space, key, value);
+        },
+        putSystem: async (space, key, value, _options = {}) => {
+          return this.callGoWasm('peerpigeonStoragePut', this.goWasmNodeId, space, key, value);
+        },
+        delete: async (space, key) => {
+          return this.callGoWasm('peerpigeonStorageDelete', this.goWasmNodeId, space, key);
+        },
+        deleteSystem: async (space, key) => {
+          return this.callGoWasm('peerpigeonStorageDelete', this.goWasmNodeId, space, key);
+        },
+      };
+    },
+
     async startMesh() {
       try {
         const normalized = this.normalizePeerBounds(this.minPeers, this.maxPeers, this.tolerantPeers);
@@ -1536,12 +1904,15 @@ export default {
         this.reconcileTopologyWithPeerBounds();
         this.networkName = String(this.networkName || '').trim();
         this.roomSessionId = String(this.roomSessionId || '').trim();
-        if (this.sessionSource === 'manual' && !this.roomSessionId) {
+        if (!this.roomSessionId) {
           this.roomSessionId = this.generateRandomRoomSessionId();
         }
         this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
         this.updateUrlState();
         await this.ensureCryptoKeys();
+        if (this.runtimeMode === 'go-wasm') {
+          await this.ensureGoWasmRuntimeLoaded();
+        }
 
         this.updateUrlState();
 
@@ -1562,7 +1933,11 @@ export default {
           underConnectedResetMs: 20_000
         });
 
-        this.gossip = new GossipProtocol(this.mesh);
+        if (this.runtimeMode === 'go-wasm') {
+          this.gossip = this.createGoWasmGossipAdapter();
+        } else {
+          this.gossip = new GossipProtocol(this.mesh);
+        }
         // Runtime inspection hook for debugging in dev tools / automation.
         window.__mesh = this.mesh;
         window.__gossip = this.gossip;
@@ -1571,6 +1946,9 @@ export default {
         this.mesh.on('signaling:connected', (data) => {
           this.signalingConnected = true;
           this.clientId = (data.clientId || '').trim();
+          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
+            this.callGoWasm('peerpigeonSetClientID', this.goWasmNodeId, this.clientId);
+          }
           this.addLog('signaling', `Connected to signaling server`, this.clientId);
           this.registerLocalPublicCryptoInfo();
           this.announceCryptoPublicInfo();
@@ -1601,16 +1979,35 @@ export default {
         });
 
         this.mesh.on('peer:connected', (peerId) => {
+          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
+            this.callGoWasm('peerpigeonHandlePeerConnected', this.goWasmNodeId, peerId);
+            this.callGoWasm('peerpigeonSetConnectedPeers', this.goWasmNodeId, this.mesh.getConnectedPeers());
+            this.callGoWasm('peerpigeonSetDiscoveredPeers', this.goWasmNodeId, this.mesh.getDiscoveredPeers());
+            this.callGoWasm('peerpigeonSetGlobalPeers', this.goWasmNodeId, this.mesh.getGlobalPeers());
+          }
           this.addLog('connected', `Connected to peer`, peerId);
           this.announceCryptoPublicInfo();
+          this.requestInterestedKeySync('peer-connected');
           this.updateStats();
           this.onMeshConnectionsChanged('peer:connected');
         });
 
         this.mesh.on('peer:disconnected', (peerId) => {
+          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
+            this.callGoWasm('peerpigeonHandlePeerDisconnected', this.goWasmNodeId, peerId);
+            this.callGoWasm('peerpigeonSetConnectedPeers', this.goWasmNodeId, this.mesh.getConnectedPeers());
+            this.callGoWasm('peerpigeonSetDiscoveredPeers', this.goWasmNodeId, this.mesh.getDiscoveredPeers());
+            this.callGoWasm('peerpigeonSetGlobalPeers', this.goWasmNodeId, this.mesh.getGlobalPeers());
+          }
           this.addLog('disconnected', `Disconnected from peer`, peerId);
           this.updateStats();
           this.onMeshConnectionsChanged('peer:disconnected');
+        });
+
+        this.mesh.on('peer:data', ({ peerId, data }) => {
+          if (this.runtimeMode !== 'go-wasm' || this.goWasmNodeId == null) return;
+          const payload = this.toPeerDataUint8Array(data);
+          this.callGoWasm('peerpigeonHandlePeerData', this.goWasmNodeId, peerId, payload);
         });
 
         this.mesh.on('peer:error', ({ peerId, error }) => {
@@ -1620,6 +2017,10 @@ export default {
         });
 
         this.mesh.on('peer:discovered', (peerId) => {
+          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
+            this.callGoWasm('peerpigeonSetDiscoveredPeers', this.goWasmNodeId, this.mesh.getDiscoveredPeers());
+            this.callGoWasm('peerpigeonSetGlobalPeers', this.goWasmNodeId, this.mesh.getGlobalPeers());
+          }
           const self = String(this.mesh?.getClientId?.() || '').trim();
           const initiator = self && peerId ? self < peerId : false;
           this.addLog('info', `Dial role -> ${initiator ? 'initiator' : 'non-initiator(wait)'}`, peerId || 'debug');
@@ -1631,6 +2032,7 @@ export default {
 
         this.mesh.on('mesh:ready', () => {
           this.addLog('info', 'Gossip reached ready state', 'System');
+          this.requestInterestedKeySync('mesh-ready');
         });
 
         // Gossip events
@@ -1788,6 +2190,7 @@ export default {
       };
 
       const sessionCryptoKey = `${this.cryptoStorageKey}:${this.effectiveSessionId}`;
+      // Keep identity tab-scoped: same tab survives reloads, separate tabs stay distinct peers.
       let keys = parseStored(sessionStorage.getItem(sessionCryptoKey));
       if (!keys) {
         keys = await generateRandomPair();
@@ -2301,6 +2704,7 @@ export default {
 
       const snapshots = this.activeMeshPeerSnapshots();
       const localSnapshot = this.localMeshPeerSnapshot();
+      const localConnectedSet = new Set((localSnapshot?.connectedPeers || []).map((peerId) => String(peerId || '').trim()).filter(Boolean));
       if (localSnapshot) {
         snapshots[localSnapshot.peerId] = localSnapshot;
       }
@@ -2334,6 +2738,17 @@ export default {
             directions: new Set(),
           };
           entry.directions.add(direction);
+
+          // WebRTC data channels are full-duplex; when local mesh confirms a link,
+          // render it as full immediately even if remote snapshot has not arrived yet.
+          const localConfirmsLink = Boolean(localSelf) && (
+            (source === localSelf && localConnectedSet.has(target)) ||
+            (target === localSelf && localConnectedSet.has(source))
+          );
+          if (localConfirmsLink) {
+            entry.directions.add(reverse);
+          }
+
           if (entry.directions.has(reverse)) {
             entry.halfDuplex = false;
           }
@@ -3047,30 +3462,18 @@ export default {
         url.searchParams.set('minPeers', String(this.minPeers));
         url.searchParams.set('maxPeers', String(this.maxPeers));
         url.searchParams.set('tolerantPeers', String(this.tolerantPeers));
-        if (this.sessionSource === 'page-url') {
-          url.searchParams.set('sessionSource', 'page-url');
-          url.searchParams.delete('deriveSessionFromUrl');
-          if (!originalParams.has('networkName') && !originalParams.has('network')) {
-            url.searchParams.delete('networkName');
-          }
-        } else {
-          url.searchParams.delete('sessionSource');
-          url.searchParams.delete('deriveSessionFromUrl');
-          if (this.networkName) {
-            url.searchParams.set('networkName', this.networkName);
-          } else if (!originalParams.has('networkName') && !originalParams.has('network')) {
-            url.searchParams.delete('networkName');
-          }
+        url.searchParams.delete('sessionSource');
+        url.searchParams.delete('deriveSessionFromUrl');
+        if (this.networkName) {
+          url.searchParams.set('networkName', this.networkName);
+        } else if (!originalParams.has('networkName') && !originalParams.has('network')) {
+          url.searchParams.delete('networkName');
         }
         
         // Only sync sessionId to URL if it wasn't explicitly provided in the original URL
         // This prevents tests' __test_* sessionIds from being modified
         const hadExplicitSessionId = originalParams.has('sessionId') || originalParams.has('roomSessionId') || originalParams.has('room');
-        if (this.sessionSource === 'page-url') {
-          if (!hadExplicitSessionId) {
-            url.searchParams.delete('sessionId');
-          }
-        } else if (hadExplicitSessionId) {
+        if (hadExplicitSessionId) {
           // Keep original sessionId param as-is
           url.searchParams.set('sessionId', originalParams.get('sessionId') || originalParams.get('roomSessionId') || originalParams.get('room'));
         } else if (this.roomSessionId) {
@@ -3107,14 +3510,17 @@ export default {
           })
         );
 
-        sessionStorage.setItem(this.uiStateKey, JSON.stringify({
+        const serialized = JSON.stringify({
           activeTab: this.activeTab || 'message',
           dmTarget: this.dmTarget || '',
           directMode: !!this.directMode,
           showPrivateCrypto: !!this.showPrivateCrypto,
-          storageActiveSpace: this.storageActiveSpace || 'public',
+          storageActiveSpace: this.storageActiveSpace || 'user',
+          storageLookupOwnerId: String(this.storageLookupOwnerId || '').trim(),
           storageInterestedKeys: interested,
-        }));
+        });
+
+        localStorage.setItem(this.uiStateKey, serialized);
       } catch {
         // ignore storage failures
       }
@@ -3122,7 +3528,7 @@ export default {
 
     loadUiState() {
       try {
-        const raw = sessionStorage.getItem(this.uiStateKey);
+        const raw = localStorage.getItem(this.uiStateKey);
         if (!raw) return;
         const parsed = JSON.parse(raw);
         const allowedTabs = new Set(this.uiTabs.map((tab) => tab.id));
@@ -3138,9 +3544,12 @@ export default {
         if (typeof parsed.showPrivateCrypto === 'boolean') {
           this.showPrivateCrypto = parsed.showPrivateCrypto;
         }
-        const allowedSpaces = new Set(['public', 'user', 'frozen', 'private']);
+        const allowedSpaces = new Set(['public', 'user', 'frozen', 'private', 'epublic']);
         if (typeof parsed.storageActiveSpace === 'string' && allowedSpaces.has(parsed.storageActiveSpace)) {
           this.storageActiveSpace = parsed.storageActiveSpace;
+        }
+        if (typeof parsed.storageLookupOwnerId === 'string') {
+          this.storageLookupOwnerId = parsed.storageLookupOwnerId;
         }
         if (parsed.storageInterestedKeys && typeof parsed.storageInterestedKeys === 'object') {
           const next = {};
@@ -3151,6 +3560,12 @@ export default {
             }
           }
           this.storageInterestedKeys = next;
+          if (!String(this.storageLookupOwnerId || '').trim()) {
+            const inferredOwner = this.inferInterestedUserOwner();
+            if (inferredOwner) {
+              this.storageLookupOwnerId = inferredOwner;
+            }
+          }
         }
       } catch {
         // ignore storage failures
