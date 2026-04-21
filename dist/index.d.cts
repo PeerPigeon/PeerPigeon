@@ -250,6 +250,11 @@ declare class PeerPigeonStorage {
     private readonly pendingRetrieveRequests;
     private closed;
     private readonly onGossipMessageBound;
+    private readonly instanceId;
+    private crossTabChannel;
+    private readonly crossTabSeenNoticeIds;
+    private readonly crossTabStorageEventBound;
+    private readonly crossTabChannelMessageBound;
     constructor(options: StorageOptions);
     init(): Promise<void>;
     on(event: 'change', listener: StorageEvents['change']): void;
@@ -265,6 +270,16 @@ declare class PeerPigeonStorage {
     private applyLocalDelete;
     private handleGossipMessage;
     private applyRemoteMutation;
+    private setupCrossTabSync;
+    private teardownCrossTabSync;
+    private crossTabChannelName;
+    private crossTabStorageKey;
+    private publishCrossTabNotice;
+    private handleCrossTabChannelMessage;
+    private handleCrossTabStorageEvent;
+    private consumeCrossTabNotice;
+    private applyCrossTabNotice;
+    private trimSeenNoticeIds;
     private broadcastMutation;
     private broadcastSyncPayload;
     private handleRetrieveRequest;
@@ -288,6 +303,7 @@ declare class PeerPigeonStorage {
     private isStorageMutation;
     private isStorageRetrieveRequest;
     private isStorageRetrieveResponse;
+    private isCrossTabNotice;
     private isCipherPayload;
     private encryptSyncPayload;
     private decryptSyncEnvelope;

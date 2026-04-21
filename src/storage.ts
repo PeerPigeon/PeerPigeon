@@ -122,6 +122,17 @@ type StorageRetrieveResponse = {
 
 type StorageSyncPayload = StorageMutation | StorageRetrieveRequest | StorageRetrieveResponse;
 
+type StorageCrossTabNotice = {
+  __ppType: 'pp-storage-cross-tab-v1';
+  id: string;
+  source: string;
+  op: 'upsert' | 'delete';
+  space: StorageSpace;
+  key: string;
+  actorId: string;
+  timestamp: number;
+};
+
 type SyncEnvelope = {
   __ppType: 'pp-storage-sync-v1';
   from: string;
@@ -267,6 +278,11 @@ export class PeerPigeonStorage {
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
   private readonly onGossipMessageBound: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void;
+  private readonly instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
+  private crossTabChannel: BroadcastChannel | null = null;
+  private readonly crossTabSeenNoticeIds = new Set<string>();
+  private readonly crossTabStorageEventBound: (event: StorageEvent) => void;
+  private readonly crossTabChannelMessageBound: (event: MessageEvent) => void;
 
   constructor(options: StorageOptions) {
     const userId = String(options.userId ?? '').trim();
@@ -285,6 +301,12 @@ export class PeerPigeonStorage {
         // ignore malformed or undecryptable sync messages
       });
     };
+    this.crossTabStorageEventBound = (event: StorageEvent) => {
+      this.handleCrossTabStorageEvent(event);
+    };
+    this.crossTabChannelMessageBound = (event: MessageEvent) => {
+      this.handleCrossTabChannelMessage(event);
+    };
   }
 
   async init(): Promise<void> {
@@ -294,6 +316,7 @@ export class PeerPigeonStorage {
     if (this.driver) return;
 
     this.driver = await this.createDriver();
+    this.setupCrossTabSync();
 
     if (this.gossip) {
       this.gossip.on('messageReceived', this.onGossipMessageBound);
@@ -436,6 +459,7 @@ export class PeerPigeonStorage {
 
     this.driver?.close();
     this.driver = null;
+    this.teardownCrossTabSync();
     this.listeners.clear();
     for (const pending of this.pendingRetrieveRequests.values()) {
       clearTimeout(pending.timeout);
@@ -501,6 +525,17 @@ export class PeerPigeonStorage {
       actorId,
     });
 
+    this.publishCrossTabNotice({
+      __ppType: 'pp-storage-cross-tab-v1',
+      id: this.makeMutationId(actorId),
+      source: this.instanceId,
+      op: 'upsert',
+      space,
+      key: normalizedKey,
+      actorId,
+      timestamp: now,
+    });
+
     return mutation;
   }
 
@@ -534,6 +569,17 @@ export class PeerPigeonStorage {
       space,
       key: normalizedKey,
       actorId,
+    });
+
+    this.publishCrossTabNotice({
+      __ppType: 'pp-storage-cross-tab-v1',
+      id: this.makeMutationId(actorId),
+      source: this.instanceId,
+      op: 'delete',
+      space,
+      key: normalizedKey,
+      actorId,
+      timestamp: Date.now(),
     });
 
     return mutation;
@@ -596,6 +642,16 @@ export class PeerPigeonStorage {
         key: mutation.key,
         actorId: mutation.actorId,
       });
+      this.publishCrossTabNotice({
+        __ppType: 'pp-storage-cross-tab-v1',
+        id: mutation.opId,
+        source: this.instanceId,
+        op: 'delete',
+        space: mutation.space,
+        key: mutation.key,
+        actorId: mutation.actorId,
+        timestamp: mutation.timestamp,
+      });
       return true;
     }
 
@@ -652,7 +708,162 @@ export class PeerPigeonStorage {
       key: incoming.key,
       actorId: mutation.actorId,
     });
+    this.publishCrossTabNotice({
+      __ppType: 'pp-storage-cross-tab-v1',
+      id: mutation.opId,
+      source: this.instanceId,
+      op: 'upsert',
+      space: incoming.space,
+      key: incoming.key,
+      actorId: mutation.actorId,
+      timestamp: mutation.timestamp,
+    });
     return true;
+  }
+
+  private setupCrossTabSync(): void {
+    if (typeof window === 'undefined') return;
+
+    if (typeof BroadcastChannel !== 'undefined') {
+      try {
+        this.crossTabChannel = new BroadcastChannel(this.crossTabChannelName());
+        this.crossTabChannel.addEventListener('message', this.crossTabChannelMessageBound);
+      } catch {
+        this.crossTabChannel = null;
+      }
+    }
+
+    window.addEventListener('storage', this.crossTabStorageEventBound);
+  }
+
+  private teardownCrossTabSync(): void {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('storage', this.crossTabStorageEventBound);
+    }
+
+    if (this.crossTabChannel) {
+      try {
+        this.crossTabChannel.removeEventListener('message', this.crossTabChannelMessageBound);
+        this.crossTabChannel.close();
+      } catch {
+        // ignore teardown failures
+      }
+      this.crossTabChannel = null;
+    }
+
+    this.crossTabSeenNoticeIds.clear();
+  }
+
+  private crossTabChannelName(): string {
+    return `peerpigeon-storage-ct:${this.dbName}:${this.sessionId}`;
+  }
+
+  private crossTabStorageKey(): string {
+    return `peerpigeon-storage-ct:${this.dbName}:${this.sessionId}:notice`;
+  }
+
+  private publishCrossTabNotice(notice: StorageCrossTabNotice): void {
+    this.crossTabSeenNoticeIds.add(notice.id);
+    this.trimSeenNoticeIds();
+
+    if (this.crossTabChannel) {
+      try {
+        this.crossTabChannel.postMessage(notice);
+      } catch {
+        // ignore channel failures
+      }
+    }
+
+    if (typeof localStorage !== 'undefined') {
+      try {
+        const key = this.crossTabStorageKey();
+        localStorage.setItem(key, JSON.stringify(notice));
+        localStorage.removeItem(key);
+      } catch {
+        // ignore localStorage failures (privacy mode / quota)
+      }
+    }
+  }
+
+  private handleCrossTabChannelMessage(event: MessageEvent): void {
+    const notice = event?.data;
+    if (!this.isCrossTabNotice(notice)) return;
+    this.consumeCrossTabNotice(notice);
+  }
+
+  private handleCrossTabStorageEvent(event: StorageEvent): void {
+    if (!event || event.key !== this.crossTabStorageKey()) return;
+    if (!event.newValue) return;
+
+    try {
+      const parsed = JSON.parse(event.newValue);
+      if (!this.isCrossTabNotice(parsed)) return;
+      this.consumeCrossTabNotice(parsed);
+    } catch {
+      // ignore malformed notices
+    }
+  }
+
+  private consumeCrossTabNotice(notice: StorageCrossTabNotice): void {
+    if (notice.source === this.instanceId) return;
+    if (this.crossTabSeenNoticeIds.has(notice.id)) return;
+    this.crossTabSeenNoticeIds.add(notice.id);
+    this.trimSeenNoticeIds();
+
+    this.applyCrossTabNotice(notice).catch(() => {
+      // best-effort local cross-tab signal
+    });
+  }
+
+  private async applyCrossTabNotice(notice: StorageCrossTabNotice): Promise<void> {
+    if (this.closed) return;
+    const driver = this.requireDriver();
+    const pk = this.makePk(notice.space, notice.key);
+
+    if (notice.op === 'delete') {
+      this.emitChange({
+        origin: 'remote',
+        op: 'delete',
+        record: null,
+        space: notice.space,
+        key: notice.key,
+        actorId: notice.actorId,
+      });
+      return;
+    }
+
+    const persisted = await driver.get(pk);
+    if (!persisted) return;
+
+    const value = await this.decodeValueForRead(persisted, this.userId);
+    this.emitChange({
+      origin: 'remote',
+      op: 'upsert',
+      record: {
+        space: persisted.space,
+        key: persisted.key,
+        value,
+        ownerId: persisted.ownerId,
+        createdAt: persisted.createdAt,
+        updatedAt: persisted.updatedAt,
+        version: persisted.version,
+      },
+      space: persisted.space,
+      key: persisted.key,
+      actorId: notice.actorId,
+    });
+  }
+
+  private trimSeenNoticeIds(): void {
+    const max = 512;
+    if (this.crossTabSeenNoticeIds.size <= max) return;
+    const toRemove = this.crossTabSeenNoticeIds.size - max;
+    let removed = 0;
+    for (const id of this.crossTabSeenNoticeIds) {
+      this.crossTabSeenNoticeIds.delete(id);
+      removed += 1;
+      if (removed >= toRemove) break;
+    }
   }
 
   private async broadcastMutation(mutation: StorageMutation): Promise<void> {
@@ -917,6 +1128,21 @@ export class PeerPigeonStorage {
       (maybe.record === null || typeof maybe.record === 'object');
   }
 
+
+  private isCrossTabNotice(value: unknown): value is StorageCrossTabNotice {
+    const maybe = value as Partial<StorageCrossTabNotice> | null;
+    return !!(
+      maybe &&
+      maybe.__ppType === 'pp-storage-cross-tab-v1' &&
+      typeof maybe.id === 'string' &&
+      typeof maybe.source === 'string' &&
+      (maybe.op === 'upsert' || maybe.op === 'delete') &&
+      typeof maybe.space === 'string' &&
+      typeof maybe.key === 'string' &&
+      typeof maybe.actorId === 'string' &&
+      typeof maybe.timestamp === 'number'
+    );
+  }
   private isCipherPayload(value: unknown): value is CipherPayload {
     const maybe = value as Partial<CipherPayload> | null;
     return !!maybe &&

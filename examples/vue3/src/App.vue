@@ -13,6 +13,17 @@
             <span class="field-label">Effective Session</span>
             <span class="effective-session-value">{{ effectiveSessionId }}</span>
           </div>
+          <div class="share-link-inline">
+            <span class="field-label">Share</span>
+            <button
+              type="button"
+              class="btn btn-small"
+              data-testid="copy-share-link"
+              @click="copyShareLink"
+            >
+              Copy Link
+            </button>
+          </div>
           <label class="field field-topology-inline">
             <span class="field-label">Topology</span>
             <select
@@ -55,6 +66,20 @@
 
         <div class="config-grid">
           <label class="field">
+            <span class="field-label">Session Source</span>
+            <select
+              v-model="sessionSource"
+              @change="onSessionSourceChange"
+              :disabled="isRunning || isConnecting"
+              class="input"
+              data-testid="session-source"
+            >
+              <option value="manual">Manual</option>
+              <option value="page-url">Page URL</option>
+            </select>
+          </label>
+
+          <label class="field">
             <span class="field-label">Server</span>
             <input
               v-model.trim="signalingServer"
@@ -69,7 +94,7 @@
             <span class="field-label">Network Name</span>
             <input
               v-model.trim="networkName"
-              :disabled="isRunning || isConnecting"
+              :disabled="isRunning || isConnecting || sessionSource === 'page-url'"
               class="input"
               data-testid="network-name"
               placeholder="peerpigeon"
@@ -80,12 +105,19 @@
             <span class="field-label">Room / Session ID</span>
             <input
               v-model.trim="roomSessionId"
-              :disabled="isRunning || isConnecting"
+              :disabled="isRunning || isConnecting || sessionSource === 'page-url'"
               class="input"
               data-testid="room-session-id"
               placeholder="my-room"
             />
           </label>
+
+          <div v-if="sessionSource === 'page-url'" class="field field-session-derived">
+            <span class="field-label">Derived Session</span>
+            <div class="session-derived-preview mono" :title="pageUrlSessionPreview">
+              {{ pageUrlSessionPreview }}
+            </div>
+          </div>
 
           <label class="field field-number">
             <span class="field-label">Min Peers</span>
@@ -490,6 +522,7 @@ export default {
       minPeers: 2,
       tolerantPeers: 1,
       topology: DEFAULT_TOPOLOGY,
+      sessionSource: 'manual',
       networkName: 'peerpigeon',
       roomSessionId: '',
       signalingServer: 'wss://peer.ooo/ws',
@@ -543,6 +576,11 @@ export default {
   mounted() {
     window.__app = this;
     const params = new URLSearchParams(window.location.search);
+    const sessionSourceParam = String(params.get('sessionSource') || '').trim().toLowerCase();
+    const deriveSessionFromUrl = String(params.get('deriveSessionFromUrl') || '').trim().toLowerCase();
+    if (sessionSourceParam === 'page-url' || sessionSourceParam === 'url' || deriveSessionFromUrl === '1' || deriveSessionFromUrl === 'true' || deriveSessionFromUrl === 'yes') {
+      this.sessionSource = 'page-url';
+    }
 
     // ==== IMPORTANT: URL params take ABSOLUTE priority for test isolation ====
     // Check for explicit sessionId param FIRST (before any session-state fallback)
@@ -566,9 +604,9 @@ export default {
     }
 
     // If URL does not provide a sessionId, use a fresh random room by default.
-    if (hasExplicitSessionId) {
+    if (this.sessionSource === 'manual' && hasExplicitSessionId) {
       this.roomSessionId = sessionIdParam;
-    } else {
+    } else if (this.sessionSource === 'manual') {
       this.roomSessionId = this.generateRandomRoomSessionId();
     }
 
@@ -597,7 +635,7 @@ export default {
     this.reconcileTopologyWithPeerBounds();
 
     const networkNameParam = params.get('networkName') || params.get('network');
-    if (networkNameParam) {
+    if (this.sessionSource === 'manual' && networkNameParam) {
       this.networkName = networkNameParam;
     }
 
@@ -623,11 +661,27 @@ export default {
   },
   computed: {
     effectiveSessionId() {
-      const network = String(this.networkName || '').trim();
-      const room = String(this.roomSessionId || '').trim();
+      const network = this.activeNetworkName;
+      const room = this.activeRoomSessionId;
 
       if (network && room) return `${network}:${room}`;
       return network || room || 'default';
+    },
+    activeNetworkName() {
+      if (this.sessionSource === 'page-url') {
+        return this.deriveSessionFromPageUrl().networkName;
+      }
+      return String(this.networkName || '').trim();
+    },
+    activeRoomSessionId() {
+      if (this.sessionSource === 'page-url') {
+        return this.deriveSessionFromPageUrl().roomSessionId;
+      }
+      return String(this.roomSessionId || '').trim();
+    },
+    pageUrlSessionPreview() {
+      const derived = this.deriveSessionFromPageUrl();
+      return `${derived.networkName}:${derived.roomSessionId}`;
     },
     connectedPeers() {
       return this.connectedPeersList.length;
@@ -708,20 +762,70 @@ export default {
         this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'connected' }));
       }
     },
-    roomSessionId(nextRoom) {
-      if (nextRoom) {
-        // Update URL when room changes via user input
-        try {
-          const url = new URL(window.location.href);
-          url.searchParams.set('sessionId', nextRoom);
-          window.history.replaceState({}, '', url.toString());
-        } catch {
-          // ignore URL state errors
-        }
+    sessionSource() {
+      this.updateUrlState();
+    },
+    networkName() {
+      if (this.sessionSource === 'manual') {
+        this.updateUrlState();
+      }
+    },
+    roomSessionId() {
+      if (this.sessionSource === 'manual') {
+        this.updateUrlState();
       }
     }
   },
   methods: {
+    sanitizeSessionPart(value, fallback) {
+      const normalized = String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/^www\./, '')
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+      return normalized || fallback;
+    },
+
+    deriveSessionFromPageUrl() {
+      try {
+        const url = new URL(window.location.href);
+        const hostname = this.sanitizeSessionPart(url.hostname, 'peerpigeon');
+        const port = this.sanitizeSessionPart(url.port, '');
+        const pathSegments = url.pathname
+          .split('/')
+          .map((segment) => this.sanitizeSessionPart(segment, ''))
+          .filter(Boolean);
+
+        return {
+          networkName: port ? `${hostname}-${port}` : hostname,
+          roomSessionId: pathSegments.length ? pathSegments.join('-') : 'root'
+        };
+      } catch {
+        return {
+          networkName: 'peerpigeon',
+          roomSessionId: 'root'
+        };
+      }
+    },
+
+    onSessionSourceChange() {
+      if (this.sessionSource === 'manual' && !String(this.roomSessionId || '').trim()) {
+        this.roomSessionId = this.generateRandomRoomSessionId();
+      }
+      this.updateUrlState();
+    },
+
+    async copyShareLink() {
+      this.updateUrlState();
+      try {
+        await navigator.clipboard.writeText(window.location.href);
+        this.showStatus('Share link copied', 'Copied current session link to clipboard.', 'info');
+      } catch (error) {
+        this.showStatus('Copy failed', String(error?.message || error || 'Clipboard write failed'), 'error');
+      }
+    },
+
     storageNormalizeUserKey(ownerId, key) {
       const owner = String(ownerId || '').trim();
       let out = String(key || '').trim();
@@ -1432,7 +1536,7 @@ export default {
         this.reconcileTopologyWithPeerBounds();
         this.networkName = String(this.networkName || '').trim();
         this.roomSessionId = String(this.roomSessionId || '').trim();
-        if (!this.roomSessionId) {
+        if (this.sessionSource === 'manual' && !this.roomSessionId) {
           this.roomSessionId = this.generateRandomRoomSessionId();
         }
         this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
@@ -2943,12 +3047,30 @@ export default {
         url.searchParams.set('minPeers', String(this.minPeers));
         url.searchParams.set('maxPeers', String(this.maxPeers));
         url.searchParams.set('tolerantPeers', String(this.tolerantPeers));
-        if (this.networkName) url.searchParams.set('networkName', this.networkName);
+        if (this.sessionSource === 'page-url') {
+          url.searchParams.set('sessionSource', 'page-url');
+          url.searchParams.delete('deriveSessionFromUrl');
+          if (!originalParams.has('networkName') && !originalParams.has('network')) {
+            url.searchParams.delete('networkName');
+          }
+        } else {
+          url.searchParams.delete('sessionSource');
+          url.searchParams.delete('deriveSessionFromUrl');
+          if (this.networkName) {
+            url.searchParams.set('networkName', this.networkName);
+          } else if (!originalParams.has('networkName') && !originalParams.has('network')) {
+            url.searchParams.delete('networkName');
+          }
+        }
         
         // Only sync sessionId to URL if it wasn't explicitly provided in the original URL
         // This prevents tests' __test_* sessionIds from being modified
         const hadExplicitSessionId = originalParams.has('sessionId') || originalParams.has('roomSessionId') || originalParams.has('room');
-        if (hadExplicitSessionId) {
+        if (this.sessionSource === 'page-url') {
+          if (!hadExplicitSessionId) {
+            url.searchParams.delete('sessionId');
+          }
+        } else if (hadExplicitSessionId) {
           // Keep original sessionId param as-is
           url.searchParams.set('sessionId', originalParams.get('sessionId') || originalParams.get('roomSessionId') || originalParams.get('room'));
         } else if (this.roomSessionId) {
@@ -3510,6 +3632,22 @@ section {
   text-align: center;
 }
 
+.field-session-derived {
+  justify-content: flex-end;
+}
+
+.session-derived-preview {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid #d6d9de;
+  border-radius: 10px;
+  background: #f8fafc;
+  color: #1e293b;
+  word-break: break-all;
+}
+
 .button-group {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -3543,6 +3681,14 @@ section {
   min-width: 0;
   width: 100%;
   max-width: 280px;
+}
+
+.share-link-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  align-items: center;
+  justify-content: flex-end;
 }
 
 .effective-session-value {
