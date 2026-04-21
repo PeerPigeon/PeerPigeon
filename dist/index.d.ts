@@ -150,6 +150,7 @@ declare class GossipProtocol {
 }
 
 type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
+type StorageVersion = string | number;
 type StorageChangeOrigin = 'local' | 'remote';
 interface StorageRecord<T = unknown> {
     space: StorageSpace;
@@ -158,7 +159,7 @@ interface StorageRecord<T = unknown> {
     ownerId: string | null;
     createdAt: number;
     updatedAt: number;
-    version: number;
+    version: StorageVersion;
 }
 interface StoragePutOptions {
     /**
@@ -294,6 +295,11 @@ declare class PeerPigeonStorage {
     private normalizeKey;
     private makePk;
     private makeMutationId;
+    private parseStorageVersion;
+    private versionSourceToken;
+    private normalizeStorageVersion;
+    private compareStorageVersions;
+    private nextStorageVersion;
     private resolveOwnerId;
     private assertCanWrite;
     private canWrite;

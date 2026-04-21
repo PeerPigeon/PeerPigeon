@@ -336,7 +336,7 @@
                   <tr>
                     <th>Key</th>
                     <th>Value</th>
-                    <th>Owner</th>
+                    <th>{{ storageOwnerLabel() }}</th>
                     <th>Ver</th>
                     <th>Updated</th>
                   </tr>
@@ -349,7 +349,7 @@
                     <td class="mono">{{ record.key }}</td>
                     <td class="mono storage-value-cell">{{ storageRecordPreview(record.value) }}</td>
                     <td class="mono">{{ record.ownerId ? `${record.ownerId}${record.ownerId === storageUserId() ? ' (You)' : ''}` : '-' }}</td>
-                    <td>{{ record.version }}</td>
+                    <td>{{ formatStorageVersion(record.version) }}</td>
                     <td>{{ formatTime(record.updatedAt) }}</td>
                   </tr>
                 </tbody>
@@ -1070,6 +1070,86 @@ export default {
       }
     },
 
+    storageOwnerLabel() {
+      if (this.storageActiveSpace === 'public' || this.storageActiveSpace === 'frozen' || this.storageActiveSpace === 'epublic') {
+        return 'Modified By';
+      }
+      return 'Owner';
+    },
+
+    parseStorageVersionParts(version) {
+      const raw = String(version ?? '').trim();
+      if (!raw) {
+        return { parts: [0, 0, 0, 0], source: '0' };
+      }
+
+      if (/^\d+$/.test(raw)) {
+        const major = Math.max(0, Math.floor(Number(raw)));
+        return { parts: [major, 0, 0, 0], source: '0' };
+      }
+
+      const split = raw.split('.');
+      const numericParts = split.slice(0, 4);
+      while (numericParts.length < 4) numericParts.push('0');
+      const parts = numericParts.map((part) => {
+        const n = Number(part);
+        if (!Number.isFinite(n) || n < 0) return 0;
+        return Math.floor(n);
+      });
+
+      const source = this.versionSourceToken(split[4] || '0');
+      return { parts, source };
+    },
+
+    versionSourceToken(value) {
+      const raw = String(value || '').trim();
+      if (!raw) return '0';
+
+      const digitsOnly = raw.replace(/\D/g, '');
+      if (digitsOnly) {
+        const trimmed = digitsOnly.slice(0, 10);
+        return String(Number(trimmed));
+      }
+
+      const cleaned = raw.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+      if (!cleaned) return '0';
+
+      const hexPrefix = cleaned.replace(/[^0-9a-f]/g, '').slice(0, 8);
+      if (hexPrefix.length >= 4) {
+        return String(parseInt(hexPrefix, 16));
+      }
+
+      let hash = 2166136261;
+      for (let i = 0; i < cleaned.length; i += 1) {
+        hash ^= cleaned.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return String(hash >>> 0);
+    },
+
+    normalizeStorageVersion(version, fallbackSource = '0') {
+      const parsed = this.parseStorageVersionParts(version);
+      const [major, minor, patch, build] = parsed.parts;
+      const source = parsed.source === '0'
+        ? this.versionSourceToken(fallbackSource)
+        : parsed.source;
+      return `${major}.${minor}.${patch}.${build}.${source}`;
+    },
+
+    compareStorageVersions(a, b) {
+      const left = this.parseStorageVersionParts(a).parts;
+      const right = this.parseStorageVersionParts(b).parts;
+      for (let i = 0; i < 4; i += 1) {
+        if (left[i] > right[i]) return 1;
+        if (left[i] < right[i]) return -1;
+      }
+      return 0;
+    },
+
+    formatStorageVersion(version) {
+      return this.normalizeStorageVersion(version);
+    },
+
     storageUserId() {
       // Use epub (ECDH public key) as stable user identity for storage,
       // not peer ID which can change during session.
@@ -1096,10 +1176,9 @@ export default {
 
     shouldReplaceStorageRecord(existing, incoming) {
       if (!existing) return true;
-      const incomingVersion = Number(incoming?.version ?? 0);
-      const existingVersion = Number(existing?.version ?? 0);
-      if (incomingVersion > existingVersion) return true;
-      if (incomingVersion < existingVersion) return false;
+      const versionCmp = this.compareStorageVersions(incoming?.version, existing?.version);
+      if (versionCmp > 0) return true;
+      if (versionCmp < 0) return false;
       const incomingUpdatedAt = Number(incoming?.updatedAt ?? 0);
       const existingUpdatedAt = Number(existing?.updatedAt ?? 0);
       return incomingUpdatedAt > existingUpdatedAt;
@@ -1238,7 +1317,7 @@ export default {
             ownerId: record.ownerId ?? null,
             createdAt: Number(record.createdAt ?? 0),
             updatedAt: Number(record.updatedAt ?? 0),
-            version: Number(record.version ?? 0),
+            version: this.normalizeStorageVersion(record.version, record.ownerId || this.storageUserId()),
           }));
 
         const byLogicalKey = new Map();
@@ -1274,7 +1353,7 @@ export default {
               ownerId: localRecord.ownerId ?? null,
               createdAt: Number(localRecord.createdAt ?? 0),
               updatedAt: Number(localRecord.updatedAt ?? 0),
-              version: Number(localRecord.version ?? 0),
+              version: this.normalizeStorageVersion(localRecord.version, localRecord.ownerId || this.storageUserId()),
             };
             const outKey = String(merged.key || '').trim();
             if (!outKey) continue;
