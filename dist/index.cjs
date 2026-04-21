@@ -1267,6 +1267,9 @@ var PeerPigeonStorage = class {
     this.listeners = /* @__PURE__ */ new Set();
     this.pendingRetrieveRequests = /* @__PURE__ */ new Map();
     this.closed = false;
+    this.instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
+    this.crossTabChannel = null;
+    this.crossTabSeenNoticeIds = /* @__PURE__ */ new Set();
     const userId = String(options.userId ?? "").trim();
     if (!userId) {
       throw new Error("PeerPigeonStorage requires a non-empty userId");
@@ -1281,6 +1284,12 @@ var PeerPigeonStorage = class {
       this.handleGossipMessage(data).catch(() => {
       });
     };
+    this.crossTabStorageEventBound = (event) => {
+      this.handleCrossTabStorageEvent(event);
+    };
+    this.crossTabChannelMessageBound = (event) => {
+      this.handleCrossTabChannelMessage(event);
+    };
   }
   async init() {
     if (this.closed) {
@@ -1288,6 +1297,7 @@ var PeerPigeonStorage = class {
     }
     if (this.driver) return;
     this.driver = await this.createDriver();
+    this.setupCrossTabSync();
     if (this.gossip) {
       this.gossip.on("messageReceived", this.onGossipMessageBound);
     }
@@ -1404,6 +1414,7 @@ var PeerPigeonStorage = class {
     }
     this.driver?.close();
     this.driver = null;
+    this.teardownCrossTabSync();
     this.listeners.clear();
     for (const pending of this.pendingRetrieveRequests.values()) {
       clearTimeout(pending.timeout);
@@ -1461,6 +1472,16 @@ var PeerPigeonStorage = class {
       key: normalizedKey,
       actorId
     });
+    this.publishCrossTabNotice({
+      __ppType: "pp-storage-cross-tab-v1",
+      id: this.makeMutationId(actorId),
+      source: this.instanceId,
+      op: "upsert",
+      space,
+      key: normalizedKey,
+      actorId,
+      timestamp: now
+    });
     return mutation;
   }
   async applyLocalDelete(space, key) {
@@ -1490,6 +1511,16 @@ var PeerPigeonStorage = class {
       space,
       key: normalizedKey,
       actorId
+    });
+    this.publishCrossTabNotice({
+      __ppType: "pp-storage-cross-tab-v1",
+      id: this.makeMutationId(actorId),
+      source: this.instanceId,
+      op: "delete",
+      space,
+      key: normalizedKey,
+      actorId,
+      timestamp: Date.now()
     });
     return mutation;
   }
@@ -1541,6 +1572,16 @@ var PeerPigeonStorage = class {
         key: mutation.key,
         actorId: mutation.actorId
       });
+      this.publishCrossTabNotice({
+        __ppType: "pp-storage-cross-tab-v1",
+        id: mutation.opId,
+        source: this.instanceId,
+        op: "delete",
+        space: mutation.space,
+        key: mutation.key,
+        actorId: mutation.actorId,
+        timestamp: mutation.timestamp
+      });
       return true;
     }
     if (!mutation.record) return false;
@@ -1585,7 +1626,136 @@ var PeerPigeonStorage = class {
       key: incoming.key,
       actorId: mutation.actorId
     });
+    this.publishCrossTabNotice({
+      __ppType: "pp-storage-cross-tab-v1",
+      id: mutation.opId,
+      source: this.instanceId,
+      op: "upsert",
+      space: incoming.space,
+      key: incoming.key,
+      actorId: mutation.actorId,
+      timestamp: mutation.timestamp
+    });
     return true;
+  }
+  setupCrossTabSync() {
+    if (typeof window === "undefined") return;
+    if (typeof BroadcastChannel !== "undefined") {
+      try {
+        this.crossTabChannel = new BroadcastChannel(this.crossTabChannelName());
+        this.crossTabChannel.addEventListener("message", this.crossTabChannelMessageBound);
+      } catch {
+        this.crossTabChannel = null;
+      }
+    }
+    window.addEventListener("storage", this.crossTabStorageEventBound);
+  }
+  teardownCrossTabSync() {
+    if (typeof window !== "undefined") {
+      window.removeEventListener("storage", this.crossTabStorageEventBound);
+    }
+    if (this.crossTabChannel) {
+      try {
+        this.crossTabChannel.removeEventListener("message", this.crossTabChannelMessageBound);
+        this.crossTabChannel.close();
+      } catch {
+      }
+      this.crossTabChannel = null;
+    }
+    this.crossTabSeenNoticeIds.clear();
+  }
+  crossTabChannelName() {
+    return `peerpigeon-storage-ct:${this.dbName}:${this.sessionId}`;
+  }
+  crossTabStorageKey() {
+    return `peerpigeon-storage-ct:${this.dbName}:${this.sessionId}:notice`;
+  }
+  publishCrossTabNotice(notice) {
+    this.crossTabSeenNoticeIds.add(notice.id);
+    this.trimSeenNoticeIds();
+    if (this.crossTabChannel) {
+      try {
+        this.crossTabChannel.postMessage(notice);
+      } catch {
+      }
+    }
+    if (typeof localStorage !== "undefined") {
+      try {
+        const key = this.crossTabStorageKey();
+        localStorage.setItem(key, JSON.stringify(notice));
+        localStorage.removeItem(key);
+      } catch {
+      }
+    }
+  }
+  handleCrossTabChannelMessage(event) {
+    const notice = event?.data;
+    if (!this.isCrossTabNotice(notice)) return;
+    this.consumeCrossTabNotice(notice);
+  }
+  handleCrossTabStorageEvent(event) {
+    if (!event || event.key !== this.crossTabStorageKey()) return;
+    if (!event.newValue) return;
+    try {
+      const parsed = JSON.parse(event.newValue);
+      if (!this.isCrossTabNotice(parsed)) return;
+      this.consumeCrossTabNotice(parsed);
+    } catch {
+    }
+  }
+  consumeCrossTabNotice(notice) {
+    if (notice.source === this.instanceId) return;
+    if (this.crossTabSeenNoticeIds.has(notice.id)) return;
+    this.crossTabSeenNoticeIds.add(notice.id);
+    this.trimSeenNoticeIds();
+    this.applyCrossTabNotice(notice).catch(() => {
+    });
+  }
+  async applyCrossTabNotice(notice) {
+    if (this.closed) return;
+    const driver = this.requireDriver();
+    const pk = this.makePk(notice.space, notice.key);
+    if (notice.op === "delete") {
+      this.emitChange({
+        origin: "remote",
+        op: "delete",
+        record: null,
+        space: notice.space,
+        key: notice.key,
+        actorId: notice.actorId
+      });
+      return;
+    }
+    const persisted = await driver.get(pk);
+    if (!persisted) return;
+    const value = await this.decodeValueForRead(persisted, this.userId);
+    this.emitChange({
+      origin: "remote",
+      op: "upsert",
+      record: {
+        space: persisted.space,
+        key: persisted.key,
+        value,
+        ownerId: persisted.ownerId,
+        createdAt: persisted.createdAt,
+        updatedAt: persisted.updatedAt,
+        version: persisted.version
+      },
+      space: persisted.space,
+      key: persisted.key,
+      actorId: notice.actorId
+    });
+  }
+  trimSeenNoticeIds() {
+    const max = 512;
+    if (this.crossTabSeenNoticeIds.size <= max) return;
+    const toRemove = this.crossTabSeenNoticeIds.size - max;
+    let removed = 0;
+    for (const id of this.crossTabSeenNoticeIds) {
+      this.crossTabSeenNoticeIds.delete(id);
+      removed += 1;
+      if (removed >= toRemove) break;
+    }
   }
   async broadcastMutation(mutation) {
     await this.broadcastSyncPayload(mutation);
@@ -1781,6 +1951,10 @@ var PeerPigeonStorage = class {
   isStorageRetrieveResponse(value) {
     const maybe = value;
     return !!maybe && maybe.__ppType === "pp-storage-res-v1" && typeof maybe.reqId === "string" && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number" && (maybe.record === null || typeof maybe.record === "object");
+  }
+  isCrossTabNotice(value) {
+    const maybe = value;
+    return !!(maybe && maybe.__ppType === "pp-storage-cross-tab-v1" && typeof maybe.id === "string" && typeof maybe.source === "string" && (maybe.op === "upsert" || maybe.op === "delete") && typeof maybe.space === "string" && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number");
   }
   isCipherPayload(value) {
     const maybe = value;

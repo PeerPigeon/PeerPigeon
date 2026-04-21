@@ -12,7 +12,7 @@ function buildDevFallbackUrl() {
 	return redirectUrl;
 }
 
-function redirectToDevFallback(reason) {
+function redirectToDevFallback(reason: string) {
 	if (typeof window === 'undefined') return;
 	if (!/\.local$/i.test(window.location.hostname || '')) return;
 	if (/^peer\.ooo$/i.test(window.location.hostname || '')) return;
@@ -80,7 +80,7 @@ if (import.meta.env.PROD && 'serviceWorker' in navigator) {
 			await navigator.serviceWorker.register('/sw.js', { scope: '/' });
 			// Keep logs quiet by default; uncomment when debugging.
 			// console.log('[sw] registered');
-		} catch (err) {
+		} catch {
 			// Non-fatal (some automation environments can be finicky).
 			// console.warn('[sw] registration failed', err);
 		}

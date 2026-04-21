@@ -53,6 +53,7 @@ export class FreeRTCClientAdapter {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectBackoffMs = 1_000;
   private intentionallyDisconnected = false;
+  private readonly _pageUnloadHandler: () => void;
 
   constructor(signalUrl: string, options?: { networkId?: string; peerId?: string; iceServers?: RTCIceServer[] | null; trickleIce?: boolean }) {
     this.signalUrl = signalUrl;
@@ -66,6 +67,21 @@ export class FreeRTCClientAdapter {
       peerId: this.requestedPeerId,
       isRegistered: true
     };
+    this._pageUnloadHandler = () => {
+      this._sendWithdraw();
+      this.intentionallyDisconnected = true;
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      this.stopLoops();
+      try { this.socket?.close(1000, 'page_unload'); } catch { /* ignore */ }
+      this.socket = null;
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', this._pageUnloadHandler);
+      window.addEventListener('pagehide', this._pageUnloadHandler);
+    }
   }
 
   on(event: string, handler: Handler): void {
@@ -477,6 +493,11 @@ export class FreeRTCClientAdapter {
   }
 
   disconnect(): void {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', this._pageUnloadHandler);
+      window.removeEventListener('pagehide', this._pageUnloadHandler);
+    }
+    this._sendWithdraw();
     this.intentionallyDisconnected = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -494,6 +515,12 @@ export class FreeRTCClientAdapter {
     this.closeAllPeerEntries();
     this.joinedOnce = false;
     this.knownPeers.clear();
+  }
+
+  private _sendWithdraw(): void {
+    this.sendEnvelope('withdraw', {
+      body: { reason: 'shutdown' }
+    });
   }
 
   isConnected(): boolean {
