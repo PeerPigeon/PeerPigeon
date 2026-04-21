@@ -1,4 +1,5 @@
 export type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
+export type StorageVersion = string | number;
 
 export type StorageChangeOrigin = 'local' | 'remote';
 
@@ -9,7 +10,7 @@ export interface StorageRecord<T = unknown> {
   ownerId: string | null;
   createdAt: number;
   updatedAt: number;
-  version: number;
+  version: StorageVersion;
 }
 
 export interface StoragePutOptions {
@@ -87,7 +88,7 @@ type PersistedRecord = {
   valueCipher: CipherPayload | null;
   createdAt: number;
   updatedAt: number;
-  version: number;
+  version: StorageVersion;
 };
 
 type StorageMutation = {
@@ -382,7 +383,7 @@ export class PeerPigeonStorage {
       ownerId: persisted.ownerId,
       createdAt: persisted.createdAt,
       updatedAt: persisted.updatedAt,
-      version: persisted.version,
+      version: this.normalizeStorageVersion(persisted.version, this.versionSourceToken(persisted.ownerId ?? this.userId)),
     };
   }
 
@@ -464,7 +465,7 @@ export class PeerPigeonStorage {
         ownerId: record.ownerId,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
-        version: record.version,
+        version: this.normalizeStorageVersion(record.version, this.versionSourceToken(record.ownerId ?? this.userId)),
       });
     }
 
@@ -502,7 +503,7 @@ export class PeerPigeonStorage {
     this.assertCanWrite(space, existing, actorId, options.ownerId, allowSystemWrite);
 
     const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
-    const nextVersion = (existing?.version ?? 0) + 1;
+    const nextVersion = this.nextStorageVersion(existing?.version, ownerId || actorId);
     const encoded = await this.encodeValueForStore(space, value);
 
     const persisted: PersistedRecord = {
@@ -681,15 +682,16 @@ export class PeerPigeonStorage {
     if (!mutation.record) return false;
 
     if (existing) {
-      const existingVersion = Number(existing.version ?? 0);
-      const incomingVersion = Number(mutation.record.version ?? 0);
+      const existingVersion = existing.version;
+      const incomingVersion = mutation.record.version;
       const existingUpdatedAt = Number(existing.updatedAt ?? 0);
       const incomingUpdatedAt = Number(mutation.timestamp ?? mutation.record.updatedAt ?? 0);
+      const versionCmp = this.compareStorageVersions(incomingVersion, existingVersion);
 
       // Arrival-time conflict resolution: accept newer version; if equal version,
       // accept only newer wall-clock value.
-      if (incomingVersion < existingVersion) return false;
-      if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return false;
+      if (versionCmp < 0) return false;
+      if (versionCmp === 0 && incomingUpdatedAt <= existingUpdatedAt) return false;
     }
 
     if (!this.canWrite(mutation.space, existing, mutation.actorId, undefined, mutation.space === 'epublic')) return false;
@@ -709,7 +711,10 @@ export class PeerPigeonStorage {
         : mutation.record.ownerId,
       updatedAt: mutation.timestamp,
       createdAt: existing?.createdAt ?? mutation.record.createdAt,
-      version: Math.max(existing?.version ?? 0, mutation.record.version),
+      version: this.normalizeStorageVersion(
+        mutation.record.version,
+        this.versionSourceToken(mutation.record.ownerId ?? mutation.actorId)
+      ),
     };
 
     await driver.put(incoming);
@@ -1024,6 +1029,83 @@ export class PeerPigeonStorage {
     return `${actorId}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
   }
 
+  private parseStorageVersion(version: StorageVersion | null | undefined): { parts: [number, number, number, number]; source: string } {
+    const raw = String(version ?? '').trim();
+    if (!raw) {
+      return { parts: [0, 0, 0, 0], source: '0' };
+    }
+
+    if (/^\d+$/.test(raw)) {
+      const major = Math.max(0, Math.floor(Number(raw)));
+      return { parts: [major, 0, 0, 0], source: '0' };
+    }
+
+    const split = raw.split('.');
+    const numeric = split.slice(0, 4);
+    while (numeric.length < 4) numeric.push('0');
+
+    const parts = numeric.map((part) => {
+      const n = Number(part);
+      if (!Number.isFinite(n) || n < 0) return 0;
+      return Math.floor(n);
+    }) as [number, number, number, number];
+
+    const source = this.versionSourceToken(split[4] || '0');
+    return { parts, source };
+  }
+
+  private versionSourceToken(value: string | null | undefined): string {
+    const raw = String(value ?? '').trim();
+    if (!raw) return '0';
+
+    const digitsOnly = raw.replace(/\D/g, '');
+    if (digitsOnly) {
+      const trimmed = digitsOnly.slice(0, 10);
+      return String(Number(trimmed));
+    }
+
+    const cleaned = raw.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    if (!cleaned) return '0';
+
+    const hexPrefix = cleaned.replace(/[^0-9a-f]/g, '').slice(0, 8);
+    if (hexPrefix.length >= 4) {
+      return String(parseInt(hexPrefix, 16));
+    }
+
+    // Stable fallback for non-hex ids (e.g. epub formats).
+    let hash = 2166136261;
+    for (let i = 0; i < cleaned.length; i += 1) {
+      hash ^= cleaned.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return String(hash >>> 0);
+  }
+
+  private normalizeStorageVersion(version: StorageVersion | null | undefined, fallbackSource = '0'): string {
+    const parsed = this.parseStorageVersion(version);
+    const source = parsed.source === '0'
+      ? this.versionSourceToken(fallbackSource)
+      : parsed.source;
+    const [major, minor, patch, build] = parsed.parts;
+    return `${major}.${minor}.${patch}.${build}.${source}`;
+  }
+
+  private compareStorageVersions(a: StorageVersion | null | undefined, b: StorageVersion | null | undefined): number {
+    const left = this.parseStorageVersion(a).parts;
+    const right = this.parseStorageVersion(b).parts;
+    for (let i = 0; i < 4; i += 1) {
+      if (left[i] > right[i]) return 1;
+      if (left[i] < right[i]) return -1;
+    }
+    return 0;
+  }
+
+  private nextStorageVersion(previous: StorageVersion | null | undefined, actorId: string): string {
+    const parsed = this.parseStorageVersion(previous);
+    const nextMajor = parsed.parts[0] + 1;
+    return `${nextMajor}.0.0.0.${this.versionSourceToken(actorId)}`;
+  }
+
   private resolveOwnerId(space: StorageSpace, existing: PersistedRecord | null, actorId: string, ownerOverride?: string): string | null {
     if (space === 'user') {
       if (existing?.ownerId) {
@@ -1035,6 +1117,9 @@ export class PeerPigeonStorage {
       }
       const requested = String(ownerOverride ?? '').trim();
       return requested || actorId;
+    }
+    if (space === 'public' || space === 'frozen' || space === 'epublic') {
+      return actorId;
     }
     return existing?.ownerId ?? null;
   }
