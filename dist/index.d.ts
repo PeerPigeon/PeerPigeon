@@ -83,6 +83,9 @@ type GossipEvents = {
 declare class GossipProtocol {
     private mesh;
     private messageLog;
+    private readonly maxTrackedMessages;
+    private readonly maxTrackedDirectIds;
+    private readonly trackingRetentionMs;
     private maxHops;
     private maxDirectHops;
     private cecrCoordinateWeight;
@@ -93,12 +96,14 @@ declare class GossipProtocol {
     private cecrPreviousExtrema;
     private cecrRemoteStates;
     private cecrSyncTimer;
+    private trackingCleanupTimer;
     private seenDirectIds;
     private callbacks;
     private peers;
     constructor(mesh: MeshLike, options?: GossipProtocolOptions);
     private setupMeshListeners;
     private startCecrSyncLoop;
+    private startTrackingCleanupLoop;
     /**
      * Broadcast an application payload using gossip-style re-propagation.
      */
@@ -141,6 +146,8 @@ declare class GossipProtocol {
     private handleIncomingDirect;
     getStats(): GossipStats;
     cleanup(maxAgeMs?: number): void;
+    private markDirectSeen;
+    private pruneTracking;
     on<K extends keyof GossipEvents>(event: K, callback: GossipEvents[K]): void;
     off<K extends keyof GossipEvents>(event: K, callback: GossipEvents[K]): void;
     destroy(): void;

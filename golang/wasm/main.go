@@ -368,11 +368,13 @@ func jsStoragePut(_ js.Value, args []js.Value) interface{} {
 		return jsError(err.Error())
 	}
 	return toJSObject(map[string]interface{}{
-		"space":   string(rec.Space),
-		"key":     rec.Key,
-		"ownerId": rec.OwnerID,
-		"value":   rec.Value,
-		"version": rec.Version,
+		"space":     string(rec.Space),
+		"key":       rec.Key,
+		"ownerId":   rec.OwnerID,
+		"value":     rec.Value,
+		"createdAt": rec.CreatedAt,
+		"updatedAt": rec.UpdatedAt,
+		"version":   rec.Version,
 	})
 }
 
@@ -391,11 +393,13 @@ func jsStorageGet(_ js.Value, args []js.Value) interface{} {
 		return js.Null()
 	}
 	return toJSObject(map[string]interface{}{
-		"space":   string(rec.Space),
-		"key":     rec.Key,
-		"ownerId": rec.OwnerID,
-		"value":   rec.Value,
-		"version": rec.Version,
+		"space":     string(rec.Space),
+		"key":       rec.Key,
+		"ownerId":   rec.OwnerID,
+		"value":     rec.Value,
+		"createdAt": rec.CreatedAt,
+		"updatedAt": rec.UpdatedAt,
+		"version":   rec.Version,
 	})
 }
 
@@ -447,17 +451,15 @@ func jsStorageRetrieve(_ js.Value, args []js.Value) interface{} {
 			}
 		}
 	}
-	// Return local value immediately and perform network retrieve in background.
-	// This keeps the browser main thread responsive while peers connect/churn.
+	// Return local value immediately and perform network retrieval in background.
+	// Blocking here can freeze the browser main thread in wasm mode.
 	rec, err := n.storage.Get(space, key)
 	if err != nil {
 		return jsError(err.Error())
 	}
 
 	go func(node *wasmNode, sp storage.Space, k string, ro storage.RetrieveOptions) {
-		if _, retrieveErr := node.storage.Retrieve(sp, k, ro); retrieveErr != nil {
-			js.Global().Get("console").Call("warn", "peerpigeonStorageRetrieve async error", retrieveErr.Error())
-		}
+		_, _ = node.storage.Retrieve(sp, k, ro)
 	}(n, space, key, opts)
 
 	if rec == nil {

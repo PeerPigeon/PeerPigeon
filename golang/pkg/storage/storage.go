@@ -11,8 +11,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -43,7 +46,30 @@ type Record struct {
 	OwnerID   string
 	CreatedAt int64
 	UpdatedAt int64
-	Version   int64
+	Version   StorageVersion
+}
+
+type StorageVersion string
+
+func (v *StorageVersion) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*v = StorageVersion("0")
+		return nil
+	}
+
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*v = StorageVersion(strings.TrimSpace(s))
+		return nil
+	}
+
+	var n float64
+	if err := json.Unmarshal(data, &n); err == nil {
+		*v = StorageVersion(strconv.FormatInt(int64(n), 10))
+		return nil
+	}
+
+	return fmt.Errorf("invalid storage version payload")
 }
 
 // ChangeOrigin indicates whether a change was local or remote.
@@ -96,15 +122,15 @@ type GossipInterface interface {
 // ── internal types ─────────────────────────────────────────────────────────
 
 type persistedRecord struct {
-	PK          string      `json:"pk"`
-	Space       Space       `json:"space"`
-	Key         string      `json:"key"`
-	OwnerID     string      `json:"ownerId"`
-	Value       interface{} `json:"value"`
-	ValueCipher *cipher64   `json:"valueCipher"`
-	CreatedAt   int64       `json:"createdAt"`
-	UpdatedAt   int64       `json:"updatedAt"`
-	Version     int64       `json:"version"`
+	PK          string         `json:"pk"`
+	Space       Space          `json:"space"`
+	Key         string         `json:"key"`
+	OwnerID     string         `json:"ownerId"`
+	Value       interface{}    `json:"value"`
+	ValueCipher *cipher64      `json:"valueCipher"`
+	CreatedAt   int64          `json:"createdAt"`
+	UpdatedAt   int64          `json:"updatedAt"`
+	Version     StorageVersion `json:"version"`
 }
 
 type cipher64 struct {
@@ -229,6 +255,19 @@ type PeerPigeonStorage struct {
 type pendingRetrieve struct {
 	resolve func(*Record)
 	timer   *time.Timer
+	space   Space
+	key     string
+}
+
+func storageTraceEnabled() bool {
+	return strings.TrimSpace(os.Getenv("PP_STORAGE_TRACE")) == "1"
+}
+
+func storageTracef(format string, args ...interface{}) {
+	if !storageTraceEnabled() {
+		return
+	}
+	fmt.Printf("[storage-trace] "+format+"\n", args...)
 }
 
 // New creates a new PeerPigeonStorage with the given options.
@@ -287,16 +326,17 @@ func (s *PeerPigeonStorage) Init() error {
 // Returns an unsubscribe function.
 func (s *PeerPigeonStorage) OnChange(fn func(ChangeEvent)) func() {
 	s.mu.Lock()
+	// Create a unique marker to identify this listener later
+	listenerIdx := len(s.listeners)
 	s.listeners = append(s.listeners, fn)
 	s.mu.Unlock()
+
+	unsubscribed := false
 	return func() {
 		s.mu.Lock()
-		for i, h := range s.listeners {
-			_ = h // compare by position; can't compare funcs
-			if i < len(s.listeners) {
-				s.listeners = append(s.listeners[:i], s.listeners[i+1:]...)
-				break
-			}
+		if !unsubscribed && listenerIdx < len(s.listeners) {
+			s.listeners = append(s.listeners[:listenerIdx], s.listeners[listenerIdx+1:]...)
+			unsubscribed = true
 		}
 		s.mu.Unlock()
 	}
@@ -312,6 +352,8 @@ func (s *PeerPigeonStorage) Close() {
 	s.closed = true
 	pending := s.pending
 	s.pending = make(map[string]*pendingRetrieve)
+	listeners := s.listeners
+	s.listeners = nil
 	s.mu.Unlock()
 
 	if s.gossipUnsub != nil {
@@ -323,6 +365,8 @@ func (s *PeerPigeonStorage) Close() {
 		}
 		p.resolve(nil)
 	}
+	// Ensure all listeners are cleared
+	_ = listeners
 }
 
 // ── CRUD ───────────────────────────────────────────────────────────────────
@@ -414,14 +458,24 @@ func (s *PeerPigeonStorage) Retrieve(space Space, key string, opts ...RetrieveOp
 		ActorID:   s.userID,
 		Timestamp: nowMs(),
 	}
+	storageTracef("retrieve start user=%s space=%s key=%s reqId=%s timeoutMs=%d", s.userID, space, normKey, reqID, timeoutMs)
 
 	resultCh := make(chan *Record, 1)
+	stopRetry := make(chan struct{})
+	stopRetryOnce := sync.Once{}
+	stopRetries := func() {
+		stopRetryOnce.Do(func() {
+			close(stopRetry)
+		})
+	}
 
 	timer := time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() {
 		s.mu.Lock()
 		delete(s.pending, reqID)
 		s.mu.Unlock()
+		stopRetries()
 		latest, _ := s.Get(space, normKey)
+		storageTracef("retrieve timeout space=%s key=%s reqId=%s hit=%t", space, normKey, reqID, latest != nil)
 		select {
 		case resultCh <- latest:
 		default:
@@ -431,16 +485,34 @@ func (s *PeerPigeonStorage) Retrieve(space Space, key string, opts ...RetrieveOp
 	s.mu.Lock()
 	s.pending[reqID] = &pendingRetrieve{
 		resolve: func(r *Record) {
+			stopRetries()
 			select {
 			case resultCh <- r:
 			default:
 			}
 		},
 		timer: timer,
+		space: space,
+		key:   normKey,
 	}
 	s.mu.Unlock()
 
 	_ = s.broadcastSyncPayload(req)
+
+	go func() {
+		ticker := time.NewTicker(700 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopRetry:
+				return
+			case <-ticker.C:
+				storageTracef("retrieve retry space=%s key=%s reqId=%s", space, normKey, reqID)
+				_ = s.broadcastSyncPayload(req)
+			}
+		}
+	}()
+
 	return <-resultCh, nil
 }
 
@@ -518,10 +590,7 @@ func (s *PeerPigeonStorage) applyLocalUpsert(space Space, key string, value inte
 	}
 
 	ownerID := s.resolveOwnerID(space, existing, s.userID, opts.OwnerID)
-	nextVersion := int64(1)
-	if existing != nil {
-		nextVersion = existing.Version + 1
-	}
+	nextVersion := s.nextVersion(versionOrZero(existing), ownerID)
 	encoded, err := s.encodeValue(space, value)
 	if err != nil {
 		return nil, err
@@ -647,10 +716,11 @@ func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool
 	if existing != nil {
 		inVersion := mutation.Record.Version
 		inTs := mutation.Timestamp
-		if int64(inVersion) < existing.Version {
+		cmp := s.compareVersions(inVersion, existing.Version)
+		if cmp < 0 {
 			return false, nil
 		}
-		if inVersion == existing.Version && inTs <= existing.UpdatedAt {
+		if cmp == 0 && inTs <= existing.UpdatedAt {
 			return false, nil
 		}
 	}
@@ -671,16 +741,6 @@ func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool
 		resolvedOwner = existing.OwnerID
 	}
 
-	inVersion := mutation.Record.Version
-	existVersion := int64(0)
-	if existing != nil {
-		existVersion = existing.Version
-	}
-	maxVersion := inVersion
-	if existVersion > maxVersion {
-		maxVersion = existVersion
-	}
-
 	createdAt := mutation.Record.CreatedAt
 	if existing != nil && existing.CreatedAt < createdAt {
 		createdAt = existing.CreatedAt
@@ -695,11 +755,13 @@ func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool
 		ValueCipher: mutation.Record.ValueCipher,
 		CreatedAt:   createdAt,
 		UpdatedAt:   mutation.Timestamp,
-		Version:     maxVersion,
+		Version:     s.normalizeVersion(mutation.Record.Version, resolvedOwner),
 	}
 	if err := driver.Put(incoming); err != nil {
 		return false, err
 	}
+
+	s.resolvePendingRetrievesForKey(incoming.Space, incoming.Key)
 
 	val, err := s.decodeValue(incoming)
 	if err != nil {
@@ -746,6 +808,9 @@ func (s *PeerPigeonStorage) handleGossipMessage(raw interface{}) error {
 
 	decrypted, err := s.decryptSyncEnvelope(cipher64{Alg: alg, IV: iv, CT: ct})
 	if err != nil || decrypted == nil {
+		if err != nil {
+			storageTracef("sync decrypt failed session=%s err=%v", s.sessionID, err)
+		}
 		return nil
 	}
 
@@ -760,6 +825,7 @@ func (s *PeerPigeonStorage) handleGossipMessage(raw interface{}) error {
 	}
 
 	innerType, _ := inner["__ppType"].(string)
+	storageTracef("sync received innerType=%s", innerType)
 	switch innerType {
 	case "pp-storage-op-v1":
 		var mut storageMutation
@@ -774,6 +840,7 @@ func (s *PeerPigeonStorage) handleGossipMessage(raw interface{}) error {
 		}
 		_, err := s.applyRemoteMutation(&mut)
 		if err == nil {
+			storageTracef("sync mutation applied op=%s space=%s key=%s actor=%s", mut.Op, mut.Space, mut.Key, mut.ActorID)
 			_ = s.broadcastMutation(&mut)
 		}
 	case "pp-storage-req-v1":
@@ -800,12 +867,15 @@ func (s *PeerPigeonStorage) handleGossipMessage(raw interface{}) error {
 
 func (s *PeerPigeonStorage) handleRetrieveRequest(req *storageRetrieveReq) error {
 	if req.ActorID == s.userID || req.Space == SpacePrivate {
+		storageTracef("retrieve request ignored space=%s key=%s reqId=%s actor=%s self=%s", req.Space, req.Key, req.ReqID, req.ActorID, s.userID)
 		return nil
 	}
 	existing, err := s.lookupPersistedRecord(req.Space, req.Key)
 	if err != nil || existing == nil {
+		storageTracef("retrieve request miss space=%s key=%s reqId=%s", req.Space, req.Key, req.ReqID)
 		return err
 	}
+	storageTracef("retrieve request hit space=%s key=%s reqId=%s responding", req.Space, req.Key, req.ReqID)
 	resp := &storageRetrieveResp{
 		PPType:    "pp-storage-res-v1",
 		ReqID:     req.ReqID,
@@ -819,6 +889,7 @@ func (s *PeerPigeonStorage) handleRetrieveRequest(req *storageRetrieveReq) error
 }
 
 func (s *PeerPigeonStorage) handleRetrieveResponse(resp *storageRetrieveResp) error {
+	storageTracef("retrieve response received space=%s key=%s reqId=%s hasRecord=%t actor=%s", resp.Space, resp.Key, resp.ReqID, resp.Record != nil, resp.ActorID)
 	s.mu.Lock()
 	p := s.pending[resp.ReqID]
 	if p != nil {
@@ -843,6 +914,7 @@ func (s *PeerPigeonStorage) handleRetrieveResponse(resp *storageRetrieveResp) er
 
 	if p != nil {
 		latest, _ := s.Get(resp.Space, resp.Key)
+		storageTracef("retrieve response resolved space=%s key=%s reqId=%s hit=%t", resp.Space, resp.Key, resp.ReqID, latest != nil)
 		p.resolve(latest)
 	}
 	return nil
@@ -953,6 +1025,9 @@ func (s *PeerPigeonStorage) resolveOwnerID(space Space, existing *persistedRecor
 		if override != "" {
 			return override
 		}
+		return actorID
+	}
+	if space == SpacePublic || space == SpaceFrozen || space == SpaceEPublic {
 		return actorID
 	}
 	if existing != nil {
@@ -1168,6 +1243,39 @@ func (s *PeerPigeonStorage) emitChange(event ChangeEvent) {
 	}
 }
 
+func (s *PeerPigeonStorage) resolvePendingRetrievesForKey(space Space, key string) {
+	normKey := strings.TrimSpace(key)
+	if normKey == "" {
+		return
+	}
+
+	var matches []*pendingRetrieve
+	s.mu.Lock()
+	for reqID, pending := range s.pending {
+		if pending == nil {
+			continue
+		}
+		if pending.space != space || pending.key != normKey {
+			continue
+		}
+		delete(s.pending, reqID)
+		if pending.timer != nil {
+			pending.timer.Stop()
+		}
+		matches = append(matches, pending)
+	}
+	s.mu.Unlock()
+
+	if len(matches) == 0 {
+		return
+	}
+
+	latest, _ := s.Get(space, normKey)
+	for _, pending := range matches {
+		pending.resolve(latest)
+	}
+}
+
 func toRecord(pr *persistedRecord, value interface{}) *Record {
 	return &Record{
 		Space:     pr.Space,
@@ -1178,6 +1286,154 @@ func toRecord(pr *persistedRecord, value interface{}) *Record {
 		UpdatedAt: pr.UpdatedAt,
 		Version:   pr.Version,
 	}
+}
+
+func versionOrZero(pr *persistedRecord) StorageVersion {
+	if pr == nil {
+		return StorageVersion("0")
+	}
+	return pr.Version
+}
+
+func (s *PeerPigeonStorage) parseVersion(v StorageVersion) ([4]int64, string) {
+	out := [4]int64{0, 0, 0, 0}
+	raw := strings.TrimSpace(string(v))
+	if raw == "" {
+		return out, "0"
+	}
+
+	if isAllDigits(raw) {
+		n, _ := strconv.ParseInt(raw, 10, 64)
+		if n < 0 {
+			n = 0
+		}
+		out[0] = n
+		return out, "0"
+	}
+
+	parts := strings.Split(raw, ".")
+	for i := 0; i < 4 && i < len(parts); i++ {
+		n, err := strconv.ParseInt(strings.TrimSpace(parts[i]), 10, 64)
+		if err != nil || n < 0 {
+			n = 0
+		}
+		out[i] = n
+	}
+
+	source := "0"
+	if len(parts) > 4 {
+		source = s.versionSourceToken(parts[4])
+	}
+	return out, source
+}
+
+func (s *PeerPigeonStorage) versionSourceToken(value string) string {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return "0"
+	}
+
+	digits := onlyDigits(raw)
+	if digits != "" {
+		if len(digits) > 10 {
+			digits = digits[:10]
+		}
+		n, err := strconv.ParseUint(digits, 10, 64)
+		if err != nil {
+			return "0"
+		}
+		return strconv.FormatUint(n, 10)
+	}
+
+	cleaned := normalizeAlphaNumLower(raw)
+	if cleaned == "" {
+		return "0"
+	}
+
+	hexPrefix := onlyHex(cleaned)
+	if len(hexPrefix) > 8 {
+		hexPrefix = hexPrefix[:8]
+	}
+	if len(hexPrefix) >= 4 {
+		n, err := strconv.ParseUint(hexPrefix, 16, 64)
+		if err == nil {
+			return strconv.FormatUint(n, 10)
+		}
+	}
+
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(cleaned))
+	return strconv.FormatUint(uint64(h.Sum32()), 10)
+}
+
+func (s *PeerPigeonStorage) normalizeVersion(version StorageVersion, fallbackSource string) StorageVersion {
+	parts, source := s.parseVersion(version)
+	if source == "0" {
+		source = s.versionSourceToken(fallbackSource)
+	}
+	return StorageVersion(fmt.Sprintf("%d.%d.%d.%d.%s", parts[0], parts[1], parts[2], parts[3], source))
+}
+
+func (s *PeerPigeonStorage) nextVersion(previous StorageVersion, actorID string) StorageVersion {
+	parts, _ := s.parseVersion(previous)
+	parts[0] += 1
+	return StorageVersion(fmt.Sprintf("%d.0.0.0.%s", parts[0], s.versionSourceToken(actorID)))
+}
+
+func (s *PeerPigeonStorage) compareVersions(a, b StorageVersion) int {
+	left, _ := s.parseVersion(a)
+	right, _ := s.parseVersion(b)
+	for i := 0; i < 4; i++ {
+		if left[i] > right[i] {
+			return 1
+		}
+		if left[i] < right[i] {
+			return -1
+		}
+	}
+	return 0
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func onlyDigits(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func onlyHex(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func normalizeAlphaNumLower(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func nowMs() int64 { return time.Now().UnixMilli() }

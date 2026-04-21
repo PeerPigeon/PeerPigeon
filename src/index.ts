@@ -1307,6 +1307,10 @@ export class PartialMesh {
       clearTimeout(t);
     }
     this.connectionTimers.clear();
+    for (const t of this.nonInitiatorFallbackTimers.values()) {
+      clearTimeout(t);
+    }
+    this.nonInitiatorFallbackTimers.clear();
 
     // Close all peer connections
     for (const peerId of this.peers.keys()) {
@@ -1319,10 +1323,19 @@ export class PartialMesh {
     this.peers.clear();
     this.connecting.clear();
     this.discoveredPeers.clear();
+    this.discoveredAtMs.clear();
+    this.connectionStartedAtMs.clear();
+    this.peerConnectedAtMs.clear();
+    this.rebalanceAttemptAtMs.clear();
+    this.pendingRebalanceDropByTarget.clear();
+    this.globalPeers.clear();
+    this.selfAliases.clear();
     this.clientId = null;
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;
     this.lastDiscoveryRefreshAtMs = 0;
+    this.lastSignalingReconnectAtMs = 0;
+    this.rebalanceCooldownUntilMs = 0;
     this.dialFailureCount.clear();
     this.dialBackoffUntilMs.clear();
 
@@ -1330,6 +1343,10 @@ export class PartialMesh {
     if (this.signalingClient) {
       this.signalingClient.disconnect();
       this.signalingClient = null;
+    }
+
+    for (const handlers of this.eventHandlers.values()) {
+      handlers.clear();
     }
   }
 }

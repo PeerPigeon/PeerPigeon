@@ -104,7 +104,9 @@ type Adapter struct {
 	reconnectDelay time.Duration
 	reconnectTimer *time.Timer
 	pingTicker     *time.Ticker
+	pingStop       chan struct{}
 	announceTicker *time.Ticker
+	announceStop   chan struct{}
 
 	intentional atomic.Bool
 	closed      atomic.Bool
@@ -426,11 +428,18 @@ func (a *Adapter) startPingLoop() {
 	}
 	ticker := time.NewTicker(time.Second)
 	a.pingTicker = ticker
+	stop := make(chan struct{})
+	a.pingStop = stop
 	a.mu.Unlock()
 
 	go func() {
-		for range ticker.C {
-			a.sendEnvelope("ping", map[string]interface{}{"nonce": generatePeerID()[:16]}, "", nil, nil)
+		for {
+			select {
+			case <-ticker.C:
+				a.sendEnvelope("ping", map[string]interface{}{"nonce": generatePeerID()[:16]}, "", nil, nil)
+			case <-stop:
+				return
+			}
 		}
 	}()
 }
@@ -443,12 +452,19 @@ func (a *Adapter) startAnnounceLoop() {
 	}
 	ticker := time.NewTicker(12 * time.Second)
 	a.announceTicker = ticker
+	stop := make(chan struct{})
+	a.announceStop = stop
 	a.mu.Unlock()
 
 	go func() {
-		for range ticker.C {
-			a.sendEnvelope("announce", map[string]interface{}{"hints": map[string]interface{}{"wants_peers": true}},
-				"", nil, int64Ptr(30_000))
+		for {
+			select {
+			case <-ticker.C:
+				a.sendEnvelope("announce", map[string]interface{}{"hints": map[string]interface{}{"wants_peers": true}},
+					"", nil, int64Ptr(30_000))
+			case <-stop:
+				return
+			}
 		}
 	}()
 }
@@ -459,9 +475,17 @@ func (a *Adapter) stopLoops() {
 		a.pingTicker.Stop()
 		a.pingTicker = nil
 	}
+	if a.pingStop != nil {
+		close(a.pingStop)
+		a.pingStop = nil
+	}
 	if a.announceTicker != nil {
 		a.announceTicker.Stop()
 		a.announceTicker = nil
+	}
+	if a.announceStop != nil {
+		close(a.announceStop)
+		a.announceStop = nil
 	}
 	a.mu.Unlock()
 }

@@ -6,11 +6,13 @@ package gossip
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -119,20 +121,32 @@ type GossipProtocol struct {
 
 	mu            sync.Mutex
 	messageLog    map[string]msgLogEntry // id → entry
-	seenDirectIDs map[string]struct{}
-	peers         map[string]int64 // peerID → connectedAtMs
+	seenDirectIDs map[string]int64       // id → first seen timestamp (ms)
+	peers         map[string]int64       // peerID → connectedAtMs
 	cecrCurrent   *cecrExtrema
 	cecrPrevious  *cecrExtrema
 	cecrRemote    map[string]*cecrRemoteState
+
+	// Tracking bounds to prevent unbounded growth
+	maxTrackedMessages  int
+	maxTrackedDirectIDs int
+	trackingRetentionMs int64
+	cleanupTickInterval time.Duration
 
 	syncTicker *time.Ticker
 	syncDone   chan struct{}
 
 	// callbacks
-	onMsgReceived []func(MessageReceivedEvent)
-	onPeerConn    []func(string)
-	onPeerDisconn []func(string)
-	onDirectMsg   []func(DirectMessageReceivedEvent)
+	onMsgReceived    []msgReceivedHandler
+	onPeerConn       []func(string)
+	onPeerDisconn    []func(string)
+	onDirectMsg      []func(DirectMessageReceivedEvent)
+	nextMsgHandlerID uint64
+}
+
+type msgReceivedHandler struct {
+	id uint64
+	fn func(MessageReceivedEvent)
 }
 
 type msgLogEntry struct {
@@ -159,18 +173,22 @@ func New(mesh MeshLike, opts Options) *GossipProtocol {
 		opts.CECRMaxAcceptedDrift = 0.18
 	}
 	g := &GossipProtocol{
-		mesh:          mesh,
-		maxHops:       opts.MaxHops,
-		maxDirectHops: opts.MaxDirectHops,
-		cecrCW:        clamp01(opts.CECRCoordinateWeight),
-		cecrMaxAgeMs:  max64(1_000, opts.CECRExtremaMaxAgeMs),
-		cecrMaxDrift:  clamp01(opts.CECRMaxAcceptedDrift),
-		cecrConsensus: !opts.CECRDisableConsensus, // default true
-		messageLog:    make(map[string]msgLogEntry),
-		seenDirectIDs: make(map[string]struct{}),
-		peers:         make(map[string]int64),
-		cecrRemote:    make(map[string]*cecrRemoteState),
-		syncDone:      make(chan struct{}),
+		mesh:                mesh,
+		maxHops:             opts.MaxHops,
+		maxDirectHops:       opts.MaxDirectHops,
+		cecrCW:              clamp01(opts.CECRCoordinateWeight),
+		cecrMaxAgeMs:        max64(1_000, opts.CECRExtremaMaxAgeMs),
+		cecrMaxDrift:        clamp01(opts.CECRMaxAcceptedDrift),
+		cecrConsensus:       !opts.CECRDisableConsensus, // default true
+		messageLog:          make(map[string]msgLogEntry),
+		seenDirectIDs:       make(map[string]int64),
+		peers:               make(map[string]int64),
+		cecrRemote:          make(map[string]*cecrRemoteState),
+		maxTrackedMessages:  12_000,
+		maxTrackedDirectIDs: 12_000,
+		trackingRetentionMs: 10 * 60_000, // 10 minutes
+		cleanupTickInterval: 2 * time.Second,
+		syncDone:            make(chan struct{}),
 	}
 	g.setupListeners()
 	g.startSyncLoop()
@@ -182,13 +200,14 @@ func New(mesh MeshLike, opts Options) *GossipProtocol {
 // OnMessageReceived registers a handler for received gossip broadcasts.
 // Returns an unsubscribe function.
 func (g *GossipProtocol) OnMessageReceived(fn func(MessageReceivedEvent)) func() {
+	id := atomic.AddUint64(&g.nextMsgHandlerID, 1)
 	g.mu.Lock()
-	g.onMsgReceived = append(g.onMsgReceived, fn)
+	g.onMsgReceived = append(g.onMsgReceived, msgReceivedHandler{id: id, fn: fn})
 	g.mu.Unlock()
 	return func() {
 		g.mu.Lock()
 		for i, h := range g.onMsgReceived {
-			if &h == &fn {
+			if h.id == id {
 				g.onMsgReceived = append(g.onMsgReceived[:i], g.onMsgReceived[i+1:]...)
 				break
 			}
@@ -251,6 +270,9 @@ func (g *GossipProtocol) Broadcast(data interface{}, metadata map[string]interfa
 
 	g.mu.Lock()
 	g.messageLog[msg.ID] = msgLogEntry{timestamp: msg.Timestamp, sender: msg.Sender, hops: 0}
+	if len(g.messageLog) > g.maxTrackedMessages {
+		g.pruneTracking(nowMs())
+	}
 	g.mu.Unlock()
 
 	g.propagate(msg, "")
@@ -277,7 +299,7 @@ func (g *GossipProtocol) SendDirect(targetPeerID string, data interface{}) strin
 		Timestamp: nowMs(),
 	}
 	g.mu.Lock()
-	g.seenDirectIDs[msg.ID] = struct{}{}
+	g.seenDirectIDs[msg.ID] = nowMs()
 	g.mu.Unlock()
 	g.routeDirect(msg, "")
 	return msg.ID
@@ -286,13 +308,57 @@ func (g *GossipProtocol) SendDirect(targetPeerID string, data interface{}) strin
 // Cleanup removes message log entries older than maxAgeMs.
 func (g *GossipProtocol) Cleanup(maxAgeMs int64) {
 	now := nowMs()
-	g.mu.Lock()
+	g.pruneTracking(now)
+}
+
+// pruneTracking enforces both age-based and size-based limits on tracking maps.
+func (g *GossipProtocol) pruneTracking(now int64) {
+	minTimestamp := now - g.trackingRetentionMs
+
+	// Time-based pruning first
 	for id, entry := range g.messageLog {
-		if now-entry.timestamp > maxAgeMs {
+		if entry.timestamp < minTimestamp {
 			delete(g.messageLog, id)
 		}
 	}
-	g.mu.Unlock()
+	for id, firstSeen := range g.seenDirectIDs {
+		if firstSeen < minTimestamp {
+			delete(g.seenDirectIDs, id)
+		}
+	}
+
+	// Size-based pruning: remove oldest entries if still over limit
+	for len(g.messageLog) > g.maxTrackedMessages {
+		var oldestID string
+		var oldestTime int64 = math.MaxInt64
+		for id, entry := range g.messageLog {
+			if entry.timestamp < oldestTime {
+				oldestTime = entry.timestamp
+				oldestID = id
+			}
+		}
+		if oldestID != "" {
+			delete(g.messageLog, oldestID)
+		} else {
+			break
+		}
+	}
+
+	for len(g.seenDirectIDs) > g.maxTrackedDirectIDs {
+		var oldestID string
+		var oldestTime int64 = math.MaxInt64
+		for id, firstSeen := range g.seenDirectIDs {
+			if firstSeen < oldestTime {
+				oldestTime = firstSeen
+				oldestID = id
+			}
+		}
+		if oldestID != "" {
+			delete(g.seenDirectIDs, oldestID)
+		} else {
+			break
+		}
+	}
 }
 
 // Destroy stops the CECR sync loop and clears internal state.
@@ -308,7 +374,7 @@ func (g *GossipProtocol) Destroy() {
 	g.mu.Lock()
 	g.messageLog = make(map[string]msgLogEntry)
 	g.peers = make(map[string]int64)
-	g.seenDirectIDs = make(map[string]struct{})
+	g.seenDirectIDs = make(map[string]int64)
 	g.cecrRemote = make(map[string]*cecrRemoteState)
 	g.onMsgReceived = nil
 	g.onPeerConn = nil
@@ -341,13 +407,16 @@ func (g *GossipProtocol) setupListeners() {
 }
 
 func (g *GossipProtocol) startSyncLoop() {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(g.cleanupTickInterval)
 	g.syncTicker = ticker
 	go func() {
 		for {
 			select {
 			case <-ticker.C:
 				g.publishCECRState()
+				g.mu.Lock()
+				g.pruneTracking(nowMs())
+				g.mu.Unlock()
 			case <-g.syncDone:
 				return
 			}
@@ -429,7 +498,10 @@ func (g *GossipProtocol) handleIncomingDirect(msg DirectMessage, fromPeer string
 		g.mu.Unlock()
 		return
 	}
-	g.seenDirectIDs[msg.ID] = struct{}{}
+	g.seenDirectIDs[msg.ID] = nowMs()
+	if len(g.seenDirectIDs) > g.maxTrackedDirectIDs {
+		g.pruneTracking(nowMs())
+	}
 	g.mu.Unlock()
 	g.routeDirect(msg, fromPeer)
 }
@@ -738,7 +810,10 @@ func (g *GossipProtocol) handleRawMessage(data []byte, fromPeer string) {
 
 func (g *GossipProtocol) fireMessageReceived(e MessageReceivedEvent) {
 	g.mu.Lock()
-	cbs := append(([]func(MessageReceivedEvent))(nil), g.onMsgReceived...)
+	cbs := make([]func(MessageReceivedEvent), 0, len(g.onMsgReceived))
+	for _, h := range g.onMsgReceived {
+		cbs = append(cbs, h.fn)
+	}
 	g.mu.Unlock()
 	for _, fn := range cbs {
 		safeCall(func() { fn(e) })

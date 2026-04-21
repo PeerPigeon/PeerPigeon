@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -127,8 +129,11 @@ func main() {
 	syncSecret := flag.String("syncSecret", "", "Optional storage sync secret (must match browser)")
 	flag.Parse()
 
-	initialNetworkName := strings.TrimSpace(*networkName)
-	initialRoomID := strings.TrimSpace(*networkID)
+	initialNetworkName, initialRoomID, signalOverride := parseLaunchURLOverrides(flag.Args(), *networkName, *networkID, *signalURL)
+	launchCfg := parseLaunchURLConfig(flag.Args())
+	if signalOverride != "" {
+		*signalURL = signalOverride
+	}
 	initialEffectiveSessionID := buildEffectiveSessionID(initialNetworkName, initialRoomID)
 
 	state := &appState{}
@@ -157,6 +162,11 @@ func main() {
 	roomEntry := widget.NewEntry()
 	roomEntry.SetText(initialRoomID)
 	roomEntry.SetPlaceHolder("room/session")
+	signalEntry := widget.NewEntry()
+	signalEntry.SetText(strings.TrimSpace(*signalURL))
+	signalEntry.SetPlaceHolder("wss://peer.ooo/ws")
+	launchURLEntry := widget.NewEntry()
+	launchURLEntry.SetPlaceHolder("Paste launch URL (runtime/go-wasm/session/network/signal/minPeers/maxPeers)")
 
 	var backendMu sync.Mutex
 	var currentMesh *mesh.Mesh
@@ -181,9 +191,9 @@ func main() {
 		defer backendMu.Unlock()
 		return currentStorage
 	}
-
 	var cleanupBackend func(string)
 	var startBackend func() error
+	var startBackendWithConfig func(*launchConfig) error
 
 	connList := widget.NewList(
 		func() int { state.mu.Lock(); defer state.mu.Unlock(); return len(state.connected) },
@@ -409,7 +419,7 @@ func main() {
 		if r == nil {
 			return "(not found)"
 		}
-		return fmt.Sprintf("space=%s\nkey=%s\nowner=%s\nversion=%d\nvalue=%v",
+		return fmt.Sprintf("space=%s\nkey=%s\nowner=%s\nversion=%s\nvalue=%v",
 			r.Space, r.Key, r.OwnerID, r.Version, r.Value)
 	}
 
@@ -453,6 +463,11 @@ func main() {
 			return
 		}
 		sp := selectedSpace()
+		state.addLogLevel("storage", "INFO", fmt.Sprintf("[%s] get %s", sp, k))
+		fyne.Do(func() {
+			storageOut.SetText(fmt.Sprintf("[%s] get %s\nchecking local...", sp, k))
+			logList.Refresh()
+		})
 		go func() {
 			rec, err := st.Get(sp, k)
 			if err != nil {
@@ -461,6 +476,9 @@ func main() {
 				return
 			}
 			if rec == nil {
+				fyne.Do(func() {
+					storageOut.SetText(fmt.Sprintf("[%s] get %s\nlocal miss, retrieving from peers...", sp, k))
+				})
 				rec, err = st.Retrieve(sp, k, storage.RetrieveOptions{TimeoutMs: 3000})
 				if err != nil {
 					state.addLog("err", "storage get/retrieve: "+err.Error())
@@ -468,7 +486,19 @@ func main() {
 					return
 				}
 			}
-			fyne.Do(func() { storageOut.SetText(formatRecord(rec)) })
+			if rec == nil {
+				state.addLogLevel("storage", "INFO", fmt.Sprintf("[%s] get %s -> not found", sp, k))
+				fyne.Do(func() {
+					storageOut.SetText("(not found)")
+					logList.Refresh()
+				})
+				return
+			}
+			state.addLogLevel("storage", "INFO", fmt.Sprintf("[%s] get %s -> found", sp, k))
+			fyne.Do(func() {
+				storageOut.SetText(formatRecord(rec))
+				logList.Refresh()
+			})
 		}()
 	})
 	retrieveBtn := widget.NewButton("Retrieve", func() {
@@ -483,6 +513,11 @@ func main() {
 			return
 		}
 		sp := selectedSpace()
+		state.addLogLevel("storage", "INFO", fmt.Sprintf("[%s] retrieve %s", sp, k))
+		fyne.Do(func() {
+			storageOut.SetText(fmt.Sprintf("[%s] retrieve %s\nrequesting from peers...", sp, k))
+			logList.Refresh()
+		})
 		go func() {
 			rec, err := st.Retrieve(sp, k, storage.RetrieveOptions{TimeoutMs: 3000})
 			if err != nil {
@@ -490,7 +525,19 @@ func main() {
 				fyne.Do(logList.Refresh)
 				return
 			}
-			fyne.Do(func() { storageOut.SetText(formatRecord(rec)) })
+			if rec == nil {
+				state.addLogLevel("storage", "INFO", fmt.Sprintf("[%s] retrieve %s -> not found", sp, k))
+				fyne.Do(func() {
+					storageOut.SetText("(not found)")
+					logList.Refresh()
+				})
+				return
+			}
+			state.addLogLevel("storage", "INFO", fmt.Sprintf("[%s] retrieve %s -> found", sp, k))
+			fyne.Do(func() {
+				storageOut.SetText(formatRecord(rec))
+				logList.Refresh()
+			})
 		}()
 	})
 	listBtn := widget.NewButton("List Space", func() {
@@ -601,27 +648,67 @@ func main() {
 	}
 
 	startBackend = func() error {
+		return startBackendWithConfig(launchCfg)
+	}
+	startBackendWithConfig = func(cfg *launchConfig) error {
 		network := strings.TrimSpace(networkEntry.Text)
 		room := strings.TrimSpace(roomEntry.Text)
+		signal := strings.TrimSpace(signalEntry.Text)
+		if signal == "" {
+			signal = strings.TrimSpace(*signalURL)
+		}
+		if cfg != nil && cfg.networkNameOverride != "" {
+			network = cfg.networkNameOverride
+		}
+		if cfg != nil && cfg.sessionIDOverride != "" {
+			room = cfg.sessionIDOverride
+		}
+		if cfg != nil && cfg.signalOverride != "" {
+			signal = cfg.signalOverride
+		}
 		effectiveSessionID := buildEffectiveSessionID(network, room)
 		if effectiveSessionID == "" {
 			return fmt.Errorf("network name and room cannot both be empty")
 		}
+		if signal == "" {
+			return fmt.Errorf("signaling URL cannot be empty")
+		}
 
 		state.setDebugCaptureEnabled(debugCaptureCheck.Checked)
+		minPeers := 2
+		maxPeers := 6
+		tolerantPeers := 1
+		if cfg != nil && cfg.minPeers > 0 {
+			minPeers = cfg.minPeers
+		}
+		if cfg != nil && cfg.maxPeers > 0 {
+			maxPeers = cfg.maxPeers
+		}
+		if maxPeers < minPeers {
+			maxPeers = minPeers
+		}
+		if cfg != nil && cfg.tolerantPeers >= 0 {
+			tolerantPeers = cfg.tolerantPeers
+		}
 
 		m := mesh.New(mesh.Config{
-			SignalingServer: *signalURL,
+			SignalingServer: signal,
 			SessionID:       effectiveSessionID,
-			MinPeers:        2,
-			MaxPeers:        6,
+			MinPeers:        minPeers,
+			MaxPeers:        maxPeers,
+			TolerantPeers:   tolerantPeers,
 			AutoDiscover:    true,
 			AutoConnect:     true,
 		})
 		g := gossip.New(m, gossip.Options{MaxHops: 6})
 		ga := &gossipAdapter{g}
+		meshClientID := strings.TrimSpace(m.GetClientID())
+		if meshClientID == "" {
+			meshClientID = fmt.Sprintf("anon-%d", time.Now().UnixNano())
+		}
+		storageUserID := "app-" + meshClientID
 		st, err := storage.New(storage.Options{
-			UserID:     "app-user",
+			UserID:     storageUserID,
 			SessionID:  effectiveSessionID,
 			SyncSecret: strings.TrimSpace(*syncSecret),
 			Gossip:     ga,
@@ -637,6 +724,8 @@ func main() {
 			m.Destroy()
 			return err
 		}
+		state.addLogLevel("storage", "INFO", "storage actor id: "+storageUserID)
+		state.addLogLevel("sig", "INFO", fmt.Sprintf("starting mesh signal=%s session=%s minPeers=%d maxPeers=%d tolerant=%d", signal, effectiveSessionID, minPeers, maxPeers, tolerantPeers))
 
 		backendMu.Lock()
 		backendGeneration++
@@ -806,13 +895,51 @@ func main() {
 
 	applySessionBtn := widget.NewButton("Apply Session", func() {
 		cleanupBackend("⬡  Restarting mesh…")
-		if err := startBackend(); err != nil {
+		if err := startBackendWithConfig(nil); err != nil {
 			state.addLog("err", "restart failed: "+err.Error())
 			fyne.Do(func() {
 				statusLabel.SetText("⬡  Restart failed — see Event Log")
 				logList.Refresh()
 			})
 		}
+	})
+	applyURLBtn := widget.NewButton("Apply Launch URL", func() {
+		raw := strings.TrimSpace(launchURLEntry.Text)
+		if raw == "" {
+			state.addLogLevel("err", "WARN", "launch URL is empty")
+			fyne.Do(logList.Refresh)
+			return
+		}
+
+		fallbackNetwork := strings.TrimSpace(networkEntry.Text)
+		fallbackRoom := strings.TrimSpace(roomEntry.Text)
+		fallbackSignal := strings.TrimSpace(signalEntry.Text)
+		network, room, signal := parseLaunchURLOverridesFromRaw(raw, fallbackNetwork, fallbackRoom, fallbackSignal)
+		cfg := parseLaunchURLConfigFromRaw(raw)
+
+		if network != "" {
+			networkEntry.SetText(network)
+		}
+		if room != "" {
+			roomEntry.SetText(room)
+		}
+		if signal != "" {
+			signalEntry.SetText(signal)
+			*signalURL = signal
+		}
+
+		launchCfg = cfg
+		cleanupBackend("⬡  Applying launch URL…")
+		if err := startBackendWithConfig(launchCfg); err != nil {
+			state.addLog("err", "apply URL failed: "+err.Error())
+			fyne.Do(func() {
+				statusLabel.SetText("⬡  Apply URL failed — see Event Log")
+				logList.Refresh()
+			})
+			return
+		}
+		state.addLogLevel("sig", "INFO", "launch URL applied")
+		fyne.Do(logList.Refresh)
 	})
 
 	// ── layout ────────────────────────────────────────────────────────────
@@ -830,7 +957,10 @@ func main() {
 		widget.NewForm(
 			widget.NewFormItem("Network", networkEntry),
 			widget.NewFormItem("Room", roomEntry),
+			widget.NewFormItem("Signal", signalEntry),
+			widget.NewFormItem("Launch URL", launchURLEntry),
 		),
+		applyURLBtn,
 		applySessionBtn,
 	)
 
@@ -902,12 +1032,23 @@ func main() {
 	w.SetOnClosed(func() {
 		cleanupBackend("")
 	})
-	if err := startBackend(); err != nil {
-		state.addLog("err", "startup failed: "+err.Error())
-		fyne.Do(func() {
-			statusLabel.SetText("⬡  Startup failed — see Event Log")
-			logList.Refresh()
-		})
+	// Auto-start if requested in URL, otherwise start normally
+	if launchCfg != nil && launchCfg.autostart {
+		if err := startBackendWithConfig(launchCfg); err != nil {
+			state.addLog("err", "auto-startup failed: "+err.Error())
+			fyne.Do(func() {
+				statusLabel.SetText("⬡  Auto-startup failed — see Event Log")
+				logList.Refresh()
+			})
+		}
+	} else {
+		if err := startBackend(); err != nil {
+			state.addLog("err", "startup failed: "+err.Error())
+			fyne.Do(func() {
+				statusLabel.SetText("⬡  Startup failed — see Event Log")
+				logList.Refresh()
+			})
+		}
 	}
 	w.ShowAndRun()
 }
@@ -1048,6 +1189,128 @@ func decryptRoomBroadcastText(roomCipher map[string]interface{}, effectiveSessio
 		return "", fmt.Errorf("decrypt room message: %w", err)
 	}
 	return string(plaintext), nil
+}
+
+func parseLaunchURLOverrides(args []string, fallbackNetwork, fallbackRoom, fallbackSignal string) (string, string, string) {
+	if len(args) == 0 {
+		return strings.TrimSpace(fallbackNetwork), strings.TrimSpace(fallbackRoom), strings.TrimSpace(fallbackSignal)
+	}
+	return parseLaunchURLOverridesFromRaw(args[0], fallbackNetwork, fallbackRoom, fallbackSignal)
+}
+
+type launchConfig struct {
+	networkNameOverride string
+	sessionIDOverride   string
+	signalOverride      string
+	minPeers            int
+	maxPeers            int
+	topology            string
+	autostart           bool
+	tolerantPeers       int
+}
+
+func parseLaunchURLConfig(args []string) *launchConfig {
+	if len(args) == 0 {
+		return &launchConfig{}
+	}
+	return parseLaunchURLConfigFromRaw(args[0])
+}
+
+func parseLaunchURLConfigFromRaw(raw string) *launchConfig {
+	cfg := &launchConfig{}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return cfg
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return cfg
+	}
+	q := parsed.Query()
+	if v := strings.TrimSpace(q.Get("networkName")); v != "" {
+		cfg.networkNameOverride = v
+	}
+	if v := strings.TrimSpace(q.Get("network")); v != "" {
+		cfg.networkNameOverride = v
+	}
+	if v := strings.TrimSpace(q.Get("sessionId")); v != "" {
+		cfg.sessionIDOverride = v
+	}
+	if v := strings.TrimSpace(q.Get("room")); v != "" {
+		cfg.sessionIDOverride = v
+	}
+	if v := strings.TrimSpace(q.Get("signal")); v != "" {
+		cfg.signalOverride = v
+	}
+	if v := strings.TrimSpace(q.Get("signalUrl")); v != "" {
+		cfg.signalOverride = v
+	}
+	if v := strings.TrimSpace(q.Get("signalingServer")); v != "" {
+		cfg.signalOverride = v
+	}
+	if v := strings.TrimSpace(q.Get("minPeers")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.minPeers = n
+		}
+	}
+	if v := strings.TrimSpace(q.Get("maxPeers")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.maxPeers = n
+		}
+	}
+	if v := strings.TrimSpace(q.Get("tolerantPeers")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.tolerantPeers = n
+		}
+	}
+	if v := strings.TrimSpace(q.Get("topology")); v != "" {
+		cfg.topology = v
+	}
+	if v := strings.TrimSpace(q.Get("autostart")); v != "" {
+		cfg.autostart = v == "1" || strings.ToLower(v) == "true"
+	}
+	return cfg
+}
+
+func parseLaunchURLOverridesFromRaw(raw, fallbackNetwork, fallbackRoom, fallbackSignal string) (string, string, string) {
+	network := strings.TrimSpace(fallbackNetwork)
+	room := strings.TrimSpace(fallbackRoom)
+	signal := strings.TrimSpace(fallbackSignal)
+
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return network, room, signal
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return network, room, signal
+	}
+
+	q := parsed.Query()
+	if v := strings.TrimSpace(q.Get("networkName")); v != "" {
+		network = v
+	}
+	if v := strings.TrimSpace(q.Get("network")); v != "" {
+		network = v
+	}
+	if v := strings.TrimSpace(q.Get("sessionId")); v != "" {
+		room = v
+	}
+	if v := strings.TrimSpace(q.Get("room")); v != "" {
+		room = v
+	}
+	if v := strings.TrimSpace(q.Get("signal")); v != "" {
+		signal = v
+	}
+	if v := strings.TrimSpace(q.Get("signalUrl")); v != "" {
+		signal = v
+	}
+	if v := strings.TrimSpace(q.Get("signalingServer")); v != "" {
+		signal = v
+	}
+
+	return network, room, signal
 }
 
 type gossipAdapter struct{ g *gossip.GossipProtocol }

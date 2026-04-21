@@ -103,6 +103,9 @@ type CecrRemoteState = {
 export class GossipProtocol {
   private mesh: MeshLike;
   private messageLog: Map<string, { timestamp: number; sender: string | null; hops: number }> = new Map();
+  private readonly maxTrackedMessages = 12_000;
+  private readonly maxTrackedDirectIds = 12_000;
+  private readonly trackingRetentionMs = 10 * 60_000;
   private maxHops: number;
   private maxDirectHops: number;
   private cecrCoordinateWeight: number;
@@ -113,7 +116,8 @@ export class GossipProtocol {
   private cecrPreviousExtrema: CecrExtrema | null = null;
   private cecrRemoteStates: Map<string, CecrRemoteState> = new Map();
   private cecrSyncTimer: ReturnType<typeof setInterval> | null = null;
-  private seenDirectIds: Set<string> = new Set();
+  private trackingCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  private seenDirectIds: Map<string, number> = new Map();
   private callbacks: Partial<Record<keyof GossipEvents, Set<Function>>> = {};
   private peers: Map<string, { connected: boolean; timestamp: number }> = new Map();
 
@@ -127,6 +131,7 @@ export class GossipProtocol {
     this.cecrRequireConsensus = options.cecrRequireConsensus ?? true;
     this.setupMeshListeners();
     this.startCecrSyncLoop();
+    this.startTrackingCleanupLoop();
   }
 
   private setupMeshListeners(): void {
@@ -163,6 +168,13 @@ export class GossipProtocol {
     }, 2_000);
   }
 
+  private startTrackingCleanupLoop(): void {
+    if (this.trackingCleanupTimer) return;
+    this.trackingCleanupTimer = setInterval(() => {
+      this.pruneTracking();
+    }, 30_000);
+  }
+
   /**
    * Broadcast an application payload using gossip-style re-propagation.
    */
@@ -189,6 +201,9 @@ export class GossipProtocol {
       sender: message.sender,
       hops: 0
     });
+    if (this.messageLog.size > this.maxTrackedMessages) {
+      this.pruneTracking(message.timestamp);
+    }
 
     this.propagate(message);
     this.emit('messageReceived', { message, local: true });
@@ -231,6 +246,9 @@ export class GossipProtocol {
       sender: message.sender,
       hops: message.hops
     });
+    if (this.messageLog.size > this.maxTrackedMessages) {
+      this.pruneTracking();
+    }
 
     this.emit('messageReceived', { message, local: false, fromPeer: fromPeerId });
 
@@ -522,7 +540,7 @@ export class GossipProtocol {
       timestamp: Date.now(),
     };
 
-    this.seenDirectIds.add(message.id);
+    this.markDirectSeen(message.id, message.timestamp);
     this.routeDirect(message, null);
     return message.id;
   }
@@ -558,7 +576,7 @@ export class GossipProtocol {
 
   private handleIncomingDirect(message: DirectMessage, fromPeerId: string): void {
     if (this.seenDirectIds.has(message.id)) return;
-    this.seenDirectIds.add(message.id);
+    this.markDirectSeen(message.id, message.timestamp);
     this.routeDirect(message, fromPeerId);
   }
 
@@ -587,6 +605,46 @@ export class GossipProtocol {
         this.messageLog.delete(id);
       }
     }
+    for (const [id, timestamp] of this.seenDirectIds.entries()) {
+      if (now - timestamp > maxAgeMs) {
+        this.seenDirectIds.delete(id);
+      }
+    }
+  }
+
+  private markDirectSeen(id: string, timestamp: number): void {
+    this.seenDirectIds.set(id, timestamp || Date.now());
+    if (this.seenDirectIds.size > this.maxTrackedDirectIds) {
+      this.pruneTracking();
+    }
+  }
+
+  private pruneTracking(now: number = Date.now()): void {
+    const minTimestamp = now - this.trackingRetentionMs;
+
+    for (const [id, info] of this.messageLog.entries()) {
+      if (info.timestamp >= minTimestamp) {
+        break;
+      }
+      this.messageLog.delete(id);
+    }
+    while (this.messageLog.size > this.maxTrackedMessages) {
+      const oldest = this.messageLog.keys().next().value;
+      if (!oldest) break;
+      this.messageLog.delete(oldest);
+    }
+
+    for (const [id, timestamp] of this.seenDirectIds.entries()) {
+      if (timestamp >= minTimestamp) {
+        break;
+      }
+      this.seenDirectIds.delete(id);
+    }
+    while (this.seenDirectIds.size > this.maxTrackedDirectIds) {
+      const oldest = this.seenDirectIds.keys().next().value;
+      if (!oldest) break;
+      this.seenDirectIds.delete(oldest);
+    }
   }
 
   on<K extends keyof GossipEvents>(event: K, callback: GossipEvents[K]): void {
@@ -612,6 +670,10 @@ export class GossipProtocol {
     if (this.cecrSyncTimer) {
       clearInterval(this.cecrSyncTimer);
       this.cecrSyncTimer = null;
+    }
+    if (this.trackingCleanupTimer) {
+      clearInterval(this.trackingCleanupTimer);
+      this.trackingCleanupTimer = null;
     }
     this.callbacks = {};
   }

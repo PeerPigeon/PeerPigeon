@@ -15,14 +15,24 @@
           </div>
           <div class="share-link-inline">
             <span class="field-label">Share</span>
-            <button
-              type="button"
-              class="btn btn-small"
-              data-testid="copy-share-link"
-              @click="copyShareLink"
-            >
-              Copy Link
-            </button>
+            <div class="share-link-actions">
+              <button
+                type="button"
+                class="btn btn-small"
+                data-testid="copy-share-link"
+                @click="copyShareLink"
+              >
+                Copy Link
+              </button>
+              <button
+                type="button"
+                class="btn btn-small"
+                data-testid="copy-perf-dump-link"
+                @click="copyPerfDumpLink"
+              >
+                Perf Dump
+              </button>
+            </div>
           </div>
           <label class="field field-topology-inline">
             <span class="field-label">Topology</span>
@@ -463,6 +473,10 @@ const STORAGE_SYNC_ENVELOPE_TYPE = 'pp-storage-sync-v1';
 const MESH_PEERS_STORAGE_KEY = 'mesh:peers';
 const MESH_PEERS_STORAGE_SPACE = 'epublic';
 const MESH_PEERS_HEARTBEAT_MS = 12_000;
+const MESH_PEERS_STALE_AFTER_MS = MESH_PEERS_HEARTBEAT_MS * 6;
+const MESH_PEERS_MAX_SNAPSHOTS = 80;
+const DEBUG_MONITOR_INTERVAL_MS = 1000;
+const DEBUG_MONITOR_PEER_LOG_MIN_GAP_MS = 2500;
 
 function toBase64Url(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -541,6 +555,7 @@ export default {
       meshPeersPublishInFlight: false,
       meshPeersLastLocalSignature: '',
       meshPeersLastPublishedAt: 0,
+      meshPeersLastSignature: '',
       uiStateKey: 'peerpigeon:ui-state',
       uiTabs: [
         { id: 'message', label: 'Message' },
@@ -550,11 +565,13 @@ export default {
       ],
       graphStabilizeTimer: null,
       graphUpdateTimer: null,
+      meshConnectWarnTimer: null,
       graphLastSignature: '',
       networkGraphState: null,
       networkGraphResizeHandler: null,
       debugMonitorTimer: null,
       debugLastByPeer: {},
+      debugLastLogAtByPeer: {},
       runtimeMode: 'go-wasm',
       goWasmNodeId: null,
       goWasmHandlers: {
@@ -640,6 +657,14 @@ export default {
 
     // Restore persisted UI state before any autostart/network events can write defaults.
     this.loadUiState();
+
+    // Local-first storage should be available even before mesh/gossip is connected.
+    // In go-wasm mode, wait for node creation to avoid a transient js-storage -> wasm-storage swap.
+    if (this.activeTab === 'storage') {
+      this.ensureStorageReady({ fastPath: true }).catch((error) => {
+        this.storageError = String(error?.message || error || 'Failed to initialize storage');
+      });
+    }
 
     const autostart = (params.get('autostart') || '1').toLowerCase();
     if (autostart === '1' || autostart === 'true' || autostart === 'yes') {
@@ -758,6 +783,10 @@ export default {
     }
   },
   methods: {
+    shouldDeferStorageInit() {
+      return false;
+    },
+
     async copyShareLink() {
       this.updateUrlState();
       try {
@@ -765,6 +794,228 @@ export default {
         this.showStatus('Share link copied', 'Copied current session link to clipboard.', 'info');
       } catch (error) {
         this.showStatus('Copy failed', String(error?.message || error || 'Clipboard write failed'), 'error');
+      }
+    },
+
+    perfNowMs() {
+      if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+        return Math.round(performance.now());
+      }
+      return 0;
+    },
+
+    getBrowserMemorySnapshot() {
+      const out = {
+        memory: null,
+        uaSpecificMemory: null,
+      };
+
+      try {
+        if (typeof performance !== 'undefined' && performance && performance.memory) {
+          const memory = performance.memory;
+          out.memory = {
+            jsHeapSizeLimit: Number(memory.jsHeapSizeLimit || 0),
+            totalJSHeapSize: Number(memory.totalJSHeapSize || 0),
+            usedJSHeapSize: Number(memory.usedJSHeapSize || 0),
+          };
+        }
+      } catch {
+        // ignore unsupported memory API
+      }
+
+      return out;
+    },
+
+    summarizeResourceEntries() {
+      try {
+        if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
+          return null;
+        }
+
+        const resources = performance.getEntriesByType('resource') || [];
+        if (!Array.isArray(resources) || resources.length === 0) {
+          return {
+            count: 0,
+            transferSizeTotal: 0,
+            decodedBodySizeTotal: 0,
+            topSlow: [],
+          };
+        }
+
+        let transferSizeTotal = 0;
+        let decodedBodySizeTotal = 0;
+        const slowest = [];
+
+        for (const entry of resources) {
+          const transferSize = Number(entry?.transferSize || 0);
+          const decodedBodySize = Number(entry?.decodedBodySize || 0);
+          transferSizeTotal += Number.isFinite(transferSize) ? transferSize : 0;
+          decodedBodySizeTotal += Number.isFinite(decodedBodySize) ? decodedBodySize : 0;
+
+          slowest.push({
+            name: String(entry?.name || '').slice(0, 180),
+            initiatorType: String(entry?.initiatorType || ''),
+            duration: Math.round(Number(entry?.duration || 0)),
+            transferSize: Math.round(transferSize),
+          });
+        }
+
+        slowest.sort((a, b) => b.duration - a.duration);
+
+        return {
+          count: resources.length,
+          transferSizeTotal: Math.round(transferSizeTotal),
+          decodedBodySizeTotal: Math.round(decodedBodySizeTotal),
+          topSlow: slowest.slice(0, 8),
+        };
+      } catch {
+        return null;
+      }
+    },
+
+    summarizeNavigationEntry() {
+      try {
+        if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
+          return null;
+        }
+        const navEntries = performance.getEntriesByType('navigation') || [];
+        const nav = navEntries[0];
+        if (!nav) return null;
+
+        return {
+          type: String(nav.type || ''),
+          duration: Math.round(Number(nav.duration || 0)),
+          domComplete: Math.round(Number(nav.domComplete || 0)),
+          domContentLoaded: Math.round(Number(nav.domContentLoadedEventEnd || 0)),
+          loadEventEnd: Math.round(Number(nav.loadEventEnd || 0)),
+        };
+      } catch {
+        return null;
+      }
+    },
+
+    async measureUaSpecificMemory() {
+      try {
+        const fn = globalThis?.performance?.measureUserAgentSpecificMemory;
+        if (typeof fn !== 'function') return null;
+        const sample = await Promise.race([
+          fn.call(globalThis.performance),
+          new Promise((resolve) => setTimeout(() => resolve(null), 1200)),
+        ]);
+        if (!sample) return null;
+
+        return {
+          bytes: Number(sample?.bytes || 0),
+          breakdownCount: Array.isArray(sample?.breakdown) ? sample.breakdown.length : 0,
+        };
+      } catch {
+        return null;
+      }
+    },
+
+    toBase64UrlJson(payload) {
+      const json = JSON.stringify(payload);
+      const bytes = new TextEncoder().encode(json);
+      let binary = '';
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.subarray(i, i + chunkSize);
+        binary += String.fromCharCode(...chunk);
+      }
+      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+    },
+
+    async buildPerfDumpLink() {
+      const startedAtMs = Date.now();
+      const memory = this.getBrowserMemorySnapshot();
+      memory.uaSpecificMemory = await this.measureUaSpecificMemory();
+
+      const networkGraphNodeCount = Number(
+        Object.keys(this.networkGraphState?.positions || {}).length || 0
+      );
+
+      const payload = {
+        v: 1,
+        kind: 'peerpigeon-perf-dump',
+        createdAt: new Date().toISOString(),
+        href: window.location.href,
+        runtimeMode: this.runtimeMode,
+        build: {
+          mode: import.meta.env.MODE,
+          dev: Boolean(import.meta.env.DEV),
+          prod: Boolean(import.meta.env.PROD),
+          baseUrl: import.meta.env.BASE_URL,
+        },
+        browser: {
+          userAgent: navigator.userAgent,
+          language: navigator.language,
+          languages: Array.isArray(navigator.languages) ? navigator.languages.slice(0, 8) : [],
+          platform: navigator.platform,
+          vendor: navigator.vendor,
+          onLine: navigator.onLine,
+          hardwareConcurrency: Number(navigator.hardwareConcurrency || 0),
+          deviceMemory: Number(navigator.deviceMemory || 0),
+          maxTouchPoints: Number(navigator.maxTouchPoints || 0),
+          isSafariLike: /Safari\//.test(navigator.userAgent) && !/Chrome\//.test(navigator.userAgent),
+        },
+        viewport: {
+          innerWidth: Number(window.innerWidth || 0),
+          innerHeight: Number(window.innerHeight || 0),
+          pixelRatio: Number(window.devicePixelRatio || 1),
+          visibilityState: document.visibilityState,
+        },
+        memory,
+        perf: {
+          nowMs: this.perfNowMs(),
+          eventLoopHintMs: Date.now() - startedAtMs,
+          navigation: this.summarizeNavigationEntry(),
+          resources: this.summarizeResourceEntries(),
+        },
+        app: {
+          isRunning: this.isRunning,
+          isConnecting: this.isConnecting,
+          signalingConnected: this.signalingConnected,
+          status: {
+            title: String(this.status?.title || ''),
+            message: String(this.status?.message || ''),
+            type: String(this.status?.type || ''),
+          },
+          activeTab: this.activeTab,
+          connectedPeers: this.connectedPeersList.length,
+          discoveredPeers: this.discoveredPeersList.length,
+          globalPeers: this.globalPeersList.length,
+          messagesSeen: Number(this.messagesSeen || 0),
+          messageLogSize: this.messageLog.length,
+          diagLogSize: this.diagnosticMessages.length,
+          chatLogSize: this.chatMessages.length,
+          storageReady: this.storageReady,
+          storageSpace: this.storageActiveSpace,
+          storageRecords: this.storageRecords.length,
+          storageError: String(this.storageError || ''),
+          meshSnapshots: Object.keys(this.sharedMeshPeerSnapshots || {}).length,
+          graph: {
+            hasState: Boolean(this.networkGraphState),
+            width: Number(this.networkGraphState?.width || 0),
+            height: Number(this.networkGraphState?.height || 0),
+            nodeCount: networkGraphNodeCount,
+            layoutVersion: Number(this.networkGraphState?.layoutVersion || 0),
+          },
+        },
+      };
+
+      const encoded = this.toBase64UrlJson(payload);
+      const url = new URL(window.location.href);
+      url.searchParams.set('ppPerfDump', encoded);
+      return url.toString();
+    },
+
+    async copyPerfDumpLink() {
+      try {
+        const link = await this.buildPerfDumpLink();
+        await navigator.clipboard.writeText(link);
+        this.showStatus('Perf dump copied', 'Copied perf dump link to clipboard. Paste it in chat.', 'info');
+      } catch (error) {
+        this.showStatus('Perf dump failed', String(error?.message || error || 'Failed to build perf dump link'), 'error');
       }
     },
 
@@ -911,6 +1162,7 @@ export default {
       const space = this.storageActiveSpace;
       const key = String(this.storageFormKey || '').trim();
       if (!key) return;
+      const isGoWasm = this.runtimeMode === 'go-wasm';
 
       const ownerId = this.storageActiveSpace === 'user'
         ? this.storageLookupUserId()
@@ -924,7 +1176,19 @@ export default {
       const wireKey = this.storageWireKey(space, key, ownerId);
       if (!wireKey) return;
       this.storage.retrieve(space, wireKey, { timeoutMs: 2500 })
-        .then(() => this.refreshStorageList({ silent: true }))
+        .then(() => {
+          this.refreshStorageList({ silent: true });
+          // go-wasm retrieve runs network fetch in background to avoid main-thread stalls.
+          // Do a couple of delayed refreshes so newly fetched values surface even if no event races in.
+          if (isGoWasm) {
+            setTimeout(() => {
+              this.refreshStorageList({ silent: true });
+            }, 250);
+            setTimeout(() => {
+              this.refreshStorageList({ silent: true });
+            }, 900);
+          }
+        })
         .catch((error) => {
           this.storageError = String(error?.message || error || 'Failed to sync storage key');
         });
@@ -1186,16 +1450,31 @@ export default {
 
     async ensureStorageReady(options = {}) {
       const fastPath = options && options.fastPath === true;
-      const userId = this.storageUserId();
-      if (!userId || !this.gossip) return;
+      if (this.shouldDeferStorageInit()) {
+        if (fastPath) {
+          this.storageError = '';
+          return;
+        }
+      }
+      let userId = this.storageUserId();
+      if (!userId) {
+        await this.ensureCryptoKeys();
+        userId = this.storageUserId();
+      }
+      if (!userId) {
+        this.storageReady = false;
+        this.storageError = 'Storage identity unavailable';
+        return;
+      }
 
-      const nextIdentity = `${this.effectiveSessionId}::${userId}`;
+      const gossipAttached = this.gossip ? '1' : '0';
+      const nextIdentity = `js-storage::${this.effectiveSessionId}::${userId}::gossip:${gossipAttached}`;
       if (this.storageReady && this.storage && this.storageIdentity === nextIdentity) {
-        if (!fastPath) {
+        if (!fastPath && this.gossip) {
           this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
             // background best-effort network sync
           });
-        } else {
+        } else if (this.gossip) {
           this.scheduleMeshPeersRetrieve('storage-tab');
         }
         await this.refreshStorageList({ silent: true, syncInterested: false });
@@ -1218,7 +1497,7 @@ export default {
       const dbName = `peerpigeon-storage-v2:${this.effectiveSessionId}`;
       this.storage = new PeerPigeonStorage({
         userId,
-        gossip: this.gossip,
+        gossip: this.gossip || undefined,
         sessionId: this.effectiveSessionId,
         dbName,
       });
@@ -1238,11 +1517,11 @@ export default {
       // Local-first: render from IndexedDB immediately.
       await this.refreshStorageList({ silent: true, syncInterested: false });
 
-      if (!fastPath) {
+      if (!fastPath && this.gossip) {
         this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
           // background best-effort network sync
         });
-      } else {
+      } else if (this.gossip) {
         this.scheduleMeshPeersRetrieve('storage-tab-init');
       }
       this.scheduleMeshPeersPublish('storage-ready');
@@ -1265,6 +1544,7 @@ export default {
       this.meshPeersLastLocalSignature = '';
       this.meshPeersLastPublishedAt = 0;
       this.sharedMeshPeerSnapshots = {};
+      this.meshPeersLastSignature = '';
       if (this.storageChangeUnsubscribe) {
         this.storageChangeUnsubscribe();
         this.storageChangeUnsubscribe = null;
@@ -1405,12 +1685,14 @@ export default {
     },
 
     pruneStaleMeshPeerSnapshots(snapshots) {
+      const now = Date.now();
       const out = {};
       for (const [peerId, snapshot] of Object.entries(snapshots || {})) {
         const normalizedPeerId = String(peerId || snapshot?.peerId || '').trim();
         const updatedAt = Number(snapshot?.updatedAt || 0);
         if (!normalizedPeerId) continue;
         if (!updatedAt) continue;
+        if (now - updatedAt > MESH_PEERS_STALE_AFTER_MS) continue;
 
         out[normalizedPeerId] = {
           peerId: normalizedPeerId,
@@ -1419,24 +1701,38 @@ export default {
           updatedAt,
         };
       }
-      return out;
-    },
 
-    activeMeshPeerSnapshots() {
-      const out = {};
-
-      for (const [peerId, snapshot] of Object.entries(this.sharedMeshPeerSnapshots || {})) {
-        const updatedAt = Number(snapshot?.updatedAt || 0);
-        if (!updatedAt) continue;
-        out[peerId] = {
-          peerId,
-          ownerId: String(snapshot?.ownerId || '').trim() || null,
-          connectedPeers: [...new Set((snapshot?.connectedPeers || []).map((peer) => String(peer || '').trim()).filter(Boolean))],
-          updatedAt,
-        };
+      const entries = Object.entries(out);
+      if (entries.length > MESH_PEERS_MAX_SNAPSHOTS) {
+        entries
+          .sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0))
+          .slice(MESH_PEERS_MAX_SNAPSHOTS)
+          .forEach(([id]) => {
+            delete out[id];
+          });
       }
 
       return out;
+    },
+
+    meshPeersSnapshotSignature(snapshots) {
+      const entries = Object.entries(snapshots || {});
+      if (!entries.length) return '';
+
+      return entries
+        .map(([peerId, snapshot]) => {
+          const connected = Array.isArray(snapshot?.connectedPeers)
+            ? snapshot.connectedPeers.map((peer) => String(peer || '').trim()).filter(Boolean).sort().join(',')
+            : '';
+          const updatedAt = Number(snapshot?.updatedAt || 0);
+          return `${String(peerId || '').trim()}|${updatedAt}|${connected}`;
+        })
+        .sort()
+        .join(';');
+    },
+
+    activeMeshPeerSnapshots() {
+      return this.pruneStaleMeshPeerSnapshots(this.sharedMeshPeerSnapshots || {});
     },
 
     localMeshPeerSnapshot() {
@@ -1508,6 +1804,11 @@ export default {
       try {
         const record = await this.storage.get(this.meshPeersStorageSpace, this.meshPeersStorageKey);
         const snapshots = this.pruneStaleMeshPeerSnapshots(this.normalizeMeshPeersPayload(record?.value));
+        const signature = this.meshPeersSnapshotSignature(snapshots);
+        if (signature === this.meshPeersLastSignature) {
+          return;
+        }
+        this.meshPeersLastSignature = signature;
         this.sharedMeshPeerSnapshots = snapshots;
         this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'mesh-storage' }));
       } catch {
@@ -1554,6 +1855,7 @@ export default {
         const priorUpdatedAt = Number(prior?.updatedAt || 0);
 
         snapshots[localSnapshot.peerId] = localSnapshot;
+        this.meshPeersLastSignature = this.meshPeersSnapshotSignature(snapshots);
         this.sharedMeshPeerSnapshots = snapshots;
         this.meshPeersLastLocalSignature = localSignature;
 
@@ -1930,6 +2232,16 @@ export default {
 
     createGoWasmStorageAdapter() {
       const subscribers = new Set();
+      const invoke = (fnName, ...args) => {
+        const result = this.callGoWasm(fnName, ...args);
+        if (result instanceof Error) {
+          throw result;
+        }
+        if (result && typeof result === 'object' && String(result.name || '') === 'Error' && typeof result.message === 'string') {
+          throw new Error(result.message);
+        }
+        return result;
+      };
       this.goWasmStorageNotify = (event) => {
         for (const fn of subscribers) {
           try {
@@ -1951,25 +2263,25 @@ export default {
           return () => subscribers.delete(fn);
         },
         list: async (space) => {
-          return this.callGoWasm('peerpigeonStorageList', this.goWasmNodeId, space) || [];
+          return invoke('peerpigeonStorageList', this.goWasmNodeId, space) || [];
         },
         get: async (space, key) => {
-          return this.callGoWasm('peerpigeonStorageGet', this.goWasmNodeId, space, key);
+          return invoke('peerpigeonStorageGet', this.goWasmNodeId, space, key);
         },
         retrieve: async (space, key, options = {}) => {
-          return this.callGoWasm('peerpigeonStorageRetrieve', this.goWasmNodeId, space, key, options || {});
+          return invoke('peerpigeonStorageRetrieve', this.goWasmNodeId, space, key, options || {});
         },
         put: async (space, key, value, _options = {}) => {
-          return this.callGoWasm('peerpigeonStoragePut', this.goWasmNodeId, space, key, value);
+          return invoke('peerpigeonStoragePut', this.goWasmNodeId, space, key, value);
         },
         putSystem: async (space, key, value, _options = {}) => {
-          return this.callGoWasm('peerpigeonStoragePut', this.goWasmNodeId, space, key, value);
+          return invoke('peerpigeonStoragePut', this.goWasmNodeId, space, key, value);
         },
         delete: async (space, key) => {
-          return this.callGoWasm('peerpigeonStorageDelete', this.goWasmNodeId, space, key);
+          return invoke('peerpigeonStorageDelete', this.goWasmNodeId, space, key);
         },
         deleteSystem: async (space, key) => {
-          return this.callGoWasm('peerpigeonStorageDelete', this.goWasmNodeId, space, key);
+          return invoke('peerpigeonStorageDelete', this.goWasmNodeId, space, key);
         },
       };
     },
@@ -2017,6 +2329,13 @@ export default {
         } else {
           this.gossip = new GossipProtocol(this.mesh);
         }
+
+        if (this.activeTab === 'storage') {
+          this.ensureStorageReady({ fastPath: true }).catch(() => {
+            // best-effort: signaling lifecycle will retry initialization
+          });
+        }
+
         // Runtime inspection hook for debugging in dev tools / automation.
         window.__mesh = this.mesh;
         window.__gossip = this.gossip;
@@ -2151,7 +2470,8 @@ export default {
         this.startDebugMonitor();
 
         // Best-effort warning only; do not hard-fail startup on transient signaling slowness.
-        setTimeout(() => {
+        clearTimeout(this.meshConnectWarnTimer);
+        this.meshConnectWarnTimer = setTimeout(() => {
           if (this.isRunning && !this.clientId) {
             this.showStatus('Connecting...', `Still waiting on signaling server (${this.signalingServer})`, 'connecting');
           }
@@ -2176,6 +2496,8 @@ export default {
       this.meshPeersLastLocalSignature = '';
       this.meshPeersLastPublishedAt = 0;
       this.sharedMeshPeerSnapshots = {};
+      clearTimeout(this.meshConnectWarnTimer);
+      this.meshConnectWarnTimer = null;
       this.teardownStorage();
       if (this.mesh) {
         this.mesh.destroy();
@@ -2895,7 +3217,7 @@ export default {
         .map((peerId) => ({
           id: peerId,
           short: peerId.slice(0, 4).toUpperCase(),
-          isSelf: peerId === this.clientId,
+          isSelf: Boolean(localSelf) && peerId === localSelf,
           isTolerant: tolerantPeerIds.has(peerId),
           hue: this.networkNodeHue(peerId),
         }));
@@ -2944,6 +3266,7 @@ export default {
       const svgEl = this.$refs.networkGraphSvg;
       const container = this.$refs.networkGraphContainer;
       if (!svgEl || !container) return;
+      const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
 
       const layoutVersion = 2;
 
@@ -3054,7 +3377,16 @@ export default {
         .map((id) => priorPositions[id])
         .filter((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y));
       const cornerCrowd = priorPoints.filter((point) => point.x < width * 0.3 && point.y < height * 0.3).length;
-      const collapsedPriorLayout = priorPoints.length >= 3 && cornerCrowd / priorPoints.length >= 0.68;
+      const selfPrior = localSelf ? priorPositions[localSelf] : null;
+      const selfInCorner = Boolean(
+        selfPrior
+        && Number.isFinite(selfPrior.x)
+        && Number.isFinite(selfPrior.y)
+        && selfPrior.x < width * 0.3
+        && selfPrior.y < height * 0.3
+      );
+      const collapsedPriorLayout = (priorPoints.length >= 3 && cornerCrowd / priorPoints.length >= 0.68)
+        || (priorPoints.length >= 2 && selfInCorner);
       const ignorePriorPositions = versionMismatch || collapsedPriorLayout;
       const missingPriorNodes = [];
 
@@ -3104,6 +3436,14 @@ export default {
         }
 
         for (const node of missingPriorNodes) {
+          if (node.id === localSelf) {
+            node.x = clampX(cx);
+            node.y = clampY(cy);
+            node.vx = 0;
+            node.vy = 0;
+            continue;
+          }
+
           const neighbors = neighborsById.get(node.id) || [];
           const anchored = neighbors
             .map((peerId) => idToNode.get(peerId))
@@ -3441,7 +3781,7 @@ export default {
 
       this.messageLog.push(entry);
 
-      if (import.meta.env.DEV) {
+      if (import.meta.env.DEV && type !== 'info') {
         // Mirror all app logs to browser console for rapid debugging.
         // eslint-disable-next-line no-console
         console.log(`[mesh:${type}] ${sender} ${text}`);
@@ -3483,12 +3823,15 @@ export default {
     startDebugMonitor() {
       this.stopDebugMonitor();
       this.debugLastByPeer = {};
+      this.debugLastLogAtByPeer = {};
 
       this.debugMonitorTimer = setInterval(() => {
         try {
+          if (!this.isRunning) return;
           const rawClient = this.mesh?.signalingClient?.client;
           const connections = rawClient?.mesh?.connections;
           if (!connections || typeof connections.entries !== 'function') return;
+          const now = Date.now();
 
           for (const [peerId, entry] of connections.entries()) {
             const snapshot = {
@@ -3509,6 +3852,11 @@ export default {
 
             if (changed) {
               this.debugLastByPeer[peerId] = snapshot;
+              const lastLogAt = Number(this.debugLastLogAtByPeer[peerId] || 0);
+              if (now - lastLogAt < DEBUG_MONITOR_PEER_LOG_MIN_GAP_MS) {
+                continue;
+              }
+              this.debugLastLogAtByPeer[peerId] = now;
               this.addLog(
                 'info',
                 `conn(mesh=${snapshot.mesh || '-'}, pc=${snapshot.pc || '-'}, ice=${snapshot.ice || '-'}, sig=${snapshot.signaling || '-'}, dc=${snapshot.dc || '-'})`,
@@ -3519,7 +3867,7 @@ export default {
         } catch {
           // ignore debug monitor failures
         }
-      }, 500);
+      }, DEBUG_MONITOR_INTERVAL_MS);
     },
 
     stopDebugMonitor() {
@@ -3528,6 +3876,7 @@ export default {
         this.debugMonitorTimer = null;
       }
       this.debugLastByPeer = {};
+      this.debugLastLogAtByPeer = {};
     },
 
     updateUrlState() {
@@ -3660,6 +4009,8 @@ export default {
     this.stopCryptoAnnounceLoop();
     this.stopDebugMonitor();
     this.resetGraphStabilization();
+    clearTimeout(this.meshConnectWarnTimer);
+    this.meshConnectWarnTimer = null;
     this.stopMesh();
   }
 };
@@ -4183,6 +4534,13 @@ section {
   gap: 0.2rem;
   align-items: center;
   justify-content: flex-end;
+}
+
+.share-link-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .effective-session-value {
