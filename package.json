@@ -19,6 +19,7 @@
     "README.md"
   ],
   "scripts": {
+    "wasm:build": "node scripts/build-wasm.mjs",
     "build": "tsup src/index.ts --format esm,cjs --dts",
     "build:browser": "tsup --config tsup.browser.config.ts",
     "dev:tls:generate": "node scripts/dev-with-mdns.mjs --generate-tls",
