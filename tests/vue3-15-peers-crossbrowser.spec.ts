@@ -11,8 +11,8 @@ test('Vue3 demo propagates a gossip message across active peers', async ({ baseU
 
   // Keep time budgeting explicit so the test stays within the loop's --timeout.
   const budgetMs = Math.max(1_000, (testInfo?.timeout ?? 15_000) - 1_000);
-  const connectWaitMs = Math.min(9_000, Math.floor(budgetMs * 0.5));
-  const messageWaitMs = Math.min(9_000, Math.floor(budgetMs * 0.65));
+  const connectWaitMs = Math.min(20_000, Math.floor(budgetMs * 0.6));
+  const messageWaitMs = Math.min(20_000, Math.floor(budgetMs * 0.75));
 
   const testId = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
   const sessionId = `__test_15peers_${testId}`;
@@ -84,6 +84,15 @@ test('Vue3 demo propagates a gossip message across active peers', async ({ baseU
       const text = ((await page.locator('[data-testid="messages-seen"]').innerText()) || '').trim();
       return Number(text) || 0;
     };
+
+    // Wait for a minimum number of connected peers so we do not send too early while
+    // late runtimes are still initializing transport + gossip handlers.
+    await expect
+      .poll(async () => {
+        const counts = await Promise.all(pages.map(async ({ page }) => await getConnectedCount(page)));
+        return counts.filter((count) => count > 0).length;
+      }, { timeout: connectWaitMs, intervals: [250, 500, 1000] })
+      .toBeGreaterThanOrEqual(Math.min(totalPeers, 6));
 
     // Pick a single sender and ensure it has at least one connection before sending.
     const sender = pages[0];

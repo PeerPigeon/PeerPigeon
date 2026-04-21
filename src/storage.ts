@@ -1,4 +1,4 @@
-export type StorageSpace = 'public' | 'user' | 'frozen' | 'private';
+export type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
 
 export type StorageChangeOrigin = 'local' | 'remote';
 
@@ -263,7 +263,8 @@ class IndexedDbStorageDriver implements StorageDriver {
  *
  * - Persists records in IndexedDB (fallback: in-memory)
  * - Syncs non-private spaces over encrypted gossip envelopes
- * - Enforces four built-in ACL spaces: public, user, frozen, private
+ * - Enforces five built-in ACL spaces: public, user, frozen, private, epublic
+ * - epublic is internal-only and can only be mutated through putSystem/deleteSystem
  */
 export class PeerPigeonStorage {
   private readonly userId: string;
@@ -341,10 +342,20 @@ export class PeerPigeonStorage {
   }
 
   async put<T = unknown>(space: StorageSpace, key: string, value: T, options: StoragePutOptions = {}): Promise<StorageRecord<T>> {
-    const mutation = await this.applyLocalUpsert(space, key, value, options);
+    const mutation = await this.applyLocalUpsert(space, key, value, options, false);
     if (space !== 'private') {
       await this.broadcastMutation(mutation);
     }
+    return (await this.get(space, key)) as StorageRecord<T>;
+  }
+
+  async putSystem<T = unknown>(space: StorageSpace, key: string, value: T, options: StoragePutOptions = {}): Promise<StorageRecord<T>> {
+    if (space !== 'epublic') {
+      throw new Error('putSystem is only allowed for epublic space');
+    }
+
+    const mutation = await this.applyLocalUpsert(space, key, value, options, true);
+    await this.broadcastMutation(mutation);
     return (await this.get(space, key)) as StorageRecord<T>;
   }
 
@@ -410,12 +421,24 @@ export class PeerPigeonStorage {
   }
 
   async delete(space: StorageSpace, key: string): Promise<boolean> {
-    const mutation = await this.applyLocalDelete(space, key);
+    const mutation = await this.applyLocalDelete(space, key, false);
     if (!mutation) return false;
 
     if (space !== 'private') {
       await this.broadcastMutation(mutation);
     }
+    return true;
+  }
+
+  async deleteSystem(space: StorageSpace, key: string): Promise<boolean> {
+    if (space !== 'epublic') {
+      throw new Error('deleteSystem is only allowed for epublic space');
+    }
+
+    const mutation = await this.applyLocalDelete(space, key, true);
+    if (!mutation) return false;
+
+    await this.broadcastMutation(mutation);
     return true;
   }
 
@@ -468,7 +491,7 @@ export class PeerPigeonStorage {
     this.pendingRetrieveRequests.clear();
   }
 
-  private async applyLocalUpsert(space: StorageSpace, key: string, value: unknown, options: StoragePutOptions): Promise<StorageMutation> {
+  private async applyLocalUpsert(space: StorageSpace, key: string, value: unknown, options: StoragePutOptions, allowSystemWrite = false): Promise<StorageMutation> {
     const normalizedKey = this.normalizeKey(key);
     const actorId = this.userId;
     const driver = this.requireDriver();
@@ -476,7 +499,7 @@ export class PeerPigeonStorage {
     const existing = await driver.get(pk);
     const now = Date.now();
 
-    this.assertCanWrite(space, existing, actorId, options.ownerId);
+    this.assertCanWrite(space, existing, actorId, options.ownerId, allowSystemWrite);
 
     const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
     const nextVersion = (existing?.version ?? 0) + 1;
@@ -539,7 +562,7 @@ export class PeerPigeonStorage {
     return mutation;
   }
 
-  private async applyLocalDelete(space: StorageSpace, key: string): Promise<StorageMutation | null> {
+  private async applyLocalDelete(space: StorageSpace, key: string, allowSystemWrite = false): Promise<StorageMutation | null> {
     const normalizedKey = this.normalizeKey(key);
     const actorId = this.userId;
     const driver = this.requireDriver();
@@ -547,7 +570,7 @@ export class PeerPigeonStorage {
     const existing = await driver.get(pk);
     if (!existing) return null;
 
-    this.assertCanDelete(space, existing, actorId);
+    this.assertCanDelete(space, existing, actorId, allowSystemWrite);
     await driver.delete(pk);
 
     const opId = this.makeMutationId(actorId);
@@ -632,7 +655,7 @@ export class PeerPigeonStorage {
     if (mutation.op === 'delete') {
       if (!existing) return false;
       if (mutation.timestamp <= existing.updatedAt) return false;
-      if (!this.canDelete(mutation.space, existing, mutation.actorId)) return false;
+      if (!this.canDelete(mutation.space, existing, mutation.actorId, mutation.space === 'epublic')) return false;
       await driver.delete(pk);
       this.emitChange({
         origin: 'remote',
@@ -669,7 +692,7 @@ export class PeerPigeonStorage {
       if (incomingVersion === existingVersion && incomingUpdatedAt <= existingUpdatedAt) return false;
     }
 
-    if (!this.canWrite(mutation.space, existing, mutation.actorId)) return false;
+    if (!this.canWrite(mutation.space, existing, mutation.actorId, undefined, mutation.space === 'epublic')) return false;
 
     if (mutation.space === 'user' && !existing) {
       const incomingOwner = String(mutation.record.ownerId ?? '').trim();
@@ -906,19 +929,21 @@ export class PeerPigeonStorage {
   }
 
   private async handleRetrieveResponse(response: StorageRetrieveResponse): Promise<void> {
-    const pending = this.pendingRetrieveRequests.get(response.reqId);
-    if (!pending) return;
-
-    this.pendingRetrieveRequests.delete(response.reqId);
-    clearTimeout(pending.timeout);
+    const pending = this.pendingRetrieveRequests.get(response.reqId) ?? null;
+    if (pending) {
+      this.pendingRetrieveRequests.delete(response.reqId);
+      clearTimeout(pending.timeout);
+    }
 
     if (response.record && response.space !== 'private') {
       if (!this.shouldAcceptRemoteSync(response.space, response.key, {
         kind: 'retrieve-response',
         actorId: response.actorId,
       })) {
-        const latest = await this.get(response.space, response.key);
-        pending.resolve(latest);
+        if (pending) {
+          const latest = await this.get(response.space, response.key);
+          pending.resolve(latest);
+        }
         return;
       }
 
@@ -935,8 +960,10 @@ export class PeerPigeonStorage {
       await this.applyRemoteMutation(mutation);
     }
 
-    const latest = await this.get(response.space, response.key);
-    pending.resolve(latest);
+    if (pending) {
+      const latest = await this.get(response.space, response.key);
+      pending.resolve(latest);
+    }
   }
 
   private shouldAcceptRemoteSync(space: StorageSpace, key: string, context: StorageSyncFilterContext): boolean {
@@ -1012,14 +1039,15 @@ export class PeerPigeonStorage {
     return existing?.ownerId ?? null;
   }
 
-  private assertCanWrite(space: StorageSpace, existing: PersistedRecord | null, actorId: string, ownerOverride?: string): void {
-    if (!this.canWrite(space, existing, actorId, ownerOverride)) {
+  private assertCanWrite(space: StorageSpace, existing: PersistedRecord | null, actorId: string, ownerOverride?: string, allowSystemWrite = false): void {
+    if (!this.canWrite(space, existing, actorId, ownerOverride, allowSystemWrite)) {
       throw new Error(`Write denied for ${space} space key`);
     }
   }
 
-  private canWrite(space: StorageSpace, existing: PersistedRecord | null, actorId: string, ownerOverride?: string): boolean {
+  private canWrite(space: StorageSpace, existing: PersistedRecord | null, actorId: string, ownerOverride?: string, allowSystemWrite = false): boolean {
     if (space === 'public') return true;
+    if (space === 'epublic') return allowSystemWrite === true;
     if (space === 'private') return actorId === this.userId;
     if (space === 'user') {
       if (!existing) return true;
@@ -1048,14 +1076,15 @@ export class PeerPigeonStorage {
     return /^[0-9a-f]{64}$/i.test(str);
   }
 
-  private assertCanDelete(space: StorageSpace, existing: PersistedRecord, actorId: string): void {
-    if (!this.canDelete(space, existing, actorId)) {
+  private assertCanDelete(space: StorageSpace, existing: PersistedRecord, actorId: string, allowSystemWrite = false): void {
+    if (!this.canDelete(space, existing, actorId, allowSystemWrite)) {
       throw new Error(`Delete denied for ${space} space key`);
     }
   }
 
-  private canDelete(space: StorageSpace, existing: PersistedRecord, actorId: string): boolean {
+  private canDelete(space: StorageSpace, existing: PersistedRecord, actorId: string, allowSystemWrite = false): boolean {
     if (space === 'public') return true;
+    if (space === 'epublic') return allowSystemWrite === true;
     if (space === 'private') return actorId === this.userId;
     if (space === 'user') return existing.ownerId === actorId;
     if (space === 'frozen') return false;
@@ -1099,7 +1128,7 @@ export class PeerPigeonStorage {
       maybe.__ppType === 'pp-storage-op-v1' &&
       typeof maybe.opId === 'string' &&
       (maybe.op === 'upsert' || maybe.op === 'delete') &&
-      (maybe.space === 'public' || maybe.space === 'user' || maybe.space === 'frozen' || maybe.space === 'private') &&
+      (maybe.space === 'public' || maybe.space === 'user' || maybe.space === 'frozen' || maybe.space === 'private' || maybe.space === 'epublic') &&
       typeof maybe.key === 'string' &&
       typeof maybe.actorId === 'string' &&
       typeof maybe.timestamp === 'number';
@@ -1110,7 +1139,7 @@ export class PeerPigeonStorage {
     return !!maybe &&
       maybe.__ppType === 'pp-storage-req-v1' &&
       typeof maybe.reqId === 'string' &&
-      (maybe.space === 'public' || maybe.space === 'user' || maybe.space === 'frozen' || maybe.space === 'private') &&
+      (maybe.space === 'public' || maybe.space === 'user' || maybe.space === 'frozen' || maybe.space === 'private' || maybe.space === 'epublic') &&
       typeof maybe.key === 'string' &&
       typeof maybe.actorId === 'string' &&
       typeof maybe.timestamp === 'number';
@@ -1121,7 +1150,7 @@ export class PeerPigeonStorage {
     return !!maybe &&
       maybe.__ppType === 'pp-storage-res-v1' &&
       typeof maybe.reqId === 'string' &&
-      (maybe.space === 'public' || maybe.space === 'user' || maybe.space === 'frozen' || maybe.space === 'private') &&
+      (maybe.space === 'public' || maybe.space === 'user' || maybe.space === 'frozen' || maybe.space === 'private' || maybe.space === 'epublic') &&
       typeof maybe.key === 'string' &&
       typeof maybe.actorId === 'string' &&
       typeof maybe.timestamp === 'number' &&
@@ -1223,7 +1252,11 @@ export class PeerPigeonStorage {
     );
 
     const text = new TextDecoder().decode(plainBuffer);
-    return JSON.parse(text);
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error('storage decrypt produced non-JSON payload');
+    }
   }
 
   private toBase64Url(buffer: ArrayBuffer | Uint8Array): string {

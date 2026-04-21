@@ -1,5 +1,5 @@
 // Package storage implements PeerPigeonStorage, an encrypted gossip-synced
-// key-value store with four ACL spaces.
+// key-value store with five ACL spaces.
 // It is a faithful Go port of src/storage.ts.
 package storage
 
@@ -20,7 +20,7 @@ import (
 
 // ── types ──────────────────────────────────────────────────────────────────
 
-// Space is one of the four ACL namespaces.
+// Space is one of the five ACL namespaces.
 type Space string
 
 const (
@@ -28,10 +28,11 @@ const (
 	SpaceUser    Space = "user"
 	SpaceFrozen  Space = "frozen"
 	SpacePrivate Space = "private"
+	SpaceEPublic Space = "epublic"
 )
 
 func isValidSpace(s Space) bool {
-	return s == SpacePublic || s == SpaceUser || s == SpaceFrozen || s == SpacePrivate
+	return s == SpacePublic || s == SpaceUser || s == SpaceFrozen || s == SpacePrivate || s == SpaceEPublic
 }
 
 // Record is the public view of a stored record.
@@ -332,13 +333,32 @@ func (s *PeerPigeonStorage) Put(space Space, key string, value interface{}, opts
 	if len(opts) > 0 {
 		putOpts = opts[0]
 	}
-	mutation, err := s.applyLocalUpsert(space, key, value, putOpts)
+	mutation, err := s.applyLocalUpsert(space, key, value, putOpts, false)
 	if err != nil {
 		return nil, err
 	}
 	if space != SpacePrivate {
 		_ = s.broadcastMutation(mutation)
 	}
+	return s.Get(space, key)
+}
+
+// PutSystem stores a value in epublic space. This bypasses user-write ACL and
+// is intended for internal runtime updates.
+func (s *PeerPigeonStorage) PutSystem(space Space, key string, value interface{}, opts ...PutOptions) (*Record, error) {
+	if space != SpaceEPublic {
+		return nil, fmt.Errorf("storage: PutSystem is only allowed for epublic space")
+	}
+
+	var putOpts PutOptions
+	if len(opts) > 0 {
+		putOpts = opts[0]
+	}
+	mutation, err := s.applyLocalUpsert(space, key, value, putOpts, true)
+	if err != nil {
+		return nil, err
+	}
+	_ = s.broadcastMutation(mutation)
 	return s.Get(space, key)
 }
 
@@ -426,13 +446,26 @@ func (s *PeerPigeonStorage) Retrieve(space Space, key string, opts ...RetrieveOp
 
 // Delete removes a record.
 func (s *PeerPigeonStorage) Delete(space Space, key string) (bool, error) {
-	mutation, err := s.applyLocalDelete(space, key)
+	mutation, err := s.applyLocalDelete(space, key, false)
 	if err != nil || mutation == nil {
 		return false, err
 	}
 	if space != SpacePrivate {
 		_ = s.broadcastMutation(mutation)
 	}
+	return true, nil
+}
+
+// DeleteSystem deletes an epublic key and is intended for internal runtime use.
+func (s *PeerPigeonStorage) DeleteSystem(space Space, key string) (bool, error) {
+	if space != SpaceEPublic {
+		return false, fmt.Errorf("storage: DeleteSystem is only allowed for epublic space")
+	}
+	mutation, err := s.applyLocalDelete(space, key, true)
+	if err != nil || mutation == nil {
+		return false, err
+	}
+	_ = s.broadcastMutation(mutation)
 	return true, nil
 }
 
@@ -467,7 +500,7 @@ func (s *PeerPigeonStorage) List(space Space) ([]*Record, error) {
 
 // ── local apply ────────────────────────────────────────────────────────────
 
-func (s *PeerPigeonStorage) applyLocalUpsert(space Space, key string, value interface{}, opts PutOptions) (*storageMutation, error) {
+func (s *PeerPigeonStorage) applyLocalUpsert(space Space, key string, value interface{}, opts PutOptions, allowSystemWrite bool) (*storageMutation, error) {
 	normKey := strings.TrimSpace(key)
 	if normKey == "" {
 		return nil, fmt.Errorf("storage: key must be non-empty")
@@ -480,7 +513,7 @@ func (s *PeerPigeonStorage) applyLocalUpsert(space Space, key string, value inte
 	}
 	now := nowMs()
 
-	if err := s.assertCanWrite(space, existing, s.userID, opts.OwnerID); err != nil {
+	if err := s.assertCanWrite(space, existing, s.userID, opts.OwnerID, allowSystemWrite); err != nil {
 		return nil, err
 	}
 
@@ -536,7 +569,7 @@ func (s *PeerPigeonStorage) applyLocalUpsert(space Space, key string, value inte
 	return mutation, nil
 }
 
-func (s *PeerPigeonStorage) applyLocalDelete(space Space, key string) (*storageMutation, error) {
+func (s *PeerPigeonStorage) applyLocalDelete(space Space, key string, allowSystemWrite bool) (*storageMutation, error) {
 	normKey := strings.TrimSpace(key)
 	if normKey == "" {
 		return nil, nil
@@ -550,7 +583,7 @@ func (s *PeerPigeonStorage) applyLocalDelete(space Space, key string) (*storageM
 	if existing == nil {
 		return nil, nil
 	}
-	if err := s.assertCanDelete(space, existing, s.userID); err != nil {
+	if err := s.assertCanDelete(space, existing, s.userID, allowSystemWrite); err != nil {
 		return nil, err
 	}
 	if err := driver.Delete(pk); err != nil {
@@ -596,7 +629,7 @@ func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool
 		if mutation.Timestamp <= existing.UpdatedAt {
 			return false, nil
 		}
-		if !s.canDelete(mutation.Space, existing, mutation.ActorID) {
+		if !s.canDelete(mutation.Space, existing, mutation.ActorID, mutation.Space == SpaceEPublic) {
 			return false, nil
 		}
 		if err := driver.Delete(pk); err != nil {
@@ -622,7 +655,7 @@ func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool
 		}
 	}
 
-	if !s.canWrite(mutation.Space, existing, mutation.ActorID, "") {
+	if !s.canWrite(mutation.Space, existing, mutation.ActorID, "", mutation.Space == SpaceEPublic) {
 		return false, nil
 	}
 
@@ -788,13 +821,11 @@ func (s *PeerPigeonStorage) handleRetrieveRequest(req *storageRetrieveReq) error
 func (s *PeerPigeonStorage) handleRetrieveResponse(resp *storageRetrieveResp) error {
 	s.mu.Lock()
 	p := s.pending[resp.ReqID]
-	if p == nil {
-		s.mu.Unlock()
-		return nil
+	if p != nil {
+		delete(s.pending, resp.ReqID)
 	}
-	delete(s.pending, resp.ReqID)
 	s.mu.Unlock()
-	if p.timer != nil {
+	if p != nil && p.timer != nil {
 		p.timer.Stop()
 	}
 
@@ -810,8 +841,10 @@ func (s *PeerPigeonStorage) handleRetrieveResponse(resp *storageRetrieveResp) er
 		}
 	}
 
-	latest, _ := s.Get(resp.Space, resp.Key)
-	p.resolve(latest)
+	if p != nil {
+		latest, _ := s.Get(resp.Space, resp.Key)
+		p.resolve(latest)
+	}
 	return nil
 }
 
@@ -850,10 +883,12 @@ func (s *PeerPigeonStorage) shouldAcceptRemote(space Space, key, kind, actorID s
 
 // ── ACL ────────────────────────────────────────────────────────────────────
 
-func (s *PeerPigeonStorage) canWrite(space Space, existing *persistedRecord, actorID, ownerOverride string) bool {
+func (s *PeerPigeonStorage) canWrite(space Space, existing *persistedRecord, actorID, ownerOverride string, allowSystemWrite bool) bool {
 	switch space {
 	case SpacePublic:
 		return true
+	case SpaceEPublic:
+		return allowSystemWrite
 	case SpacePrivate:
 		return actorID == s.userID
 	case SpaceUser:
@@ -877,17 +912,19 @@ func (s *PeerPigeonStorage) canWrite(space Space, existing *persistedRecord, act
 	return false
 }
 
-func (s *PeerPigeonStorage) assertCanWrite(space Space, existing *persistedRecord, actorID, ownerOverride string) error {
-	if !s.canWrite(space, existing, actorID, ownerOverride) {
+func (s *PeerPigeonStorage) assertCanWrite(space Space, existing *persistedRecord, actorID, ownerOverride string, allowSystemWrite bool) error {
+	if !s.canWrite(space, existing, actorID, ownerOverride, allowSystemWrite) {
 		return fmt.Errorf("storage: write denied for %s space", space)
 	}
 	return nil
 }
 
-func (s *PeerPigeonStorage) canDelete(space Space, existing *persistedRecord, actorID string) bool {
+func (s *PeerPigeonStorage) canDelete(space Space, existing *persistedRecord, actorID string, allowSystemWrite bool) bool {
 	switch space {
 	case SpacePublic:
 		return true
+	case SpaceEPublic:
+		return allowSystemWrite
 	case SpacePrivate:
 		return actorID == s.userID
 	case SpaceUser:
@@ -898,8 +935,8 @@ func (s *PeerPigeonStorage) canDelete(space Space, existing *persistedRecord, ac
 	return false
 }
 
-func (s *PeerPigeonStorage) assertCanDelete(space Space, existing *persistedRecord, actorID string) error {
-	if !s.canDelete(space, existing, actorID) {
+func (s *PeerPigeonStorage) assertCanDelete(space Space, existing *persistedRecord, actorID string, allowSystemWrite bool) error {
+	if !s.canDelete(space, existing, actorID, allowSystemWrite) {
 		return fmt.Errorf("storage: delete denied for %s space", space)
 	}
 	return nil

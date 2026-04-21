@@ -149,7 +149,7 @@ declare class GossipProtocol {
     private generateMessageId;
 }
 
-type StorageSpace = 'public' | 'user' | 'frozen' | 'private';
+type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
 type StorageChangeOrigin = 'local' | 'remote';
 interface StorageRecord<T = unknown> {
     space: StorageSpace;
@@ -235,7 +235,8 @@ interface GossipLike {
  *
  * - Persists records in IndexedDB (fallback: in-memory)
  * - Syncs non-private spaces over encrypted gossip envelopes
- * - Enforces four built-in ACL spaces: public, user, frozen, private
+ * - Enforces five built-in ACL spaces: public, user, frozen, private, epublic
+ * - epublic is internal-only and can only be mutated through putSystem/deleteSystem
  */
 declare class PeerPigeonStorage {
     private readonly userId;
@@ -261,9 +262,11 @@ declare class PeerPigeonStorage {
     subscribe(listener: StorageEvents['change']): StorageUnsubscribe;
     off(event: 'change', listener: StorageEvents['change']): void;
     put<T = unknown>(space: StorageSpace, key: string, value: T, options?: StoragePutOptions): Promise<StorageRecord<T>>;
+    putSystem<T = unknown>(space: StorageSpace, key: string, value: T, options?: StoragePutOptions): Promise<StorageRecord<T>>;
     get<T = unknown>(space: StorageSpace, key: string): Promise<StorageRecord<T> | null>;
     retrieve<T = unknown>(space: StorageSpace, key: string, options?: StorageRetrieveOptions): Promise<StorageRecord<T> | null>;
     delete(space: StorageSpace, key: string): Promise<boolean>;
+    deleteSystem(space: StorageSpace, key: string): Promise<boolean>;
     list(space: StorageSpace): Promise<StorageRecord[]>;
     close(): Promise<void>;
     private applyLocalUpsert;
