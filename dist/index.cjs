@@ -724,11 +724,15 @@ var freertc_client_adapter_default = FreeRTCClientAdapter;
 var GossipProtocol = class {
   constructor(mesh, options = {}) {
     this.messageLog = /* @__PURE__ */ new Map();
+    this.maxTrackedMessages = 12e3;
+    this.maxTrackedDirectIds = 12e3;
+    this.trackingRetentionMs = 10 * 6e4;
     this.cecrCurrentExtrema = null;
     this.cecrPreviousExtrema = null;
     this.cecrRemoteStates = /* @__PURE__ */ new Map();
     this.cecrSyncTimer = null;
-    this.seenDirectIds = /* @__PURE__ */ new Set();
+    this.trackingCleanupTimer = null;
+    this.seenDirectIds = /* @__PURE__ */ new Map();
     this.callbacks = {};
     this.peers = /* @__PURE__ */ new Map();
     this.mesh = mesh;
@@ -740,6 +744,7 @@ var GossipProtocol = class {
     this.cecrRequireConsensus = options.cecrRequireConsensus ?? true;
     this.setupMeshListeners();
     this.startCecrSyncLoop();
+    this.startTrackingCleanupLoop();
   }
   setupMeshListeners() {
     this.mesh.on("peer:data", ({ peerId, data }) => {
@@ -771,6 +776,12 @@ var GossipProtocol = class {
       this.publishCecrState();
     }, 2e3);
   }
+  startTrackingCleanupLoop() {
+    if (this.trackingCleanupTimer) return;
+    this.trackingCleanupTimer = setInterval(() => {
+      this.pruneTracking();
+    }, 3e4);
+  }
   /**
    * Broadcast an application payload using gossip-style re-propagation.
    */
@@ -795,6 +806,9 @@ var GossipProtocol = class {
       sender: message.sender,
       hops: 0
     });
+    if (this.messageLog.size > this.maxTrackedMessages) {
+      this.pruneTracking(message.timestamp);
+    }
     this.propagate(message);
     this.emit("messageReceived", { message, local: true });
     return message.id;
@@ -828,6 +842,9 @@ var GossipProtocol = class {
       sender: message.sender,
       hops: message.hops
     });
+    if (this.messageLog.size > this.maxTrackedMessages) {
+      this.pruneTracking();
+    }
     this.emit("messageReceived", { message, local: false, fromPeer: fromPeerId });
     if (message.hops < message.maxHops) {
       this.propagate(message, fromPeerId);
@@ -1071,7 +1088,7 @@ var GossipProtocol = class {
       maxHops: this.maxDirectHops,
       timestamp: Date.now()
     };
-    this.seenDirectIds.add(message.id);
+    this.markDirectSeen(message.id, message.timestamp);
     this.routeDirect(message, null);
     return message.id;
   }
@@ -1099,7 +1116,7 @@ var GossipProtocol = class {
   }
   handleIncomingDirect(message, fromPeerId) {
     if (this.seenDirectIds.has(message.id)) return;
-    this.seenDirectIds.add(message.id);
+    this.markDirectSeen(message.id, message.timestamp);
     this.routeDirect(message, fromPeerId);
   }
   getStats() {
@@ -1125,6 +1142,42 @@ var GossipProtocol = class {
         this.messageLog.delete(id);
       }
     }
+    for (const [id, timestamp] of this.seenDirectIds.entries()) {
+      if (now - timestamp > maxAgeMs) {
+        this.seenDirectIds.delete(id);
+      }
+    }
+  }
+  markDirectSeen(id, timestamp) {
+    this.seenDirectIds.set(id, timestamp || Date.now());
+    if (this.seenDirectIds.size > this.maxTrackedDirectIds) {
+      this.pruneTracking();
+    }
+  }
+  pruneTracking(now = Date.now()) {
+    const minTimestamp = now - this.trackingRetentionMs;
+    for (const [id, info] of this.messageLog.entries()) {
+      if (info.timestamp >= minTimestamp) {
+        break;
+      }
+      this.messageLog.delete(id);
+    }
+    while (this.messageLog.size > this.maxTrackedMessages) {
+      const oldest = this.messageLog.keys().next().value;
+      if (!oldest) break;
+      this.messageLog.delete(oldest);
+    }
+    for (const [id, timestamp] of this.seenDirectIds.entries()) {
+      if (timestamp >= minTimestamp) {
+        break;
+      }
+      this.seenDirectIds.delete(id);
+    }
+    while (this.seenDirectIds.size > this.maxTrackedDirectIds) {
+      const oldest = this.seenDirectIds.keys().next().value;
+      if (!oldest) break;
+      this.seenDirectIds.delete(oldest);
+    }
   }
   on(event, callback) {
     const existing = this.callbacks[event];
@@ -1147,6 +1200,10 @@ var GossipProtocol = class {
     if (this.cecrSyncTimer) {
       clearInterval(this.cecrSyncTimer);
       this.cecrSyncTimer = null;
+    }
+    if (this.trackingCleanupTimer) {
+      clearInterval(this.trackingCleanupTimer);
+      this.trackingCleanupTimer = null;
     }
     this.callbacks = {};
   }
@@ -3120,6 +3177,10 @@ var PartialMesh = class {
       clearTimeout(t);
     }
     this.connectionTimers.clear();
+    for (const t of this.nonInitiatorFallbackTimers.values()) {
+      clearTimeout(t);
+    }
+    this.nonInitiatorFallbackTimers.clear();
     for (const peerId of this.peers.keys()) {
       try {
         this.signalingClient?.closeConnection(peerId);
@@ -3129,15 +3190,27 @@ var PartialMesh = class {
     this.peers.clear();
     this.connecting.clear();
     this.discoveredPeers.clear();
+    this.discoveredAtMs.clear();
+    this.connectionStartedAtMs.clear();
+    this.peerConnectedAtMs.clear();
+    this.rebalanceAttemptAtMs.clear();
+    this.pendingRebalanceDropByTarget.clear();
+    this.globalPeers.clear();
+    this.selfAliases.clear();
     this.clientId = null;
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;
     this.lastDiscoveryRefreshAtMs = 0;
+    this.lastSignalingReconnectAtMs = 0;
+    this.rebalanceCooldownUntilMs = 0;
     this.dialFailureCount.clear();
     this.dialBackoffUntilMs.clear();
     if (this.signalingClient) {
       this.signalingClient.disconnect();
       this.signalingClient = null;
+    }
+    for (const handlers of this.eventHandlers.values()) {
+      handlers.clear();
     }
   }
 };
