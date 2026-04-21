@@ -40,8 +40,8 @@ type peerListBody struct {
 }
 
 type sdpBody struct {
-	SDP       string `json:"sdp"`
-	TrickleICE bool  `json:"trickle_ice"`
+	SDP        string `json:"sdp"`
+	TrickleICE bool   `json:"trickle_ice"`
 }
 
 type candidateBody struct {
@@ -83,11 +83,11 @@ type RTCDataEvent struct {
 // It manages a WebSocket connection to a FreeRTC signaling server and
 // coordinates WebRTC peer connections through it.
 type Adapter struct {
-	signalURL   string
-	networkID   string
-	peerID      string // requested / stable local peer ID
-	iceServers  []webrtc.ICEServer
-	trickleICE  bool
+	signalURL  string
+	networkID  string
+	peerID     string // requested / stable local peer ID
+	iceServers []webrtc.ICEServer
+	trickleICE bool
 
 	mu            sync.Mutex
 	socket        *websocket.Conn
@@ -95,7 +95,7 @@ type Adapter struct {
 	peerEntries   map[string]*peerEntry
 	knownPeers    map[string]struct{}
 	pendingCands  map[string][]rtcpeer.Signal // buffered before remote desc set
-	offerMu       map[string]*sync.Mutex       // per-peer serialisation
+	offerMu       map[string]*sync.Mutex      // per-peer serialisation
 	lastOfferSDP  map[string]string
 	lastAnswerSDP map[string]string
 	selfAliases   map[string]struct{}
@@ -110,15 +110,15 @@ type Adapter struct {
 	closed      atomic.Bool
 
 	// event callbacks
-	onConnected        []func(ConnectedEvent)
-	onJoined           []func(JoinedEvent)
-	onPeerJoined       []func(string)
-	onPeerLeft         []func(string)
-	onRTCConnected     []func(string)
-	onRTCDisconnected  []func(string)
-	onRTCData          []func(RTCDataEvent)
-	onError            []func(error)
-	onSignalingLog     []func(string)
+	onConnected       []func(ConnectedEvent)
+	onJoined          []func(JoinedEvent)
+	onPeerJoined      []func(string)
+	onPeerLeft        []func(string)
+	onRTCConnected    []func(string)
+	onRTCDisconnected []func(string)
+	onRTCData         []func(RTCDataEvent)
+	onError           []func(error)
+	onSignalingLog    []func(string)
 }
 
 // New creates a new Adapter.
@@ -148,15 +148,51 @@ func New(signalURL, networkID string, peerID string, iceServers []webrtc.ICEServ
 
 // ── event registration ─────────────────────────────────────────────────────
 
-func (a *Adapter) OnConnected(fn func(ConnectedEvent))     { a.mu.Lock(); a.onConnected = append(a.onConnected, fn); a.mu.Unlock() }
-func (a *Adapter) OnJoined(fn func(JoinedEvent))           { a.mu.Lock(); a.onJoined = append(a.onJoined, fn); a.mu.Unlock() }
-func (a *Adapter) OnPeerJoined(fn func(string))            { a.mu.Lock(); a.onPeerJoined = append(a.onPeerJoined, fn); a.mu.Unlock() }
-func (a *Adapter) OnPeerLeft(fn func(string))              { a.mu.Lock(); a.onPeerLeft = append(a.onPeerLeft, fn); a.mu.Unlock() }
-func (a *Adapter) OnRTCConnected(fn func(string))          { a.mu.Lock(); a.onRTCConnected = append(a.onRTCConnected, fn); a.mu.Unlock() }
-func (a *Adapter) OnRTCDisconnected(fn func(string))       { a.mu.Lock(); a.onRTCDisconnected = append(a.onRTCDisconnected, fn); a.mu.Unlock() }
-func (a *Adapter) OnRTCData(fn func(RTCDataEvent))         { a.mu.Lock(); a.onRTCData = append(a.onRTCData, fn); a.mu.Unlock() }
-func (a *Adapter) OnError(fn func(error))                  { a.mu.Lock(); a.onError = append(a.onError, fn); a.mu.Unlock() }
-func (a *Adapter) OnSignalingLog(fn func(string))          { a.mu.Lock(); a.onSignalingLog = append(a.onSignalingLog, fn); a.mu.Unlock() }
+func (a *Adapter) OnConnected(fn func(ConnectedEvent)) {
+	a.mu.Lock()
+	a.onConnected = append(a.onConnected, fn)
+	a.mu.Unlock()
+}
+func (a *Adapter) OnJoined(fn func(JoinedEvent)) {
+	a.mu.Lock()
+	a.onJoined = append(a.onJoined, fn)
+	a.mu.Unlock()
+}
+func (a *Adapter) OnPeerJoined(fn func(string)) {
+	a.mu.Lock()
+	a.onPeerJoined = append(a.onPeerJoined, fn)
+	a.mu.Unlock()
+}
+func (a *Adapter) OnPeerLeft(fn func(string)) {
+	a.mu.Lock()
+	a.onPeerLeft = append(a.onPeerLeft, fn)
+	a.mu.Unlock()
+}
+func (a *Adapter) OnRTCConnected(fn func(string)) {
+	a.mu.Lock()
+	a.onRTCConnected = append(a.onRTCConnected, fn)
+	a.mu.Unlock()
+}
+func (a *Adapter) OnRTCDisconnected(fn func(string)) {
+	a.mu.Lock()
+	a.onRTCDisconnected = append(a.onRTCDisconnected, fn)
+	a.mu.Unlock()
+}
+func (a *Adapter) OnRTCData(fn func(RTCDataEvent)) {
+	a.mu.Lock()
+	a.onRTCData = append(a.onRTCData, fn)
+	a.mu.Unlock()
+}
+func (a *Adapter) OnError(fn func(error)) {
+	a.mu.Lock()
+	a.onError = append(a.onError, fn)
+	a.mu.Unlock()
+}
+func (a *Adapter) OnSignalingLog(fn func(string)) {
+	a.mu.Lock()
+	a.onSignalingLog = append(a.onSignalingLog, fn)
+	a.mu.Unlock()
+}
 
 // ── public API ─────────────────────────────────────────────────────────────
 
@@ -661,7 +697,7 @@ func (a *Adapter) attachPeer(peerID string, peer *rtcpeer.RtcPeer, initiator boo
 	peer.OnSignal(func(sig rtcpeer.Signal) {
 		if sig.Type == "offer" || sig.Type == "answer" {
 			a.sendEnvelope(sig.Type, map[string]interface{}{
-				"sdp":        sig.SDP,
+				"sdp":         sig.SDP,
 				"trickle_ice": entry.trickleICE,
 			}, peerID, nil, nil)
 		} else if sig.Candidate != nil {
@@ -843,36 +879,68 @@ func (a *Adapter) log(msg string) {
 // ── event fires ────────────────────────────────────────────────────────────
 
 func (a *Adapter) fireConnected(e ConnectedEvent) {
-	a.mu.Lock(); cbs := append(([]func(ConnectedEvent))(nil), a.onConnected...); a.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(e) }) }
+	a.mu.Lock()
+	cbs := append(([]func(ConnectedEvent))(nil), a.onConnected...)
+	a.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(e) })
+	}
 }
 func (a *Adapter) fireJoined(e JoinedEvent) {
-	a.mu.Lock(); cbs := append(([]func(JoinedEvent))(nil), a.onJoined...); a.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(e) }) }
+	a.mu.Lock()
+	cbs := append(([]func(JoinedEvent))(nil), a.onJoined...)
+	a.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(e) })
+	}
 }
 func (a *Adapter) firePeerJoined(id string) {
-	a.mu.Lock(); cbs := append(([]func(string))(nil), a.onPeerJoined...); a.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	a.mu.Lock()
+	cbs := append(([]func(string))(nil), a.onPeerJoined...)
+	a.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (a *Adapter) firePeerLeft(id string) {
-	a.mu.Lock(); cbs := append(([]func(string))(nil), a.onPeerLeft...); a.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	a.mu.Lock()
+	cbs := append(([]func(string))(nil), a.onPeerLeft...)
+	a.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (a *Adapter) fireRTCConnected(id string) {
-	a.mu.Lock(); cbs := append(([]func(string))(nil), a.onRTCConnected...); a.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	a.mu.Lock()
+	cbs := append(([]func(string))(nil), a.onRTCConnected...)
+	a.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (a *Adapter) fireRTCDisconnected(id string) {
-	a.mu.Lock(); cbs := append(([]func(string))(nil), a.onRTCDisconnected...); a.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	a.mu.Lock()
+	cbs := append(([]func(string))(nil), a.onRTCDisconnected...)
+	a.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (a *Adapter) fireRTCData(e RTCDataEvent) {
-	a.mu.Lock(); cbs := append(([]func(RTCDataEvent))(nil), a.onRTCData...); a.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(e) }) }
+	a.mu.Lock()
+	cbs := append(([]func(RTCDataEvent))(nil), a.onRTCData...)
+	a.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(e) })
+	}
 }
 func (a *Adapter) fireError(err error) {
-	a.mu.Lock(); cbs := append(([]func(error))(nil), a.onError...); a.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(err) }) }
+	a.mu.Lock()
+	cbs := append(([]func(error))(nil), a.onError...)
+	a.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(err) })
+	}
 }
 
 // ── utilities ──────────────────────────────────────────────────────────────

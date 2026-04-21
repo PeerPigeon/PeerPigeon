@@ -109,30 +109,30 @@ type MeshLike interface {
 
 // GossipProtocol manages gossip broadcast and direct routed messaging.
 type GossipProtocol struct {
-	mesh            MeshLike
-	maxHops         int
-	maxDirectHops   int
-	cecrCW          float64
-	cecrMaxAgeMs    int64
-	cecrMaxDrift    float64
-	cecrConsensus   bool
+	mesh          MeshLike
+	maxHops       int
+	maxDirectHops int
+	cecrCW        float64
+	cecrMaxAgeMs  int64
+	cecrMaxDrift  float64
+	cecrConsensus bool
 
-	mu              sync.Mutex
-	messageLog      map[string]msgLogEntry // id → entry
-	seenDirectIDs   map[string]struct{}
-	peers           map[string]int64 // peerID → connectedAtMs
-	cecrCurrent     *cecrExtrema
-	cecrPrevious    *cecrExtrema
-	cecrRemote      map[string]*cecrRemoteState
+	mu            sync.Mutex
+	messageLog    map[string]msgLogEntry // id → entry
+	seenDirectIDs map[string]struct{}
+	peers         map[string]int64 // peerID → connectedAtMs
+	cecrCurrent   *cecrExtrema
+	cecrPrevious  *cecrExtrema
+	cecrRemote    map[string]*cecrRemoteState
 
 	syncTicker *time.Ticker
 	syncDone   chan struct{}
 
 	// callbacks
-	onMsgReceived  []func(MessageReceivedEvent)
-	onPeerConn     []func(string)
-	onPeerDisconn  []func(string)
-	onDirectMsg    []func(DirectMessageReceivedEvent)
+	onMsgReceived []func(MessageReceivedEvent)
+	onPeerConn    []func(string)
+	onPeerDisconn []func(string)
+	onDirectMsg   []func(DirectMessageReceivedEvent)
 }
 
 type msgLogEntry struct {
@@ -199,17 +199,23 @@ func (g *GossipProtocol) OnMessageReceived(fn func(MessageReceivedEvent)) func()
 
 // OnPeerConnected registers a handler for peer connection events.
 func (g *GossipProtocol) OnPeerConnected(fn func(string)) {
-	g.mu.Lock(); g.onPeerConn = append(g.onPeerConn, fn); g.mu.Unlock()
+	g.mu.Lock()
+	g.onPeerConn = append(g.onPeerConn, fn)
+	g.mu.Unlock()
 }
 
 // OnPeerDisconnected registers a handler for peer disconnection events.
 func (g *GossipProtocol) OnPeerDisconnected(fn func(string)) {
-	g.mu.Lock(); g.onPeerDisconn = append(g.onPeerDisconn, fn); g.mu.Unlock()
+	g.mu.Lock()
+	g.onPeerDisconn = append(g.onPeerDisconn, fn)
+	g.mu.Unlock()
 }
 
 // OnDirectMessageReceived registers a handler for direct messages addressed to this peer.
 func (g *GossipProtocol) OnDirectMessageReceived(fn func(DirectMessageReceivedEvent)) {
-	g.mu.Lock(); g.onDirectMsg = append(g.onDirectMsg, fn); g.mu.Unlock()
+	g.mu.Lock()
+	g.onDirectMsg = append(g.onDirectMsg, fn)
+	g.mu.Unlock()
 }
 
 // ── public API ─────────────────────────────────────────────────────────────
@@ -604,7 +610,7 @@ func (g *GossipProtocol) closestPeerHybrid(target, exclude string) string {
 	}
 
 	var best string
-	bestScore := float64(1<<62)
+	bestScore := float64(1 << 62)
 	for _, p := range filtered {
 		d := xorMap[p]
 		xorScore := normalizedRatio(d, maxXor)
@@ -731,20 +737,36 @@ func (g *GossipProtocol) handleRawMessage(data []byte, fromPeer string) {
 // ── event fires ────────────────────────────────────────────────────────────
 
 func (g *GossipProtocol) fireMessageReceived(e MessageReceivedEvent) {
-	g.mu.Lock(); cbs := append(([]func(MessageReceivedEvent))(nil), g.onMsgReceived...); g.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(e) }) }
+	g.mu.Lock()
+	cbs := append(([]func(MessageReceivedEvent))(nil), g.onMsgReceived...)
+	g.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(e) })
+	}
 }
 func (g *GossipProtocol) firePeerConnected(id string) {
-	g.mu.Lock(); cbs := append(([]func(string))(nil), g.onPeerConn...); g.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	g.mu.Lock()
+	cbs := append(([]func(string))(nil), g.onPeerConn...)
+	g.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (g *GossipProtocol) firePeerDisconnected(id string) {
-	g.mu.Lock(); cbs := append(([]func(string))(nil), g.onPeerDisconn...); g.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	g.mu.Lock()
+	cbs := append(([]func(string))(nil), g.onPeerDisconn...)
+	g.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (g *GossipProtocol) fireDirectMessageReceived(e DirectMessageReceivedEvent) {
-	g.mu.Lock(); cbs := append(([]func(DirectMessageReceivedEvent))(nil), g.onDirectMsg...); g.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(e) }) }
+	g.mu.Lock()
+	cbs := append(([]func(DirectMessageReceivedEvent))(nil), g.onDirectMsg...)
+	g.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(e) })
+	}
 }
 
 // ── utilities ──────────────────────────────────────────────────────────────

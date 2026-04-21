@@ -55,9 +55,9 @@ func (h *hub) broadcast(eventType string, data interface{}) {
 // ── main ───────────────────────────────────────────────────────────────────
 
 func main() {
-	addr       := flag.String("addr", ":8080", "HTTP listen address")
-	signalURL  := flag.String("signal", "wss://freewebrtc.cloud", "Signaling server WebSocket URL")
-	networkID  := flag.String("network", "peerpigeon-webgui-go", "Network / session ID")
+	addr := flag.String("addr", ":8080", "HTTP listen address")
+	signalURL := flag.String("signal", "wss://freewebrtc.cloud", "Signaling server WebSocket URL")
+	networkID := flag.String("network", "peerpigeon-webgui-go", "Network / session ID")
 	flag.Parse()
 
 	h := newHub()
@@ -67,11 +67,11 @@ func main() {
 	// ── mesh ──────────────────────────────────────────────────────────────
 	m := mesh.New(mesh.Config{
 		SignalingServer: *signalURL,
-		SessionID:      *networkID,
-		MinPeers:       2,
-		MaxPeers:       6,
-		AutoDiscover:   true,
-		AutoConnect:    true,
+		SessionID:       *networkID,
+		MinPeers:        2,
+		MaxPeers:        6,
+		AutoDiscover:    true,
+		AutoConnect:     true,
 	})
 
 	// ── gossip ────────────────────────────────────────────────────────────
@@ -135,11 +135,11 @@ func main() {
 	go func() {
 		for range time.NewTicker(3 * time.Second).C {
 			emit("heartbeat", map[string]interface{}{
-				"clientId":  m.GetClientID(),
-				"connected": m.GetConnectedPeers(),
+				"clientId":   m.GetClientID(),
+				"connected":  m.GetConnectedPeers(),
 				"discovered": m.GetDiscoveredPeers(),
-				"global":    m.GetGlobalPeers(),
-				"ts":        nowMs(),
+				"global":     m.GetGlobalPeers(),
+				"ts":         nowMs(),
 			})
 		}
 	}()

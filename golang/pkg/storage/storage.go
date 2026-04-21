@@ -71,7 +71,7 @@ type Options struct {
 	SyncSecret string
 	DBName     string
 	// Gossip is the optional GossipInterface for network sync.
-	Gossip     GossipInterface
+	Gossip GossipInterface
 	// SyncFilter optionally gates incoming remote sync payloads.
 	SyncFilter func(space Space, key string, kind string, actorID string) bool
 }
@@ -113,14 +113,14 @@ type cipher64 struct {
 }
 
 type storageMutation struct {
-	PPType  string           `json:"__ppType"` // "pp-storage-op-v1"
-	OpID    string           `json:"opId"`
-	Op      string           `json:"op"` // "upsert"|"delete"
-	Space   Space            `json:"space"`
-	Key     string           `json:"key"`
-	ActorID string           `json:"actorId"`
-	Timestamp int64          `json:"timestamp"`
-	Record  *persistedRecord `json:"record"`
+	PPType    string           `json:"__ppType"` // "pp-storage-op-v1"
+	OpID      string           `json:"opId"`
+	Op        string           `json:"op"` // "upsert"|"delete"
+	Space     Space            `json:"space"`
+	Key       string           `json:"key"`
+	ActorID   string           `json:"actorId"`
+	Timestamp int64            `json:"timestamp"`
+	Record    *persistedRecord `json:"record"`
 }
 
 type storageRetrieveReq struct {
@@ -217,11 +217,11 @@ type PeerPigeonStorage struct {
 	syncFilter func(Space, string, string, string) bool
 	instanceID string
 
-	mu         sync.Mutex
-	driver     StorageDriver
-	closed     bool
-	listeners  []func(ChangeEvent)
-	pending    map[string]*pendingRetrieve
+	mu          sync.Mutex
+	driver      StorageDriver
+	closed      bool
+	listeners   []func(ChangeEvent)
+	pending     map[string]*pendingRetrieve
 	gossipUnsub func()
 }
 
@@ -674,8 +674,8 @@ func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool
 	}
 	s.emitChange(ChangeEvent{
 		Origin: OriginRemote, Op: "upsert",
-		Record:  toRecord(incoming, val),
-		Space:   incoming.Space, Key: incoming.Key, ActorID: mutation.ActorID,
+		Record: toRecord(incoming, val),
+		Space:  incoming.Space, Key: incoming.Key, ActorID: mutation.ActorID,
 	})
 	return true, nil
 }

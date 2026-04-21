@@ -145,22 +145,42 @@ func New(opts Options) (*RtcPeer, error) {
 }
 
 // OnSignal registers a callback invoked when a local signal is ready to send.
-func (p *RtcPeer) OnSignal(fn func(Signal)) { p.mu.Lock(); p.signalCBs = append(p.signalCBs, fn); p.mu.Unlock() }
+func (p *RtcPeer) OnSignal(fn func(Signal)) {
+	p.mu.Lock()
+	p.signalCBs = append(p.signalCBs, fn)
+	p.mu.Unlock()
+}
 
 // OnConnect registers a callback invoked when the data channel opens.
-func (p *RtcPeer) OnConnect(fn func()) { p.mu.Lock(); p.connectCBs = append(p.connectCBs, fn); p.mu.Unlock() }
+func (p *RtcPeer) OnConnect(fn func()) {
+	p.mu.Lock()
+	p.connectCBs = append(p.connectCBs, fn)
+	p.mu.Unlock()
+}
 
 // OnData registers a callback invoked when data arrives on the data channel.
-func (p *RtcPeer) OnData(fn func([]byte)) { p.mu.Lock(); p.dataCBs = append(p.dataCBs, fn); p.mu.Unlock() }
+func (p *RtcPeer) OnData(fn func([]byte)) {
+	p.mu.Lock()
+	p.dataCBs = append(p.dataCBs, fn)
+	p.mu.Unlock()
+}
 
 // OnClose registers a callback invoked when the peer connection closes.
 func (p *RtcPeer) OnClose(fn func()) { p.mu.Lock(); p.closeCBs = append(p.closeCBs, fn); p.mu.Unlock() }
 
 // OnError registers a callback invoked on peer errors.
-func (p *RtcPeer) OnError(fn func(error)) { p.mu.Lock(); p.errorCBs = append(p.errorCBs, fn); p.mu.Unlock() }
+func (p *RtcPeer) OnError(fn func(error)) {
+	p.mu.Lock()
+	p.errorCBs = append(p.errorCBs, fn)
+	p.mu.Unlock()
+}
 
 // OnDebug registers a callback invoked on state-change debug snapshots.
-func (p *RtcPeer) OnDebug(fn func(DebugSnapshot)) { p.mu.Lock(); p.debugCBs = append(p.debugCBs, fn); p.mu.Unlock() }
+func (p *RtcPeer) OnDebug(fn func(DebugSnapshot)) {
+	p.mu.Lock()
+	p.debugCBs = append(p.debugCBs, fn)
+	p.mu.Unlock()
+}
 
 // Signal processes an incoming WebRTC signal (offer, answer, or ICE candidate).
 func (p *RtcPeer) Signal(sig Signal) error {

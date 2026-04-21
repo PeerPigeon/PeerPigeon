@@ -1,5 +1,5 @@
-//	   -network my-network \
-//	   -peer my-unique-peer-id
+// -network my-network \
+// -peer my-unique-peer-id
 package main
 
 import (
@@ -19,7 +19,7 @@ import (
 func main() {
 	signalURL := flag.String("signal", "wss://freewebrtc.cloud", "Signaling server WebSocket URL")
 	networkID := flag.String("network", "peerpigeon-example-go", "Network / session ID")
-	peerID    := flag.String("peer", "", "Unique peer ID (hex string, random if empty)")
+	peerID := flag.String("peer", "", "Unique peer ID (hex string, random if empty)")
 	flag.Parse()
 
 	// ── mesh ──────────────────────────────────────────────────────────────
@@ -41,7 +41,7 @@ func main() {
 
 	// ── gossip ────────────────────────────────────────────────────────────
 	g := gossip.New(m, gossip.Options{
-		MaxHops:             6,
+		MaxHops:              6,
 		CECRCoordinateWeight: 0.35,
 	})
 

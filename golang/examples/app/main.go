@@ -6,10 +6,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"encoding/base64"
 	"strings"
 	"sync"
 	"time"
@@ -30,13 +30,13 @@ import (
 // ── colour palette ─────────────────────────────────────────────────────────
 
 var (
-	colPurple  = color32(0x7C, 0x3A, 0xED, 0xFF)
-	colGreen   = color32(0x22, 0xC5, 0x5E, 0xFF)
-	colCyan    = color32(0x06, 0xB6, 0xD4, 0xFF)
-	colYellow  = color32(0xF5, 0x9E, 0x0B, 0xFF)
-	colRed     = color32(0xEF, 0x44, 0x44, 0xFF)
-	colFg      = color32(0xE2, 0xE8, 0xF0, 0xFF)
-	colDim     = color32(0x6B, 0x72, 0x80, 0xFF)
+	colPurple = color32(0x7C, 0x3A, 0xED, 0xFF)
+	colGreen  = color32(0x22, 0xC5, 0x5E, 0xFF)
+	colCyan   = color32(0x06, 0xB6, 0xD4, 0xFF)
+	colYellow = color32(0xF5, 0x9E, 0x0B, 0xFF)
+	colRed    = color32(0xEF, 0x44, 0x44, 0xFF)
+	colFg     = color32(0xE2, 0xE8, 0xF0, 0xFF)
+	colDim    = color32(0x6B, 0x72, 0x80, 0xFF)
 )
 
 func color32(r, g, b, a uint8) color { return color{r, g, b, a} }
@@ -60,10 +60,10 @@ type appState struct {
 }
 
 type logEntry struct {
-	ts   time.Time
-	kind string // gossip storage peer sig err
+	ts    time.Time
+	kind  string // gossip storage peer sig err
 	level string
-	text string
+	text  string
 }
 
 type chatEntry struct {
@@ -189,7 +189,8 @@ func main() {
 		func() int { state.mu.Lock(); defer state.mu.Unlock(); return len(state.connected) },
 		func() fyne.CanvasObject { return widget.NewLabel("") },
 		func(i widget.ListItemID, o fyne.CanvasObject) {
-			state.mu.Lock(); defer state.mu.Unlock()
+			state.mu.Lock()
+			defer state.mu.Unlock()
 			if i < len(state.connected) {
 				o.(*widget.Label).SetText("● " + truncate(state.connected[i], 48))
 			}
@@ -200,7 +201,8 @@ func main() {
 		func() int { state.mu.Lock(); defer state.mu.Unlock(); return len(state.discovered) },
 		func() fyne.CanvasObject { return widget.NewLabel("") },
 		func(i widget.ListItemID, o fyne.CanvasObject) {
-			state.mu.Lock(); defer state.mu.Unlock()
+			state.mu.Lock()
+			defer state.mu.Unlock()
 			if i < len(state.discovered) {
 				o.(*widget.Label).SetText("○ " + truncate(state.discovered[i], 48))
 			}
@@ -665,7 +667,9 @@ func main() {
 			if !isCurrentBackend(gen) {
 				return
 			}
-			state.mu.Lock(); state.clientID = id; state.mu.Unlock()
+			state.mu.Lock()
+			state.clientID = id
+			state.mu.Unlock()
 			state.addLogLevel("sig", "INFO", "signaling connected · id="+id)
 			fyne.Do(func() { statusLabel.SetText("⬡  Signaling connected · waiting for peers…") })
 			refresh()
@@ -683,7 +687,9 @@ func main() {
 				return
 			}
 			id := m.GetClientID()
-			state.mu.Lock(); state.clientID = id; state.mu.Unlock()
+			state.mu.Lock()
+			state.clientID = id
+			state.mu.Unlock()
 			state.addLogLevel("sig", "INFO", "mesh ready · id="+id)
 			fyne.Do(func() { statusLabel.SetText("⬡  Mesh ready") })
 			refresh()

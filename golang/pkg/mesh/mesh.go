@@ -98,30 +98,30 @@ type peerConn struct {
 type Mesh struct {
 	cfg Config
 
-	mu                        sync.Mutex
-	sig                       *signaling.Adapter
-	clientID                  string
-	selfAliases               map[string]struct{}
-	peers                     map[string]*peerConn
-	discoveredPeers           map[string]struct{}
-	globalPeers               map[string]struct{}
-	connecting                map[string]struct{}
-	connTimers                map[string]*time.Timer
-	connStartedAt             map[string]int64
-	peerConnectedAt           map[string]int64
-	discoveredAt              map[string]int64
-	dialFailures              map[string]int
-	dialBackoffUntil          map[string]int64
-	nonInitFallbackTimers     map[string]*time.Timer
-	rebalanceCooldownUntil    int64
-	rebalanceAttemptAt        map[string]int64
-	pendingRebalanceDrop      map[string]string // newTarget → dropPeer
-	underConnectedSince       int64 // unix ms, 0 = not tracking
-	lastHardReset             int64
-	lastDiscoveryRefresh      int64
-	lastSignalingReconnect    int64
-	maintenanceTicker         *time.Ticker
-	maintenanceDone           chan struct{}
+	mu                     sync.Mutex
+	sig                    *signaling.Adapter
+	clientID               string
+	selfAliases            map[string]struct{}
+	peers                  map[string]*peerConn
+	discoveredPeers        map[string]struct{}
+	globalPeers            map[string]struct{}
+	connecting             map[string]struct{}
+	connTimers             map[string]*time.Timer
+	connStartedAt          map[string]int64
+	peerConnectedAt        map[string]int64
+	discoveredAt           map[string]int64
+	dialFailures           map[string]int
+	dialBackoffUntil       map[string]int64
+	nonInitFallbackTimers  map[string]*time.Timer
+	rebalanceCooldownUntil int64
+	rebalanceAttemptAt     map[string]int64
+	pendingRebalanceDrop   map[string]string // newTarget → dropPeer
+	underConnectedSince    int64             // unix ms, 0 = not tracking
+	lastHardReset          int64
+	lastDiscoveryRefresh   int64
+	lastSignalingReconnect int64
+	maintenanceTicker      *time.Ticker
+	maintenanceDone        chan struct{}
 
 	// event callbacks
 	onSignalingConnected    []func(clientID string)
@@ -141,39 +141,83 @@ type Mesh struct {
 func New(cfg Config) *Mesh {
 	cfg = defaultConfig(cfg)
 	m := &Mesh{
-		cfg:                  cfg,
-		selfAliases:          make(map[string]struct{}),
-		peers:                make(map[string]*peerConn),
-		discoveredPeers:      make(map[string]struct{}),
-		globalPeers:          make(map[string]struct{}),
-		connecting:           make(map[string]struct{}),
-		connTimers:           make(map[string]*time.Timer),
-		connStartedAt:        make(map[string]int64),
-		peerConnectedAt:      make(map[string]int64),
-		discoveredAt:         make(map[string]int64),
-		dialFailures:         make(map[string]int),
-		dialBackoffUntil:     make(map[string]int64),
+		cfg:                   cfg,
+		selfAliases:           make(map[string]struct{}),
+		peers:                 make(map[string]*peerConn),
+		discoveredPeers:       make(map[string]struct{}),
+		globalPeers:           make(map[string]struct{}),
+		connecting:            make(map[string]struct{}),
+		connTimers:            make(map[string]*time.Timer),
+		connStartedAt:         make(map[string]int64),
+		peerConnectedAt:       make(map[string]int64),
+		discoveredAt:          make(map[string]int64),
+		dialFailures:          make(map[string]int),
+		dialBackoffUntil:      make(map[string]int64),
 		nonInitFallbackTimers: make(map[string]*time.Timer),
-		rebalanceAttemptAt:   make(map[string]int64),
-		pendingRebalanceDrop: make(map[string]string),
-		maintenanceDone:      make(chan struct{}),
+		rebalanceAttemptAt:    make(map[string]int64),
+		pendingRebalanceDrop:  make(map[string]string),
+		maintenanceDone:       make(chan struct{}),
 	}
 	return m
 }
 
 // ── event registration ─────────────────────────────────────────────────────
 
-func (m *Mesh) OnSignalingConnected(fn func(string))    { m.mu.Lock(); m.onSignalingConnected = append(m.onSignalingConnected, fn); m.mu.Unlock() }
-func (m *Mesh) OnSignalingDisconnected(fn func())       { m.mu.Lock(); m.onSignalingDisconnected = append(m.onSignalingDisconnected, fn); m.mu.Unlock() }
-func (m *Mesh) OnSignalingError(fn func(error))         { m.mu.Lock(); m.onSignalingError = append(m.onSignalingError, fn); m.mu.Unlock() }
-func (m *Mesh) OnSignalingLog(fn func(string))          { m.mu.Lock(); m.onSignalingLog = append(m.onSignalingLog, fn); m.mu.Unlock() }
-func (m *Mesh) OnPeerConnected(fn func(string))         { m.mu.Lock(); m.onPeerConnected = append(m.onPeerConnected, fn); m.mu.Unlock() }
-func (m *Mesh) OnPeerDisconnected(fn func(string))      { m.mu.Lock(); m.onPeerDisconnected = append(m.onPeerDisconnected, fn); m.mu.Unlock() }
-func (m *Mesh) OnPeerData(fn func(string, []byte))      { m.mu.Lock(); m.onPeerData = append(m.onPeerData, fn); m.mu.Unlock() }
-func (m *Mesh) OnPeerError(fn func(string, error))      { m.mu.Lock(); m.onPeerError = append(m.onPeerError, fn); m.mu.Unlock() }
-func (m *Mesh) OnPeerDiscovered(fn func(string))        { m.mu.Lock(); m.onPeerDiscovered = append(m.onPeerDiscovered, fn); m.mu.Unlock() }
-func (m *Mesh) OnMeshReady(fn func())                   { m.mu.Lock(); m.onMeshReady = append(m.onMeshReady, fn); m.mu.Unlock() }
-func (m *Mesh) OnMeshMembership(fn func([]string))      { m.mu.Lock(); m.onMeshMembership = append(m.onMeshMembership, fn); m.mu.Unlock() }
+func (m *Mesh) OnSignalingConnected(fn func(string)) {
+	m.mu.Lock()
+	m.onSignalingConnected = append(m.onSignalingConnected, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnSignalingDisconnected(fn func()) {
+	m.mu.Lock()
+	m.onSignalingDisconnected = append(m.onSignalingDisconnected, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnSignalingError(fn func(error)) {
+	m.mu.Lock()
+	m.onSignalingError = append(m.onSignalingError, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnSignalingLog(fn func(string)) {
+	m.mu.Lock()
+	m.onSignalingLog = append(m.onSignalingLog, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnPeerConnected(fn func(string)) {
+	m.mu.Lock()
+	m.onPeerConnected = append(m.onPeerConnected, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnPeerDisconnected(fn func(string)) {
+	m.mu.Lock()
+	m.onPeerDisconnected = append(m.onPeerDisconnected, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnPeerData(fn func(string, []byte)) {
+	m.mu.Lock()
+	m.onPeerData = append(m.onPeerData, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnPeerError(fn func(string, error)) {
+	m.mu.Lock()
+	m.onPeerError = append(m.onPeerError, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnPeerDiscovered(fn func(string)) {
+	m.mu.Lock()
+	m.onPeerDiscovered = append(m.onPeerDiscovered, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnMeshReady(fn func()) {
+	m.mu.Lock()
+	m.onMeshReady = append(m.onMeshReady, fn)
+	m.mu.Unlock()
+}
+func (m *Mesh) OnMeshMembership(fn func([]string)) {
+	m.mu.Lock()
+	m.onMeshMembership = append(m.onMeshMembership, fn)
+	m.mu.Unlock()
+}
 
 // ── public API ─────────────────────────────────────────────────────────────
 
@@ -1143,8 +1187,8 @@ func (m *Mesh) maybeRebalance(candidates []string) bool {
 	})
 
 	type candDist struct {
-		id          string
-		dist        *big.Int
+		id           string
+		dist         *big.Int
 		discoveredAt int64
 		lastAttempt  int64
 	}
@@ -1402,48 +1446,92 @@ func (m *Mesh) isSignalingConnectedLocked() bool {
 // ── event fires ────────────────────────────────────────────────────────────
 
 func (m *Mesh) fireSignalingConnected(id string) {
-	m.mu.Lock(); cbs := append(([]func(string))(nil), m.onSignalingConnected...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	m.mu.Lock()
+	cbs := append(([]func(string))(nil), m.onSignalingConnected...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (m *Mesh) fireSignalingDisconnected() {
-	m.mu.Lock(); cbs := append(([]func())(nil), m.onSignalingDisconnected...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(fn) }
+	m.mu.Lock()
+	cbs := append(([]func())(nil), m.onSignalingDisconnected...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(fn)
+	}
 }
 func (m *Mesh) fireSignalingError(err error) {
-	m.mu.Lock(); cbs := append(([]func(error))(nil), m.onSignalingError...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(err) }) }
+	m.mu.Lock()
+	cbs := append(([]func(error))(nil), m.onSignalingError...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(err) })
+	}
 }
 func (m *Mesh) fireSignalingLog(msg string) {
-	m.mu.Lock(); cbs := append(([]func(string))(nil), m.onSignalingLog...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(msg) }) }
+	m.mu.Lock()
+	cbs := append(([]func(string))(nil), m.onSignalingLog...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(msg) })
+	}
 }
 func (m *Mesh) firePeerConnected(id string) {
-	m.mu.Lock(); cbs := append(([]func(string))(nil), m.onPeerConnected...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	m.mu.Lock()
+	cbs := append(([]func(string))(nil), m.onPeerConnected...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (m *Mesh) firePeerDisconnected(id string) {
-	m.mu.Lock(); cbs := append(([]func(string))(nil), m.onPeerDisconnected...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	m.mu.Lock()
+	cbs := append(([]func(string))(nil), m.onPeerDisconnected...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (m *Mesh) firePeerData(id string, data []byte) {
-	m.mu.Lock(); cbs := append(([]func(string, []byte))(nil), m.onPeerData...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id, data) }) }
+	m.mu.Lock()
+	cbs := append(([]func(string, []byte))(nil), m.onPeerData...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id, data) })
+	}
 }
 func (m *Mesh) firePeerError(id string, err error) {
-	m.mu.Lock(); cbs := append(([]func(string, error))(nil), m.onPeerError...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id, err) }) }
+	m.mu.Lock()
+	cbs := append(([]func(string, error))(nil), m.onPeerError...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id, err) })
+	}
 }
 func (m *Mesh) firePeerDiscovered(id string) {
-	m.mu.Lock(); cbs := append(([]func(string))(nil), m.onPeerDiscovered...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(id) }) }
+	m.mu.Lock()
+	cbs := append(([]func(string))(nil), m.onPeerDiscovered...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(id) })
+	}
 }
 func (m *Mesh) fireMeshReady() {
-	m.mu.Lock(); cbs := append(([]func())(nil), m.onMeshReady...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(fn) }
+	m.mu.Lock()
+	cbs := append(([]func())(nil), m.onMeshReady...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(fn)
+	}
 }
 func (m *Mesh) fireMeshMembership(peers []string) {
-	m.mu.Lock(); cbs := append(([]func([]string))(nil), m.onMeshMembership...); m.mu.Unlock()
-	for _, fn := range cbs { safeCall(func() { fn(peers) }) }
+	m.mu.Lock()
+	cbs := append(([]func([]string))(nil), m.onMeshMembership...)
+	m.mu.Unlock()
+	for _, fn := range cbs {
+		safeCall(func() { fn(peers) })
+	}
 }
 
 // ── utilities ──────────────────────────────────────────────────────────────

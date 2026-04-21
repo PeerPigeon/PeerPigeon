@@ -22,16 +22,16 @@ import (
 // ── styles ─────────────────────────────────────────────────────────────────
 
 var (
-	purple    = lipgloss.Color("#7C3AED")
-	green     = lipgloss.Color("#22C55E")
-	cyan      = lipgloss.Color("#06B6D4")
-	yellow    = lipgloss.Color("#F59E0B")
-	red       = lipgloss.Color("#EF4444")
-	dim       = lipgloss.Color("#4B5563")
-	light     = lipgloss.Color("#E2E8F0")
-	bgDark    = lipgloss.Color("#0F1117")
-	bgCard    = lipgloss.Color("#1E2130")
-	bgBorder  = lipgloss.Color("#2D3148")
+	purple   = lipgloss.Color("#7C3AED")
+	green    = lipgloss.Color("#22C55E")
+	cyan     = lipgloss.Color("#06B6D4")
+	yellow   = lipgloss.Color("#F59E0B")
+	red      = lipgloss.Color("#EF4444")
+	dim      = lipgloss.Color("#4B5563")
+	light    = lipgloss.Color("#E2E8F0")
+	bgDark   = lipgloss.Color("#0F1117")
+	bgCard   = lipgloss.Color("#1E2130")
+	bgBorder = lipgloss.Color("#2D3148")
 
 	titleStyle = lipgloss.NewStyle().
 			Foreground(purple).
@@ -274,7 +274,7 @@ func (m model) View() string {
 
 	// ── title bar ──────────────────────────────────────────────────────────
 	title := titleStyle.Render("🐦 PeerPigeon Go")
-	net   := idStyle.Render("network: " + m.network)
+	net := idStyle.Render("network: " + m.network)
 	title = lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", net)
 
 	// ── left column ────────────────────────────────────────────────────────
@@ -463,11 +463,11 @@ func main() {
 	// ── mesh ──────────────────────────────────────────────────────────────
 	m := mesh.New(mesh.Config{
 		SignalingServer: *signalURL,
-		SessionID:      *networkID,
-		MinPeers:       2,
-		MaxPeers:       6,
-		AutoDiscover:   true,
-		AutoConnect:    true,
+		SessionID:       *networkID,
+		MinPeers:        2,
+		MaxPeers:        6,
+		AutoDiscover:    true,
+		AutoConnect:     true,
 	})
 
 	// ── gossip ────────────────────────────────────────────────────────────
