@@ -496,6 +496,8 @@ declare class PartialMesh {
      * Maintain the target number of peer connections
      */
     private maintainPeerConnections;
+    private shouldPreferXorCompatiblePeers;
+    private isXorCompatiblePeer;
     /**
      * Connect to a specific peer
      */

@@ -4,6 +4,9 @@ import App from '/src/App.vue';
 const DEV_FALLBACK_HOST = 'peer.ooo';
 
 function buildDevFallbackUrl() {
+	if (typeof window === 'undefined' || typeof window.location === 'undefined') {
+		return { toString: () => '', searchParams: { set: () => {} }, protocol: '', hostname: '', port: '' };
+	}
 	const redirectUrl = new URL(window.location.href);
 	redirectUrl.protocol = 'https:';
 	redirectUrl.hostname = DEV_FALLBACK_HOST;
@@ -18,8 +21,12 @@ function redirectToDevFallback(reason: string) {
 	if (/^peer\.ooo$/i.test(window.location.hostname || '')) return;
 
 	const redirectUrl = buildDevFallbackUrl();
-	redirectUrl.searchParams.set('fallback_reason', reason);
-	window.location.replace(redirectUrl.toString());
+	if (redirectUrl && redirectUrl.searchParams && typeof redirectUrl.searchParams.set === 'function') {
+		redirectUrl.searchParams.set('fallback_reason', reason);
+	}
+	if (redirectUrl && typeof redirectUrl.toString === 'function') {
+		window.location.replace(redirectUrl.toString());
+	}
 }
 
 if (import.meta.env.DEV && typeof window !== 'undefined') {

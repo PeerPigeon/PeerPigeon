@@ -7,9 +7,18 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { createPrivateKey } from 'node:crypto'
+import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import multicastDns from 'multicast-dns'
 import { generateRandomPair } from 'unsea'
+
+const require = createRequire(import.meta.url)
+let MDNSResolver = null
+try {
+  MDNSResolver = require('pigeonns')
+} catch {
+  MDNSResolver = null
+}
 
 const DEV_PORT_DEFAULT = 5173
 const PUBLIC_HTTP_PORT = 80
@@ -24,6 +33,9 @@ const TLS_CERT_DIR = process.env.PEERPIGEON_TLS_DIR || path.join(REPO_ROOT, '.pe
 const TLS_KEY_PATH = `${TLS_CERT_DIR}/peerpigeon-dev.key.pem`
 const TLS_CERT_PATH = `${TLS_CERT_DIR}/peerpigeon-dev.cert.pem`
 const GENERATE_TLS_ONLY = process.argv.includes('--generate-tls')
+const PIGEONNS_DISABLED = process.argv.includes('--no-pigeonns')
+const PIGEONNS_SERVER_PORT = Math.max(1, Number(process.env.PEERPIGEON_PIGEONNS_PORT || 5380) || 5380)
+const PIGEONNS_SERVER_HOST = String(process.env.PEERPIGEON_PIGEONNS_HOST || '0.0.0.0').trim() || '0.0.0.0'
 
 function isRfc1918IPv4(ip) {
   return (
@@ -610,6 +622,38 @@ async function main() {
 
   const mdnsProcs = []
   let mdnsHostResponder = null
+  let pigeonnsResolver = null
+
+  if (!PIGEONNS_DISABLED && MDNSResolver) {
+    try {
+      pigeonnsResolver = new MDNSResolver({
+        server: true,
+        serverPort: PIGEONNS_SERVER_PORT,
+        serverHost: PIGEONNS_SERVER_HOST,
+        cors: true,
+        timeout: 5000,
+        ttl: 120,
+      })
+
+      pigeonnsResolver.on('server-started', ({ url }) => {
+        console.log(`[pigeonns] Resolver API started at ${url}`)
+      })
+      pigeonnsResolver.on('server-error', (error) => {
+        console.warn(`[pigeonns] API server error: ${error?.message || error}`)
+      })
+      pigeonnsResolver.on('error', (error) => {
+        console.warn(`[pigeonns] Resolver error: ${error?.message || error}`)
+      })
+
+      pigeonnsResolver.start()
+    } catch (error) {
+      console.warn(`[pigeonns] Could not start resolver API (${error?.message || error}).`)
+      pigeonnsResolver = null
+    }
+  } else if (!PIGEONNS_DISABLED) {
+    console.warn('[pigeonns] Package not installed; skipping resolver API startup.')
+  }
+
   if (process.platform === 'darwin') {
     const preferred = preferredNetwork
     if (!preferred) {
@@ -692,10 +736,17 @@ async function main() {
     shutdownRequested = true
     clearRestartTimer()
 
-    const finalize = () => {
+    const finalize = async () => {
       for (const proc of mdnsProcs) {
         if (proc && !proc.killed) {
           proc.kill('SIGTERM')
+        }
+      }
+      if (pigeonnsResolver && typeof pigeonnsResolver.stop === 'function') {
+        try {
+          await pigeonnsResolver.stop()
+        } catch {
+          // best-effort shutdown
         }
       }
       if (mdnsHostResponder) {
@@ -713,11 +764,15 @@ async function main() {
 
     if (devProc) {
       const current = devProc
-      current.once('exit', () => finalize())
+      current.once('exit', () => {
+        finalize().catch(() => process.exit(code))
+      })
       terminateProcessTree(current)
-      setTimeout(() => finalize(), 2000).unref?.()
+      setTimeout(() => {
+        finalize().catch(() => process.exit(code))
+      }, 2000).unref?.()
     } else {
-      finalize()
+      finalize().catch(() => process.exit(code))
     }
   }
 

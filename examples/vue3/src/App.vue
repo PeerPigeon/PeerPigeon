@@ -50,6 +50,22 @@
               <option value="custom">Custom</option>
             </select>
           </label>
+
+          <label class="field field-runtime-inline">
+            <span class="field-label">Runtime</span>
+            <select
+              v-model="runtimeMode"
+              @change="onRuntimeChange"
+              :disabled="isRunning || isConnecting"
+              class="input"
+              data-testid="runtime-mode"
+            >
+              <option value="rust-wasm">Rust (WASM)</option>
+              <option value="go-wasm">Go (WASM)</option>
+              <option value="js">Vanilla JS</option>
+            </select>
+          </label>
+
           <div class="button-actions">
             <button 
               @click="startMesh" 
@@ -427,17 +443,8 @@
         </div>
       </section>
 
-      <!-- Peer Network Visualization -->
-      <section v-if="isRunning" class="network-viz">
-        <h3>📊 Network Graph</h3>
-        <div ref="networkGraphContainer" class="network-graph-container" data-testid="mesh-visualizer">
-          <svg ref="networkGraphSvg" class="network-graph-svg"></svg>
-        </div>
-        <div class="mesh-visualizer-caption">Live connected topology from <code>epublic/mesh:peers</code> with per-peer audits</div>
-      </section>
-
       <!-- Diagnostics -->
-      <section class="chat diagnostics" v-if="isRunning">
+      <section class="chat diagnostics" v-if="isRunning && verboseDiagnostics">
         <h3>🛠 Diagnostics</h3>
         <div ref="diagLogContainer" class="log-container diag-container" data-testid="diag-log">
           <div
@@ -458,11 +465,11 @@
 </template>
 
 <script>
+import { markRaw } from 'vue';
 import { PartialMesh } from 'peerpigeon';
 import { GossipProtocol } from 'peerpigeon';
 import { PeerPigeonStorage } from 'peerpigeon';
 import { generateRandomPair, encryptMessageWithMeta, decryptMessageWithMeta } from 'unsea';
-import * as d3 from 'd3';
 
 const DEFAULT_TOPOLOGY = 'token-ring';
 const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
@@ -475,8 +482,9 @@ const MESH_PEERS_STORAGE_SPACE = 'epublic';
 const MESH_PEERS_HEARTBEAT_MS = 12_000;
 const MESH_PEERS_STALE_AFTER_MS = MESH_PEERS_HEARTBEAT_MS * 6;
 const MESH_PEERS_MAX_SNAPSHOTS = 80;
-const DEBUG_MONITOR_INTERVAL_MS = 1000;
+const DEBUG_MONITOR_INTERVAL_MS = 4000;
 const DEBUG_MONITOR_PEER_LOG_MIN_GAP_MS = 2500;
+const ENABLE_NETWORK_GRAPH = false;
 
 function toBase64Url(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -532,6 +540,7 @@ export default {
       pendingDirectMessages: {},
       cryptoStorageKey: 'peerpigeon:unsea:keypair:v1',
       cryptoAnnounceTimer: null,
+      cryptoAnnounceBurstUntil: 0,
       storage: null,
       storageIdentity: '',
       storageReady: false,
@@ -563,7 +572,6 @@ export default {
         { id: 'storage', label: 'Storage' },
         { id: 'crypto', label: 'Crypto' }
       ],
-      graphStabilizeTimer: null,
       graphUpdateTimer: null,
       meshConnectWarnTimer: null,
       graphLastSignature: '',
@@ -572,6 +580,8 @@ export default {
       debugMonitorTimer: null,
       debugLastByPeer: {},
       debugLastLogAtByPeer: {},
+      lastLogFingerprint: '',
+      lastLogAtMs: 0,
       runtimeMode: 'go-wasm',
       goWasmNodeId: null,
       goWasmHandlers: {
@@ -581,6 +591,8 @@ export default {
       goWasmStorageNotify: null,
       goWasmLoadPromise: null,
       goWasmStarted: false,
+      verboseDiagnostics: false,
+      networkGraphEnabled: ENABLE_NETWORK_GRAPH,
     };
   },
   mounted() {
@@ -589,9 +601,19 @@ export default {
     const runtimeParam = String(params.get('runtime') || params.get('engine') || '').trim().toLowerCase();
     if (runtimeParam === 'js' || runtimeParam === 'javascript') {
       this.runtimeMode = 'js';
+      this._runtimeModeFromUrl = true;
     } else if (runtimeParam === 'go' || runtimeParam === 'go-wasm' || runtimeParam === 'wasm') {
       this.runtimeMode = 'go-wasm';
+      this._runtimeModeFromUrl = true;
+    } else if (runtimeParam === 'rust' || runtimeParam === 'rust-wasm') {
+      this.runtimeMode = 'rust-wasm';
+      this._runtimeModeFromUrl = true;
+    } else {
+      this._runtimeModeFromUrl = false;
     }
+
+    const diagParam = String(params.get('debugDiag') || params.get('verboseDiagnostics') || '').trim().toLowerCase();
+    this.verboseDiagnostics = diagParam === '1' || diagParam === 'true' || diagParam === 'yes';
 
     // ==== IMPORTANT: URL params take ABSOLUTE priority for test isolation ====
     // Check for explicit sessionId param FIRST (before any session-state fallback)
@@ -657,6 +679,8 @@ export default {
 
     // Restore persisted UI state before any autostart/network events can write defaults.
     this.loadUiState();
+    // Graph feature is removed; force graph runtime off regardless of prior persisted state.
+    this.networkGraphEnabled = false;
 
     // Local-first storage should be available even before mesh/gossip is connected.
     // In go-wasm mode, wait for node creation to avoid a transient js-storage -> wasm-storage swap.
@@ -674,10 +698,6 @@ export default {
     // Normalize/shareable URL immediately on load so defaults are explicit
     // and subsequent topology changes reuse the same URL state.
     this.updateUrlState();
-    this.networkGraphResizeHandler = () => {
-      this.scheduleNetworkGraphRender({ immediate: true, reason: 'resize' });
-    };
-    window.addEventListener('resize', this.networkGraphResizeHandler);
   },
   computed: {
     effectiveSessionId() {
@@ -748,6 +768,10 @@ export default {
     }
   },
   watch: {
+        runtimeMode(newVal, oldVal) {
+          this.updateUrlState();
+          this.saveUiState();
+        },
     messageLog() {
       const last = this.messageLog[this.messageLog.length - 1];
       if (!last) return;
@@ -767,11 +791,13 @@ export default {
       this.saveUiState();
     },
     clientId() {
+      if (!this.networkGraphEnabled) return;
       this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'client' }));
     },
     connectedPeersList: {
       deep: false,
       handler() {
+        if (!this.networkGraphEnabled) return;
         this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'connected' }));
       }
     },
@@ -930,10 +956,6 @@ export default {
       const memory = this.getBrowserMemorySnapshot();
       memory.uaSpecificMemory = await this.measureUaSpecificMemory();
 
-      const networkGraphNodeCount = Number(
-        Object.keys(this.networkGraphState?.positions || {}).length || 0
-      );
-
       const payload = {
         v: 1,
         kind: 'peerpigeon-perf-dump',
@@ -994,11 +1016,12 @@ export default {
           storageError: String(this.storageError || ''),
           meshSnapshots: Object.keys(this.sharedMeshPeerSnapshots || {}).length,
           graph: {
-            hasState: Boolean(this.networkGraphState),
-            width: Number(this.networkGraphState?.width || 0),
-            height: Number(this.networkGraphState?.height || 0),
-            nodeCount: networkGraphNodeCount,
-            layoutVersion: Number(this.networkGraphState?.layoutVersion || 0),
+            enabled: false,
+            hasState: false,
+            width: 0,
+            height: 0,
+            nodeCount: 0,
+            layoutVersion: 0,
           },
         },
       };
@@ -1392,8 +1415,8 @@ export default {
     },
 
     normalizeStorageVersion(version, fallbackSource = '0') {
-      const parsed = this.parseStorageVersionParts(version);
-      const [major, minor, patch, build] = parsed.parts;
+      const parsed = this.parseStorageVersionParts(version) || { parts: [0, 0, 0, 0], source: '0' };
+      const [major, minor, patch, build] = (parsed.parts || [0, 0, 0, 0]);
       const source = parsed.source === '0'
         ? this.versionSourceToken(fallbackSource)
         : parsed.source;
@@ -1470,12 +1493,14 @@ export default {
       const gossipAttached = this.gossip ? '1' : '0';
       const nextIdentity = `js-storage::${this.effectiveSessionId}::${userId}::gossip:${gossipAttached}`;
       if (this.storageReady && this.storage && this.storageIdentity === nextIdentity) {
-        if (!fastPath && this.gossip) {
-          this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
-            // background best-effort network sync
-          });
-        } else if (this.gossip) {
-          this.scheduleMeshPeersRetrieve('storage-tab');
+        if (this.networkGraphEnabled) {
+          if (!fastPath && this.gossip) {
+            this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
+              // background best-effort network sync
+            });
+          } else if (this.gossip) {
+            this.scheduleMeshPeersRetrieve('storage-tab');
+          }
         }
         await this.refreshStorageList({ silent: true, syncInterested: false });
         this.requestInterestedKeySync('storage-ready-existing');
@@ -1495,16 +1520,20 @@ export default {
       }
 
       const dbName = `peerpigeon-storage-v2:${this.effectiveSessionId}`;
-      this.storage = new PeerPigeonStorage({
+      this.storage = markRaw(new PeerPigeonStorage({
         userId,
         gossip: this.gossip || undefined,
         sessionId: this.effectiveSessionId,
         dbName,
-      });
+      }));
       await this.storage.init();
       this.storageIdentity = nextIdentity;
       this.storageChangeUnsubscribe = this.storage.subscribe((event) => {
-        if (event?.space === this.meshPeersStorageSpace && event?.key === this.meshPeersStorageKey) {
+        if (
+          this.networkGraphEnabled
+          && event?.space === this.meshPeersStorageSpace
+          && event?.key === this.meshPeersStorageKey
+        ) {
           this.refreshMeshPeersFromStorage();
         }
         if (this.activeTab === 'storage') {
@@ -1517,14 +1546,16 @@ export default {
       // Local-first: render from IndexedDB immediately.
       await this.refreshStorageList({ silent: true, syncInterested: false });
 
-      if (!fastPath && this.gossip) {
-        this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
-          // background best-effort network sync
-        });
-      } else if (this.gossip) {
-        this.scheduleMeshPeersRetrieve('storage-tab-init');
+      if (this.networkGraphEnabled) {
+        if (!fastPath && this.gossip) {
+          this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
+            // background best-effort network sync
+          });
+        } else if (this.gossip) {
+          this.scheduleMeshPeersRetrieve('storage-tab-init');
+        }
+        this.scheduleMeshPeersPublish('storage-ready');
       }
-      this.scheduleMeshPeersPublish('storage-ready');
       this.requestInterestedKeySync('storage-ready-init');
     },
 
@@ -1761,25 +1792,31 @@ export default {
     },
 
     scheduleMeshPeersPublish(reason = 'update') {
+      if (!this.networkGraphEnabled) return;
       if (!this.isRunning) return;
 
       clearTimeout(this.meshPeersPublishTimer);
+      const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      const delayMs = hidden ? 1200 : 140;
       this.meshPeersPublishTimer = setTimeout(() => {
         this.meshPeersPublishTimer = null;
         this.publishMeshPeersToStorage(reason);
-      }, 140);
+      }, delayMs);
     },
 
     scheduleMeshPeersRetrieve(reason = 'update') {
+      if (!this.networkGraphEnabled) return;
       if (!this.isRunning || !this.storageReady || !this.storage) return;
 
       clearTimeout(this.meshPeersRetrieveTimer);
+      const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      const delayMs = hidden ? 1500 : 120;
       this.meshPeersRetrieveTimer = setTimeout(() => {
         this.meshPeersRetrieveTimer = null;
         this.syncMeshPeersFromNetwork(reason).catch(() => {
           // ignore mesh snapshot retrieval failures
         });
-      }, 120);
+      }, delayMs);
     },
 
     onMeshConnectionsChanged(reason = 'connection-change') {
@@ -1788,6 +1825,7 @@ export default {
     },
 
     async syncMeshPeersFromNetwork(_reason = 'update') {
+      if (!this.networkGraphEnabled) return;
       if (!this.storageReady || !this.storage) return;
       try {
         await this.storage.retrieve(this.meshPeersStorageSpace, this.meshPeersStorageKey, { timeoutMs: 1800 });
@@ -1799,6 +1837,7 @@ export default {
     },
 
     async refreshMeshPeersFromStorage() {
+      if (!this.networkGraphEnabled) return;
       if (!this.storageReady || !this.storage) return;
 
       try {
@@ -1817,6 +1856,7 @@ export default {
     },
 
     async publishMeshPeersToStorage(reason = 'update') {
+      if (!this.networkGraphEnabled) return;
       if (!this.storageReady || !this.storage || !this.isRunning) return;
       if (this.meshPeersPublishInFlight) return;
 
@@ -2053,6 +2093,10 @@ export default {
     onPeerBoundsInput() {
       this.reconcileTopologyWithPeerBounds();
       this.updateUrlState();
+    },
+
+    onNetworkGraphToggle() {
+      // Graph feature removed.
     },
 
     noteGoWasmRuntimeExited(errorLike) {
@@ -2310,7 +2354,7 @@ export default {
         this.isConnecting = true;
         this.showStatus('Connecting...', 'Initializing PartialMesh with PeerPigeon...', 'connecting');
 
-        this.mesh = new PartialMesh({
+        this.mesh = markRaw(new PartialMesh({
           signalingServer: this.signalingServer,
           sessionId: this.effectiveSessionId,
           minPeers: this.minPeers,
@@ -2322,12 +2366,12 @@ export default {
           // avoid indefinite non-initiator wait when all discovered peers are smaller IDs.
           nonInitiatorFallbackDialMs: 8_000,
           underConnectedResetMs: 20_000
-        });
+        }));
 
         if (this.runtimeMode === 'go-wasm') {
-          this.gossip = this.createGoWasmGossipAdapter();
+          this.gossip = markRaw(this.createGoWasmGossipAdapter());
         } else {
-          this.gossip = new GossipProtocol(this.mesh);
+          this.gossip = markRaw(new GossipProtocol(this.mesh));
         }
 
         if (this.activeTab === 'storage') {
@@ -2387,7 +2431,9 @@ export default {
           this.announceCryptoPublicInfo();
           this.requestInterestedKeySync('peer-connected');
           this.updateStats();
-          this.onMeshConnectionsChanged('peer:connected');
+          if (this.networkGraphEnabled) {
+            this.onMeshConnectionsChanged('peer:connected');
+          }
         });
 
         this.mesh.on('peer:disconnected', (peerId) => {
@@ -2399,7 +2445,9 @@ export default {
           }
           this.addLog('disconnected', `Disconnected from peer`, peerId);
           this.updateStats();
-          this.onMeshConnectionsChanged('peer:disconnected');
+          if (this.networkGraphEnabled) {
+            this.onMeshConnectionsChanged('peer:disconnected');
+          }
         });
 
         this.mesh.on('peer:data', ({ peerId, data }) => {
@@ -2452,6 +2500,9 @@ export default {
         });
 
         this.mesh.on('signaling:log', ({ message }) => {
+          // WebRTC debug logs can be very high frequency and cause heavy
+          // diagnostics re-render churn, especially in Safari with >1 peer.
+          if (String(message || '').startsWith('[webrtc]')) return;
           this.addLog('info', message, 'freertc');
         });
 
@@ -2622,16 +2673,38 @@ export default {
 
     startCryptoAnnounceLoop() {
       this.stopCryptoAnnounceLoop();
-      this.cryptoAnnounceTimer = setInterval(() => {
+      const tick = () => {
+        if (!this.isRunning || !this.gossip) {
+          this.cryptoAnnounceTimer = null;
+          return;
+        }
+
         this.announceCryptoPublicInfo();
-      }, 10_000);
+
+        const now = Date.now();
+        const connected = this.connectedPeersList.length;
+        const healthy = connected >= Math.max(1, Number(this.minPeers) || 1);
+        const inBurst = now < Number(this.cryptoAnnounceBurstUntil || 0);
+        const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+
+        const nextMs = inBurst
+          ? 4_000
+          : healthy
+            ? (hidden ? 60_000 : 45_000)
+            : (hidden ? 18_000 : 12_000);
+
+        this.cryptoAnnounceTimer = setTimeout(tick, nextMs);
+      };
+
+      this.cryptoAnnounceTimer = setTimeout(tick, 300);
     },
 
     stopCryptoAnnounceLoop() {
       if (this.cryptoAnnounceTimer) {
-        clearInterval(this.cryptoAnnounceTimer);
+        clearTimeout(this.cryptoAnnounceTimer);
         this.cryptoAnnounceTimer = null;
       }
+      this.cryptoAnnounceBurstUntil = 0;
     },
 
     announceCryptoPublicInfo() {
@@ -2755,6 +2828,8 @@ export default {
         to: target,
         timestamp: Date.now()
       };
+
+      this.cryptoAnnounceBurstUntil = Date.now() + 20_000;
 
       try {
         this.gossip.sendDirect(target, payload);
@@ -3053,6 +3128,22 @@ export default {
       return `${text.slice(0, 6)}********${text.slice(-6)}`;
     },
 
+    normalizePeerIdList(list) {
+      return [...new Set((Array.isArray(list) ? list : [])
+        .map((peerId) => String(peerId || '').trim())
+        .filter(Boolean))].sort((a, b) => a.localeCompare(b));
+    },
+
+    samePeerIdList(a, b) {
+      if (a === b) return true;
+      if (!Array.isArray(a) || !Array.isArray(b)) return false;
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i += 1) {
+        if (a[i] !== b[i]) return false;
+      }
+      return true;
+    },
+
     updateStats() {
       if (this.mesh) {
         const meshClientId = String(this.mesh.getClientId?.() || this.clientId || '').trim();
@@ -3060,22 +3151,34 @@ export default {
           this.clientId = meshClientId;
         }
 
-        this.connectedPeersList = this.mesh.getConnectedPeers();
-        this.discoveredPeersList = this.mesh.getDiscoveredPeers();
-        const global = this.mesh.getGlobalPeers ? this.mesh.getGlobalPeers() : [];
+        const nextConnected = this.normalizePeerIdList(this.mesh.getConnectedPeers());
+        const nextDiscovered = this.normalizePeerIdList(this.mesh.getDiscoveredPeers());
+        const global = this.normalizePeerIdList(this.mesh.getGlobalPeers ? this.mesh.getGlobalPeers() : []);
         const self = meshClientId;
-        this.globalPeersList = [...new Set([
+        const nextGlobal = this.normalizePeerIdList([
           ...global,
-          ...this.connectedPeersList,
-          ...this.discoveredPeersList,
-        ])].filter(p => p && p !== self);
+          ...nextConnected,
+          ...nextDiscovered,
+        ]).filter(p => p && p !== self);
 
-        // Keep DM target valid as the membership view converges.
-        if (!this.globalPeersList.includes(this.dmTarget) || this.dmTarget === self) {
-          this.dmTarget = this.globalPeersList[0] || '';
+        if (!this.samePeerIdList(this.connectedPeersList, nextConnected)) {
+          this.connectedPeersList = nextConnected;
+        }
+        if (!this.samePeerIdList(this.discoveredPeersList, nextDiscovered)) {
+          this.discoveredPeersList = nextDiscovered;
+        }
+        if (!this.samePeerIdList(this.globalPeersList, nextGlobal)) {
+          this.globalPeersList = nextGlobal;
         }
 
-        this.saveUiState();
+        // Keep DM target valid as the membership view converges.
+        const nextDmTarget = (!nextGlobal.includes(this.dmTarget) || this.dmTarget === self)
+          ? (nextGlobal[0] || '')
+          : this.dmTarget;
+        if (nextDmTarget !== this.dmTarget) {
+          this.dmTarget = nextDmTarget;
+          this.saveUiState();
+        }
       }
 
       this.syncGossipStatus();
@@ -3242,8 +3345,10 @@ export default {
     },
 
     scheduleNetworkGraphRender(options = {}) {
+      if (!this.networkGraphEnabled) return;
       const { immediate = false, reason = 'update' } = options;
-      const delayMs = reason === 'resize' ? 0 : 120;
+      const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      const delayMs = reason === 'resize' ? 0 : (hidden ? 1000 : 120);
 
       clearTimeout(this.graphUpdateTimer);
       this.graphUpdateTimer = null;
@@ -3262,13 +3367,16 @@ export default {
     },
 
     renderNetworkGraph(options = {}) {
+      if (!this.networkGraphEnabled) return;
       const { reason = 'update' } = options;
+      const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      if (hidden && reason !== 'resize') return;
       const svgEl = this.$refs.networkGraphSvg;
       const container = this.$refs.networkGraphContainer;
       if (!svgEl || !container) return;
       const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
 
-      const layoutVersion = 2;
+      const layoutVersion = 3;
 
       const width = Math.max(320, Math.floor(container.clientWidth || 320));
       const height = Math.max(280, Math.floor(container.clientHeight || 280));
@@ -3280,10 +3388,9 @@ export default {
       const sameTopology = this.graphLastSignature && signature === this.graphLastSignature;
       const sameSize = prevState && prevState.width === width && prevState.height === height;
 
-      const svg = d3.select(svgEl)
-        .attr('viewBox', `0 0 ${width} ${height}`)
-        .attr('width', width)
-        .attr('height', height);
+      svgEl.setAttribute('viewBox', `0 0 ${width} ${height}`);
+      svgEl.setAttribute('width', String(width));
+      svgEl.setAttribute('height', String(height));
 
       if (sameTopology && sameSize && !versionMismatch) {
         return;
@@ -3300,196 +3407,79 @@ export default {
 
       this.graphLastSignature = signature;
 
-      svg.selectAll('*').remove();
+      while (svgEl.firstChild) {
+        svgEl.removeChild(svgEl.firstChild);
+      }
 
       if (!nodes.length) {
-        clearTimeout(this.graphStabilizeTimer);
-        this.graphStabilizeTimer = null;
-        if (prevState?.simulation) prevState.simulation.stop();
-        this.networkGraphState = null;
+        this.networkGraphState = {
+          layoutVersion,
+          width,
+          height,
+          nodeIds: [],
+          edgeIds: [],
+          positions: {},
+        };
         return;
       }
-
+      const NS = 'http://www.w3.org/2000/svg';
+      const createSvg = (tag) => document.createElementNS(NS, tag);
       const nodeRadius = 16;
-      const boxPadding = nodeRadius + 8;
-      const clampX = (x) => Math.max(boxPadding, Math.min(width - boxPadding, Number.isFinite(x) ? x : width / 2));
-      const clampY = (y) => Math.max(boxPadding, Math.min(height - boxPadding, Number.isFinite(y) ? y : height / 2));
-      const minNodeGap = 58;
+      const padding = nodeRadius + 10;
+      const clampX = (x) => Math.max(padding, Math.min(width - padding, Number.isFinite(x) ? x : width / 2));
+      const clampY = (y) => Math.max(padding, Math.min(height - padding, Number.isFinite(y) ? y : height / 2));
+      const centerX = width / 2;
+      const centerY = height / 2;
 
-      const enforceNodeSpacing = (iterations = 1) => {
-        for (let pass = 0; pass < iterations; pass += 1) {
-          for (let i = 0; i < nodes.length; i += 1) {
-            for (let j = i + 1; j < nodes.length; j += 1) {
-              const a = nodes[i];
-              const b = nodes[j];
-              const dx = (b.x ?? width / 2) - (a.x ?? width / 2);
-              const dy = (b.y ?? height / 2) - (a.y ?? height / 2);
-              const dist = Math.hypot(dx, dy) || 0.001;
-              if (dist >= minNodeGap) continue;
-
-              const overlap = (minNodeGap - dist) / 2;
-              const ux = dx / dist;
-              const uy = dy / dist;
-              const aFixed = Number.isFinite(a.fx) && Number.isFinite(a.fy);
-              const bFixed = Number.isFinite(b.fx) && Number.isFinite(b.fy);
-
-              if (aFixed && bFixed) continue;
-
-              if (aFixed) {
-                b.x = clampX((b.x ?? width / 2) + ux * overlap * 2);
-                b.y = clampY((b.y ?? height / 2) + uy * overlap * 2);
-              } else if (bFixed) {
-                a.x = clampX((a.x ?? width / 2) - ux * overlap * 2);
-                a.y = clampY((a.y ?? height / 2) - uy * overlap * 2);
-              } else {
-                a.x = clampX((a.x ?? width / 2) - ux * overlap);
-                a.y = clampY((a.y ?? height / 2) - uy * overlap);
-                b.x = clampX((b.x ?? width / 2) + ux * overlap);
-                b.y = clampY((b.y ?? height / 2) + uy * overlap);
-              }
-            }
-          }
+      const hashToUnit = (text) => {
+        let hash = 2166136261;
+        const raw = String(text || '');
+        for (let i = 0; i < raw.length; i += 1) {
+          hash ^= raw.charCodeAt(i);
+          hash = Math.imul(hash, 16777619);
         }
+        return (hash >>> 0) / 4294967295;
       };
 
-      const enforceNodesInBox = () => {
-        for (const n of nodes) {
-          const clampedX = clampX(n.x);
-          const clampedY = clampY(n.y);
+      const prevPositions = (prevState && prevState.positions) ? prevState.positions : {};
+      const selfNode = nodes.find((node) => node.id === localSelf) || null;
+      const otherNodes = nodes
+        .filter((node) => !selfNode || node.id !== selfNode.id)
+        .sort((a, b) => a.id.localeCompare(b.id));
 
-          if (clampedX !== n.x && Number.isFinite(n.vx)) {
-            n.vx *= 0.25;
-          }
-          if (clampedY !== n.y && Number.isFinite(n.vy)) {
-            n.vy *= 0.25;
-          }
-
-          n.x = clampedX;
-          n.y = clampedY;
-          if (Number.isFinite(n.fx)) n.fx = clampX(n.fx);
-          if (Number.isFinite(n.fy)) n.fy = clampY(n.fy);
-        }
-      };
-
-      const priorPositions = prevState?.positions || {};
-      const previousIds = nodes.map((n) => n.id);
-      const priorPoints = previousIds
-        .map((id) => priorPositions[id])
-        .filter((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y));
-      const cornerCrowd = priorPoints.filter((point) => point.x < width * 0.3 && point.y < height * 0.3).length;
-      const selfPrior = localSelf ? priorPositions[localSelf] : null;
-      const selfInCorner = Boolean(
-        selfPrior
-        && Number.isFinite(selfPrior.x)
-        && Number.isFinite(selfPrior.y)
-        && selfPrior.x < width * 0.3
-        && selfPrior.y < height * 0.3
-      );
-      const collapsedPriorLayout = (priorPoints.length >= 3 && cornerCrowd / priorPoints.length >= 0.68)
-        || (priorPoints.length >= 2 && selfInCorner);
-      const ignorePriorPositions = versionMismatch || collapsedPriorLayout;
-      const missingPriorNodes = [];
-
-      for (const node of nodes) {
-        if (ignorePriorPositions) break;
-        const prior = priorPositions[node.id];
-        if (!prior) {
-          missingPriorNodes.push(node);
-          continue;
-        }
-
-        node.x = clampX(prior.x);
-        node.y = clampY(prior.y);
-        node.vx = 0;
-        node.vy = 0;
+      const positioned = [];
+      if (selfNode) {
+        const priorSelf = prevPositions[selfNode.id];
+        const selfX = priorSelf && Number.isFinite(priorSelf.x) ? priorSelf.x : centerX;
+        const selfY = priorSelf && Number.isFinite(priorSelf.y) ? priorSelf.y : centerY;
+        positioned.push({ ...selfNode, x: clampX(selfX), y: clampY(selfY) });
       }
 
-      if (ignorePriorPositions) {
-        const cx = width / 2;
-        const cy = height / 2;
-        const spreadX = Math.max(40, width * 0.22);
-        const spreadY = Math.max(36, height * 0.2);
+      const ringCapacity = 10;
+      const baseRadius = Math.max(54, Math.min(width, height) * 0.24);
+      const ringStep = Math.max(42, Math.min(width, height) * 0.1);
 
-        nodes.forEach((node) => {
-          const jitterX = (Math.random() - 0.5) * spreadX;
-          const jitterY = (Math.random() - 0.5) * spreadY;
-          node.x = clampX(cx + jitterX);
-          node.y = clampY(cy + jitterY);
-          node.vx = 0;
-          node.vy = 0;
-        });
+      for (let i = 0; i < otherNodes.length; i += 1) {
+        const node = otherNodes[i];
+        const ring = Math.floor(i / ringCapacity);
+        const ringIndex = i % ringCapacity;
+        const ringCount = Math.min(ringCapacity, otherNodes.length - ring * ringCapacity);
+        const jitter = (hashToUnit(node.id) - 0.5) * 0.24;
+        const angle = ((2 * Math.PI * ringIndex) / Math.max(1, ringCount)) + jitter;
+        const radius = baseRadius + ring * ringStep;
+        const prior = prevPositions[node.id];
+        const fallbackX = centerX + Math.cos(angle) * radius;
+        const fallbackY = centerY + Math.sin(angle) * radius;
+        const x = prior && Number.isFinite(prior.x) ? prior.x : fallbackX;
+        const y = prior && Number.isFinite(prior.y) ? prior.y : fallbackY;
+        positioned.push({ ...node, x: clampX(x), y: clampY(y) });
       }
 
-      // New nodes with no saved coordinates should spawn near neighbors or center, not (0,0).
-      if (!ignorePriorPositions && missingPriorNodes.length) {
-        const cx = width / 2;
-        const cy = height / 2;
-        const idToNode = new Map(nodes.map((node) => [node.id, node]));
-        const neighborsById = new Map(nodes.map((node) => [node.id, []]));
-
-        for (const link of links) {
-          const sourceId = String(typeof link.source === 'object' ? link.source?.id : link.source || '').trim();
-          const targetId = String(typeof link.target === 'object' ? link.target?.id : link.target || '').trim();
-          if (!sourceId || !targetId || sourceId === targetId) continue;
-          if (neighborsById.has(sourceId)) neighborsById.get(sourceId).push(targetId);
-          if (neighborsById.has(targetId)) neighborsById.get(targetId).push(sourceId);
-        }
-
-        for (const node of missingPriorNodes) {
-          if (node.id === localSelf) {
-            node.x = clampX(cx);
-            node.y = clampY(cy);
-            node.vx = 0;
-            node.vy = 0;
-            continue;
-          }
-
-          const neighbors = neighborsById.get(node.id) || [];
-          const anchored = neighbors
-            .map((peerId) => idToNode.get(peerId))
-            .filter((peer) => peer && Number.isFinite(peer.x) && Number.isFinite(peer.y));
-
-          const tryPlace = (baseX, baseY, spreadX, spreadY) => {
-            let candidateX = baseX;
-            let candidateY = baseY;
-            for (let attempt = 0; attempt < 14; attempt += 1) {
-              const jitterX = (Math.random() - 0.5) * spreadX;
-              const jitterY = (Math.random() - 0.5) * spreadY;
-              candidateX = clampX(baseX + jitterX);
-              candidateY = clampY(baseY + jitterY);
-
-              const overlapsExisting = nodes.some((peer) => {
-                if (peer === node) return false;
-                if (!Number.isFinite(peer.x) || !Number.isFinite(peer.y)) return false;
-                return Math.hypot(peer.x - candidateX, peer.y - candidateY) < minNodeGap;
-              });
-
-              if (!overlapsExisting) break;
-            }
-
-            return { x: candidateX, y: candidateY };
-          };
-
-          if (anchored.length > 0) {
-            const avgX = anchored.reduce((sum, peer) => sum + peer.x, 0) / anchored.length;
-            const avgY = anchored.reduce((sum, peer) => sum + peer.y, 0) / anchored.length;
-            const placed = tryPlace(avgX, avgY, 44, 40);
-            node.x = placed.x;
-            node.y = placed.y;
-          } else {
-            const placed = tryPlace(cx, cy, Math.max(76, width * 0.28), Math.max(70, height * 0.24));
-            node.x = placed.x;
-            node.y = placed.y;
-          }
-
-          node.vx = 0;
-          node.vy = 0;
-        }
-      }
+      const positionsById = Object.fromEntries(positioned.map((node) => [node.id, { x: node.x, y: node.y }]));
 
       const prevNodeIds = new Set(prevState?.nodeIds || []);
       const prevEdgeIds = new Set(prevState?.edgeIds || []);
-      const currentNodeIds = nodes.map((node) => node.id);
+      const currentNodeIds = positioned.map((node) => node.id);
       const currentEdgeIds = links
         .map((link) => [String(link.source || ''), String(link.target || '')].sort().join('|'))
         .sort();
@@ -3499,232 +3489,114 @@ export default {
       const addedEdges = currentEdgeIds.filter((id) => !prevEdgeIds.has(id)).length;
       const removedEdges = [...prevEdgeIds].filter((id) => !currentEdgeIds.includes(id)).length;
       const topologyDelta = addedNodes + removedNodes + addedEdges + removedEdges;
-      const lockExistingNodes = Boolean(prevState) && reason !== 'resize' && topologyDelta > 0 && topologyDelta <= 4;
+      const defs = createSvg('defs');
 
-      if (lockExistingNodes) {
-        for (const node of nodes) {
-          const prior = priorPositions[node.id];
-          if (!prior) continue;
-          node.fx = clampX(prior.x);
-          node.fy = clampY(prior.y);
+      const selfFill = createSvg('radialGradient');
+      selfFill.setAttribute('id', 'network-self-fill');
+      const selfStopA = createSvg('stop');
+      selfStopA.setAttribute('offset', '0%');
+      selfStopA.setAttribute('stop-color', '#f0f9ff');
+      const selfStopB = createSvg('stop');
+      selfStopB.setAttribute('offset', '100%');
+      selfStopB.setAttribute('stop-color', '#38bdf8');
+      selfFill.appendChild(selfStopA);
+      selfFill.appendChild(selfStopB);
+      defs.appendChild(selfFill);
+
+      const tolerantFill = createSvg('radialGradient');
+      tolerantFill.setAttribute('id', 'network-tolerant-fill');
+      const tolStopA = createSvg('stop');
+      tolStopA.setAttribute('offset', '0%');
+      tolStopA.setAttribute('stop-color', '#fff8bf');
+      const tolStopB = createSvg('stop');
+      tolStopB.setAttribute('offset', '100%');
+      tolStopB.setAttribute('stop-color', '#facc15');
+      tolerantFill.appendChild(tolStopA);
+      tolerantFill.appendChild(tolStopB);
+      defs.appendChild(tolerantFill);
+
+      svgEl.appendChild(defs);
+
+      const linksGroup = createSvg('g');
+      linksGroup.setAttribute('class', 'network-links');
+      for (const link of links) {
+        const sourceId = String(typeof link.source === 'object' ? link.source?.id : link.source || '').trim();
+        const targetId = String(typeof link.target === 'object' ? link.target?.id : link.target || '').trim();
+        const sourcePos = positionsById[sourceId];
+        const targetPos = positionsById[targetId];
+        if (!sourcePos || !targetPos) continue;
+
+        const line = createSvg('line');
+        line.setAttribute('class', 'network-link');
+        line.setAttribute('x1', String(sourcePos.x));
+        line.setAttribute('y1', String(sourcePos.y));
+        line.setAttribute('x2', String(targetPos.x));
+        line.setAttribute('y2', String(targetPos.y));
+        line.setAttribute('stroke-opacity', link.halfDuplex ? '0.5' : '0.92');
+        if (link.halfDuplex) {
+          line.setAttribute('stroke-dasharray', '6 4');
         }
+        linksGroup.appendChild(line);
       }
+      svgEl.appendChild(linksGroup);
 
-      enforceNodeSpacing(2);
-      enforceNodesInBox();
+      const nodesGroup = createSvg('g');
+      nodesGroup.setAttribute('class', 'network-nodes');
+      for (const node of positioned) {
+        const group = createSvg('g');
+        group.setAttribute('class', `network-node${node.isSelf ? ' self' : ''}${node.isTolerant ? ' tolerant' : ''}`);
+        group.setAttribute('transform', `translate(${node.x},${node.y})`);
 
-      const defs = svg.append('defs');
-
-      const linkGradient = defs.append('linearGradient')
-        .attr('id', 'network-link-gradient')
-        .attr('x1', '0%')
-        .attr('y1', '0%')
-        .attr('x2', '100%')
-        .attr('y2', '100%');
-      linkGradient.append('stop').attr('offset', '0%').attr('stop-color', '#22d3ee').attr('stop-opacity', 0.42);
-      linkGradient.append('stop').attr('offset', '50%').attr('stop-color', '#60a5fa').attr('stop-opacity', 0.88);
-      linkGradient.append('stop').attr('offset', '100%').attr('stop-color', '#22d3ee').attr('stop-opacity', 0.42);
-
-      const linkGlow = defs.append('filter')
-        .attr('id', 'network-link-glow')
-        .attr('x', '-40%')
-        .attr('y', '-40%')
-        .attr('width', '180%')
-        .attr('height', '180%');
-      linkGlow.append('feGaussianBlur').attr('stdDeviation', 1.7).attr('result', 'blur');
-      linkGlow.append('feMerge')
-        .selectAll('feMergeNode')
-        .data(['blur', 'SourceGraphic'])
-        .enter()
-        .append('feMergeNode')
-        .attr('in', (d) => d);
-
-      const nodeGlow = defs.append('filter')
-        .attr('id', 'network-node-glow')
-        .attr('x', '-60%')
-        .attr('y', '-60%')
-        .attr('width', '220%')
-        .attr('height', '220%');
-      nodeGlow.append('feGaussianBlur').attr('stdDeviation', 2.1).attr('result', 'glow');
-      nodeGlow.append('feMerge')
-        .selectAll('feMergeNode')
-        .data(['glow', 'SourceGraphic'])
-        .enter()
-        .append('feMergeNode')
-        .attr('in', (d) => d);
-
-      const selfFill = defs.append('radialGradient').attr('id', 'network-self-fill');
-      selfFill.append('stop').attr('offset', '0%').attr('stop-color', '#f0f9ff');
-      selfFill.append('stop').attr('offset', '100%').attr('stop-color', '#38bdf8');
-
-      const tolerantFill = defs.append('radialGradient').attr('id', 'network-tolerant-fill');
-      tolerantFill.append('stop').attr('offset', '0%').attr('stop-color', '#fff8bf');
-      tolerantFill.append('stop').attr('offset', '100%').attr('stop-color', '#facc15');
-
-      const root = svg.append('g').attr('class', 'network-root');
-
-      const link = root
-        .append('g')
-        .attr('class', 'network-links')
-        .selectAll('line')
-        .data(links)
-        .enter()
-        .append('line')
-        .attr('class', 'network-link')
-        .attr('stroke', 'url(#network-link-gradient)')
-        .attr('stroke-width', 2.2)
-        .attr('stroke-opacity', (d) => (d.halfDuplex ? 0.5 : 0.95))
-        .attr('stroke-dasharray', (d) => (d.halfDuplex ? '6 4' : null))
-        .attr('filter', 'url(#network-link-glow)');
-
-      const node = root
-        .append('g')
-        .attr('class', 'network-nodes')
-        .selectAll('g')
-        .data(nodes)
-        .enter()
-        .append('g')
-        .attr('class', (d) => `network-node${d.isSelf ? ' self' : ''}${d.isTolerant ? ' tolerant' : ''}`);
-
-      node.append('circle')
-        .attr('class', 'network-node-core')
-        .attr('r', 16)
-        .attr('stroke', (d) => (d.isTolerant ? '#f59e0b' : `hsl(${d.hue}, 96%, 62%)`))
-        .attr('fill', (d) => {
-          if (d.isSelf) return 'url(#network-self-fill)';
-          if (d.isTolerant) return 'url(#network-tolerant-fill)';
-          return `hsl(${d.hue}, 68%, 20%)`;
-        })
-        .attr('stroke-width', 1)
-        .attr('filter', 'url(#network-node-glow)');
-
-      node.append('text')
-        .attr('class', 'network-node-label')
-        .attr('text-anchor', 'middle')
-        .attr('dy', '0.35em')
-        .attr('fill', (d) => (d.isSelf || d.isTolerant ? '#0b1222' : '#f8fafc'))
-        .attr('stroke', (d) => (d.isSelf || d.isTolerant ? 'rgba(248,250,252,0.66)' : 'rgba(11,18,34,0.72)'))
-        .attr('stroke-width', 1.2)
-        .attr('paint-order', 'stroke')
-        .text((d) => d.short);
-
-      const simulation = d3.forceSimulation(nodes)
-        .force('link', d3.forceLink(links).id((d) => d.id).distance(lockExistingNodes ? 100 : 118).strength(lockExistingNodes ? 0.26 : 0.38))
-        .force('charge', d3.forceManyBody().strength(lockExistingNodes ? -300 : -470))
-        .force('center', d3.forceCenter(width / 2, height / 2))
-        .force('collision', d3.forceCollide().radius(minNodeGap / 2 + 4).iterations(4))
-        .alphaDecay(lockExistingNodes ? 0.16 : 0.08)
-        .alpha(lockExistingNodes ? 0.22 : 0.85);
-
-      const drag = d3.drag()
-        .on('start', (event, d) => {
-          if (!event.active) simulation.alphaTarget(0.25).restart();
-          d.fx = d.x;
-          d.fy = d.y;
-        })
-        .on('drag', (event, d) => {
-          d.fx = clampX(event.x);
-          d.fy = clampY(event.y);
-        })
-        .on('end', (event, d) => {
-          if (!event.active) simulation.alphaTarget(0);
-          d.fx = null;
-          d.fy = null;
-        });
-
-      node.call(drag);
-
-      simulation.on('tick', () => {
-        enforceNodeSpacing(2);
-        enforceNodesInBox();
-
-        link
-          .attr('x1', (d) => clampX(d.source.x))
-          .attr('y1', (d) => clampY(d.source.y))
-          .attr('x2', (d) => clampX(d.target.x))
-          .attr('y2', (d) => clampY(d.target.y));
-
-        node.attr('transform', (d) => {
-          const x = clampX(d.x);
-          const y = clampY(d.y);
-          d.x = x;
-          d.y = y;
-          return `translate(${x},${y})`;
-        });
-
-        if (this.networkGraphState?.simulation === simulation) {
-          this.networkGraphState.positions = Object.fromEntries(
-            nodes.map((n) => [
-              n.id,
-              {
-                x: clampX(n.x),
-                y: clampY(n.y),
-              },
-            ])
-          );
+        const circle = createSvg('circle');
+        circle.setAttribute('class', 'network-node-core');
+        circle.setAttribute('r', String(nodeRadius));
+        circle.setAttribute('stroke', node.isTolerant ? '#f59e0b' : `hsl(${node.hue}, 96%, 62%)`);
+        if (node.isSelf) {
+          circle.setAttribute('fill', 'url(#network-self-fill)');
+        } else if (node.isTolerant) {
+          circle.setAttribute('fill', 'url(#network-tolerant-fill)');
+        } else {
+          circle.setAttribute('fill', `hsl(${node.hue}, 68%, 20%)`);
         }
-      });
+        circle.setAttribute('stroke-width', '1');
 
-      clearTimeout(this.graphStabilizeTimer);
-      this.graphStabilizeTimer = setTimeout(() => {
-        for (const n of nodes) {
-          n.fx = null;
-          n.fy = null;
-        }
-        simulation.stop();
-      }, lockExistingNodes ? 550 : 1300);
+        const label = createSvg('text');
+        label.setAttribute('class', 'network-node-label');
+        label.setAttribute('text-anchor', 'middle');
+        label.setAttribute('dy', '0.35em');
+        label.setAttribute('fill', (node.isSelf || node.isTolerant) ? '#0b1222' : '#f8fafc');
+        label.textContent = node.short;
 
-      if (prevState?.simulation) {
-        prevState.simulation.stop();
+        group.appendChild(circle);
+        group.appendChild(label);
+        nodesGroup.appendChild(group);
       }
+      svgEl.appendChild(nodesGroup);
+
       this.networkGraphState = {
-        simulation,
         layoutVersion,
         width,
         height,
         nodeIds: currentNodeIds,
         edgeIds: currentEdgeIds,
-        positions: Object.fromEntries(
-          nodes.map((n) => [
-            n.id,
-            {
-              x: clampX(n.x),
-              y: clampY(n.y),
-            },
-          ])
-        ),
+        positions: positionsById,
+        topologyDelta,
       };
-
-      simulation.on('end', () => {
-        if (!this.networkGraphState || this.networkGraphState.simulation !== simulation) return;
-        this.networkGraphState.positions = Object.fromEntries(
-          nodes.map((n) => [
-            n.id,
-            {
-              x: clampX(n.x),
-              y: clampY(n.y),
-            },
-          ])
-        );
-      });
     },
 
     destroyNetworkGraph() {
-      if (this.networkGraphState?.simulation) {
-        this.networkGraphState.simulation.stop();
-      }
       this.networkGraphState = null;
 
       const svgEl = this.$refs.networkGraphSvg;
       if (svgEl) {
-        d3.select(svgEl).selectAll('*').remove();
+        while (svgEl.firstChild) {
+          svgEl.removeChild(svgEl.firstChild);
+        }
       }
     },
 
     resetGraphStabilization() {
-      clearTimeout(this.graphStabilizeTimer);
       clearTimeout(this.graphUpdateTimer);
-      this.graphStabilizeTimer = null;
       this.graphUpdateTimer = null;
       this.graphLastSignature = '';
       this.destroyNetworkGraph();
@@ -3769,6 +3641,21 @@ export default {
     },
 
     addLog(type, text, sender = 'System', hops = 0, local = false, options = {}) {
+      const isChat = type === 'sent' || type === 'received';
+      if (!isChat && !this.verboseDiagnostics) {
+        return;
+      }
+
+      const now = Date.now();
+      if (type === 'info') {
+        const fingerprint = `${String(sender)}|${String(text)}`;
+        if (fingerprint === this.lastLogFingerprint && now - Number(this.lastLogAtMs || 0) < 1500) {
+          return;
+        }
+        this.lastLogFingerprint = fingerprint;
+        this.lastLogAtMs = now;
+      }
+
       const entry = {
         type,
         text,
@@ -3821,6 +3708,14 @@ export default {
 
 
     startDebugMonitor() {
+      const params = new URLSearchParams(window.location.search);
+      const debugConn = String(params.get('debugConn') || '').trim();
+      // Connection-state polling is useful for diagnostics, but expensive on Safari.
+      // Keep it opt-in via ?debugConn=1.
+      if (debugConn !== '1') {
+        return;
+      }
+
       this.stopDebugMonitor();
       this.debugLastByPeer = {};
       this.debugLastLogAtByPeer = {};
@@ -3828,6 +3723,7 @@ export default {
       this.debugMonitorTimer = setInterval(() => {
         try {
           if (!this.isRunning) return;
+          if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
           const rawClient = this.mesh?.signalingClient?.client;
           const connections = rawClient?.mesh?.connections;
           if (!connections || typeof connections.entries !== 'function') return;
@@ -3880,9 +3776,16 @@ export default {
     },
 
     updateUrlState() {
+              // Set runtime param
       try {
-        const url = new URL(window.location.href);
+        let url;
+        try {
+          url = new URL(window.location.href);
+        } catch (e) {
+          url = { searchParams: new URLSearchParams(), toString: () => window.location.href };
+        }
         // Preserve original query params to avoid disturbing tests or manual URL state
+        if (this.runtimeMode) { url.searchParams.set("runtime", this.runtimeMode); }
         const originalParams = new URLSearchParams(window.location.search);
         
         // Update only the configuration params; preserve any explicitly provided sessionId
@@ -3946,6 +3849,7 @@ export default {
           storageActiveSpace: this.storageActiveSpace || 'user',
           storageLookupOwnerId: String(this.storageLookupOwnerId || '').trim(),
           storageInterestedKeys: interested,
+          runtimeMode: this.runtimeMode,
         });
 
         localStorage.setItem(this.uiStateKey, serialized);
@@ -3955,10 +3859,12 @@ export default {
     },
 
     loadUiState() {
+              // Restore runtimeMode if present and not overridden by URL
       try {
         const raw = localStorage.getItem(this.uiStateKey);
         if (!raw) return;
         const parsed = JSON.parse(raw);
+        if (typeof parsed.runtimeMode === "string" && !this._runtimeModeFromUrl) { this.runtimeMode = parsed.runtimeMode; }
         const allowedTabs = new Set(this.uiTabs.map((tab) => tab.id));
         if (typeof parsed.activeTab === 'string' && allowedTabs.has(parsed.activeTab)) {
           this.activeTab = parsed.activeTab;
@@ -3972,6 +3878,8 @@ export default {
         if (typeof parsed.showPrivateCrypto === 'boolean') {
           this.showPrivateCrypto = parsed.showPrivateCrypto;
         }
+        // Graph feature removed: ignore any persisted networkGraphEnabled value.
+        this.networkGraphEnabled = false;
         const allowedSpaces = new Set(['public', 'user', 'frozen', 'private', 'epublic']);
         if (typeof parsed.storageActiveSpace === 'string' && allowedSpaces.has(parsed.storageActiveSpace)) {
           this.storageActiveSpace = parsed.storageActiveSpace;
@@ -4002,10 +3910,6 @@ export default {
   },
 
   beforeUnmount() {
-    if (this.networkGraphResizeHandler) {
-      window.removeEventListener('resize', this.networkGraphResizeHandler);
-      this.networkGraphResizeHandler = null;
-    }
     this.stopCryptoAnnounceLoop();
     this.stopDebugMonitor();
     this.resetGraphStabilization();
@@ -4819,103 +4723,6 @@ section {
   border-color: #f1c3c3;
 }
 
-/* Network Visualization */
-.network-viz {
-  text-align: center;
-}
-
-.network-viz h3 {
-  margin-bottom: 0.6rem;
-  color: #000000;
-  letter-spacing: 0.02em;
-}
-
-.network-graph-container {
-  position: relative;
-  margin: 0.9rem auto 0;
-  max-width: 920px;
-  min-height: 340px;
-  border: 1px solid rgba(96, 165, 250, 0.32);
-  border-radius: 14px;
-  box-shadow: 0 20px 40px rgba(2, 6, 23, 0.35), inset 0 1px 0 rgba(186, 230, 253, 0.08);
-  background:
-    radial-gradient(circle at 14% 16%, rgba(56, 189, 248, 0.22), rgba(56, 189, 248, 0) 30%),
-    radial-gradient(circle at 88% 84%, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0) 34%),
-    linear-gradient(180deg, #0b1222 0%, #0a1328 100%);
-  overflow: hidden;
-}
-
-.network-graph-container::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  background-image:
-    linear-gradient(rgba(96, 165, 250, 0.06) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(96, 165, 250, 0.06) 1px, transparent 1px);
-  background-size: 22px 22px;
-  mask-image: radial-gradient(circle at 50% 52%, rgba(0, 0, 0, 0.92) 0%, rgba(0, 0, 0, 0.28) 100%);
-}
-
-.network-graph-svg {
-  width: 100%;
-  height: 340px;
-  display: block;
-}
-
-.network-link {
-  stroke-width: 2px;
-  opacity: 0.95;
-}
-
-.network-node {
-  cursor: grab;
-}
-
-.network-node:active {
-  cursor: grabbing;
-}
-
-.network-node-label {
-  font-family: 'Monaco', 'Courier New', monospace;
-  font-size: 11.5px;
-  font-weight: 800;
-  pointer-events: none;
-  user-select: none;
-}
-
-.network-node.self .network-node-core {
-  animation: self-node-pulse 1.8s ease-in-out infinite;
-}
-
-.network-empty {
-  fill: #93c5fd;
-  font-size: 14px;
-  font-family: 'Monaco', 'Courier New', monospace;
-}
-
-.mesh-visualizer-caption {
-  margin-top: 0.35rem;
-  font-size: 0.8rem;
-  color: #93c5fd;
-}
-
-.mesh-visualizer-caption code {
-  font-family: 'Monaco', 'Courier New', monospace;
-  font-weight: 700;
-  color: #bfdbfe;
-}
-
-@keyframes self-node-pulse {
-  0%,
-  100% {
-    filter: url(#network-node-glow);
-  }
-  50% {
-    filter: url(#network-node-glow) brightness(1.14);
-  }
-}
-
 /* Chat */
 .chat h3 {
   margin-bottom: 1rem;
@@ -5058,14 +4865,6 @@ section {
 
   .stats {
     grid-template-columns: 1fr;
-  }
-
-  .network-graph-container {
-    min-height: 260px;
-  }
-
-  .network-graph-svg {
-    height: 260px;
   }
 
   .field-topology,

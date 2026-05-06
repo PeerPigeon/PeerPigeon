@@ -35,7 +35,7 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 5173,
     strictPort: true,
-    allowedHosts: ['peer.local'],
+    allowedHosts: ['peer.local', 'peerpigeon.local'],
     headers: {
       'Cache-Control': 'no-cache, no-store, must-revalidate',
       Pragma: 'no-cache',

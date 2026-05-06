@@ -49,9 +49,11 @@ export class FreeRTCClientAdapter {
   private joinedOnce = false;
   private socket: WebSocket | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
-  private announceTimer: ReturnType<typeof setInterval> | null = null;
+  private announceTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectBackoffMs = 1_000;
+  private announceBurstUntilMs = 0;
+  private lastAnnounceAtMs = 0;
   private intentionallyDisconnected = false;
   private readonly _pageUnloadHandler: () => void;
 
@@ -154,6 +156,13 @@ export class FreeRTCClientAdapter {
     return String(peerId ?? '').trim();
   }
 
+  private peerIdFromWire(peer: any): string {
+    if (typeof peer === 'string') {
+      return this.normalizePeerId(peer);
+    }
+    return this.normalizePeerId(peer?.peer_id ?? peer?.peerId ?? peer?.id);
+  }
+
   private addSelfAlias(peerId: string | null | undefined): void {
     const id = this.normalizePeerId(peerId);
     if (!id) return;
@@ -170,17 +179,45 @@ export class FreeRTCClientAdapter {
     if (this.pingTimer) return;
     this.pingTimer = setInterval(() => {
       this.sendEnvelope('ping', { body: { nonce: generatePeerId().slice(0, 16) } });
-    }, 1_000);
+    }, 8_000);
   }
 
-  private startAnnounceLoop(): void {
-    if (this.announceTimer) return;
-    this.announceTimer = setInterval(() => {
+  private desiredAnnounceIntervalMs(): number {
+    const now = Date.now();
+    if (now < this.announceBurstUntilMs) return 4_000;
+    // Once peers are connected, announce less frequently to reduce background churn.
+    return this.knownPeers.size > 0 ? 45_000 : 12_000;
+  }
+
+  private scheduleNextAnnounce(delayMs?: number): void {
+    if (this.announceTimer) {
+      clearTimeout(this.announceTimer);
+      this.announceTimer = null;
+    }
+    const nextDelay = Math.max(0, Number.isFinite(delayMs as number) ? Number(delayMs) : this.desiredAnnounceIntervalMs());
+    this.announceTimer = setTimeout(() => {
+      this.announceTimer = null;
       this.sendEnvelope('announce', {
         ttl_ms: 30_000,
         body: { hints: { wants_peers: true } }
       });
-    }, 12_000);
+      this.lastAnnounceAtMs = Date.now();
+      this.scheduleNextAnnounce();
+    }, nextDelay);
+  }
+
+  private startAnnounceLoop(): void {
+    if (this.announceTimer) return;
+    this.scheduleNextAnnounce(0);
+  }
+
+  public requestDiscoveryBurst(durationMs: number = 20_000): void {
+    const now = Date.now();
+    this.announceBurstUntilMs = Math.max(this.announceBurstUntilMs, now + Math.max(1_000, durationMs));
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    if (!this.announceTimer || now - this.lastAnnounceAtMs > 1_500) {
+      this.scheduleNextAnnounce(0);
+    }
   }
 
   private stopLoops(): void {
@@ -189,7 +226,7 @@ export class FreeRTCClientAdapter {
       this.pingTimer = null;
     }
     if (this.announceTimer) {
-      clearInterval(this.announceTimer);
+        clearTimeout(this.announceTimer);
       this.announceTimer = null;
     }
   }
@@ -221,10 +258,12 @@ export class FreeRTCClientAdapter {
 
     switch (message?.type) {
       case 'peer_list': {
-        const peers = Array.isArray(message?.body?.peers) ? message.body.peers : [];
+        const peers = Array.isArray(message?.body?.peers)
+          ? message.body.peers
+          : (Array.isArray(message?.body?.clients) ? message.body.clients : []);
         const nextPeers = new Set(
           peers
-            .map((peer: any) => this.normalizePeerId(peer?.peer_id))
+            .map((peer: any) => this.peerIdFromWire(peer))
             .filter((peerId: string) => peerId && !this.isSelfAlias(peerId))
         );
 

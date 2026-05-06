@@ -16,7 +16,7 @@ export default defineConfig({
     viewport: { width: 900, height: 700 }
   },
   webServer: {
-    command: 'cd examples/vue3 && npm run dev -- --host 127.0.0.1 --port 5183 --strictPort --clearScreen false',
+    command: 'npm run dev:raw -- --host 127.0.0.1 --port 5183 --strictPort --clearScreen false',
     url: 'http://127.0.0.1:5183',
     reuseExistingServer: false,
     timeout: 120_000,

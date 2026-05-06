@@ -202,6 +202,8 @@ var FreeRTCClientAdapter = class {
     this.announceTimer = null;
     this.reconnectTimer = null;
     this.reconnectBackoffMs = 1e3;
+    this.announceBurstUntilMs = 0;
+    this.lastAnnounceAtMs = 0;
     this.intentionallyDisconnected = false;
     this.signalUrl = signalUrl;
     this.networkId = options?.networkId ?? "default-session";
@@ -292,6 +294,12 @@ var FreeRTCClientAdapter = class {
   normalizePeerId(peerId) {
     return String(peerId ?? "").trim();
   }
+  peerIdFromWire(peer) {
+    if (typeof peer === "string") {
+      return this.normalizePeerId(peer);
+    }
+    return this.normalizePeerId(peer?.peer_id ?? peer?.peerId ?? peer?.id);
+  }
   addSelfAlias(peerId) {
     const id = this.normalizePeerId(peerId);
     if (!id) return;
@@ -306,16 +314,40 @@ var FreeRTCClientAdapter = class {
     if (this.pingTimer) return;
     this.pingTimer = setInterval(() => {
       this.sendEnvelope("ping", { body: { nonce: generatePeerId().slice(0, 16) } });
-    }, 1e3);
+    }, 8e3);
   }
-  startAnnounceLoop() {
-    if (this.announceTimer) return;
-    this.announceTimer = setInterval(() => {
+  desiredAnnounceIntervalMs() {
+    const now = Date.now();
+    if (now < this.announceBurstUntilMs) return 4e3;
+    return this.knownPeers.size > 0 ? 45e3 : 12e3;
+  }
+  scheduleNextAnnounce(delayMs) {
+    if (this.announceTimer) {
+      clearTimeout(this.announceTimer);
+      this.announceTimer = null;
+    }
+    const nextDelay = Math.max(0, Number.isFinite(delayMs) ? Number(delayMs) : this.desiredAnnounceIntervalMs());
+    this.announceTimer = setTimeout(() => {
+      this.announceTimer = null;
       this.sendEnvelope("announce", {
         ttl_ms: 3e4,
         body: { hints: { wants_peers: true } }
       });
-    }, 12e3);
+      this.lastAnnounceAtMs = Date.now();
+      this.scheduleNextAnnounce();
+    }, nextDelay);
+  }
+  startAnnounceLoop() {
+    if (this.announceTimer) return;
+    this.scheduleNextAnnounce(0);
+  }
+  requestDiscoveryBurst(durationMs = 2e4) {
+    const now = Date.now();
+    this.announceBurstUntilMs = Math.max(this.announceBurstUntilMs, now + Math.max(1e3, durationMs));
+    if (this.socket?.readyState !== WebSocket.OPEN) return;
+    if (!this.announceTimer || now - this.lastAnnounceAtMs > 1500) {
+      this.scheduleNextAnnounce(0);
+    }
   }
   stopLoops() {
     if (this.pingTimer) {
@@ -323,7 +355,7 @@ var FreeRTCClientAdapter = class {
       this.pingTimer = null;
     }
     if (this.announceTimer) {
-      clearInterval(this.announceTimer);
+      clearTimeout(this.announceTimer);
       this.announceTimer = null;
     }
   }
@@ -351,9 +383,9 @@ var FreeRTCClientAdapter = class {
     }
     switch (message?.type) {
       case "peer_list": {
-        const peers = Array.isArray(message?.body?.peers) ? message.body.peers : [];
+        const peers = Array.isArray(message?.body?.peers) ? message.body.peers : Array.isArray(message?.body?.clients) ? message.body.clients : [];
         const nextPeers = new Set(
-          peers.map((peer) => this.normalizePeerId(peer?.peer_id)).filter((peerId) => peerId && !this.isSelfAlias(peerId))
+          peers.map((peer) => this.peerIdFromWire(peer)).filter((peerId) => peerId && !this.isSelfAlias(peerId))
         );
         const peerList = Array.from(nextPeers);
         if (!this.joinedOnce) {
@@ -2596,10 +2628,14 @@ var PartialMesh = class {
     const underConnected = connected < this.config.minPeers;
     const hasFewCandidates = this.discoveredPeers.size < this.config.minPeers;
     if (!underConnected && !hasFewCandidates) return;
-    if (now - this.lastDiscoveryRefreshAtMs < 2e3) return;
+    const refreshMinIntervalMs = underConnected ? 2e3 : 2e4;
+    if (now - this.lastDiscoveryRefreshAtMs < refreshMinIntervalMs) return;
     this.lastDiscoveryRefreshAtMs = now;
     try {
       this.signalingClient?.joinSession(this.config.sessionId);
+      if (underConnected) {
+        this.signalingClient?.requestDiscoveryBurst?.(2e4);
+      }
     } catch {
     }
   }
@@ -2805,12 +2841,19 @@ var PartialMesh = class {
       if (available.length === 0 && allCandidates.length === 0 || count <= 0) return [];
       const selfId = this.normalizePeerId(this.clientId);
       const source = available.length > 0 ? available : allCandidates;
-      const sorted = source.slice().sort((a, b) => {
+      const sortedBase = source.slice().sort((a, b) => {
         const failA = this.dialFailureCount.get(a) ?? 0;
         const failB = this.dialFailureCount.get(b) ?? 0;
         if (failA !== failB) return failA - failB;
         return a.localeCompare(b);
       });
+      let sorted = sortedBase;
+      if (this.shouldPreferXorCompatiblePeers()) {
+        const preferred = sortedBase.filter((peerId) => this.isXorCompatiblePeer(peerId));
+        if (preferred.length > 0) {
+          sorted = preferred;
+        }
+      }
       let offset = 0;
       if (selfId) {
         let hash = 0;
@@ -2846,6 +2889,27 @@ var PartialMesh = class {
         return;
       }
     }
+  }
+  shouldPreferXorCompatiblePeers() {
+    const connectedCount = this.getConnectedPeerCount();
+    if (connectedCount < this.config.minPeers) return false;
+    const candidateCount = this.discoveredPeers.size;
+    return candidateCount >= Math.max(this.config.maxPeers * 3, 12);
+  }
+  isXorCompatiblePeer(peerId) {
+    const selfId = this.normalizePeerId(this.clientId);
+    const targetId = this.normalizePeerId(peerId);
+    if (!selfId || !targetId) return true;
+    const selfByte = Number.parseInt(selfId.slice(0, 2) || "00", 16);
+    const targetByte = Number.parseInt(targetId.slice(0, 2) || "00", 16);
+    if (!Number.isFinite(selfByte) || !Number.isFinite(targetByte)) return true;
+    let sessionHash = 0;
+    const session = String(this.config.sessionId || "default");
+    for (let i = 0; i < session.length; i++) {
+      sessionHash = sessionHash * 31 + session.charCodeAt(i) & 255;
+    }
+    const xorDistance = (selfByte ^ targetByte) & 255;
+    return (xorDistance & 3) === (sessionHash & 3);
   }
   /**
    * Connect to a specific peer

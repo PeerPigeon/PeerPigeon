@@ -1,3 +1,11 @@
+# Rust build artifacts
+rust/target/
+rust/target/**
+**/*.rs.bk
+
+# wasm-pack output (Rust WASM)
+examples/vue3/public/rust-wasm/
+examples/vue3/public/rust-wasm/**
 # Logs
 logs
 *.log

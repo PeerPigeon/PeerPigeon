@@ -597,11 +597,15 @@ export class PartialMesh {
     const hasFewCandidates = this.discoveredPeers.size < this.config.minPeers;
 
     if (!underConnected && !hasFewCandidates) return;
-    if (now - this.lastDiscoveryRefreshAtMs < 2_000) return;
+      const refreshMinIntervalMs = underConnected ? 2_000 : 20_000;
+    if (now - this.lastDiscoveryRefreshAtMs < refreshMinIntervalMs) return;
 
     this.lastDiscoveryRefreshAtMs = now;
     try {
       this.signalingClient?.joinSession(this.config.sessionId);
+      if (underConnected) {
+        this.signalingClient?.requestDiscoveryBurst?.(20_000);
+      }
     } catch {
       // ignore
     }
@@ -877,12 +881,23 @@ export class PartialMesh {
       // This reduces thundering-herd behavior and improves overall convergence.
       const selfId = this.normalizePeerId(this.clientId);
       const source = available.length > 0 ? available : allCandidates;
-      const sorted = source.slice().sort((a, b) => {
+      const sortedBase = source.slice().sort((a, b) => {
         const failA = this.dialFailureCount.get(a) ?? 0;
         const failB = this.dialFailureCount.get(b) ?? 0;
         if (failA !== failB) return failA - failB;
         return a.localeCompare(b);
       });
+
+      // Under high candidate pressure, prefer XOR-compatible peers first.
+      // If this filter would starve dialing, we fall back to the full list.
+      let sorted = sortedBase;
+      if (this.shouldPreferXorCompatiblePeers()) {
+        const preferred = sortedBase.filter((peerId) => this.isXorCompatiblePeer(peerId));
+        if (preferred.length > 0) {
+          sorted = preferred;
+        }
+      }
+
       let offset = 0;
       if (selfId) {
         let hash = 0;
@@ -900,7 +915,6 @@ export class PartialMesh {
     };
 
     if (totalInProgress < this.config.minPeers) {
-      // Need more connections
       const needed = this.config.minPeers - totalInProgress;
       const emergencyBurst = emergencyIsolated ? Math.min(3, Math.max(2, available.length)) : 0;
       const dialCount = emergencyIsolated ? Math.max(needed, emergencyBurst) : needed;
@@ -923,6 +937,33 @@ export class PartialMesh {
         return;
       }
     }
+  }
+
+  private shouldPreferXorCompatiblePeers(): boolean {
+    const connectedCount = this.getConnectedPeerCount();
+    if (connectedCount < this.config.minPeers) return false;
+    const candidateCount = this.discoveredPeers.size;
+    return candidateCount >= Math.max(this.config.maxPeers * 3, 12);
+  }
+
+  private isXorCompatiblePeer(peerId: string): boolean {
+    const selfId = this.normalizePeerId(this.clientId);
+    const targetId = this.normalizePeerId(peerId);
+    if (!selfId || !targetId) return true;
+
+    const selfByte = Number.parseInt(selfId.slice(0, 2) || '00', 16);
+    const targetByte = Number.parseInt(targetId.slice(0, 2) || '00', 16);
+    if (!Number.isFinite(selfByte) || !Number.isFinite(targetByte)) return true;
+
+    let sessionHash = 0;
+    const session = String(this.config.sessionId || 'default');
+    for (let i = 0; i < session.length; i++) {
+      sessionHash = (sessionHash * 31 + session.charCodeAt(i)) & 0xff;
+    }
+
+    const xorDistance = (selfByte ^ targetByte) & 0xff;
+    // Keep 1/4 of peers as preferred when there are many candidates.
+    return (xorDistance & 0x03) === (sessionHash & 0x03);
   }
 
   /**

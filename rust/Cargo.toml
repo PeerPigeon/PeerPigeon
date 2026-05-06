@@ -1,0 +1,21 @@
+[package]
+name = "peerpigeon-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust port scaffold of PeerPigeon Go runtime"
+
+[lib]
+name = "peerpigeon_rs"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rand = "0.8"
+getrandom = { version = "0.2", features = ["js"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+anyhow = "1"
