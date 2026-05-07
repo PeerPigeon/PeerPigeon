@@ -244,13 +244,13 @@ type PeerPigeonStorage struct {
 	syncFilter func(Space, string, string, string) bool
 	instanceID string
 
-	mu          sync.Mutex
-	driver      StorageDriver
-	closed      bool
-	listeners   []func(ChangeEvent)
-	pending     map[string]*pendingRetrieve
+	mu            sync.Mutex
+	driver        StorageDriver
+	closed        bool
+	listeners     []func(ChangeEvent)
+	pending       map[string]*pendingRetrieve
 	seenMutations map[string]int64
-	gossipUnsub func()
+	gossipUnsub   func()
 }
 
 type pendingRetrieve struct {
@@ -287,13 +287,13 @@ func New(opts Options) (*PeerPigeonStorage, error) {
 		dbName = "peerpigeon-storage-v1"
 	}
 	s := &PeerPigeonStorage{
-		userID:     userID,
-		sessionID:  sessionID,
-		syncSecret: strings.TrimSpace(opts.SyncSecret),
-		gossip:     opts.Gossip,
-		syncFilter: opts.SyncFilter,
-		instanceID: fmt.Sprintf("storage-%d", time.Now().UnixNano()),
-		pending:    make(map[string]*pendingRetrieve),
+		userID:        userID,
+		sessionID:     sessionID,
+		syncSecret:    strings.TrimSpace(opts.SyncSecret),
+		gossip:        opts.Gossip,
+		syncFilter:    opts.SyncFilter,
+		instanceID:    fmt.Sprintf("storage-%d", time.Now().UnixNano()),
+		pending:       make(map[string]*pendingRetrieve),
 		seenMutations: make(map[string]int64),
 	}
 	return s, nil
