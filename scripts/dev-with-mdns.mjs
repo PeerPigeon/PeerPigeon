@@ -712,7 +712,23 @@ async function main() {
 
   function startDevProc() {
     clearRestartTimer()
-    devProc = spawnLogged('npm', ['run', 'dev:raw', '--', '--port', String(vitePort)])
+    const devEnv = {
+      ...process.env,
+    }
+
+    if (tlsEnabled) {
+      devEnv.PEERPIGEON_VITE_HMR_HOST = DEV_HOSTNAME
+      devEnv.PEERPIGEON_VITE_HMR_PROTOCOL = 'wss'
+      devEnv.PEERPIGEON_VITE_HMR_CLIENT_PORT = String(PUBLIC_HTTPS_PORT)
+    } else if (publicPort === PUBLIC_HTTP_PORT) {
+      devEnv.PEERPIGEON_VITE_HMR_HOST = DEV_HOSTNAME
+      devEnv.PEERPIGEON_VITE_HMR_PROTOCOL = 'ws'
+      devEnv.PEERPIGEON_VITE_HMR_CLIENT_PORT = String(PUBLIC_HTTP_PORT)
+    }
+
+    devProc = spawnLogged('npm', ['run', 'dev:raw', '--', '--port', String(vitePort)], {
+      env: devEnv,
+    })
 
     devProc.on('exit', (code, signal) => {
       devProc = null

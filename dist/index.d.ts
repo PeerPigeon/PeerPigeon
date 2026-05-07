@@ -460,11 +460,14 @@ declare class PartialMesh {
     private pendingRebalanceDropByTarget;
     /** Converged global peer membership — populated via in-band membership gossip. */
     private globalPeers;
+    private globalPeerSeenAtMs;
     constructor(config?: PartialMeshConfig);
     private normalizePeerId;
     private addSelfAlias;
     private isSelfAlias;
     private addDiscoveredPeer;
+    private noteGlobalPeer;
+    private pruneStalePeerKnowledge;
     private getConnectedPeerCount;
     private getPendingPeerCount;
     private getMaxPeersWithTolerance;

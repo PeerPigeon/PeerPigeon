@@ -2,6 +2,7 @@ import { createApp } from 'vue';
 import App from '/src/App.vue';
 
 const DEV_FALLBACK_HOST = 'peer.ooo';
+const DEV_BOOT_CLEANUP_SESSION_KEY = 'peerpigeon:dev-boot-cleanup:v1';
 
 function buildDevFallbackUrl() {
 	const redirectUrl = new URL(window.location.href);
@@ -58,6 +59,20 @@ if (import.meta.env.DEV && typeof window !== 'undefined') {
 
 if (import.meta.env.DEV && typeof window !== 'undefined') {
 	window.addEventListener('load', async () => {
+		let shouldRunCleanup = true;
+		try {
+			shouldRunCleanup = window.sessionStorage.getItem(DEV_BOOT_CLEANUP_SESSION_KEY) !== '1';
+			if (shouldRunCleanup) {
+				window.sessionStorage.setItem(DEV_BOOT_CLEANUP_SESSION_KEY, '1');
+			}
+		} catch {
+			shouldRunCleanup = true;
+		}
+
+		if (!shouldRunCleanup) {
+			return;
+		}
+
 		try {
 			if ('serviceWorker' in navigator) {
 				const regs = await navigator.serviceWorker.getRegistrations();

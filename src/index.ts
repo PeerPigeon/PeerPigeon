@@ -1,5 +1,7 @@
 import FreeRTCClientAdapter from './freertc-client-adapter.js';
 
+const STALE_PEER_KNOWLEDGE_TTL_MS = 45_000;
+
 export interface PartialMeshConfig {
   /**
    * Minimum number of peers to maintain connections with
@@ -130,6 +132,7 @@ export class PartialMesh {
   private pendingRebalanceDropByTarget: Map<string, string> = new Map();
   /** Converged global peer membership — populated via in-band membership gossip. */
   private globalPeers: Set<string> = new Set();
+  private globalPeerSeenAtMs: Map<string, number> = new Map();
 
   constructor(config: PartialMeshConfig = {}) {
     this.config = {
@@ -177,7 +180,9 @@ export class PartialMesh {
     if (!id) return;
     this.selfAliases.add(id);
     this.discoveredPeers.delete(id);
+    this.discoveredAtMs.delete(id);
     this.globalPeers.delete(id);
+    this.globalPeerSeenAtMs.delete(id);
   }
 
   private isSelfAlias(peerId: string | null | undefined): boolean {
@@ -189,10 +194,51 @@ export class PartialMesh {
   private addDiscoveredPeer(peerId: string): void {
     const id = this.normalizePeerId(peerId);
     if (!id || this.isSelfAlias(id)) return;
-    if (this.discoveredPeers.has(id)) return;
-    this.discoveredPeers.add(id);
+    const alreadyKnown = this.discoveredPeers.has(id);
     this.discoveredAtMs.set(id, Date.now());
+    if (alreadyKnown) return;
+    this.discoveredPeers.add(id);
     this.emit('peer:discovered', id);
+  }
+
+  private noteGlobalPeer(peerId: string, seenAt: number = Date.now()): boolean {
+    const id = this.normalizePeerId(peerId);
+    if (!id || this.isSelfAlias(id)) return false;
+    this.globalPeerSeenAtMs.set(id, seenAt);
+    if (this.globalPeers.has(id)) return false;
+    this.globalPeers.add(id);
+    return true;
+  }
+
+  private pruneStalePeerKnowledge(now: number = Date.now()): void {
+    let membershipChanged = false;
+
+    for (const peerId of Array.from(this.globalPeers)) {
+      if (this.peers.get(peerId)?.connected) continue;
+      const seenAt = this.globalPeerSeenAtMs.get(peerId) ?? 0;
+      if (now - seenAt <= STALE_PEER_KNOWLEDGE_TTL_MS) continue;
+      this.globalPeers.delete(peerId);
+      this.globalPeerSeenAtMs.delete(peerId);
+      membershipChanged = true;
+    }
+
+    for (const peerId of Array.from(this.discoveredPeers)) {
+      if (this.peers.get(peerId)?.connected) continue;
+      const discoveredAt = this.discoveredAtMs.get(peerId) ?? 0;
+      if (now - discoveredAt <= STALE_PEER_KNOWLEDGE_TTL_MS) continue;
+      this.discoveredPeers.delete(peerId);
+      this.discoveredAtMs.delete(peerId);
+      this.dialFailureCount.delete(peerId);
+      this.dialBackoffUntilMs.delete(peerId);
+      if (this.globalPeers.delete(peerId)) {
+        membershipChanged = true;
+      }
+      this.globalPeerSeenAtMs.delete(peerId);
+    }
+
+    if (membershipChanged) {
+      this.emit('mesh:membership', Array.from(this.globalPeers));
+    }
   }
 
   private getConnectedPeerCount(): number {
@@ -437,6 +483,7 @@ export class PartialMesh {
       data.clients.forEach((rawPeerId: string) => {
         const peerId = this.normalizePeerId(rawPeerId);
         this.addDiscoveredPeer(peerId);
+        this.noteGlobalPeer(peerId);
       });
 
       if (this.config.autoConnect) {
@@ -448,6 +495,7 @@ export class PartialMesh {
       const peerId = this.normalizePeerId(data.peerId);
       if (peerId) {
         this.addDiscoveredPeer(peerId);
+        this.noteGlobalPeer(peerId);
         if (this.config.autoConnect) {
           this.maintainPeerConnections();
         }
@@ -459,6 +507,7 @@ export class PartialMesh {
       if (!peerId) return;
       this.removeFromGlobalMembership(peerId);
       this.discoveredPeers.delete(peerId);
+      this.discoveredAtMs.delete(peerId);
       this.dialFailureCount.delete(peerId);
       this.dialBackoffUntilMs.delete(peerId);
       this.removePeer(peerId, true);
@@ -467,6 +516,8 @@ export class PartialMesh {
     this.signalingClient.on('rtc:connected', (data: { peerId: string }) => {
       const peerId = this.normalizePeerId(data.peerId);
       if (!peerId || this.isSelfAlias(peerId)) return;
+      this.addDiscoveredPeer(peerId);
+      this.noteGlobalPeer(peerId);
       let peerConnection = this.peers.get(peerId);
       if (!peerConnection) {
         // Inbound connection — FreeRTC accepted and fully established without us initiating.
@@ -579,6 +630,7 @@ export class PartialMesh {
     this.maintenanceTimer = setInterval(() => {
       try {
         this.maybeRefreshDiscovery();
+        this.pruneStalePeerKnowledge();
         this.maybeRecoverStalledNegotiations();
         this.maintainPeerConnections();
         this.maybeHardResetUnderConnected();
@@ -925,9 +977,11 @@ export class PartialMesh {
       if (now < this.rebalanceCooldownUntilMs) {
         return;
       }
-      // Once the mesh is minimally healthy, keep adding a small number of bridge links.
-      // This helps later-joining peers connect across sub-clusters instead of staying siloed.
-      for (const peerId of pickCandidates(1)) {
+      // Once the mesh is minimally healthy, continue filling all currently-open
+      // slots toward maxPeers so the mesh does not get stuck hovering at minPeers
+      // when a single extra dial stalls or backs off.
+      const openSlots = Math.max(1, this.config.maxPeers - totalInProgress);
+      for (const peerId of pickCandidates(openSlots)) {
         this.connectToPeer(peerId);
       }
     } else if (connectedCount > this.getMaxPeersWithTolerance()) {
@@ -1279,7 +1333,6 @@ export class PartialMesh {
       const self = this.normalizePeerId(this.clientId);
       const all = new Set<string>(this.globalPeers);
       if (self) all.add(self);
-      for (const p of this.discoveredPeers) all.add(p);
       const payload = JSON.stringify({ __membership: true, peers: Array.from(all) });
       try {
         this.signalingClient?.send(toPeerId, payload);
@@ -1302,14 +1355,14 @@ export class PartialMesh {
 
     private mergeMembership(incoming: string[], fromPeerId: string): void {
       let changed = false;
+      this.noteGlobalPeer(fromPeerId);
       for (const raw of incoming) {
         const id = this.normalizePeerId(raw);
         if (!id || this.isSelfAlias(id)) continue;
-        if (!this.globalPeers.has(id)) {
-          this.globalPeers.add(id);
+        if (this.noteGlobalPeer(id)) {
           changed = true;
-          this.addDiscoveredPeer(id);
         }
+        this.addDiscoveredPeer(id);
       }
       if (changed) {
         this.emit('mesh:membership', Array.from(this.globalPeers));
@@ -1326,6 +1379,7 @@ export class PartialMesh {
 
     private removeFromGlobalMembership(peerId: string): void {
       const removed = this.globalPeers.delete(peerId);
+      this.globalPeerSeenAtMs.delete(peerId);
       if (!removed) return;
       this.emit('mesh:membership', Array.from(this.globalPeers));
       for (const connectedPeerId of this.getConnectedPeers()) {

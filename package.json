@@ -19,13 +19,15 @@
     "README.md"
   ],
   "scripts": {
-    "wasm:build": "node scripts/build-wasm.mjs",
-    "build": "tsup src/index.ts --format esm,cjs --dts",
+    "wasm:build": "node scripts/build-wasm.mjs --all",
+    "wasm:build:go": "node scripts/build-wasm.mjs --go",
+    "wasm:build:rust": "node scripts/build-wasm.mjs --rust",
+    "build": "npm run wasm:build && tsup src/index.ts --format esm,cjs --dts",
     "build:browser": "tsup --config tsup.browser.config.ts",
     "dev:tls:generate": "node scripts/dev-with-mdns.mjs --generate-tls",
     "dev:mdns": "node scripts/dev-with-mdns.mjs",
     "dev:raw": "npm run wasm:build && node scripts/dev-vite.mjs",
-    "dev": "npm run dev:mdns",
+    "dev": "npm run build && npm run dev:mdns",
     "prepare": "npm run build",
     "prepack": "npm run build",
     "prepublishOnly": "npm run build",

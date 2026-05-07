@@ -309,7 +309,7 @@
                   <button
                     class="btn btn-small storage-get-sync-btn"
                     :class="{ active: isStorageKeyInterested(storageActiveSpace, storageFormKey) }"
-                    :disabled="!storageFormKey.trim() || !isRunning || !storageReady"
+                    :disabled="!storageFormKey.trim() || !isRunning"
                     @click="getSyncStorageKey"
                   >GET &amp; SYNC</button>
                 </div>
@@ -1166,18 +1166,34 @@ export default {
       const pk = this.storageInterestPk(space, key, ownerId);
       if (!pk) return;
 
+      const wasInterested = this.storageInterestedKeys[pk] === true;
+      const nowInterested = Boolean(enabled);
+
       this.storageInterestedKeys = {
         ...this.storageInterestedKeys,
-        [pk]: Boolean(enabled),
+        [pk]: nowInterested,
       };
       this.saveUiState();
+
+      // When a key becomes newly interested, pull current value once.
+      if (!wasInterested && nowInterested) {
+        this.requestInterestedKeySync('interest:add', [space], { timeoutMs: 1800 });
+      }
 
       if (this.activeTab === 'storage') {
         this.refreshStorageList();
       }
     },
 
-    getSyncStorageKey() {
+    async getSyncStorageKey() {
+      if (!this.storageReady || !this.storage) {
+        try {
+          await this.ensureStorageReady({ fastPath: true });
+        } catch (error) {
+          this.storageError = String(error?.message || error || 'Failed to initialize storage');
+          return;
+        }
+      }
       if (!this.storage) return;
       const space = this.storageActiveSpace;
       const key = String(this.storageFormKey || '').trim();
@@ -1463,21 +1479,45 @@ export default {
       const normalizedKey = String(key || '').trim();
       const kind = String(context?.kind || '').trim();
       const op = String(context?.op || '').trim();
+      const isInboundData = kind === 'mutation' || kind === 'retrieve-response';
 
-      // Public space should only mutate locally when the key is explicitly
-      // subscribed/interested in this client.
-      if (
-        normalizedSpace === 'public'
-        && normalizedKey
-        && (kind === 'mutation' || kind === 'retrieve-response')
-      ) {
-        if (kind === 'mutation' && op === 'delete') {
-          return true;
-        }
-        return this.isStorageKeyInterested('public', normalizedKey);
+      if (!normalizedKey) {
+        return false;
       }
 
-      return true;
+      if (!isInboundData) {
+        return true;
+      }
+
+      if (kind === 'mutation' && op === 'delete') {
+        return true;
+      }
+
+      if (normalizedSpace === 'epublic') {
+        // Keep mesh topology snapshots flowing even when not manually interested.
+        return normalizedKey === this.meshPeersStorageKey;
+      }
+
+      if (normalizedSpace === 'user') {
+        const splitAt = normalizedKey.indexOf('::');
+        if (splitAt <= 0) return false;
+        const ownerId = normalizedKey.slice(0, splitAt).trim();
+        const logicalKey = this.storageNormalizeUserKey(ownerId, normalizedKey);
+        if (!ownerId || !logicalKey) return false;
+
+        // Always accept your own user-space records.
+        if (ownerId === this.storageUserId()) {
+          return true;
+        }
+
+        return this.isStorageKeyInterested('user', logicalKey, ownerId);
+      }
+
+      if (normalizedSpace === 'public' || normalizedSpace === 'frozen') {
+        return this.isStorageKeyInterested(normalizedSpace, normalizedKey);
+      }
+
+      return false;
     },
 
     shouldReplaceStorageRecord(existing, incoming) {
@@ -1510,7 +1550,8 @@ export default {
       }
 
       const gossipAttached = this.gossip ? '1' : '0';
-      const nextIdentity = `js-storage::${this.effectiveSessionId}::${userId}::gossip:${gossipAttached}`;
+      const storageEngine = this.runtimeMode === 'go-wasm' ? 'go-wasm-storage' : 'js-storage';
+      const nextIdentity = `${storageEngine}::${this.effectiveSessionId}::${userId}::gossip:${gossipAttached}`;
       if (this.storageReady && this.storage && this.storageIdentity === nextIdentity) {
         if (this.networkGraphEnabled) {
           if (!fastPath && this.gossip) {
@@ -1522,6 +1563,10 @@ export default {
           }
         }
         await this.refreshStorageList({ silent: true, syncInterested: false });
+        // Pull current values for any restored interests if gossip is now available.
+        if (this.gossip) {
+          this.requestInterestedKeySync('storage-ready-cached', null, { timeoutMs: 2000 });
+        }
         return;
       }
 
@@ -1537,14 +1582,18 @@ export default {
         }
       }
 
-      const dbName = `peerpigeon-storage-v2:${this.effectiveSessionId}`;
-      this.storage = markRaw(new PeerPigeonStorage({
-        userId,
-        gossip: this.gossip || undefined,
-        sessionId: this.effectiveSessionId,
-        dbName,
-        syncFilter: (space, key, context) => this.shouldAcceptStorageSync(space, key, context),
-      }));
+      if (this.runtimeMode === 'go-wasm') {
+        this.storage = markRaw(this.createGoWasmStorageAdapter());
+      } else {
+        const dbName = `peerpigeon-storage-v2:${this.effectiveSessionId}`;
+        this.storage = markRaw(new PeerPigeonStorage({
+          userId,
+          gossip: this.gossip || undefined,
+          sessionId: this.effectiveSessionId,
+          dbName,
+          syncFilter: (space, key, context) => this.shouldAcceptStorageSync(space, key, context),
+        }));
+      }
       await this.storage.init();
       this.storageIdentity = nextIdentity;
       this.storageChangeUnsubscribe = this.storage.subscribe((event) => {
@@ -1564,6 +1613,11 @@ export default {
       this.storageError = '';
       // Local-first: render from IndexedDB immediately.
       await this.refreshStorageList({ silent: true, syncInterested: false });
+
+      // Pull current values for any restored interests from peers if gossip is available.
+      if (this.gossip) {
+        this.requestInterestedKeySync('storage-ready', null, { timeoutMs: 2000 });
+      }
 
       if (this.networkGraphEnabled) {
         if (!fastPath && this.gossip) {
@@ -1626,7 +1680,17 @@ export default {
         const records = allRecords
           .filter((record) => {
             if (!record || record.deleted === true) return false;
-            if (this.storageActiveSpace !== 'user') return true;
+            if (this.storageActiveSpace !== 'user') {
+              if (this.storageActiveSpace === 'public' || this.storageActiveSpace === 'frozen') {
+                const logicalKey = this.storageLogicalKey(this.storageActiveSpace, record.key, record);
+                if (!logicalKey) return false;
+                const selfOwner = String(this.storageUserId() || '').trim();
+                const ownerId = String(record.ownerId || '').trim();
+                if (selfOwner && ownerId && ownerId === selfOwner) return true;
+                return this.isStorageKeyInterested(this.storageActiveSpace, logicalKey);
+              }
+              return true;
+            }
             // If own identity not loaded yet, show nothing rather than leaking
             if (!selfOwner) return false;
             if (String(record.ownerId || '').trim() !== String(userOwner || '').trim()) return false;
@@ -1978,6 +2042,8 @@ export default {
         }
 
         await this.storage.put(space, storeKey, value, { ownerId: ownerId || undefined });
+        // Local writer should automatically remain interested in keys it saves.
+        this.setStorageKeyInterest(space, key, true, ownerId);
         await this.refreshStorageList();
       } catch (error) {
         this.storageError = String(error?.message || error || 'Failed to save storage key');
@@ -2304,7 +2370,40 @@ export default {
         }
         return result;
       };
+
+      const cacheDbName = `peerpigeon-storage-v2:${this.effectiveSessionId}`;
+      let cache = null;
+      let cacheClosed = false;
+
       this.goWasmStorageNotify = (event) => {
+        // Mirror every Go WASM storage change into IDB so it persists across reloads.
+        if (cache && !cacheClosed && event && event.space && event.key) {
+          const { space, key, op } = event;
+          if (op === 'delete') {
+            cache.delete(space, key).catch(() => {
+              // ignore cache delete errors
+            });
+          } else if (op === 'upsert') {
+            // Capture nodeId now; defer the get to avoid re-entering Go WASM synchronously.
+            const nodeId = this.goWasmNodeId;
+            queueMicrotask(() => {
+              if (!cache || cacheClosed || nodeId == null) return;
+              try {
+                const rec = invoke('peerpigeonStorageGet', nodeId, space, key);
+                if (rec && typeof rec === 'object' && rec.key && !rec.message) {
+                  cache.put(
+                    String(rec.space || space),
+                    String(rec.key || key),
+                    rec.value,
+                    { ownerId: rec.ownerId || undefined }
+                  ).catch(() => {
+                    // ignore cache put errors
+                  });
+                }
+              } catch {}
+            });
+          }
+        }
         for (const fn of subscribers) {
           try {
             fn(event || {});
@@ -2315,20 +2414,47 @@ export default {
       };
 
       return {
-        init: async () => {},
+        init: async () => {
+          cache = new PeerPigeonStorage({
+            userId: this.storageUserId(),
+            sessionId: this.effectiveSessionId,
+            dbName: cacheDbName,
+          });
+          await cache.init();
+        },
         close: async () => {
           subscribers.clear();
           this.goWasmStorageNotify = null;
+          cacheClosed = true;
+          if (cache) {
+            try {
+              await cache.close();
+            } catch {
+              // ignore cache close errors
+            }
+            cache = null;
+          }
         },
         subscribe: (fn) => {
           subscribers.add(fn);
           return () => subscribers.delete(fn);
         },
         list: async (space) => {
-          return invoke('peerpigeonStorageList', this.goWasmNodeId, space) || [];
+          const live = invoke('peerpigeonStorageList', this.goWasmNodeId, space) || [];
+          // Merge live Go WASM data with IDB cache: records from previous sessions are
+          // visible before peers reconnect and gossip re-delivers them.
+          if (!cache) return live;
+          const cached = await cache.list(space);
+          if (!cached.length) return live;
+          if (!live.length) return cached;
+          const liveKeys = new Set(live.map(r => String(r.key || '')));
+          return [...live, ...cached.filter(r => !liveKeys.has(String(r.key || '')))];
         },
         get: async (space, key) => {
-          return invoke('peerpigeonStorageGet', this.goWasmNodeId, space, key);
+          const live = invoke('peerpigeonStorageGet', this.goWasmNodeId, space, key);
+          if (live !== null && live !== undefined && !(live instanceof Error) && !live?.message) return live;
+          if (!cache) return null;
+          return await cache.get(space, key);
         },
         retrieve: async (space, key, options = {}) => {
           return invoke('peerpigeonStorageRetrieve', this.goWasmNodeId, space, key, options || {});
@@ -2381,8 +2507,10 @@ export default {
           autoDiscover: true,
           autoConnect: true,
           // Helps highest-lexicographic peers (often Chrome in mixed-browser sessions)
-          // avoid indefinite non-initiator wait when all discovered peers are smaller IDs.
-          nonInitiatorFallbackDialMs: 8_000,
+          // JS runtime should rely on deterministic initiator selection only.
+          // The delayed non-initiator fallback dial can create offer glare,
+          // which Firefox is especially sensitive to.
+          nonInitiatorFallbackDialMs: this.runtimeMode === 'js' ? 0 : 8_000,
           underConnectedResetMs: 20_000
         }));
 
@@ -2448,6 +2576,8 @@ export default {
           this.addLog('connected', `Connected to peer`, peerId);
           this.announceCryptoPublicInfo();
           this.updateStats();
+          // Sync any restored interested keys from the newly connected peer.
+          this.requestInterestedKeySync('peer-connected', null, { timeoutMs: 2000 });
           if (this.networkGraphEnabled) {
             this.onMeshConnectionsChanged('peer:connected');
           }

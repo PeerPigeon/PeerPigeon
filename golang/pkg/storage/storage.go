@@ -249,6 +249,7 @@ type PeerPigeonStorage struct {
 	closed      bool
 	listeners   []func(ChangeEvent)
 	pending     map[string]*pendingRetrieve
+	seenMutations map[string]int64
 	gossipUnsub func()
 }
 
@@ -293,6 +294,7 @@ func New(opts Options) (*PeerPigeonStorage, error) {
 		syncFilter: opts.SyncFilter,
 		instanceID: fmt.Sprintf("storage-%d", time.Now().UnixNano()),
 		pending:    make(map[string]*pendingRetrieve),
+		seenMutations: make(map[string]int64),
 	}
 	return s, nil
 }
@@ -461,19 +463,11 @@ func (s *PeerPigeonStorage) Retrieve(space Space, key string, opts ...RetrieveOp
 	storageTracef("retrieve start user=%s space=%s key=%s reqId=%s timeoutMs=%d", s.userID, space, normKey, reqID, timeoutMs)
 
 	resultCh := make(chan *Record, 1)
-	stopRetry := make(chan struct{})
-	stopRetryOnce := sync.Once{}
-	stopRetries := func() {
-		stopRetryOnce.Do(func() {
-			close(stopRetry)
-		})
-	}
 
 	timer := time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() {
 		s.mu.Lock()
 		delete(s.pending, reqID)
 		s.mu.Unlock()
-		stopRetries()
 		latest, _ := s.Get(space, normKey)
 		storageTracef("retrieve timeout space=%s key=%s reqId=%s hit=%t", space, normKey, reqID, latest != nil)
 		select {
@@ -485,7 +479,6 @@ func (s *PeerPigeonStorage) Retrieve(space Space, key string, opts ...RetrieveOp
 	s.mu.Lock()
 	s.pending[reqID] = &pendingRetrieve{
 		resolve: func(r *Record) {
-			stopRetries()
 			select {
 			case resultCh <- r:
 			default:
@@ -498,20 +491,6 @@ func (s *PeerPigeonStorage) Retrieve(space Space, key string, opts ...RetrieveOp
 	s.mu.Unlock()
 
 	_ = s.broadcastSyncPayload(req)
-
-	go func() {
-		ticker := time.NewTicker(700 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopRetry:
-				return
-			case <-ticker.C:
-				storageTracef("retrieve retry space=%s key=%s reqId=%s", space, normKey, reqID)
-				_ = s.broadcastSyncPayload(req)
-			}
-		}
-	}()
 
 	return <-resultCh, nil
 }
@@ -627,6 +606,7 @@ func (s *PeerPigeonStorage) applyLocalUpsert(space Space, key string, value inte
 		Timestamp: now,
 		Record:    pr,
 	}
+	s.markMutationSeen(opID)
 	s.emitChange(ChangeEvent{
 		Origin:  OriginLocal,
 		Op:      "upsert",
@@ -670,6 +650,7 @@ func (s *PeerPigeonStorage) applyLocalDelete(space Space, key string, allowSyste
 		Timestamp: nowMs(),
 		Record:    nil,
 	}
+	s.markMutationSeen(opID)
 	s.emitChange(ChangeEvent{
 		Origin:  OriginLocal,
 		Op:      "delete",
@@ -684,6 +665,10 @@ func (s *PeerPigeonStorage) applyLocalDelete(space Space, key string, allowSyste
 // ── remote apply ───────────────────────────────────────────────────────────
 
 func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool, error) {
+	if s.hasSeenMutation(mutation.OpID) {
+		return false, nil
+	}
+
 	driver := s.requireDriver()
 	pk := s.makePK(mutation.Space, mutation.Key)
 	existing, err := driver.Get(pk)
@@ -695,7 +680,9 @@ func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool
 		if existing == nil {
 			return false, nil
 		}
-		if mutation.Timestamp <= existing.UpdatedAt {
+		s.markMutationSeen(mutation.OpID)
+		// Public deletes should not be blocked by peer clock skew.
+		if mutation.Space != SpacePublic && mutation.Timestamp <= existing.UpdatedAt {
 			return false, nil
 		}
 		if !s.canDelete(mutation.Space, existing, mutation.ActorID, mutation.Space == SpaceEPublic) {
@@ -712,6 +699,8 @@ func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool
 	if mutation.Record == nil {
 		return false, nil
 	}
+
+	s.markMutationSeen(mutation.OpID)
 
 	if existing != nil {
 		inVersion := mutation.Record.Version
@@ -838,8 +827,8 @@ func (s *PeerPigeonStorage) handleGossipMessage(raw interface{}) error {
 		if !s.shouldAcceptRemote(mut.Space, mut.Key, "mutation", mut.ActorID) {
 			return nil
 		}
-		_, err := s.applyRemoteMutation(&mut)
-		if err == nil {
+		applied, err := s.applyRemoteMutation(&mut)
+		if err == nil && applied {
 			storageTracef("sync mutation applied op=%s space=%s key=%s actor=%s", mut.Op, mut.Space, mut.Key, mut.ActorID)
 			_ = s.broadcastMutation(&mut)
 		}
@@ -898,15 +887,22 @@ func (s *PeerPigeonStorage) handleRetrieveResponse(resp *storageRetrieveResp) er
 	s.mu.Unlock()
 	if p != nil && p.timer != nil {
 		p.timer.Stop()
+	} else if p == nil {
+		// Ignore unsolicited responses to prevent fanout churn and stale replay.
+		return nil
 	}
 
 	if resp.Record != nil && resp.Space != SpacePrivate {
 		if s.shouldAcceptRemote(resp.Space, resp.Key, "retrieve-response", resp.ActorID) {
+			timestamp := resp.Timestamp
+			if resp.Record.UpdatedAt > 0 {
+				timestamp = resp.Record.UpdatedAt
+			}
 			mut := &storageMutation{
 				PPType: "pp-storage-op-v1",
 				OpID:   fmt.Sprintf("retrieve-%s-%s", resp.ReqID, resp.ActorID),
 				Op:     "upsert", Space: resp.Space, Key: resp.Key,
-				ActorID: resp.ActorID, Timestamp: resp.Timestamp, Record: resp.Record,
+				ActorID: resp.ActorID, Timestamp: timestamp, Record: resp.Record,
 			}
 			_, _ = s.applyRemoteMutation(mut)
 		}
@@ -1232,6 +1228,36 @@ func (s *PeerPigeonStorage) lookupPersistedRecord(space Space, key string) (*per
 
 func (s *PeerPigeonStorage) makeMutationID(actorID string) string {
 	return fmt.Sprintf("%s-%d-%d", actorID, nowMs(), fastRand())
+}
+
+func (s *PeerPigeonStorage) hasSeenMutation(opID string) bool {
+	trimmed := strings.TrimSpace(opID)
+	if trimmed == "" {
+		return false
+	}
+	s.mu.Lock()
+	_, seen := s.seenMutations[trimmed]
+	s.mu.Unlock()
+	return seen
+}
+
+func (s *PeerPigeonStorage) markMutationSeen(opID string) {
+	trimmed := strings.TrimSpace(opID)
+	if trimmed == "" {
+		return
+	}
+	now := nowMs()
+	s.mu.Lock()
+	s.seenMutations[trimmed] = now
+	if len(s.seenMutations) > 4096 {
+		cutoff := now - 10*60*1000
+		for id, seenAt := range s.seenMutations {
+			if seenAt < cutoff {
+				delete(s.seenMutations, id)
+			}
+		}
+	}
+	s.mu.Unlock()
 }
 
 func (s *PeerPigeonStorage) emitChange(event ChangeEvent) {
