@@ -38,6 +38,7 @@ export interface StorageRetrieveOptions {
 export interface StorageSyncFilterContext {
   kind: 'mutation' | 'retrieve-request' | 'retrieve-response';
   actorId: string;
+  op?: 'upsert' | 'delete';
 }
 
 export interface StorageOptions extends StorageSyncOptions {
@@ -279,6 +280,7 @@ export class PeerPigeonStorage {
   private readonly listeners = new Set<ChangeListener>();
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
+  private readonly seenMutationOpIds = new Set<string>();
   private readonly onGossipMessageBound: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void;
   private readonly instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
   private crossTabChannel: BroadcastChannel | null = null;
@@ -560,6 +562,8 @@ export class PeerPigeonStorage {
       timestamp: now,
     });
 
+    // Mark locally-created mutations as seen so they never re-apply
+    this.seenMutationOpIds.add(opId);
     return mutation;
   }
 
@@ -606,6 +610,8 @@ export class PeerPigeonStorage {
       timestamp: Date.now(),
     });
 
+    // Mark locally-created mutations as seen so they never re-apply
+    this.seenMutationOpIds.add(opId);
     return mutation;
   }
 
@@ -622,6 +628,7 @@ export class PeerPigeonStorage {
       if (!this.shouldAcceptRemoteSync(decrypted.space, decrypted.key, {
         kind: 'mutation',
         actorId: decrypted.actorId,
+        op: decrypted.op,
       })) {
         return;
       }
@@ -655,7 +662,14 @@ export class PeerPigeonStorage {
 
     if (mutation.op === 'delete') {
       if (!existing) return false;
-      if (mutation.timestamp <= existing.updatedAt) return false;
+      // Never re-apply the same mutation twice globally
+      if (this.seenMutationOpIds.has(mutation.opId)) {
+        return false;
+      }
+      this.seenMutationOpIds.add(mutation.opId);
+      // Public space allows any actor to delete; avoid wall-clock skew
+      // blocking legitimate remote deletes from peers with older clocks.
+      if (mutation.space !== 'public' && mutation.timestamp <= existing.updatedAt) return false;
       if (!this.canDelete(mutation.space, existing, mutation.actorId, mutation.space === 'epublic')) return false;
       await driver.delete(pk);
       this.emitChange({
@@ -681,12 +695,37 @@ export class PeerPigeonStorage {
 
     if (!mutation.record) return false;
 
+    // Never re-apply the same mutation (opId) twice, whether delete or upsert
+    if (this.seenMutationOpIds.has(mutation.opId)) {
+      return false;
+    }
+
     if (existing) {
       const existingVersion = existing.version;
       const incomingVersion = mutation.record.version;
       const existingUpdatedAt = Number(existing.updatedAt ?? 0);
       const incomingUpdatedAt = Number(mutation.timestamp ?? mutation.record.updatedAt ?? 0);
       const versionCmp = this.compareStorageVersions(incomingVersion, existingVersion);
+
+      const normalizedIncomingVersion = this.normalizeStorageVersion(
+        incomingVersion,
+        this.versionSourceToken(mutation.record.ownerId ?? mutation.actorId)
+      );
+      const normalizedExistingVersion = this.normalizeStorageVersion(
+        existingVersion,
+        this.versionSourceToken(existing.ownerId ?? this.userId)
+      );
+
+      // Idempotency guard: identical same-version payloads should never churn
+      // local state or trigger UI refresh loops.
+      if (
+        normalizedIncomingVersion === normalizedExistingVersion
+        && String(existing.ownerId ?? '') === String(mutation.record.ownerId ?? '')
+        && this.persistedValueEqual(existing.value, mutation.record.value)
+        && this.cipherPayloadEqual(existing.valueCipher, mutation.record.valueCipher)
+      ) {
+        return false;
+      }
 
       // Arrival-time conflict resolution: accept newer version; if equal version,
       // accept only newer wall-clock value.
@@ -746,6 +785,8 @@ export class PeerPigeonStorage {
       actorId: mutation.actorId,
       timestamp: mutation.timestamp,
     });
+    // Mark as seen so this exact opId never re-applies on any peer
+    this.seenMutationOpIds.add(mutation.opId);
     return true;
   }
 
@@ -938,6 +979,10 @@ export class PeerPigeonStorage {
     if (pending) {
       this.pendingRetrieveRequests.delete(response.reqId);
       clearTimeout(pending.timeout);
+    } else {
+      // Ignore unsolicited retrieve responses. Applying these on peers that
+      // did not request them creates fanout churn and apparent save loops.
+      return;
     }
 
     if (response.record && response.space !== 'private') {
@@ -959,7 +1004,9 @@ export class PeerPigeonStorage {
         space: response.space,
         key: response.key,
         actorId: response.actorId,
-        timestamp: response.timestamp,
+        // Preserve source record freshness to avoid treating every retrieve
+        // response as a newer write based on responder wall-clock.
+        timestamp: Number(response.record.updatedAt || 0) || response.timestamp,
         record: response.record,
       };
       await this.applyRemoteMutation(mutation);
@@ -1091,13 +1138,34 @@ export class PeerPigeonStorage {
   }
 
   private compareStorageVersions(a: StorageVersion | null | undefined, b: StorageVersion | null | undefined): number {
-    const left = this.parseStorageVersion(a).parts;
-    const right = this.parseStorageVersion(b).parts;
+    const leftParsed = this.parseStorageVersion(a);
+    const rightParsed = this.parseStorageVersion(b);
+    const left = leftParsed.parts;
+    const right = rightParsed.parts;
     for (let i = 0; i < 4; i += 1) {
       if (left[i] > right[i]) return 1;
       if (left[i] < right[i]) return -1;
     }
+    const leftSource = Number(leftParsed.source || '0');
+    const rightSource = Number(rightParsed.source || '0');
+    if (leftSource > rightSource) return 1;
+    if (leftSource < rightSource) return -1;
     return 0;
+  }
+
+  private persistedValueEqual(a: unknown, b: unknown): boolean {
+    if (a === b) return true;
+    try {
+      return JSON.stringify(a) === JSON.stringify(b);
+    } catch {
+      return false;
+    }
+  }
+
+  private cipherPayloadEqual(a: CipherPayload | null, b: CipherPayload | null): boolean {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    return a.alg === b.alg && a.iv === b.iv && a.ct === b.ct;
   }
 
   private nextStorageVersion(previous: StorageVersion | null | undefined, actorId: string): string {

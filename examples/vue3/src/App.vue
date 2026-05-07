@@ -1171,9 +1171,6 @@ export default {
         [pk]: Boolean(enabled),
       };
       this.saveUiState();
-      if (enabled === true) {
-        this.requestInterestedKeySync('interest-added', [space]);
-      }
 
       if (this.activeTab === 'storage') {
         this.refreshStorageList();
@@ -1259,6 +1256,7 @@ export default {
 
     requestInterestedKeySync(_reason = 'update', spaces = null, options = {}) {
       if (!this.storage || !this.storageReady) return;
+
       const requestedSpaces = Array.isArray(spaces)
         ? spaces
         : ['public', 'user', 'frozen', 'private', 'epublic'];
@@ -1328,7 +1326,6 @@ export default {
 
       this.storageInterestedKeys = next;
       this.saveUiState();
-      this.requestInterestedKeySync('interest-cleared', [normalizedSpace], { timeoutMs: 1000 });
 
       if (this.activeTab === 'storage') {
         this.refreshStorageList();
@@ -1461,6 +1458,28 @@ export default {
       return this.storageRecordPk('user', logicalKey, owner);
     },
 
+    shouldAcceptStorageSync(space, key, context = null) {
+      const normalizedSpace = String(space || '').trim();
+      const normalizedKey = String(key || '').trim();
+      const kind = String(context?.kind || '').trim();
+      const op = String(context?.op || '').trim();
+
+      // Public space should only mutate locally when the key is explicitly
+      // subscribed/interested in this client.
+      if (
+        normalizedSpace === 'public'
+        && normalizedKey
+        && (kind === 'mutation' || kind === 'retrieve-response')
+      ) {
+        if (kind === 'mutation' && op === 'delete') {
+          return true;
+        }
+        return this.isStorageKeyInterested('public', normalizedKey);
+      }
+
+      return true;
+    },
+
     shouldReplaceStorageRecord(existing, incoming) {
       if (!existing) return true;
       const versionCmp = this.compareStorageVersions(incoming?.version, existing?.version);
@@ -1503,7 +1522,6 @@ export default {
           }
         }
         await this.refreshStorageList({ silent: true, syncInterested: false });
-        this.requestInterestedKeySync('storage-ready-existing');
         return;
       }
 
@@ -1525,6 +1543,7 @@ export default {
         gossip: this.gossip || undefined,
         sessionId: this.effectiveSessionId,
         dbName,
+        syncFilter: (space, key, context) => this.shouldAcceptStorageSync(space, key, context),
       }));
       await this.storage.init();
       this.storageIdentity = nextIdentity;
@@ -1556,7 +1575,6 @@ export default {
         }
         this.scheduleMeshPeersPublish('storage-ready');
       }
-      this.requestInterestedKeySync('storage-ready-init');
     },
 
     teardownStorage() {
@@ -2429,7 +2447,6 @@ export default {
           }
           this.addLog('connected', `Connected to peer`, peerId);
           this.announceCryptoPublicInfo();
-          this.requestInterestedKeySync('peer-connected');
           this.updateStats();
           if (this.networkGraphEnabled) {
             this.onMeshConnectionsChanged('peer:connected');
@@ -2478,7 +2495,6 @@ export default {
 
         this.mesh.on('mesh:ready', () => {
           this.addLog('info', 'Gossip reached ready state', 'System');
-          this.requestInterestedKeySync('mesh-ready');
         });
 
         // Gossip events

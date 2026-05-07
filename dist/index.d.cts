@@ -190,6 +190,7 @@ interface StorageRetrieveOptions {
 interface StorageSyncFilterContext {
     kind: 'mutation' | 'retrieve-request' | 'retrieve-response';
     actorId: string;
+    op?: 'upsert' | 'delete';
 }
 interface StorageOptions extends StorageSyncOptions {
     /**
@@ -258,6 +259,7 @@ declare class PeerPigeonStorage {
     private readonly listeners;
     private readonly pendingRetrieveRequests;
     private closed;
+    private readonly seenMutationOpIds;
     private readonly onGossipMessageBound;
     private readonly instanceId;
     private crossTabChannel;
@@ -306,6 +308,8 @@ declare class PeerPigeonStorage {
     private versionSourceToken;
     private normalizeStorageVersion;
     private compareStorageVersions;
+    private persistedValueEqual;
+    private cipherPayloadEqual;
     private nextStorageVersion;
     private resolveOwnerId;
     private assertCanWrite;

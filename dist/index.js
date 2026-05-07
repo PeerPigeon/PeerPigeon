@@ -1355,6 +1355,7 @@ var PeerPigeonStorage = class {
     this.listeners = /* @__PURE__ */ new Set();
     this.pendingRetrieveRequests = /* @__PURE__ */ new Map();
     this.closed = false;
+    this.seenMutationOpIds = /* @__PURE__ */ new Set();
     this.instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
     this.crossTabChannel = null;
     this.crossTabSeenNoticeIds = /* @__PURE__ */ new Set();
@@ -1587,6 +1588,7 @@ var PeerPigeonStorage = class {
       actorId,
       timestamp: now
     });
+    this.seenMutationOpIds.add(opId);
     return mutation;
   }
   async applyLocalDelete(space, key, allowSystemWrite = false) {
@@ -1627,6 +1629,7 @@ var PeerPigeonStorage = class {
       actorId,
       timestamp: Date.now()
     });
+    this.seenMutationOpIds.add(opId);
     return mutation;
   }
   async handleGossipMessage(data) {
@@ -1639,7 +1642,8 @@ var PeerPigeonStorage = class {
       if (decrypted.space === "private") return;
       if (!this.shouldAcceptRemoteSync(decrypted.space, decrypted.key, {
         kind: "mutation",
-        actorId: decrypted.actorId
+        actorId: decrypted.actorId,
+        op: decrypted.op
       })) {
         return;
       }
@@ -1666,7 +1670,11 @@ var PeerPigeonStorage = class {
     const existing = await driver.get(pk);
     if (mutation.op === "delete") {
       if (!existing) return false;
-      if (mutation.timestamp <= existing.updatedAt) return false;
+      if (this.seenMutationOpIds.has(mutation.opId)) {
+        return false;
+      }
+      this.seenMutationOpIds.add(mutation.opId);
+      if (mutation.space !== "public" && mutation.timestamp <= existing.updatedAt) return false;
       if (!this.canDelete(mutation.space, existing, mutation.actorId, mutation.space === "epublic")) return false;
       await driver.delete(pk);
       this.emitChange({
@@ -1690,12 +1698,26 @@ var PeerPigeonStorage = class {
       return true;
     }
     if (!mutation.record) return false;
+    if (this.seenMutationOpIds.has(mutation.opId)) {
+      return false;
+    }
     if (existing) {
       const existingVersion = existing.version;
       const incomingVersion = mutation.record.version;
       const existingUpdatedAt = Number(existing.updatedAt ?? 0);
       const incomingUpdatedAt = Number(mutation.timestamp ?? mutation.record.updatedAt ?? 0);
       const versionCmp = this.compareStorageVersions(incomingVersion, existingVersion);
+      const normalizedIncomingVersion = this.normalizeStorageVersion(
+        incomingVersion,
+        this.versionSourceToken(mutation.record.ownerId ?? mutation.actorId)
+      );
+      const normalizedExistingVersion = this.normalizeStorageVersion(
+        existingVersion,
+        this.versionSourceToken(existing.ownerId ?? this.userId)
+      );
+      if (normalizedIncomingVersion === normalizedExistingVersion && String(existing.ownerId ?? "") === String(mutation.record.ownerId ?? "") && this.persistedValueEqual(existing.value, mutation.record.value) && this.cipherPayloadEqual(existing.valueCipher, mutation.record.valueCipher)) {
+        return false;
+      }
       if (versionCmp < 0) return false;
       if (versionCmp === 0 && incomingUpdatedAt <= existingUpdatedAt) return false;
     }
@@ -1745,6 +1767,7 @@ var PeerPigeonStorage = class {
       actorId: mutation.actorId,
       timestamp: mutation.timestamp
     });
+    this.seenMutationOpIds.add(mutation.opId);
     return true;
   }
   setupCrossTabSync() {
@@ -1903,6 +1926,8 @@ var PeerPigeonStorage = class {
     if (pending) {
       this.pendingRetrieveRequests.delete(response.reqId);
       clearTimeout(pending.timeout);
+    } else {
+      return;
     }
     if (response.record && response.space !== "private") {
       if (!this.shouldAcceptRemoteSync(response.space, response.key, {
@@ -1922,7 +1947,9 @@ var PeerPigeonStorage = class {
         space: response.space,
         key: response.key,
         actorId: response.actorId,
-        timestamp: response.timestamp,
+        // Preserve source record freshness to avoid treating every retrieve
+        // response as a newer write based on responder wall-clock.
+        timestamp: Number(response.record.updatedAt || 0) || response.timestamp,
         record: response.record
       };
       await this.applyRemoteMutation(mutation);
@@ -2027,13 +2054,32 @@ var PeerPigeonStorage = class {
     return `${major}.${minor}.${patch}.${build}.${source}`;
   }
   compareStorageVersions(a, b) {
-    const left = this.parseStorageVersion(a).parts;
-    const right = this.parseStorageVersion(b).parts;
+    const leftParsed = this.parseStorageVersion(a);
+    const rightParsed = this.parseStorageVersion(b);
+    const left = leftParsed.parts;
+    const right = rightParsed.parts;
     for (let i = 0; i < 4; i += 1) {
       if (left[i] > right[i]) return 1;
       if (left[i] < right[i]) return -1;
     }
+    const leftSource = Number(leftParsed.source || "0");
+    const rightSource = Number(rightParsed.source || "0");
+    if (leftSource > rightSource) return 1;
+    if (leftSource < rightSource) return -1;
     return 0;
+  }
+  persistedValueEqual(a, b) {
+    if (a === b) return true;
+    try {
+      return JSON.stringify(a) === JSON.stringify(b);
+    } catch {
+      return false;
+    }
+  }
+  cipherPayloadEqual(a, b) {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    return a.alg === b.alg && a.iv === b.iv && a.ct === b.ct;
   }
   nextStorageVersion(previous, actorId) {
     const parsed = this.parseStorageVersion(previous);
