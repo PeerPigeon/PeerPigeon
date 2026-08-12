@@ -5,6 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const workspaceRoot = path.resolve(__dirname, '../..')
 
 export default defineConfig({
   plugins: [
@@ -35,6 +36,9 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 5173,
     strictPort: true,
+    fs: {
+      allow: [workspaceRoot]
+    },
     allowedHosts: ['peer.local'],
     headers: {
       'Cache-Control': 'no-cache, no-store, must-revalidate',

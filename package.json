@@ -20,10 +20,19 @@
   ],
   "scripts": {
     "wasm:build": "node scripts/build-wasm.mjs",
+    "freertc:sync": "node scripts/sync-freertc-head.mjs",
+    "prebuild": "npm run freertc:sync",
+    "predev": "npm run freertc:sync",
+    "predev:raw": "npm run freertc:sync",
+    "prebuild:browser": "npm run freertc:sync",
+    "pretest": "npm run freertc:sync",
+    "preexample:basic": "npm run freertc:sync",
+    "preexample:vue3": "npm run freertc:sync",
     "build": "tsup src/index.ts --format esm,cjs --dts",
     "build:browser": "tsup --config tsup.browser.config.ts",
     "dev:tls:generate": "node scripts/dev-with-mdns.mjs --generate-tls",
-    "dev": "cd examples/vue3 && npm run dev --",
+    "dev": "node scripts/dev-with-mdns.mjs",
+    "dev:raw": "cd examples/vue3 && npm run dev:raw --",
     "prepare": "npm run build",
     "prepack": "npm run build",
     "prepublishOnly": "npm run build",
@@ -49,7 +58,7 @@
     "url": "https://github.com/draeder/peerpigeon.git"
   },
   "dependencies": {
-    "freertc": "github:draeder/freertc",
+    "freertc": "github:draeder/freertc#d6ce3ea0dfccdbafb17ee16cd80ef2d39e76c876",
     "unsea": "^1.1.2"
   },
   "devDependencies": {

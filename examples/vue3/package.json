@@ -4,25 +4,30 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "npm --prefix ../.. run freertc:sync",
+    "predev:raw": "npm --prefix ../.. run freertc:sync",
+    "prebuild": "npm --prefix ../.. run freertc:sync",
+    "prepreview": "npm --prefix ../.. run freertc:sync && npm run build",
     "dev": "npm --prefix ../.. run wasm:build && vite --host 0.0.0.0 --port 5173 --strictPort",
+    "dev:raw": "npm --prefix ../.. run wasm:build && vite --host 0.0.0.0 --strictPort",
     "build": "npm --prefix ../.. run wasm:build && vite build",
     "preview": "vite preview"
   },
   "dependencies": {
     "d3": "^7.9.0",
+    "freertc": "github:draeder/freertc#d6ce3ea0dfccdbafb17ee16cd80ef2d39e76c876",
     "peerpigeon": "file:../..",
-    "freertc": "github:draeder/freertc",
     "unsea": "^1.1.2",
     "vue": "^3.3.0"
   },
   "devDependencies": {
-    "vite": "^5.0.0",
-    "@vitejs/plugin-vue": "^5.0.0",
     "@rollup/plugin-inject": "^5.0.5",
+    "@vitejs/plugin-vue": "^5.0.0",
     "buffer": "^6.0.3",
     "events": "^3.3.0",
     "process": "^0.11.10",
     "stream-browserify": "^3.0.0",
-    "util": "^0.12.5"
+    "util": "^0.12.5",
+    "vite": "^5.0.0"
   }
 }

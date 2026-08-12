@@ -145,9 +145,9 @@ export class PartialMesh {
       // FreeRTC retries relayed offers for up to ~30s; keep this above that window
       // so we do not abort otherwise-recoverable negotiations.
       connectionTimeoutMs: config.connectionTimeoutMs ?? 45_000,
-      maintenanceIntervalMs: config.maintenanceIntervalMs ?? 2_000,
+      maintenanceIntervalMs: config.maintenanceIntervalMs ?? 1_000,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
-      nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 8_000,
+      nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 2_500,
       trickleIce: config.trickleIce ?? true
     };
 
@@ -338,7 +338,7 @@ export class PartialMesh {
     const closestCandidate = candidateByDistance.find((candidate) => {
       const discoveredAgeMs = now - candidate.discoveredAt;
       const sinceAttemptMs = now - candidate.lastAttemptAt;
-      return discoveredAgeMs >= 2_000 && sinceAttemptMs >= 20_000;
+      return discoveredAgeMs >= 1_000 && sinceAttemptMs >= 5_000;
     });
 
     // Rebalance only when the newcomer is genuinely closer than our weakest edge.
@@ -348,13 +348,16 @@ export class PartialMesh {
 
     // Keep existing edges sticky for a short period to prevent oscillation.
     const connectedAgeMs = now - (farthestConnected.connectedAt || 0);
-    if (connectedAgeMs < 12_000) {
+    if (connectedAgeMs < 4_000) {
       return false;
     }
 
-    // Require a meaningful improvement margin (candidate at least 25% closer)
-    // before replacing an existing edge.
-    if (closestCandidate.distance * 4n >= farthestConnected.distance * 3n) {
+    // Prefer genuinely closer candidates, but do not exclude late joiners forever
+    // when random peer IDs produce a stable yet closed cluster.
+    const candidateDiscoveredAgeMs = now - closestCandidate.discoveredAt;
+    const materiallyCloser = closestCandidate.distance * 4n < farthestConnected.distance * 3n;
+    const staleExcludedCandidate = candidateDiscoveredAgeMs >= 3_000;
+    if (!materiallyCloser && !staleExcludedCandidate) {
       return false;
     }
 
@@ -373,7 +376,7 @@ export class PartialMesh {
       return false;
     }
 
-    this.rebalanceCooldownUntilMs = now + 12_000;
+    this.rebalanceCooldownUntilMs = now + 4_000;
     this.rebalanceAttemptAtMs.set(closestCandidate.peerId, now);
     this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now);
     this.pendingRebalanceDropByTarget.set(closestCandidate.peerId, farthestConnected.peerId);
@@ -382,6 +385,10 @@ export class PartialMesh {
     });
 
     this.connectToPeerInternal(closestCandidate.peerId, true);
+    if (!this.peers.has(closestCandidate.peerId) && !this.connecting.has(closestCandidate.peerId)) {
+      this.pendingRebalanceDropByTarget.delete(closestCandidate.peerId);
+      return false;
+    }
     return true;
   }
 
@@ -595,8 +602,9 @@ export class PartialMesh {
     const now = Date.now();
     const underConnected = connected < this.config.minPeers;
     const hasFewCandidates = this.discoveredPeers.size < this.config.minPeers;
+    const saturatedWithoutSpareCandidates = connected >= this.config.maxPeers && this.discoveredPeers.size <= connected;
 
-    if (!underConnected && !hasFewCandidates) return;
+    if (!underConnected && !hasFewCandidates && !saturatedWithoutSpareCandidates) return;
     if (now - this.lastDiscoveryRefreshAtMs < 2_000) return;
 
     this.lastDiscoveryRefreshAtMs = now;
@@ -615,7 +623,7 @@ export class PartialMesh {
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.discoveredPeers.size > 0;
     const baseStallMs = Math.max(10_000, Math.min(this.config.connectionTimeoutMs, 15_000));
-    const stallMs = isolated ? Math.max(3_500, Math.min(this.config.connectionTimeoutMs, 6_000)) : baseStallMs;
+    const stallMs = isolated ? Math.max(8_000, Math.min(this.config.connectionTimeoutMs, 12_000)) : baseStallMs;
 
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
@@ -900,11 +908,19 @@ export class PartialMesh {
     };
 
     if (totalInProgress < this.config.minPeers) {
-      // Need more connections
+      // Need more connections.
       const needed = this.config.minPeers - totalInProgress;
       const emergencyBurst = emergencyIsolated ? Math.min(3, Math.max(2, available.length)) : 0;
       const dialCount = emergencyIsolated ? Math.max(needed, emergencyBurst) : needed;
-      for (const peerId of pickCandidates(dialCount)) {
+      // When under minPeers, try all available candidates (up to a small cap) so
+      // deterministic role selection doesn't leave the node with only non-initiator
+      // candidates selected. connectToPeer skips non-initiator candidates immediately
+      // (scheduling a fallback timer instead), so iterating all candidates is cheap
+      // and ensures at least one actual outgoing dial fires.
+      const tryCount = available.length <= this.config.maxPeers * 2
+        ? available.length
+        : Math.max(dialCount, this.config.minPeers + 1);
+      for (const peerId of pickCandidates(tryCount)) {
         this.connectToPeer(peerId);
       }
     } else if (totalInProgress < this.config.maxPeers && available.length > 0) {
@@ -919,6 +935,12 @@ export class PartialMesh {
     } else if (connectedCount > this.getMaxPeersWithTolerance()) {
       this.trimExcessPeers();
     } else if (connectedCount >= this.config.maxPeers && pendingCount === 0 && available.length > 0) {
+      if (connectedCount < this.getMaxPeersWithTolerance()) {
+        for (const peerId of pickCandidates(1)) {
+          this.connectToPeer(peerId);
+        }
+        return;
+      }
       if (this.maybeRebalanceForCloserPeer(available)) {
         return;
       }
@@ -960,6 +982,27 @@ export class PartialMesh {
       return;
     }
 
+    const existingRtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(normalizedPeerId);
+    if (existingRtcEntry && !emergencyIsolated) {
+      // Treat any entry as live unless explicitly failed/closed.
+      // state='new' is set by the debug handler right after an inbound offer is answered
+      // (RTCPeerConnection.connectionState='new' during early ICE). If we don't guard this
+      // window, the mesh layer fires a second outgoing dial that destroys the responder.
+      const existingState = String(existingRtcEntry.state ?? existingRtcEntry.connection?.connectionState ?? '').toLowerCase();
+      const isDefinitelyDead = existingState === 'failed' || existingState === 'closed';
+      if (!isDefinitelyDead) {
+        return;
+      }
+    }
+
+    if (existingRtcEntry && emergencyIsolated) {
+      try {
+        this.signalingClient?.closeConnection?.(normalizedPeerId);
+      } catch {
+        // ignore
+      }
+    }
+
     if (this.isPeerBackedOff(normalizedPeerId) && !emergencyIsolated) {
       return;
     }
@@ -976,16 +1019,11 @@ export class PartialMesh {
     }
 
     // Discovery can be asymmetric (one side sees the other first).
-    // Always dialing here prevents deadlock where neither side initiates.
-    // Use deterministic role selection to prevent SDP glare.
-    // When both peers discover each other simultaneously, only the one with the
-    // lexicographically smaller ID sends an offer; the other waits for the inbound offer.
+    // Use deterministic role selection to reduce glare, but keep a delayed
+    // assist dial so asymmetric discovery does not deadlock the edge forever.
     const initiator = selfId < normalizedPeerId;
 
     if (!initiator) {
-      // Let FreeRTC accept the inbound offer on the non-initiator side.
-      // If this node is lexicographically greater than all discovered peers,
-      // no one may proactively dial it in time; allow one deterministic fallback dial.
       this.signalingClient?.nudgeSignaling?.();
 
       const fallbackMs = this.config.nonInitiatorFallbackDialMs;
@@ -995,28 +1033,37 @@ export class PartialMesh {
 
       const candidatePeers = Array.from(this.discoveredPeers)
         .map((id) => this.normalizePeerId(id))
-        .filter((id) => id && !this.isSelfAlias(id) && id !== selfId && !this.peers.has(id) && !this.connecting.has(id) && !this.isPeerBackedOff(id));
+        .filter((id) => {
+          if (!id || id === selfId || this.isSelfAlias(id)) return false;
+          if (this.peers.has(id) || this.connecting.has(id)) return false;
+          if (!emergencyIsolated && this.isPeerBackedOff(id)) return false;
+          return true;
+        });
 
-      const hasNaturalInitiatorTarget = candidatePeers.some((id) => selfId < id);
-      if (hasNaturalInitiatorTarget) {
+      // If we already have at least one natural initiator candidate, skip fallback.
+      // This prevents the largest-ID peer from scheduling extra assist dials.
+      if (candidatePeers.some((id) => selfId < id)) {
         return;
       }
 
       const fallbackTargets = candidatePeers
         .filter((id) => selfId > id)
         .sort((a, b) => a.localeCompare(b));
-
       if (fallbackTargets.length === 0) {
         return;
       }
 
-      // Deterministically rotate fallback target per local peer so not all nodes
-      // stampede the same candidate when recovering from saturation.
-      let hash = 0;
-      for (let i = 0; i < selfId.length; i++) {
-        hash = (hash * 31 + selfId.charCodeAt(i)) >>> 0;
-      }
-      const selectedFallbackTarget = fallbackTargets[hash % fallbackTargets.length];
+      const selectedFallbackTarget = fallbackTargets
+        .slice()
+        .sort((a, b) => {
+          const failA = this.dialFailureCount.get(a) ?? 0;
+          const failB = this.dialFailureCount.get(b) ?? 0;
+          if (failA !== failB) return failA - failB;
+          const discoveredA = this.discoveredAtMs.get(a) ?? 0;
+          const discoveredB = this.discoveredAtMs.get(b) ?? 0;
+          if (discoveredA !== discoveredB) return discoveredA - discoveredB;
+          return a.localeCompare(b);
+        })[0];
       if (selectedFallbackTarget !== normalizedPeerId) {
         return;
       }
@@ -1029,38 +1076,63 @@ export class PartialMesh {
             return;
           }
 
-          if (this.getConnectedPeerCount() >= this.config.maxPeers) {
-            return;
-          }
-
           const refreshedCandidates = Array.from(this.discoveredPeers)
             .map((id) => this.normalizePeerId(id))
-            .filter((id) => id && !this.isSelfAlias(id) && id !== selfId && !this.peers.has(id) && !this.connecting.has(id) && !this.isPeerBackedOff(id));
+            .filter((id) => {
+              if (!id || id === selfId || this.isSelfAlias(id)) return false;
+              if (this.peers.has(id) || this.connecting.has(id)) return false;
+              if (!emergencyIsolated && this.isPeerBackedOff(id)) return false;
+              return true;
+            });
+
           if (refreshedCandidates.some((id) => selfId < id)) {
             return;
           }
 
-          const refreshedFallbackTargets = refreshedCandidates
+          const refreshedTargets = refreshedCandidates
             .filter((id) => selfId > id)
             .sort((a, b) => a.localeCompare(b));
-          if (refreshedFallbackTargets.length === 0) {
+          if (refreshedTargets.length === 0) {
             return;
           }
 
-          let refreshedHash = 0;
-          for (let i = 0; i < selfId.length; i++) {
-            refreshedHash = (refreshedHash * 31 + selfId.charCodeAt(i)) >>> 0;
-          }
-          const refreshedSelected = refreshedFallbackTargets[refreshedHash % refreshedFallbackTargets.length];
-          if (refreshedSelected !== normalizedPeerId) {
+          const refreshedSelectedTarget = refreshedTargets
+            .slice()
+            .sort((a, b) => {
+              const failA = this.dialFailureCount.get(a) ?? 0;
+              const failB = this.dialFailureCount.get(b) ?? 0;
+              if (failA !== failB) return failA - failB;
+              const discoveredA = this.discoveredAtMs.get(a) ?? 0;
+              const discoveredB = this.discoveredAtMs.get(b) ?? 0;
+              if (discoveredA !== discoveredB) return discoveredA - discoveredB;
+              return a.localeCompare(b);
+            })[0];
+          if (refreshedSelectedTarget !== normalizedPeerId) {
             return;
           }
 
-          const rtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(normalizedPeerId);
-          if (rtcEntry?.state === 'connecting' || rtcEntry?.state === 'connected') {
-            return;
+          const fallbackRtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(normalizedPeerId);
+          if (fallbackRtcEntry && !emergencyIsolated) {
+            const fallbackRtcState = String(fallbackRtcEntry.state ?? fallbackRtcEntry.connection?.connectionState ?? '').toLowerCase();
+            const isFallbackDead = fallbackRtcState === 'failed' || fallbackRtcState === 'closed';
+            if (!isFallbackDead) {
+              return;
+            }
           }
-          if (rtcEntry?.channel?.readyState === 'open') {
+
+          if (fallbackRtcEntry && emergencyIsolated) {
+            try {
+              this.signalingClient?.closeConnection?.(normalizedPeerId);
+            } catch {
+              // ignore
+            }
+          }
+
+          const currentConnectedCount = this.getConnectedPeerCount();
+          const fallbackMaxAllowed = allowTemporaryOverflow
+            ? this.config.maxPeers + 1
+            : this.getMaxPeersWithTolerance();
+          if (currentConnectedCount >= fallbackMaxAllowed) {
             return;
           }
 
@@ -1074,7 +1146,7 @@ export class PartialMesh {
     }
 
     this.connecting.add(normalizedPeerId);
-    this.createPeerConnection(normalizedPeerId, initiator);
+    this.createPeerConnection(normalizedPeerId, true);
   }
 
   /**

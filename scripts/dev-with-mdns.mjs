@@ -11,9 +11,9 @@ import { fileURLToPath } from 'node:url'
 import multicastDns from 'multicast-dns'
 import { generateRandomPair } from 'unsea'
 
-const DEV_PORT_DEFAULT = 5173
-const PUBLIC_HTTP_PORT = 80
-const PUBLIC_HTTPS_PORT = 443
+const DEV_PORT_DEFAULT = 5174
+const PUBLIC_HTTP_PORT = 5172
+const PUBLIC_HTTPS_PORT = 5173
 const DEV_HOSTNAME = 'peer.local'
 const DEV_HOSTNAME_ALIASES = [DEV_HOSTNAME, 'peerpigeon.local']
 const MDNS_SERVICE_NAME = 'PeerPigeon Dev'
