@@ -1,5 +1,8 @@
 // src/freertc-client-adapter.ts
 import { createSignalingClient } from "freertc/client";
+var RTC_DISCONNECT_GRACE_MS = 5e3;
+var RECOVERY_PROBE_TIMEOUT_MS = 5e3;
+var RECOVERY_PROBE_THROTTLE_MS = 1500;
 function generateMessageId(bytesLength = 8) {
   const bytes = new Uint8Array(bytesLength);
   const webCrypto = globalThis.window?.crypto ?? globalThis.crypto;
@@ -33,10 +36,28 @@ var FreeRTCClientAdapter = class {
     this.selfAliases = /* @__PURE__ */ new Set();
     this.connectedPeers = /* @__PURE__ */ new Set();
     this.openChannelTimers = /* @__PURE__ */ new Map();
+    this.disconnectGraceTimers = /* @__PURE__ */ new Map();
     this.client = null;
     this.joinedOnce = false;
     this.intentionallyDisconnected = false;
     this.signalingConnected = false;
+    this.recoveryProbeTimer = null;
+    this.lastRecoveryProbeAtMs = 0;
+    this.lifecycleListenersAttached = false;
+    this.retiredPeerIdsWithdrawn = false;
+    this.handleVisibilityChange = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      this.recoverAfterInactivity("visible");
+    };
+    this.handleWindowFocus = () => {
+      this.recoverAfterInactivity("focus");
+    };
+    this.handleWindowOnline = () => {
+      this.recoverAfterInactivity("online");
+    };
+    this.handlePageShow = () => {
+      this.recoverAfterInactivity("pageshow");
+    };
     this.signalUrl = signalUrl;
     this.networkId = options?.networkId ?? "default-session";
     this.roomId = options?.roomId ?? this.networkId;
@@ -55,11 +76,15 @@ var FreeRTCClientAdapter = class {
   }
   connect() {
     this.intentionallyDisconnected = false;
+    this.attachLifecycleListeners();
     if (this.client) {
       this.client.connect?.();
       return;
     }
-    this.withdrawRetiredPeerIds();
+    if (!this.retiredPeerIdsWithdrawn) {
+      this.retiredPeerIdsWithdrawn = true;
+      this.withdrawRetiredPeerIds();
+    }
     this.client = createSignalingClient({
       peerId: this.requestedPeerId,
       networkId: this.networkId,
@@ -80,6 +105,7 @@ var FreeRTCClientAdapter = class {
         this.client?.requestBootstrap?.(Array.from(this.selfAliases));
       },
       onBootstrap: (candidates) => {
+        this.clearRecoveryProbeTimer();
         this.handleBootstrapCandidates(candidates);
       },
       onConnectionStateChange: (data) => {
@@ -109,7 +135,10 @@ var FreeRTCClientAdapter = class {
   disconnect() {
     this.intentionallyDisconnected = true;
     this.signalingConnected = false;
+    this.detachLifecycleListeners();
+    this.clearRecoveryProbeTimer();
     this.clearOpenChannelTimers();
+    this.clearDisconnectGraceTimers();
     try {
       this.client?.disconnect?.();
     } catch {
@@ -143,11 +172,50 @@ var FreeRTCClientAdapter = class {
     this.client?.advertise?.({});
     this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
+  /**
+   * Revalidate signaling and RTC transports after a tab resumes, regains focus,
+   * or the browser reports that the network is online again.
+   */
+  recoverAfterInactivity(reason = "resume") {
+    if (this.intentionallyDisconnected) return;
+    const now = Date.now();
+    if (now - this.lastRecoveryProbeAtMs < RECOVERY_PROBE_THROTTLE_MS) return;
+    this.lastRecoveryProbeAtMs = now;
+    for (const peerId of Array.from(this.connectedPeers)) {
+      const entry = this.client?.mesh?.connections?.get?.(peerId);
+      const connectionState = String(entry?.connection?.connectionState ?? entry?.state ?? "").toLowerCase();
+      const channelState = String(entry?.channel?.readyState ?? "").toLowerCase();
+      if (!entry || channelState !== "open" || connectionState === "failed" || connectionState === "closed" || connectionState === "dead") {
+        this.closeConnection(peerId);
+        continue;
+      }
+      if (connectionState === "disconnected" || connectionState === "recovering") {
+        this.scheduleDisconnectedPeerRecovery(peerId);
+      }
+    }
+    if (!this.client?.isRegistered) {
+      this.emitter.emit("signaling:log", { message: `[signal] ${reason} recovery: reconnecting signaling` });
+      this.client?.connect?.();
+      return;
+    }
+    this.emitter.emit("signaling:log", { message: `[signal] ${reason} recovery: refreshing discovery` });
+    this.clearRecoveryProbeTimer();
+    this.recoveryProbeTimer = setTimeout(() => {
+      this.recoveryProbeTimer = null;
+      if (this.intentionallyDisconnected) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+      this.restartClientAfterStaleSignaling(reason);
+    }, RECOVERY_PROBE_TIMEOUT_MS);
+    this.nudgeSignaling();
+  }
   closeConnection(peerId) {
     const id = this.normalizePeerId(peerId);
     if (!id) return;
+    this.clearDisconnectGraceTimer(id);
     this.clearOpenChannelTimer(id);
     const entry = this.client?.mesh?.connections?.get?.(id);
+    this.client?.mesh?.connections?.delete?.(id);
+    const wasConnected = this.connectedPeers.delete(id);
     try {
       entry?.channel?.close?.();
     } catch {
@@ -156,8 +224,7 @@ var FreeRTCClientAdapter = class {
       entry?.connection?.close?.();
     } catch {
     }
-    this.client?.mesh?.connections?.delete?.(id);
-    if (this.connectedPeers.delete(id)) {
+    if (wasConnected) {
       this.emitter.emit("rtc:disconnected", { peerId: id });
     }
   }
@@ -210,15 +277,34 @@ var FreeRTCClientAdapter = class {
       return;
     }
     if (state === "connected") {
+      this.clearDisconnectGraceTimer(peerId);
       this.waitForOpenDataChannel(peerId);
       return;
     }
-    if (state === "failed" || state === "closed") {
-      this.clearOpenChannelTimer(peerId);
-      if (this.connectedPeers.delete(peerId)) {
-        this.emitter.emit("rtc:disconnected", { peerId });
-      }
+    if (state === "disconnected" || state === "recovering") {
+      this.scheduleDisconnectedPeerRecovery(peerId);
+      return;
     }
+    if (state === "failed" || state === "closed") {
+      this.closeConnection(peerId);
+    }
+  }
+  scheduleDisconnectedPeerRecovery(peerId) {
+    if (this.disconnectGraceTimers.has(peerId)) return;
+    const timer = setTimeout(() => {
+      this.disconnectGraceTimers.delete(peerId);
+      if (this.intentionallyDisconnected) return;
+      const entry = this.client?.mesh?.connections?.get?.(peerId);
+      const state = String(entry?.connection?.connectionState ?? entry?.state ?? "").toLowerCase();
+      const channelState = String(entry?.channel?.readyState ?? "").toLowerCase();
+      if (state === "connected" && channelState === "open") return;
+      this.emitter.emit("signaling:log", {
+        message: `[webrtc] connection to ${peerId} did not recover after inactivity; redialing`
+      });
+      this.closeConnection(peerId);
+      this.client?.requestBootstrap?.(Array.from(this.selfAliases));
+    }, RTC_DISCONNECT_GRACE_MS);
+    this.disconnectGraceTimers.set(peerId, timer);
   }
   waitForOpenDataChannel(peerId) {
     if (this.connectedPeers.has(peerId) || this.openChannelTimers.has(peerId)) return;
@@ -249,6 +335,68 @@ var FreeRTCClientAdapter = class {
   clearOpenChannelTimers() {
     for (const timer of this.openChannelTimers.values()) clearInterval(timer);
     this.openChannelTimers.clear();
+  }
+  clearDisconnectGraceTimer(peerId) {
+    const timer = this.disconnectGraceTimers.get(peerId);
+    if (timer) clearTimeout(timer);
+    this.disconnectGraceTimers.delete(peerId);
+  }
+  clearDisconnectGraceTimers() {
+    for (const timer of this.disconnectGraceTimers.values()) clearTimeout(timer);
+    this.disconnectGraceTimers.clear();
+  }
+  clearRecoveryProbeTimer() {
+    if (this.recoveryProbeTimer) clearTimeout(this.recoveryProbeTimer);
+    this.recoveryProbeTimer = null;
+  }
+  restartClientAfterStaleSignaling(reason) {
+    if (this.intentionallyDisconnected) return;
+    const staleClient = this.client;
+    this.client = null;
+    this.signalingConnected = false;
+    this.joinedOnce = false;
+    this.clearOpenChannelTimers();
+    this.clearDisconnectGraceTimers();
+    const disconnectedPeerIds = Array.from(this.connectedPeers);
+    this.connectedPeers.clear();
+    this.knownPeers.clear();
+    try {
+      staleClient?.disconnect?.();
+    } catch {
+    }
+    for (const peerId of disconnectedPeerIds) {
+      this.emitter.emit("rtc:disconnected", { peerId });
+    }
+    this.emitter.emit("signaling:log", {
+      message: `[signal] ${reason} recovery: discovery probe timed out; rebuilding signaling connection`
+    });
+    this.connect();
+  }
+  attachLifecycleListeners() {
+    if (this.lifecycleListenersAttached) return;
+    this.lifecycleListenersAttached = true;
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.handleVisibilityChange);
+      document.addEventListener("resume", this.handleVisibilityChange);
+    }
+    if (typeof window !== "undefined") {
+      window.addEventListener("focus", this.handleWindowFocus);
+      window.addEventListener("online", this.handleWindowOnline);
+      window.addEventListener("pageshow", this.handlePageShow);
+    }
+  }
+  detachLifecycleListeners() {
+    if (!this.lifecycleListenersAttached) return;
+    this.lifecycleListenersAttached = false;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.handleVisibilityChange);
+      document.removeEventListener("resume", this.handleVisibilityChange);
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("focus", this.handleWindowFocus);
+      window.removeEventListener("online", this.handleWindowOnline);
+      window.removeEventListener("pageshow", this.handlePageShow);
+    }
   }
   withdrawRetiredPeerIds() {
     for (const peerId of this.retiredPeerIds) {
@@ -2314,6 +2462,7 @@ var PartialMesh = class {
     this.maintenanceTimer = setInterval(() => {
       try {
         this.maybeRefreshDiscovery();
+        this.recoverStaleConnectedPeers("maintenance");
         this.maybeRecoverStalledNegotiations();
         this.maintainPeerConnections();
         this.maybeHardResetUnderConnected();
@@ -2334,6 +2483,40 @@ var PartialMesh = class {
     try {
       this.signalingClient?.joinSession(this.config.sessionId);
     } catch {
+    }
+  }
+  /**
+   * Revalidate transports after browser suspension, network changes, or focus
+   * restoration. Browsers do not always deliver every lifecycle event, so the
+   * maintenance loop also calls the same stale-channel check.
+   */
+  recoverAfterInactivity(reason = "resume") {
+    try {
+      this.signalingClient?.recoverAfterInactivity?.(reason);
+    } catch {
+    }
+    this.recoverStaleConnectedPeers(reason);
+    this.lastDiscoveryRefreshAtMs = 0;
+    this.underConnectedSinceMs = null;
+    try {
+      this.maybeRefreshDiscovery();
+      if (this.config.autoConnect) this.maintainPeerConnections();
+    } catch {
+    }
+  }
+  recoverStaleConnectedPeers(reason) {
+    for (const peer of Array.from(this.peers.values())) {
+      if (!peer.connected) continue;
+      const rtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(peer.id);
+      const connectionState = String(rtcEntry?.connection?.connectionState ?? rtcEntry?.state ?? "").toLowerCase();
+      const channelState = String(rtcEntry?.channel?.readyState ?? "").toLowerCase();
+      const transportIsDead = connectionState === "failed" || connectionState === "closed" || connectionState === "dead";
+      const channelIsGone = !rtcEntry || !rtcEntry.channel || channelState === "closing" || channelState === "closed";
+      if (!transportIsDead && !channelIsGone) continue;
+      this.emit("signaling:log", {
+        message: `[webrtc] ${reason} recovery: removing stale connection to ${peer.id}`
+      });
+      this.removePeer(peer.id, false);
     }
   }
   maybeRecoverStalledNegotiations() {

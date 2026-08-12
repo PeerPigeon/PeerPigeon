@@ -693,6 +693,7 @@ export class PartialMesh {
     this.maintenanceTimer = setInterval(() => {
       try {
         this.maybeRefreshDiscovery();
+        this.recoverStaleConnectedPeers('maintenance');
         this.maybeRecoverStalledNegotiations();
         this.maintainPeerConnections();
         this.maybeHardResetUnderConnected();
@@ -723,6 +724,51 @@ export class PartialMesh {
 
     // Do not force signaling reconnects here.
     // Reconnect churn can reset discovery repeatedly and prevent peer convergence.
+  }
+
+  /**
+   * Revalidate transports after browser suspension, network changes, or focus
+   * restoration. Browsers do not always deliver every lifecycle event, so the
+   * maintenance loop also calls the same stale-channel check.
+   */
+  public recoverAfterInactivity(reason: string = 'resume'): void {
+    try {
+      this.signalingClient?.recoverAfterInactivity?.(reason);
+    } catch {
+      // Continue with local transport validation even if signaling recovery fails.
+    }
+
+    this.recoverStaleConnectedPeers(reason);
+    this.lastDiscoveryRefreshAtMs = 0;
+    this.underConnectedSinceMs = null;
+
+    try {
+      this.maybeRefreshDiscovery();
+      if (this.config.autoConnect) this.maintainPeerConnections();
+    } catch {
+      // The regular maintenance loop will retry.
+    }
+  }
+
+  private recoverStaleConnectedPeers(reason: string): void {
+    for (const peer of Array.from(this.peers.values())) {
+      if (!peer.connected) continue;
+
+      const rtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(peer.id);
+      const connectionState = String(rtcEntry?.connection?.connectionState ?? rtcEntry?.state ?? '').toLowerCase();
+      const channelState = String(rtcEntry?.channel?.readyState ?? '').toLowerCase();
+      const transportIsDead = connectionState === 'failed'
+        || connectionState === 'closed'
+        || connectionState === 'dead';
+      const channelIsGone = !rtcEntry || !rtcEntry.channel || channelState === 'closing' || channelState === 'closed';
+
+      if (!transportIsDead && !channelIsGone) continue;
+
+      this.emit('signaling:log', {
+        message: `[webrtc] ${reason} recovery: removing stale connection to ${peer.id}`
+      });
+      this.removePeer(peer.id, false);
+    }
   }
 
   private maybeRecoverStalledNegotiations(): void {

@@ -800,6 +800,9 @@ export default {
     },
     roomSessionId() {
       this.updateUrlState();
+    },
+    signalingServer() {
+      this.updateUrlState();
     }
   },
   methods: {
@@ -4096,6 +4099,13 @@ export default {
         url.searchParams.set('minPeers', String(this.minPeers));
         url.searchParams.set('maxPeers', String(this.maxPeers));
         url.searchParams.set('tolerantPeers', String(this.tolerantPeers));
+        const signalingServer = String(this.signalingServer || '').trim();
+        if (signalingServer) {
+          url.searchParams.set('signalingServer', signalingServer);
+        } else {
+          url.searchParams.delete('signalingServer');
+        }
+        url.searchParams.delete('signalUrl');
         url.searchParams.delete('sessionSource');
         url.searchParams.delete('deriveSessionFromUrl');
         if (this.networkName) {
