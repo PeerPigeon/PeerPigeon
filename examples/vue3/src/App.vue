@@ -433,7 +433,7 @@
         <div ref="networkGraphContainer" class="network-graph-container" data-testid="mesh-visualizer">
           <svg ref="networkGraphSvg" class="network-graph-svg"></svg>
         </div>
-        <div class="mesh-visualizer-caption">Live connected topology from <code>epublic/mesh:peers</code> with per-peer audits</div>
+        <div class="mesh-visualizer-caption">Live connected topology from <code>epublic/mesh:peers</code>; labels are each peer ID's first 4 characters (hover for the full ID)</div>
       </section>
 
       <!-- Diagnostics -->
@@ -569,6 +569,8 @@ export default {
       graphLastSignature: '',
       networkGraphState: null,
       networkGraphResizeHandler: null,
+      networkGraphResizeObserver: null,
+      networkGraphResizeObservedElement: null,
       debugMonitorTimer: null,
       debugLastByPeer: {},
       debugLastLogAtByPeer: {},
@@ -1415,9 +1417,10 @@ export default {
     },
 
     storageUserId() {
-      // Use epub (ECDH public key) as stable user identity for storage,
-      // not peer ID which can change during session.
-      return String(this.cryptoKeys?.epub || '').trim();
+      // Prefer epub (ECDH public key) as stable storage identity, but fall
+      // back to mesh client ID so storage can come up before crypto identity
+      // is fully available.
+      return String(this.cryptoKeys?.epub || this.mesh?.getClientId?.() || this.clientId || '').trim();
     },
 
     storageOpId() {
@@ -1559,12 +1562,23 @@ export default {
 
     async refreshStorageList(options = {}) {
       const silent = options && options.silent === true;
+      const syncInterested = !(options && options.syncInterested === false);
       if (!silent) this.storageBusy = true;
       this.storageError = '';
       try {
         if (!this.storage) {
           this.storageRecords = [];
           return;
+        }
+
+        // Pull latest values for keys this peer explicitly follows before
+        // rendering the local list, unless caller opts out for fast-path refresh.
+        if (syncInterested && this.storageReady) {
+          try {
+            await this.syncInterestedKeysForSpace(this.storageActiveSpace, { timeoutMs: 1200 });
+          } catch {
+            // best-effort sync; continue rendering local snapshot
+          }
         }
 
         const allRecords = await this.storage.list(this.storageActiveSpace);
@@ -1835,8 +1849,20 @@ export default {
 
       this.meshPeersPublishInFlight = true;
       try {
+        // Pull latest mesh:peers from network before writing so concurrent
+        // publishers merge from a fresh base instead of clobbering snapshots.
+        try {
+          await this.storage.retrieve(this.meshPeersStorageSpace, this.meshPeersStorageKey, { timeoutMs: 1800 });
+        } catch {
+          // best-effort network retrieval; continue with local state
+        }
+
         const existing = await this.storage.get(this.meshPeersStorageSpace, this.meshPeersStorageKey);
-        const snapshots = this.pruneStaleMeshPeerSnapshots(this.normalizeMeshPeersPayload(existing?.value));
+        const mergedBase = {
+          ...this.activeMeshPeerSnapshots(),
+          ...this.normalizeMeshPeersPayload(existing?.value),
+        };
+        const snapshots = this.pruneStaleMeshPeerSnapshots(mergedBase);
 
         // Peer ID can rotate on reload/reconnect; keep only newest entry per stable owner identity.
         const localOwnerId = String(localSnapshot.ownerId || '').trim();
@@ -2203,6 +2229,12 @@ export default {
         userId: String(this.cryptoKeys?.epub || 'wasm-user').trim() || 'wasm-user',
         maxHops: 6,
       }, bridge);
+      if (nextNodeId instanceof Error) {
+        throw nextNodeId;
+      }
+      if (nextNodeId && typeof nextNodeId === 'object' && String(nextNodeId.name || '') === 'Error' && typeof nextNodeId.message === 'string') {
+        throw new Error(nextNodeId.message);
+      }
       if (nextNodeId == null) {
         throw new Error('failed to create go-wasm node');
       }
@@ -2320,7 +2352,7 @@ export default {
           autoConnect: true,
           // Helps highest-lexicographic peers (often Chrome in mixed-browser sessions)
           // avoid indefinite non-initiator wait when all discovered peers are smaller IDs.
-          nonInitiatorFallbackDialMs: 8_000,
+          nonInitiatorFallbackDialMs: 2_500,
           underConnectedResetMs: 20_000
         });
 
@@ -3163,47 +3195,8 @@ export default {
         halfDuplex: Boolean(entry.halfDuplex),
       }));
 
-      // Render only the mesh component that is connected to local self.
-      // This hides detached islands from stale/foreign snapshot groups.
-      if (localSelf && participants.has(localSelf)) {
-        const adjacency = new Map();
-        for (const peerId of participants) {
-          adjacency.set(peerId, new Set());
-        }
-
-        for (const link of links) {
-          const source = String(link.source || '').trim();
-          const target = String(link.target || '').trim();
-          if (!source || !target || source === target) continue;
-          if (!adjacency.has(source)) adjacency.set(source, new Set());
-          if (!adjacency.has(target)) adjacency.set(target, new Set());
-          adjacency.get(source).add(target);
-          adjacency.get(target).add(source);
-        }
-
-        const component = new Set([localSelf]);
-        const queue = [localSelf];
-        while (queue.length) {
-          const current = queue.shift();
-          const neighbors = adjacency.get(current) || new Set();
-          for (const neighbor of neighbors) {
-            if (component.has(neighbor)) continue;
-            component.add(neighbor);
-            queue.push(neighbor);
-          }
-        }
-
-        links = links.filter((link) => {
-          const source = String(link.source || '').trim();
-          const target = String(link.target || '').trim();
-          return component.has(source) && component.has(target);
-        });
-
-        participants.clear();
-        for (const peerId of component) {
-          participants.add(peerId);
-        }
-      }
+      // Render the full merged topology from epublic mesh:peers, not only
+      // the local connected component.
 
       // Always include local self so the graph never disappears when isolated.
       if (localSelf) {
@@ -3266,9 +3259,38 @@ export default {
       const svgEl = this.$refs.networkGraphSvg;
       const container = this.$refs.networkGraphContainer;
       if (!svgEl || !container) return;
+
+      if (typeof ResizeObserver !== 'undefined') {
+        if (!this.networkGraphResizeObserver) {
+          this.networkGraphResizeObserver = new ResizeObserver(() => {
+            const observed = this.networkGraphResizeObservedElement;
+            if (!observed?.isConnected) return;
+
+            const observedWidth = Math.max(320, Math.floor(observed.clientWidth || 320));
+            const observedHeight = Math.max(280, Math.floor(observed.clientHeight || 280));
+            if (
+              this.networkGraphState?.width === observedWidth
+              && this.networkGraphState?.height === observedHeight
+            ) {
+              return;
+            }
+
+            this.scheduleNetworkGraphRender({ immediate: true, reason: 'resize' });
+          });
+        }
+
+        if (this.networkGraphResizeObservedElement !== container) {
+          if (this.networkGraphResizeObservedElement) {
+            this.networkGraphResizeObserver.unobserve(this.networkGraphResizeObservedElement);
+          }
+          this.networkGraphResizeObserver.observe(container);
+          this.networkGraphResizeObservedElement = container;
+        }
+      }
+
       const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
 
-      const layoutVersion = 2;
+      const layoutVersion = 4;
 
       const width = Math.max(320, Math.floor(container.clientWidth || 320));
       const height = Math.max(280, Math.floor(container.clientHeight || 280));
@@ -3279,22 +3301,47 @@ export default {
       const versionMismatch = Boolean(prevState) && prevState.layoutVersion !== layoutVersion;
       const sameTopology = this.graphLastSignature && signature === this.graphLastSignature;
       const sameSize = prevState && prevState.width === width && prevState.height === height;
+      const previousIds = nodes.map((node) => node.id);
+      const rawPriorPositions = prevState?.positions || {};
+      const priorLayoutWidth = Math.max(1, Number(prevState?.width) || width);
+      const priorLayoutHeight = Math.max(1, Number(prevState?.height) || height);
+      const priorPoints = previousIds
+        .map((id) => rawPriorPositions[id])
+        .filter((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y));
+      const cornerCrowd = priorPoints.filter((point) => (
+        point.x < priorLayoutWidth * 0.3 && point.y < priorLayoutHeight * 0.3
+      )).length;
+      const selfPrior = localSelf ? rawPriorPositions[localSelf] : null;
+      const selfInCorner = Boolean(
+        selfPrior
+        && Number.isFinite(selfPrior.x)
+        && Number.isFinite(selfPrior.y)
+        && selfPrior.x < priorLayoutWidth * 0.3
+        && selfPrior.y < priorLayoutHeight * 0.3
+      );
+      const peerPinnedToOrigin = priorPoints.length >= 2 && priorPoints.some((point) => (
+        point.x <= 32 && point.y <= 32
+      ));
+      const priorSpanX = priorPoints.length
+        ? Math.max(...priorPoints.map((point) => point.x)) - Math.min(...priorPoints.map((point) => point.x))
+        : 0;
+      const priorSpanY = priorPoints.length
+        ? Math.max(...priorPoints.map((point) => point.y)) - Math.min(...priorPoints.map((point) => point.y))
+        : 0;
+      const tightlyClusteredPrior = priorPoints.length >= 4
+        && priorSpanX < Math.max(48, priorLayoutWidth * 0.16)
+        && priorSpanY < Math.max(48, priorLayoutHeight * 0.16);
+      const collapsedPriorLayout = (priorPoints.length >= 3 && cornerCrowd / priorPoints.length >= 0.68)
+        || (priorPoints.length >= 2 && selfInCorner)
+        || peerPinnedToOrigin
+        || tightlyClusteredPrior;
 
       const svg = d3.select(svgEl)
         .attr('viewBox', `0 0 ${width} ${height}`)
         .attr('width', width)
         .attr('height', height);
 
-      if (sameTopology && sameSize && !versionMismatch) {
-        return;
-      }
-
-      if (sameTopology && reason === 'resize' && prevState && !versionMismatch) {
-        this.networkGraphState = {
-          ...prevState,
-          width,
-          height,
-        };
+      if (sameTopology && sameSize && !versionMismatch && !collapsedPriorLayout) {
         return;
       }
 
@@ -3322,12 +3369,23 @@ export default {
             for (let j = i + 1; j < nodes.length; j += 1) {
               const a = nodes[i];
               const b = nodes[j];
-              const dx = (b.x ?? width / 2) - (a.x ?? width / 2);
-              const dy = (b.y ?? height / 2) - (a.y ?? height / 2);
-              const dist = Math.hypot(dx, dy) || 0.001;
+              let dx = (b.x ?? width / 2) - (a.x ?? width / 2);
+              let dy = (b.y ?? height / 2) - (a.y ?? height / 2);
+              let dist = Math.hypot(dx, dy);
               if (dist >= minNodeGap) continue;
 
               const overlap = (minNodeGap - dist) / 2;
+              if (dist < 0.001) {
+                const pairId = `${a.id}|${b.id}`;
+                let seed = 0;
+                for (let index = 0; index < pairId.length; index += 1) {
+                  seed = (seed * 31 + pairId.charCodeAt(index)) >>> 0;
+                }
+                const angle = (seed % 360) * (Math.PI / 180);
+                dx = Math.cos(angle);
+                dy = Math.sin(angle);
+                dist = 1;
+              }
               const ux = dx / dist;
               const uy = dy / dist;
               const aFixed = Number.isFinite(a.fx) && Number.isFinite(a.fy);
@@ -3371,22 +3429,28 @@ export default {
         }
       };
 
-      const priorPositions = prevState?.positions || {};
-      const previousIds = nodes.map((n) => n.id);
-      const priorPoints = previousIds
-        .map((id) => priorPositions[id])
-        .filter((point) => point && Number.isFinite(point.x) && Number.isFinite(point.y));
-      const cornerCrowd = priorPoints.filter((point) => point.x < width * 0.3 && point.y < height * 0.3).length;
-      const selfPrior = localSelf ? priorPositions[localSelf] : null;
-      const selfInCorner = Boolean(
-        selfPrior
-        && Number.isFinite(selfPrior.x)
-        && Number.isFinite(selfPrior.y)
-        && selfPrior.x < width * 0.3
-        && selfPrior.y < height * 0.3
+      const sizeChanged = Boolean(prevState) && (
+        priorLayoutWidth !== width || priorLayoutHeight !== height
       );
-      const collapsedPriorLayout = (priorPoints.length >= 3 && cornerCrowd / priorPoints.length >= 0.68)
-        || (priorPoints.length >= 2 && selfInCorner);
+      const priorPositions = Object.fromEntries(
+        Object.entries(rawPriorPositions).map(([id, point]) => {
+          if (!sizeChanged || !point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
+            return [id, point];
+          }
+
+          const oldPaddingX = Math.min(boxPadding, Math.max(0, priorLayoutWidth / 2 - 1));
+          const oldPaddingY = Math.min(boxPadding, Math.max(0, priorLayoutHeight / 2 - 1));
+          const oldSpanX = Math.max(1, priorLayoutWidth - oldPaddingX * 2);
+          const oldSpanY = Math.max(1, priorLayoutHeight - oldPaddingY * 2);
+          const normalizedX = Math.max(0, Math.min(1, (point.x - oldPaddingX) / oldSpanX));
+          const normalizedY = Math.max(0, Math.min(1, (point.y - oldPaddingY) / oldSpanY));
+
+          return [id, {
+            x: clampX(boxPadding + normalizedX * Math.max(1, width - boxPadding * 2)),
+            y: clampY(boxPadding + normalizedY * Math.max(1, height - boxPadding * 2)),
+          }];
+        })
+      );
       const ignorePriorPositions = versionMismatch || collapsedPriorLayout;
       const missingPriorNodes = [];
 
@@ -3407,14 +3471,24 @@ export default {
       if (ignorePriorPositions) {
         const cx = width / 2;
         const cy = height / 2;
-        const spreadX = Math.max(40, width * 0.22);
-        const spreadY = Math.max(36, height * 0.2);
+        const spreadX = Math.max(56, Math.min(width * 0.34, width / 2 - boxPadding));
+        const spreadY = Math.max(48, Math.min(height * 0.32, height / 2 - boxPadding));
+        const layoutNodes = nodes.filter((node) => node.id !== localSelf);
+        const goldenAngle = Math.PI * (3 - Math.sqrt(5));
 
-        nodes.forEach((node) => {
-          const jitterX = (Math.random() - 0.5) * spreadX;
-          const jitterY = (Math.random() - 0.5) * spreadY;
-          node.x = clampX(cx + jitterX);
-          node.y = clampY(cy + jitterY);
+        const selfNode = nodes.find((node) => node.id === localSelf);
+        if (selfNode) {
+          selfNode.x = clampX(cx);
+          selfNode.y = clampY(cy);
+          selfNode.vx = 0;
+          selfNode.vy = 0;
+        }
+
+        layoutNodes.forEach((node, index) => {
+          const radius = Math.sqrt((index + 1) / Math.max(1, layoutNodes.length));
+          const angle = index * goldenAngle - Math.PI / 2;
+          node.x = clampX(cx + Math.cos(angle) * spreadX * radius);
+          node.y = clampY(cy + Math.sin(angle) * spreadY * radius);
           node.vx = 0;
           node.vy = 0;
         });
@@ -3499,7 +3573,11 @@ export default {
       const addedEdges = currentEdgeIds.filter((id) => !prevEdgeIds.has(id)).length;
       const removedEdges = [...prevEdgeIds].filter((id) => !currentEdgeIds.includes(id)).length;
       const topologyDelta = addedNodes + removedNodes + addedEdges + removedEdges;
-      const lockExistingNodes = Boolean(prevState) && reason !== 'resize' && topologyDelta > 0 && topologyDelta <= 4;
+      const lockExistingNodes = Boolean(prevState)
+        && !ignorePriorPositions
+        && reason !== 'resize'
+        && topologyDelta > 0
+        && topologyDelta <= 4;
 
       if (lockExistingNodes) {
         for (const node of nodes) {
@@ -3586,6 +3664,9 @@ export default {
         .append('g')
         .attr('class', (d) => `network-node${d.isSelf ? ' self' : ''}${d.isTolerant ? ' tolerant' : ''}`);
 
+      node.append('title')
+        .text((d) => `${d.id}${d.isSelf ? ' (you)' : ''}`);
+
       node.append('circle')
         .attr('class', 'network-node-core')
         .attr('r', 16)
@@ -3612,6 +3693,8 @@ export default {
         .force('link', d3.forceLink(links).id((d) => d.id).distance(lockExistingNodes ? 100 : 118).strength(lockExistingNodes ? 0.26 : 0.38))
         .force('charge', d3.forceManyBody().strength(lockExistingNodes ? -300 : -470))
         .force('center', d3.forceCenter(width / 2, height / 2))
+        .force('x', d3.forceX(width / 2).strength(lockExistingNodes ? 0.025 : 0.055))
+        .force('y', d3.forceY(height / 2).strength(lockExistingNodes ? 0.025 : 0.055))
         .force('collision', d3.forceCollide().radius(minNodeGap / 2 + 4).iterations(4))
         .alphaDecay(lockExistingNodes ? 0.16 : 0.08)
         .alpha(lockExistingNodes ? 0.22 : 0.85);
@@ -3634,7 +3717,7 @@ export default {
 
       node.call(drag);
 
-      simulation.on('tick', () => {
+      const paintNetworkGraph = () => {
         enforceNodeSpacing(2);
         enforceNodesInBox();
 
@@ -3663,7 +3746,9 @@ export default {
             ])
           );
         }
-      });
+      };
+
+      simulation.on('tick', paintNetworkGraph);
 
       clearTimeout(this.graphStabilizeTimer);
       this.graphStabilizeTimer = setTimeout(() => {
@@ -3694,6 +3779,10 @@ export default {
           ])
         ),
       };
+
+      // Background tabs may throttle D3's first timer tick. Paint the seeded
+      // coordinates now so SVG nodes never remain at their default (0, 0).
+      paintNetworkGraph();
 
       simulation.on('end', () => {
         if (!this.networkGraphState || this.networkGraphState.simulation !== simulation) return;
@@ -4002,6 +4091,11 @@ export default {
   },
 
   beforeUnmount() {
+    if (this.networkGraphResizeObserver) {
+      this.networkGraphResizeObserver.disconnect();
+      this.networkGraphResizeObserver = null;
+      this.networkGraphResizeObservedElement = null;
+    }
     if (this.networkGraphResizeHandler) {
       window.removeEventListener('resize', this.networkGraphResizeHandler);
       this.networkGraphResizeHandler = null;

@@ -110,7 +110,7 @@ export class FreeRTCClientAdapter {
       this.emitter.emit('signaling:log', { message: '[signal] connected' });
       this.sendEnvelope('announce', {
         ttl_ms: 30_000,
-        body: { hints: { wants_peers: true } }
+        body: { instance_id: this.networkId, hints: { wants_peers: true } }
       });
       this.startPingLoop();
       this.startAnnounceLoop();
@@ -178,7 +178,7 @@ export class FreeRTCClientAdapter {
     this.announceTimer = setInterval(() => {
       this.sendEnvelope('announce', {
         ttl_ms: 30_000,
-        body: { hints: { wants_peers: true } }
+        body: { instance_id: this.networkId, hints: { wants_peers: true } }
       });
     }, 12_000);
   }
@@ -203,7 +203,7 @@ export class FreeRTCClientAdapter {
       network: this.networkId,
       from: this.requestedPeerId,
       to: options.to ?? null,
-      session_id: options.session_id ?? null,
+      session_id: options.session_id ?? this.networkId,
       message_id: generatePeerId().slice(0, 16),
       timestamp: Date.now(),
       ttl_ms: options.ttl_ms ?? null,
@@ -222,7 +222,7 @@ export class FreeRTCClientAdapter {
     switch (message?.type) {
       case 'peer_list': {
         const peers = Array.isArray(message?.body?.peers) ? message.body.peers : [];
-        const nextPeers = new Set(
+        const nextPeers = new Set<string>(
           peers
             .map((peer: any) => this.normalizePeerId(peer?.peer_id))
             .filter((peerId: string) => peerId && !this.isSelfAlias(peerId))
@@ -358,7 +358,7 @@ export class FreeRTCClientAdapter {
 
     peer.on('close', () => {
       const current = this.peerEntries.get(peerId);
-      if (!current) return;
+      if (!current || current.peer !== peer) return;
       this.peerEntries.delete(peerId);
       this.pendingCandidates.delete(peerId);
       this.emitter.emit('rtc:disconnected', { peerId });
@@ -373,10 +373,30 @@ export class FreeRTCClientAdapter {
     if (!peerId) return;
     const incomingOfferSdp = String(body?.sdp ?? '');
     if (!incomingOfferSdp) return;
+    const trickleIce = body?.trickle_ice ?? this.defaultTrickleIce;
 
     let entry = this.peerEntries.get(peerId);
+    const pc = entry?.connection as RTCPeerConnection | undefined;
+    const localPeerId = this.normalizePeerId(this.client?.peerId ?? this.requestedPeerId);
+    const shouldPreferRemoteOffer = !!localPeerId && localPeerId > peerId;
+    const shouldYieldToRemoteOffer = Boolean(entry) && !entry?.connected && shouldPreferRemoteOffer && (
+      entry?.initiator === true ||
+      pc?.signalingState === 'have-local-offer'
+    );
+
+    if (shouldYieldToRemoteOffer) {
+      try {
+        entry?.peer?.destroy?.();
+      } catch {
+        // ignore teardown failures during glare recovery
+      }
+      this.peerEntries.delete(peerId);
+      this.pendingCandidates.delete(peerId);
+      entry = undefined;
+      this.lastAppliedAnswerSdp.delete(peerId);
+    }
+
     if (!entry) {
-      const trickleIce = body?.trickle_ice ?? this.defaultTrickleIce;
       const peer = new RtcPeer({
         initiator: false,
         trickleIce,
@@ -389,7 +409,7 @@ export class FreeRTCClientAdapter {
       }
     }
 
-    const pc = entry?.connection as RTCPeerConnection | undefined;
+    const nextPc = entry?.connection as RTCPeerConnection | undefined;
     if (entry?.connected) {
       return;
     }
@@ -400,10 +420,21 @@ export class FreeRTCClientAdapter {
     }
 
     if (
-      pc?.signalingState === 'have-remote-offer' ||
-      pc?.remoteDescription?.sdp === incomingOfferSdp ||
-      (pc?.signalingState === 'stable' && !!pc?.remoteDescription)
+      nextPc?.signalingState === 'have-remote-offer' ||
+      nextPc?.remoteDescription?.sdp === incomingOfferSdp
     ) {
+      return;
+    }
+
+    if (
+      entry?.initiator === false &&
+      nextPc?.signalingState === 'stable' &&
+      !!nextPc?.remoteDescription &&
+      nextPc?.connectionState !== 'failed' &&
+      nextPc?.connectionState !== 'closed'
+    ) {
+      // During early ICE the signaling server can replay equivalent offers.
+      // Avoid replacing a live responder path, which causes channel churn.
       return;
     }
 
@@ -572,7 +603,7 @@ export class FreeRTCClientAdapter {
   nudgeSignaling(): void {
     this.sendEnvelope('announce', {
       ttl_ms: 30_000,
-      body: { hints: { wants_peers: true } }
+      body: { instance_id: this.networkId, hints: { wants_peers: true } }
     });
     this.joinSession(this.networkId);
   }

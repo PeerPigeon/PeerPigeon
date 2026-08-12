@@ -255,7 +255,7 @@ var FreeRTCClientAdapter = class {
       this.emitter.emit("signaling:log", { message: "[signal] connected" });
       this.sendEnvelope("announce", {
         ttl_ms: 3e4,
-        body: { hints: { wants_peers: true } }
+        body: { instance_id: this.networkId, hints: { wants_peers: true } }
       });
       this.startPingLoop();
       this.startAnnounceLoop();
@@ -313,7 +313,7 @@ var FreeRTCClientAdapter = class {
     this.announceTimer = setInterval(() => {
       this.sendEnvelope("announce", {
         ttl_ms: 3e4,
-        body: { hints: { wants_peers: true } }
+        body: { instance_id: this.networkId, hints: { wants_peers: true } }
       });
     }, 12e3);
   }
@@ -335,7 +335,7 @@ var FreeRTCClientAdapter = class {
       network: this.networkId,
       from: this.requestedPeerId,
       to: options.to ?? null,
-      session_id: options.session_id ?? null,
+      session_id: options.session_id ?? this.networkId,
       message_id: generatePeerId().slice(0, 16),
       timestamp: Date.now(),
       ttl_ms: options.ttl_ms ?? null,
@@ -472,7 +472,7 @@ var FreeRTCClientAdapter = class {
     });
     peer.on("close", () => {
       const current = this.peerEntries.get(peerId);
-      if (!current) return;
+      if (!current || current.peer !== peer) return;
       this.peerEntries.delete(peerId);
       this.pendingCandidates.delete(peerId);
       this.emitter.emit("rtc:disconnected", { peerId });
@@ -485,9 +485,23 @@ var FreeRTCClientAdapter = class {
     if (!peerId) return;
     const incomingOfferSdp = String(body?.sdp ?? "");
     if (!incomingOfferSdp) return;
+    const trickleIce = body?.trickle_ice ?? this.defaultTrickleIce;
     let entry = this.peerEntries.get(peerId);
+    const pc = entry?.connection;
+    const localPeerId = this.normalizePeerId(this.client?.peerId ?? this.requestedPeerId);
+    const shouldPreferRemoteOffer = !!localPeerId && localPeerId > peerId;
+    const shouldYieldToRemoteOffer = Boolean(entry) && !entry?.connected && shouldPreferRemoteOffer && (entry?.initiator === true || pc?.signalingState === "have-local-offer");
+    if (shouldYieldToRemoteOffer) {
+      try {
+        entry?.peer?.destroy?.();
+      } catch {
+      }
+      this.peerEntries.delete(peerId);
+      this.pendingCandidates.delete(peerId);
+      entry = void 0;
+      this.lastAppliedAnswerSdp.delete(peerId);
+    }
     if (!entry) {
-      const trickleIce = body?.trickle_ice ?? this.defaultTrickleIce;
       const peer = new RtcPeer({
         initiator: false,
         trickleIce,
@@ -499,7 +513,7 @@ var FreeRTCClientAdapter = class {
         entry.trickleIce = trickleIce;
       }
     }
-    const pc = entry?.connection;
+    const nextPc = entry?.connection;
     if (entry?.connected) {
       return;
     }
@@ -507,7 +521,10 @@ var FreeRTCClientAdapter = class {
     if (lastSdp && lastSdp === incomingOfferSdp) {
       return;
     }
-    if (pc?.signalingState === "have-remote-offer" || pc?.remoteDescription?.sdp === incomingOfferSdp || pc?.signalingState === "stable" && !!pc?.remoteDescription) {
+    if (nextPc?.signalingState === "have-remote-offer" || nextPc?.remoteDescription?.sdp === incomingOfferSdp) {
+      return;
+    }
+    if (entry?.initiator === false && nextPc?.signalingState === "stable" && !!nextPc?.remoteDescription && nextPc?.connectionState !== "failed" && nextPc?.connectionState !== "closed") {
       return;
     }
     await entry.peer.signal({ type: "offer", sdp: incomingOfferSdp });
@@ -655,7 +672,7 @@ var FreeRTCClientAdapter = class {
   nudgeSignaling() {
     this.sendEnvelope("announce", {
       ttl_ms: 3e4,
-      body: { hints: { wants_peers: true } }
+      body: { instance_id: this.networkId, hints: { wants_peers: true } }
     });
     this.joinSession(this.networkId);
   }
@@ -2238,9 +2255,9 @@ var PartialMesh = class {
       // FreeRTC retries relayed offers for up to ~30s; keep this above that window
       // so we do not abort otherwise-recoverable negotiations.
       connectionTimeoutMs: config.connectionTimeoutMs ?? 45e3,
-      maintenanceIntervalMs: config.maintenanceIntervalMs ?? 2e3,
+      maintenanceIntervalMs: config.maintenanceIntervalMs ?? 1e3,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
-      nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 8e3,
+      nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 2500,
       trickleIce: config.trickleIce ?? true
     };
     const events = [
@@ -2392,16 +2409,19 @@ var PartialMesh = class {
     const closestCandidate = candidateByDistance.find((candidate) => {
       const discoveredAgeMs = now - candidate.discoveredAt;
       const sinceAttemptMs = now - candidate.lastAttemptAt;
-      return discoveredAgeMs >= 2e3 && sinceAttemptMs >= 2e4;
+      return discoveredAgeMs >= 1e3 && sinceAttemptMs >= 5e3;
     });
     if (!closestCandidate || !farthestConnected) {
       return false;
     }
     const connectedAgeMs = now - (farthestConnected.connectedAt || 0);
-    if (connectedAgeMs < 12e3) {
+    if (connectedAgeMs < 4e3) {
       return false;
     }
-    if (closestCandidate.distance * 4n >= farthestConnected.distance * 3n) {
+    const candidateDiscoveredAgeMs = now - closestCandidate.discoveredAt;
+    const materiallyCloser = closestCandidate.distance * 4n < farthestConnected.distance * 3n;
+    const staleExcludedCandidate = candidateDiscoveredAgeMs >= 3e3;
+    if (!materiallyCloser && !staleExcludedCandidate) {
       return false;
     }
     const otherDiscoveredPeers = Array.from(this.discoveredPeers).filter((p) => {
@@ -2411,7 +2431,7 @@ var PartialMesh = class {
     if (otherDiscoveredPeers < 1) {
       return false;
     }
-    this.rebalanceCooldownUntilMs = now + 12e3;
+    this.rebalanceCooldownUntilMs = now + 4e3;
     this.rebalanceAttemptAtMs.set(closestCandidate.peerId, now);
     this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now);
     this.pendingRebalanceDropByTarget.set(closestCandidate.peerId, farthestConnected.peerId);
@@ -2419,6 +2439,10 @@ var PartialMesh = class {
       message: `[rebalance] dial closer ${closestCandidate.peerId.slice(0, 8)} then drop ${farthestConnected.peerId.slice(0, 8)}`
     });
     this.connectToPeerInternal(closestCandidate.peerId, true);
+    if (!this.peers.has(closestCandidate.peerId) && !this.connecting.has(closestCandidate.peerId)) {
+      this.pendingRebalanceDropByTarget.delete(closestCandidate.peerId);
+      return false;
+    }
     return true;
   }
   /**
@@ -2595,7 +2619,8 @@ var PartialMesh = class {
     const now = Date.now();
     const underConnected = connected < this.config.minPeers;
     const hasFewCandidates = this.discoveredPeers.size < this.config.minPeers;
-    if (!underConnected && !hasFewCandidates) return;
+    const saturatedWithoutSpareCandidates = connected >= this.config.maxPeers && this.discoveredPeers.size <= connected;
+    if (!underConnected && !hasFewCandidates && !saturatedWithoutSpareCandidates) return;
     if (now - this.lastDiscoveryRefreshAtMs < 2e3) return;
     this.lastDiscoveryRefreshAtMs = now;
     try {
@@ -2608,7 +2633,7 @@ var PartialMesh = class {
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.discoveredPeers.size > 0;
     const baseStallMs = Math.max(1e4, Math.min(this.config.connectionTimeoutMs, 15e3));
-    const stallMs = isolated ? Math.max(3500, Math.min(this.config.connectionTimeoutMs, 6e3)) : baseStallMs;
+    const stallMs = isolated ? Math.max(8e3, Math.min(this.config.connectionTimeoutMs, 12e3)) : baseStallMs;
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
       const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
@@ -2829,7 +2854,8 @@ var PartialMesh = class {
       const needed = this.config.minPeers - totalInProgress;
       const emergencyBurst = emergencyIsolated ? Math.min(3, Math.max(2, available.length)) : 0;
       const dialCount = emergencyIsolated ? Math.max(needed, emergencyBurst) : needed;
-      for (const peerId of pickCandidates(dialCount)) {
+      const tryCount = available.length <= this.config.maxPeers * 2 ? available.length : Math.max(dialCount, this.config.minPeers + 1);
+      for (const peerId of pickCandidates(tryCount)) {
         this.connectToPeer(peerId);
       }
     } else if (totalInProgress < this.config.maxPeers && available.length > 0) {
@@ -2842,6 +2868,12 @@ var PartialMesh = class {
     } else if (connectedCount > this.getMaxPeersWithTolerance()) {
       this.trimExcessPeers();
     } else if (connectedCount >= this.config.maxPeers && pendingCount === 0 && available.length > 0) {
+      if (connectedCount < this.getMaxPeersWithTolerance()) {
+        for (const peerId of pickCandidates(1)) {
+          this.connectToPeer(peerId);
+        }
+        return;
+      }
       if (this.maybeRebalanceForCloserPeer(available)) {
         return;
       }
@@ -2871,6 +2903,20 @@ var PartialMesh = class {
     if (!normalizedPeerId || this.peers.has(normalizedPeerId) || this.connecting.has(normalizedPeerId) || this.isSelfAlias(normalizedPeerId) || normalizedPeerId === selfId) {
       return;
     }
+    const existingRtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(normalizedPeerId);
+    if (existingRtcEntry && !emergencyIsolated) {
+      const existingState = String(existingRtcEntry.state ?? existingRtcEntry.connection?.connectionState ?? "").toLowerCase();
+      const isDefinitelyDead = existingState === "failed" || existingState === "closed";
+      if (!isDefinitelyDead) {
+        return;
+      }
+    }
+    if (existingRtcEntry && emergencyIsolated) {
+      try {
+        this.signalingClient?.closeConnection?.(normalizedPeerId);
+      } catch {
+      }
+    }
     if (this.isPeerBackedOff(normalizedPeerId) && !emergencyIsolated) {
       return;
     }
@@ -2890,20 +2936,28 @@ var PartialMesh = class {
       if (!fallbackMs || fallbackMs <= 0) {
         return;
       }
-      const candidatePeers = Array.from(this.discoveredPeers).map((id) => this.normalizePeerId(id)).filter((id) => id && !this.isSelfAlias(id) && id !== selfId && !this.peers.has(id) && !this.connecting.has(id) && !this.isPeerBackedOff(id));
-      const hasNaturalInitiatorTarget = candidatePeers.some((id) => selfId < id);
-      if (hasNaturalInitiatorTarget) {
+      const candidatePeers = Array.from(this.discoveredPeers).map((id) => this.normalizePeerId(id)).filter((id) => {
+        if (!id || id === selfId || this.isSelfAlias(id)) return false;
+        if (this.peers.has(id) || this.connecting.has(id)) return false;
+        if (!emergencyIsolated && this.isPeerBackedOff(id)) return false;
+        return true;
+      });
+      if (candidatePeers.some((id) => selfId < id)) {
         return;
       }
       const fallbackTargets = candidatePeers.filter((id) => selfId > id).sort((a, b) => a.localeCompare(b));
       if (fallbackTargets.length === 0) {
         return;
       }
-      let hash = 0;
-      for (let i = 0; i < selfId.length; i++) {
-        hash = hash * 31 + selfId.charCodeAt(i) >>> 0;
-      }
-      const selectedFallbackTarget = fallbackTargets[hash % fallbackTargets.length];
+      const selectedFallbackTarget = fallbackTargets.slice().sort((a, b) => {
+        const failA = this.dialFailureCount.get(a) ?? 0;
+        const failB = this.dialFailureCount.get(b) ?? 0;
+        if (failA !== failB) return failA - failB;
+        const discoveredA = this.discoveredAtMs.get(a) ?? 0;
+        const discoveredB = this.discoveredAtMs.get(b) ?? 0;
+        if (discoveredA !== discoveredB) return discoveredA - discoveredB;
+        return a.localeCompare(b);
+      })[0];
       if (selectedFallbackTarget !== normalizedPeerId) {
         return;
       }
@@ -2913,30 +2967,48 @@ var PartialMesh = class {
           if (this.peers.has(normalizedPeerId) || this.connecting.has(normalizedPeerId)) {
             return;
           }
-          if (this.getConnectedPeerCount() >= this.config.maxPeers) {
-            return;
-          }
-          const refreshedCandidates = Array.from(this.discoveredPeers).map((id) => this.normalizePeerId(id)).filter((id) => id && !this.isSelfAlias(id) && id !== selfId && !this.peers.has(id) && !this.connecting.has(id) && !this.isPeerBackedOff(id));
+          const refreshedCandidates = Array.from(this.discoveredPeers).map((id) => this.normalizePeerId(id)).filter((id) => {
+            if (!id || id === selfId || this.isSelfAlias(id)) return false;
+            if (this.peers.has(id) || this.connecting.has(id)) return false;
+            if (!emergencyIsolated && this.isPeerBackedOff(id)) return false;
+            return true;
+          });
           if (refreshedCandidates.some((id) => selfId < id)) {
             return;
           }
-          const refreshedFallbackTargets = refreshedCandidates.filter((id) => selfId > id).sort((a, b) => a.localeCompare(b));
-          if (refreshedFallbackTargets.length === 0) {
+          const refreshedTargets = refreshedCandidates.filter((id) => selfId > id).sort((a, b) => a.localeCompare(b));
+          if (refreshedTargets.length === 0) {
             return;
           }
-          let refreshedHash = 0;
-          for (let i = 0; i < selfId.length; i++) {
-            refreshedHash = refreshedHash * 31 + selfId.charCodeAt(i) >>> 0;
-          }
-          const refreshedSelected = refreshedFallbackTargets[refreshedHash % refreshedFallbackTargets.length];
-          if (refreshedSelected !== normalizedPeerId) {
+          const refreshedSelectedTarget = refreshedTargets.slice().sort((a, b) => {
+            const failA = this.dialFailureCount.get(a) ?? 0;
+            const failB = this.dialFailureCount.get(b) ?? 0;
+            if (failA !== failB) return failA - failB;
+            const discoveredA = this.discoveredAtMs.get(a) ?? 0;
+            const discoveredB = this.discoveredAtMs.get(b) ?? 0;
+            if (discoveredA !== discoveredB) return discoveredA - discoveredB;
+            return a.localeCompare(b);
+          })[0];
+          if (refreshedSelectedTarget !== normalizedPeerId) {
             return;
           }
-          const rtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(normalizedPeerId);
-          if (rtcEntry?.state === "connecting" || rtcEntry?.state === "connected") {
-            return;
+          const fallbackRtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(normalizedPeerId);
+          if (fallbackRtcEntry && !emergencyIsolated) {
+            const fallbackRtcState = String(fallbackRtcEntry.state ?? fallbackRtcEntry.connection?.connectionState ?? "").toLowerCase();
+            const isFallbackDead = fallbackRtcState === "failed" || fallbackRtcState === "closed";
+            if (!isFallbackDead) {
+              return;
+            }
           }
-          if (rtcEntry?.channel?.readyState === "open") {
+          if (fallbackRtcEntry && emergencyIsolated) {
+            try {
+              this.signalingClient?.closeConnection?.(normalizedPeerId);
+            } catch {
+            }
+          }
+          const currentConnectedCount = this.getConnectedPeerCount();
+          const fallbackMaxAllowed = allowTemporaryOverflow ? this.config.maxPeers + 1 : this.getMaxPeersWithTolerance();
+          if (currentConnectedCount >= fallbackMaxAllowed) {
             return;
           }
           this.connecting.add(normalizedPeerId);
@@ -2947,7 +3019,7 @@ var PartialMesh = class {
       return;
     }
     this.connecting.add(normalizedPeerId);
-    this.createPeerConnection(normalizedPeerId, initiator);
+    this.createPeerConnection(normalizedPeerId, true);
   }
   /**
    * Disconnect from a specific peer

@@ -253,7 +253,7 @@ test.describe('RtcPeer semantics', () => {
       const { RtcPeer } = await import(modulePath);
       const peer = new RtcPeer({ initiator: false, trickleIce: false });
       const signals: any[] = [];
-      peer.on('signal', (signal) => signals.push(signal));
+      peer.on('signal', (signal: any) => signals.push(signal));
 
       const pending = peer.signal({ type: 'offer', sdp: 'remote-offer' });
       await Promise.resolve();
