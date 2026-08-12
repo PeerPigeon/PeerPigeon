@@ -33,7 +33,12 @@ function packageIsPinned(packageRoot, dependencySpec, commit) {
   const lock = readJson(lockPath);
   const installedLock = readJson(installedLockPath);
 
-  return manifest.dependencies?.freertc === dependencySpec
+  const manifestSpec = manifest.dependencies?.freertc;
+  const targetsGitHubCommit = typeof manifestSpec === 'string'
+    && /(?:github:|git\+(?:https|ssh):\/\/.*github\.com[\/:])draeder\/freertc(?:\.git)?#/i.test(manifestSpec)
+    && manifestSpec.endsWith(`#${commit}`);
+
+  return (manifestSpec === dependencySpec || targetsGitHubCommit)
     && resolvedCommit(lock, 'freertc') === commit
     && resolvedCommit(installedLock, 'freertc') === commit;
 }

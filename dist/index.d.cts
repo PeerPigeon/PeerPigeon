@@ -164,6 +164,8 @@ interface StorageRecord<T = unknown> {
     key: string;
     value: T;
     ownerId: string | null;
+    /** Mesh peer ID that most recently changed this record. */
+    modifiedBy: string | null;
     createdAt: number;
     updatedAt: number;
     version: StorageVersion;
@@ -196,6 +198,8 @@ interface StorageOptions extends StorageSyncOptions {
      * Local user identity used by ACL checks.
      */
     userId: string;
+    /** Local mesh peer ID recorded as modification provenance. */
+    peerId?: string;
     /**
      * Optional mesh gossip helper.
      */
@@ -242,12 +246,13 @@ interface GossipLike {
  * PeerPigeonStorage
  *
  * - Persists records in IndexedDB (fallback: in-memory)
- * - Syncs non-private spaces over encrypted gossip envelopes
+ * - Syncs subscribed non-private keys over encrypted gossip envelopes
  * - Enforces five built-in ACL spaces: public, user, frozen, private, epublic
  * - epublic is internal-only and can only be mutated through putSystem/deleteSystem
  */
 declare class PeerPigeonStorage {
     private readonly userId;
+    private peerId;
     private readonly gossip;
     private readonly sessionId;
     private readonly syncSecret;
@@ -256,6 +261,7 @@ declare class PeerPigeonStorage {
     private readonly storeName;
     private driver;
     private readonly listeners;
+    private readonly subscribedKeys;
     private readonly pendingRetrieveRequests;
     private closed;
     private readonly onGossipMessageBound;
@@ -268,6 +274,14 @@ declare class PeerPigeonStorage {
     init(): Promise<void>;
     on(event: 'change', listener: StorageEvents['change']): void;
     subscribe(listener: StorageEvents['change']): StorageUnsubscribe;
+    /** Subscribe to remote updates for one exact storage-space/key pair. */
+    subscribeKey(space: StorageSpace, key: string): StorageUnsubscribe;
+    /** Stop accepting remote updates for one exact storage-space/key pair. */
+    unsubscribeKey(space: StorageSpace, key: string): void;
+    /** Return whether this instance accepts remote updates for a key. */
+    isSubscribed(space: StorageSpace, key: string): boolean;
+    /** Update the mesh peer ID recorded on subsequent local mutations. */
+    setPeerId(peerId: string): void;
     off(event: 'change', listener: StorageEvents['change']): void;
     put<T = unknown>(space: StorageSpace, key: string, value: T, options?: StoragePutOptions): Promise<StorageRecord<T>>;
     putSystem<T = unknown>(space: StorageSpace, key: string, value: T, options?: StoragePutOptions): Promise<StorageRecord<T>>;
@@ -349,6 +363,11 @@ interface PartialMeshConfig {
       * FreeRTC signaling server URL
      */
     signalingServer?: string;
+    /**
+     * FreeRTC network/application namespace. Peers must match both networkId and
+     * sessionId (room) even when they use different federated relay domains.
+     */
+    networkId?: string;
     /**
      * Session/room ID for peer discovery
      */
@@ -437,6 +456,7 @@ declare class PartialMesh {
     private discoveredPeers;
     private clientId;
     private selfAliases;
+    private retiredPeerIds;
     private eventHandlers;
     private connecting;
     private connectionTimers;
@@ -458,9 +478,13 @@ declare class PartialMesh {
     private globalPeers;
     constructor(config?: PartialMeshConfig);
     private normalizePeerId;
+    private normalizeSignalingUrl;
     private addSelfAlias;
     private isSelfAlias;
     private addDiscoveredPeer;
+    private rotateBrowserPeerId;
+    private retirePeerId;
+    private reconcileSignalingPeers;
     private getConnectedPeerCount;
     private getPendingPeerCount;
     private getMaxPeersWithTolerance;

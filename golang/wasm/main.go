@@ -200,6 +200,8 @@ func main() {
 	register("peerpigeonStorageGet", jsStorageGet)
 	register("peerpigeonStorageList", jsStorageList)
 	register("peerpigeonStorageRetrieve", jsStorageRetrieve)
+	register("peerpigeonStorageSubscribe", jsStorageSubscribe)
+	register("peerpigeonStorageUnsubscribe", jsStorageUnsubscribe)
 	register("peerpigeonStorageDelete", jsStorageDelete)
 	register("peerpigeonSetClientID", jsSetClientID)
 	register("peerpigeonSetConnectedPeers", jsSetConnectedPeers)
@@ -249,6 +251,7 @@ func jsCreateNode(_ js.Value, args []js.Value) interface{} {
 
 	st, err := storage.New(storage.Options{
 		UserID:     uID,
+		PeerID:     stringsOrEmpty(cfg.Get("clientId")),
 		SessionID:  sID,
 		SyncSecret: stringsOrEmpty(cfg.Get("syncSecret")),
 		Gossip:     ga,
@@ -368,13 +371,14 @@ func jsStoragePut(_ js.Value, args []js.Value) interface{} {
 		return jsError(err.Error())
 	}
 	return toJSObject(map[string]interface{}{
-		"space":     string(rec.Space),
-		"key":       rec.Key,
-		"ownerId":   rec.OwnerID,
-		"value":     rec.Value,
-		"createdAt": rec.CreatedAt,
-		"updatedAt": rec.UpdatedAt,
-		"version":   rec.Version,
+		"space":      string(rec.Space),
+		"key":        rec.Key,
+		"ownerId":    rec.OwnerID,
+		"modifiedBy": rec.ModifiedBy,
+		"value":      rec.Value,
+		"createdAt":  rec.CreatedAt,
+		"updatedAt":  rec.UpdatedAt,
+		"version":    rec.Version,
 	})
 }
 
@@ -393,13 +397,14 @@ func jsStorageGet(_ js.Value, args []js.Value) interface{} {
 		return js.Null()
 	}
 	return toJSObject(map[string]interface{}{
-		"space":     string(rec.Space),
-		"key":       rec.Key,
-		"ownerId":   rec.OwnerID,
-		"value":     rec.Value,
-		"createdAt": rec.CreatedAt,
-		"updatedAt": rec.UpdatedAt,
-		"version":   rec.Version,
+		"space":      string(rec.Space),
+		"key":        rec.Key,
+		"ownerId":    rec.OwnerID,
+		"modifiedBy": rec.ModifiedBy,
+		"value":      rec.Value,
+		"createdAt":  rec.CreatedAt,
+		"updatedAt":  rec.UpdatedAt,
+		"version":    rec.Version,
 	})
 }
 
@@ -419,13 +424,14 @@ func jsStorageList(_ js.Value, args []js.Value) interface{} {
 			continue
 		}
 		out = append(out, map[string]interface{}{
-			"space":     string(rec.Space),
-			"key":       rec.Key,
-			"ownerId":   rec.OwnerID,
-			"value":     rec.Value,
-			"createdAt": rec.CreatedAt,
-			"updatedAt": rec.UpdatedAt,
-			"version":   rec.Version,
+			"space":      string(rec.Space),
+			"key":        rec.Key,
+			"ownerId":    rec.OwnerID,
+			"modifiedBy": rec.ModifiedBy,
+			"value":      rec.Value,
+			"createdAt":  rec.CreatedAt,
+			"updatedAt":  rec.UpdatedAt,
+			"version":    rec.Version,
 		})
 	}
 	return toJSObject(out)
@@ -466,14 +472,33 @@ func jsStorageRetrieve(_ js.Value, args []js.Value) interface{} {
 		return js.Null()
 	}
 	return toJSObject(map[string]interface{}{
-		"space":     string(rec.Space),
-		"key":       rec.Key,
-		"ownerId":   rec.OwnerID,
-		"value":     rec.Value,
-		"createdAt": rec.CreatedAt,
-		"updatedAt": rec.UpdatedAt,
-		"version":   rec.Version,
+		"space":      string(rec.Space),
+		"key":        rec.Key,
+		"ownerId":    rec.OwnerID,
+		"modifiedBy": rec.ModifiedBy,
+		"value":      rec.Value,
+		"createdAt":  rec.CreatedAt,
+		"updatedAt":  rec.UpdatedAt,
+		"version":    rec.Version,
 	})
+}
+
+func jsStorageSubscribe(_ js.Value, args []js.Value) interface{} {
+	n, ok := getNodeArg(args)
+	if !ok || len(args) < 3 {
+		return jsError("peerpigeonStorageSubscribe(nodeId, space, key) expects 3 arguments")
+	}
+	n.storage.SubscribeKey(storage.Space(stringsOrEmpty(args[1])), stringsOrEmpty(args[2]))
+	return nil
+}
+
+func jsStorageUnsubscribe(_ js.Value, args []js.Value) interface{} {
+	n, ok := getNodeArg(args)
+	if !ok || len(args) < 3 {
+		return jsError("peerpigeonStorageUnsubscribe(nodeId, space, key) expects 3 arguments")
+	}
+	n.storage.UnsubscribeKey(storage.Space(stringsOrEmpty(args[1])), stringsOrEmpty(args[2]))
+	return nil
 }
 
 func jsStorageDelete(_ js.Value, args []js.Value) interface{} {
@@ -500,7 +525,9 @@ func jsSetClientID(_ js.Value, args []js.Value) interface{} {
 	if !ok || len(args) < 2 {
 		return jsError("peerpigeonSetClientID(nodeId, clientId) expects 2 arguments")
 	}
-	n.mesh.setClientID(stringsOrEmpty(args[1]))
+	peerID := stringsOrEmpty(args[1])
+	n.mesh.setClientID(peerID)
+	n.storage.SetPeerID(peerID)
 	return nil
 }
 

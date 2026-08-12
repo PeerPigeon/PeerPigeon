@@ -8,6 +8,8 @@ export interface StorageRecord<T = unknown> {
   key: string;
   value: T;
   ownerId: string | null;
+  /** Mesh peer ID that most recently changed this record. */
+  modifiedBy: string | null;
   createdAt: number;
   updatedAt: number;
   version: StorageVersion;
@@ -45,6 +47,8 @@ export interface StorageOptions extends StorageSyncOptions {
    * Local user identity used by ACL checks.
    */
   userId: string;
+  /** Local mesh peer ID recorded as modification provenance. */
+  peerId?: string;
   /**
    * Optional mesh gossip helper.
    */
@@ -84,6 +88,7 @@ type PersistedRecord = {
   space: StorageSpace;
   key: string;
   ownerId: string | null;
+  modifiedBy: string | null;
   value: unknown;
   valueCipher: CipherPayload | null;
   createdAt: number;
@@ -263,12 +268,13 @@ class IndexedDbStorageDriver implements StorageDriver {
  * PeerPigeonStorage
  *
  * - Persists records in IndexedDB (fallback: in-memory)
- * - Syncs non-private spaces over encrypted gossip envelopes
+ * - Syncs subscribed non-private keys over encrypted gossip envelopes
  * - Enforces five built-in ACL spaces: public, user, frozen, private, epublic
  * - epublic is internal-only and can only be mutated through putSystem/deleteSystem
  */
 export class PeerPigeonStorage {
   private readonly userId: string;
+  private peerId: string;
   private readonly gossip: GossipLike | null;
   private readonly sessionId: string;
   private readonly syncSecret: string;
@@ -277,6 +283,7 @@ export class PeerPigeonStorage {
   private readonly storeName = 'records';
   private driver: StorageDriver | null = null;
   private readonly listeners = new Set<ChangeListener>();
+  private readonly subscribedKeys = new Set<string>();
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
   private readonly onGossipMessageBound: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void;
@@ -293,6 +300,7 @@ export class PeerPigeonStorage {
     }
 
     this.userId = userId;
+    this.peerId = String(options.peerId ?? '').trim();
     this.gossip = options.gossip ?? null;
     this.sessionId = String(options.sessionId ?? 'default-session').trim() || 'default-session';
     this.syncSecret = String(options.syncSecret ?? '').trim();
@@ -335,6 +343,31 @@ export class PeerPigeonStorage {
     return () => {
       this.off('change', listener);
     };
+  }
+
+  /** Subscribe to remote updates for one exact storage-space/key pair. */
+  subscribeKey(space: StorageSpace, key: string): StorageUnsubscribe {
+    const normalizedKey = this.normalizeKey(key);
+    const subscriptionKey = this.makePk(space, normalizedKey);
+    this.subscribedKeys.add(subscriptionKey);
+    return () => this.unsubscribeKey(space, normalizedKey);
+  }
+
+  /** Stop accepting remote updates for one exact storage-space/key pair. */
+  unsubscribeKey(space: StorageSpace, key: string): void {
+    const normalizedKey = this.normalizeKey(key);
+    this.subscribedKeys.delete(this.makePk(space, normalizedKey));
+  }
+
+  /** Return whether this instance accepts remote updates for a key. */
+  isSubscribed(space: StorageSpace, key: string): boolean {
+    const normalizedKey = this.normalizeKey(key);
+    return this.subscribedKeys.has(this.makePk(space, normalizedKey));
+  }
+
+  /** Update the mesh peer ID recorded on subsequent local mutations. */
+  setPeerId(peerId: string): void {
+    this.peerId = String(peerId ?? '').trim();
   }
 
   off(event: 'change', listener: StorageEvents['change']): void {
@@ -381,6 +414,7 @@ export class PeerPigeonStorage {
       key: persisted.key,
       value: value as T,
       ownerId: persisted.ownerId,
+      modifiedBy: persisted.modifiedBy ?? null,
       createdAt: persisted.createdAt,
       updatedAt: persisted.updatedAt,
       version: this.normalizeStorageVersion(persisted.version, this.versionSourceToken(persisted.ownerId ?? this.userId)),
@@ -389,6 +423,9 @@ export class PeerPigeonStorage {
 
   async retrieve<T = unknown>(space: StorageSpace, key: string, options: StorageRetrieveOptions = {}): Promise<StorageRecord<T> | null> {
     const normalizedKey = this.normalizeKey(key);
+    // An explicit network Get is also the subscription boundary for future
+    // remote changes to this exact key.
+    this.subscribeKey(space, normalizedKey);
     const existing = await this.get<T>(space, normalizedKey);
     if (space === 'private') return existing;
     if (!this.gossip) return existing;
@@ -463,6 +500,7 @@ export class PeerPigeonStorage {
         key: record.key,
         value,
         ownerId: record.ownerId,
+        modifiedBy: record.modifiedBy ?? null,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
         version: this.normalizeStorageVersion(record.version, this.versionSourceToken(record.ownerId ?? this.userId)),
@@ -485,6 +523,7 @@ export class PeerPigeonStorage {
     this.driver = null;
     this.teardownCrossTabSync();
     this.listeners.clear();
+    this.subscribedKeys.clear();
     for (const pending of this.pendingRetrieveRequests.values()) {
       clearTimeout(pending.timeout);
       pending.resolve(null);
@@ -503,7 +542,8 @@ export class PeerPigeonStorage {
     this.assertCanWrite(space, existing, actorId, options.ownerId, allowSystemWrite);
 
     const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
-    const nextVersion = this.nextStorageVersion(existing?.version, ownerId || actorId);
+    const modifiedBy = this.peerId || null;
+    const nextVersion = this.nextStorageVersion(existing?.version, modifiedBy || ownerId || actorId);
     const encoded = await this.encodeValueForStore(space, value);
 
     const persisted: PersistedRecord = {
@@ -511,6 +551,7 @@ export class PeerPigeonStorage {
       space,
       key: normalizedKey,
       ownerId,
+      modifiedBy,
       value: encoded.value,
       valueCipher: encoded.valueCipher,
       createdAt: existing?.createdAt ?? now,
@@ -540,6 +581,7 @@ export class PeerPigeonStorage {
         key: normalizedKey,
         value,
         ownerId,
+        modifiedBy,
         createdAt: persisted.createdAt,
         updatedAt: persisted.updatedAt,
         version: persisted.version,
@@ -709,6 +751,7 @@ export class PeerPigeonStorage {
       ownerId: mutation.space === 'user'
         ? (existing?.ownerId ?? mutation.record.ownerId ?? mutation.actorId)
         : mutation.record.ownerId,
+      modifiedBy: mutation.record.modifiedBy ?? null,
       updatedAt: mutation.timestamp,
       createdAt: existing?.createdAt ?? mutation.record.createdAt,
       version: this.normalizeStorageVersion(
@@ -728,6 +771,7 @@ export class PeerPigeonStorage {
         key: incoming.key,
         value,
         ownerId: incoming.ownerId,
+        modifiedBy: incoming.modifiedBy,
         createdAt: incoming.createdAt,
         updatedAt: incoming.updatedAt,
         version: incoming.version,
@@ -872,6 +916,7 @@ export class PeerPigeonStorage {
         key: persisted.key,
         value,
         ownerId: persisted.ownerId,
+        modifiedBy: persisted.modifiedBy ?? null,
         createdAt: persisted.createdAt,
         updatedAt: persisted.updatedAt,
         version: persisted.version,
@@ -973,6 +1018,12 @@ export class PeerPigeonStorage {
 
   private shouldAcceptRemoteSync(space: StorageSpace, key: string, context: StorageSyncFilterContext): boolean {
     if (space === 'private') return false;
+    // A retrieve request contains no stored value and must reach holders so
+    // they can answer an explicitly interested requester. Mutations and
+    // responses are accepted only for locally subscribed keys.
+    if (context.kind !== 'retrieve-request' && !this.isSubscribed(space, key)) {
+      return false;
+    }
     if (!this.syncFilter) return true;
     try {
       return this.syncFilter(space, key, context) !== false;
@@ -1118,9 +1169,7 @@ export class PeerPigeonStorage {
       const requested = String(ownerOverride ?? '').trim();
       return requested || actorId;
     }
-    if (space === 'public' || space === 'frozen' || space === 'epublic') {
-      return actorId;
-    }
+    if (space === 'public' || space === 'frozen' || space === 'epublic') return null;
     return existing?.ownerId ?? null;
   }
 

@@ -40,13 +40,14 @@ func isValidSpace(s Space) bool {
 
 // Record is the public view of a stored record.
 type Record struct {
-	Space     Space
-	Key       string
-	Value     interface{}
-	OwnerID   string
-	CreatedAt int64
-	UpdatedAt int64
-	Version   StorageVersion
+	Space      Space
+	Key        string
+	Value      interface{}
+	OwnerID    string
+	ModifiedBy string
+	CreatedAt  int64
+	UpdatedAt  int64
+	Version    StorageVersion
 }
 
 type StorageVersion string
@@ -93,7 +94,9 @@ type ChangeEvent struct {
 // Options configures a PeerPigeonStorage instance.
 type Options struct {
 	// UserID is the local identity used for ACL checks (required).
-	UserID     string
+	UserID string
+	// PeerID is the mesh peer ID recorded as modification provenance.
+	PeerID     string
 	SessionID  string
 	SyncSecret string
 	DBName     string
@@ -126,6 +129,7 @@ type persistedRecord struct {
 	Space       Space          `json:"space"`
 	Key         string         `json:"key"`
 	OwnerID     string         `json:"ownerId"`
+	ModifiedBy  string         `json:"modifiedBy"`
 	Value       interface{}    `json:"value"`
 	ValueCipher *cipher64      `json:"valueCipher"`
 	CreatedAt   int64          `json:"createdAt"`
@@ -235,9 +239,10 @@ func (d *MemoryDriver) ListBySpace(space Space) ([]*persistedRecord, error) {
 
 // ── PeerPigeonStorage ──────────────────────────────────────────────────────
 
-// PeerPigeonStorage is a gossip-synced, encrypted key-value store.
+// PeerPigeonStorage is a subscription-gated, encrypted key-value store.
 type PeerPigeonStorage struct {
 	userID     string
+	peerID     string
 	sessionID  string
 	syncSecret string
 	gossip     GossipInterface
@@ -249,6 +254,7 @@ type PeerPigeonStorage struct {
 	closed      bool
 	listeners   []func(ChangeEvent)
 	pending     map[string]*pendingRetrieve
+	subscribed  map[string]struct{}
 	gossipUnsub func()
 }
 
@@ -287,14 +293,29 @@ func New(opts Options) (*PeerPigeonStorage, error) {
 	}
 	s := &PeerPigeonStorage{
 		userID:     userID,
+		peerID:     strings.TrimSpace(opts.PeerID),
 		sessionID:  sessionID,
 		syncSecret: strings.TrimSpace(opts.SyncSecret),
 		gossip:     opts.Gossip,
 		syncFilter: opts.SyncFilter,
 		instanceID: fmt.Sprintf("storage-%d", time.Now().UnixNano()),
 		pending:    make(map[string]*pendingRetrieve),
+		subscribed: make(map[string]struct{}),
 	}
 	return s, nil
+}
+
+// SetPeerID updates the mesh peer ID used as modification provenance.
+func (s *PeerPigeonStorage) SetPeerID(peerID string) {
+	s.mu.Lock()
+	s.peerID = strings.TrimSpace(peerID)
+	s.mu.Unlock()
+}
+
+func (s *PeerPigeonStorage) localPeerID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.peerID
 }
 
 // Init initialises the storage driver and connects gossip sync.
@@ -342,6 +363,36 @@ func (s *PeerPigeonStorage) OnChange(fn func(ChangeEvent)) func() {
 	}
 }
 
+// SubscribeKey enables remote mutation and retrieve-response sync for one key.
+func (s *PeerPigeonStorage) SubscribeKey(space Space, key string) func() {
+	normKey := strings.TrimSpace(key)
+	if normKey == "" {
+		return func() {}
+	}
+	pk := s.makePK(space, normKey)
+	s.mu.Lock()
+	s.subscribed[pk] = struct{}{}
+	s.mu.Unlock()
+	return func() { s.UnsubscribeKey(space, normKey) }
+}
+
+// UnsubscribeKey stops accepting remote sync for one key.
+func (s *PeerPigeonStorage) UnsubscribeKey(space Space, key string) {
+	pk := s.makePK(space, strings.TrimSpace(key))
+	s.mu.Lock()
+	delete(s.subscribed, pk)
+	s.mu.Unlock()
+}
+
+// IsSubscribed reports whether remote sync is enabled for one key.
+func (s *PeerPigeonStorage) IsSubscribed(space Space, key string) bool {
+	pk := s.makePK(space, strings.TrimSpace(key))
+	s.mu.Lock()
+	_, ok := s.subscribed[pk]
+	s.mu.Unlock()
+	return ok
+}
+
 // Close shuts down the storage instance.
 func (s *PeerPigeonStorage) Close() {
 	s.mu.Lock()
@@ -352,6 +403,7 @@ func (s *PeerPigeonStorage) Close() {
 	s.closed = true
 	pending := s.pending
 	s.pending = make(map[string]*pendingRetrieve)
+	s.subscribed = make(map[string]struct{})
 	listeners := s.listeners
 	s.listeners = nil
 	s.mu.Unlock()
@@ -423,19 +475,21 @@ func (s *PeerPigeonStorage) Get(space Space, key string) (*Record, error) {
 		return nil, err
 	}
 	return &Record{
-		Space:     pr.Space,
-		Key:       pr.Key,
-		Value:     val,
-		OwnerID:   pr.OwnerID,
-		CreatedAt: pr.CreatedAt,
-		UpdatedAt: pr.UpdatedAt,
-		Version:   pr.Version,
+		Space:      pr.Space,
+		Key:        pr.Key,
+		Value:      val,
+		OwnerID:    pr.OwnerID,
+		ModifiedBy: pr.ModifiedBy,
+		CreatedAt:  pr.CreatedAt,
+		UpdatedAt:  pr.UpdatedAt,
+		Version:    pr.Version,
 	}, nil
 }
 
 // Retrieve fetches a key, requesting it from the network if not present locally.
 func (s *PeerPigeonStorage) Retrieve(space Space, key string, opts ...RetrieveOptions) (*Record, error) {
 	normKey := strings.TrimSpace(key)
+	s.SubscribeKey(space, normKey)
 	existing, err := s.Get(space, normKey)
 	if err != nil {
 		return nil, err
@@ -558,13 +612,14 @@ func (s *PeerPigeonStorage) List(space Space) ([]*Record, error) {
 			return nil, err
 		}
 		out = append(out, &Record{
-			Space:     pr.Space,
-			Key:       pr.Key,
-			Value:     val,
-			OwnerID:   pr.OwnerID,
-			CreatedAt: pr.CreatedAt,
-			UpdatedAt: pr.UpdatedAt,
-			Version:   pr.Version,
+			Space:      pr.Space,
+			Key:        pr.Key,
+			Value:      val,
+			OwnerID:    pr.OwnerID,
+			ModifiedBy: pr.ModifiedBy,
+			CreatedAt:  pr.CreatedAt,
+			UpdatedAt:  pr.UpdatedAt,
+			Version:    pr.Version,
 		})
 	}
 	return out, nil
@@ -590,7 +645,15 @@ func (s *PeerPigeonStorage) applyLocalUpsert(space Space, key string, value inte
 	}
 
 	ownerID := s.resolveOwnerID(space, existing, s.userID, opts.OwnerID)
-	nextVersion := s.nextVersion(versionOrZero(existing), ownerID)
+	modifiedBy := s.localPeerID()
+	versionActor := modifiedBy
+	if versionActor == "" {
+		versionActor = ownerID
+	}
+	if versionActor == "" {
+		versionActor = s.userID
+	}
+	nextVersion := s.nextVersion(versionOrZero(existing), versionActor)
 	encoded, err := s.encodeValue(space, value)
 	if err != nil {
 		return nil, err
@@ -606,6 +669,7 @@ func (s *PeerPigeonStorage) applyLocalUpsert(space Space, key string, value inte
 		Space:       space,
 		Key:         normKey,
 		OwnerID:     ownerID,
+		ModifiedBy:  modifiedBy,
 		Value:       encoded.value,
 		ValueCipher: encoded.cipher,
 		CreatedAt:   createdAt,
@@ -751,6 +815,7 @@ func (s *PeerPigeonStorage) applyRemoteMutation(mutation *storageMutation) (bool
 		Space:       mutation.Space,
 		Key:         mutation.Key,
 		OwnerID:     resolvedOwner,
+		ModifiedBy:  mutation.Record.ModifiedBy,
 		Value:       mutation.Record.Value,
 		ValueCipher: mutation.Record.ValueCipher,
 		CreatedAt:   createdAt,
@@ -946,6 +1011,11 @@ func (s *PeerPigeonStorage) shouldAcceptRemote(space Space, key, kind, actorID s
 	if space == SpacePrivate {
 		return false
 	}
+	// Retrieve requests contain no value and must reach record holders. Values
+	// and later mutations are accepted only by explicit subscribers.
+	if kind != "retrieve-request" && !s.IsSubscribed(space, key) {
+		return false
+	}
 	if s.syncFilter == nil {
 		return true
 	}
@@ -1028,7 +1098,7 @@ func (s *PeerPigeonStorage) resolveOwnerID(space Space, existing *persistedRecor
 		return actorID
 	}
 	if space == SpacePublic || space == SpaceFrozen || space == SpaceEPublic {
-		return actorID
+		return ""
 	}
 	if existing != nil {
 		return existing.OwnerID
@@ -1278,13 +1348,14 @@ func (s *PeerPigeonStorage) resolvePendingRetrievesForKey(space Space, key strin
 
 func toRecord(pr *persistedRecord, value interface{}) *Record {
 	return &Record{
-		Space:     pr.Space,
-		Key:       pr.Key,
-		Value:     value,
-		OwnerID:   pr.OwnerID,
-		CreatedAt: pr.CreatedAt,
-		UpdatedAt: pr.UpdatedAt,
-		Version:   pr.Version,
+		Space:      pr.Space,
+		Key:        pr.Key,
+		Value:      value,
+		OwnerID:    pr.OwnerID,
+		ModifiedBy: pr.ModifiedBy,
+		CreatedAt:  pr.CreatedAt,
+		UpdatedAt:  pr.UpdatedAt,
+		Version:    pr.Version,
 	}
 }
 
