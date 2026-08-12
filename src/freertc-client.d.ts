@@ -1,3 +1,3 @@
-declare module 'freertc/demo/src/utils/signalingClient.js' {
+declare module 'freertc/client' {
   export function createSignalingClient(options?: any): any;
 }

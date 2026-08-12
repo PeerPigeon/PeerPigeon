@@ -27,169 +27,10 @@ __export(index_exports, {
 });
 module.exports = __toCommonJS(index_exports);
 
-// src/rtc-peer.ts
-var TinyEmitter = class {
-  constructor() {
-    this.handlers = /* @__PURE__ */ new Map();
-  }
-  on(event, handler) {
-    const set = this.handlers.get(event) ?? /* @__PURE__ */ new Set();
-    set.add(handler);
-    this.handlers.set(event, set);
-  }
-  emit(event, ...args) {
-    const set = this.handlers.get(event);
-    if (!set) return;
-    for (const fn of set) {
-      try {
-        fn(...args);
-      } catch {
-      }
-    }
-  }
-};
-var RtcPeer = class {
-  constructor(options) {
-    this.destroyed = false;
-    this.dc = null;
-    this.emitter = new TinyEmitter();
-    this.connectedEmitted = false;
-    this.initiator = options.initiator;
-    this.trickleIce = options.trickleIce ?? options.trickle ?? true;
-    this.pc = new RTCPeerConnection(options.config ?? {});
-    this.pc.onicecandidate = (event) => {
-      if (!event.candidate || !this.trickleIce) {
-        return;
-      }
-      this.emitter.emit("signal", { candidate: event.candidate.toJSON() });
-    };
-    this.pc.onsignalingstatechange = () => {
-      this.emitDebugSnapshot("signalingstatechange");
-    };
-    this.pc.oniceconnectionstatechange = () => {
-      this.emitDebugSnapshot("iceconnectionstatechange");
-    };
-    this.pc.onconnectionstatechange = () => {
-      const s = this.pc.connectionState;
-      this.emitDebugSnapshot("connectionstatechange");
-      if (s === "failed" || s === "closed") {
-        this.destroy();
-      }
-    };
-    this.pc.ondatachannel = (event) => {
-      this.attachDataChannel(event.channel);
-    };
-    if (this.initiator) {
-      this.attachDataChannel(this.pc.createDataChannel("gossip"));
-      this.createOffer().catch((err) => this.emitter.emit("error", err));
-    }
-    this.emitDebugSnapshot("constructed");
-  }
-  on(event, handler) {
-    this.emitter.on(event, handler);
-  }
-  async signal(signal) {
-    if (this.destroyed || !signal) return;
-    if (signal.type === "offer" || signal.type === "answer") {
-      await this.pc.setRemoteDescription(new RTCSessionDescription(signal));
-      this.emitDebugSnapshot(`remote-${signal.type}`);
-      if (signal.type === "offer") {
-        const answer = await this.pc.createAnswer();
-        await this.pc.setLocalDescription(answer);
-        await this.emitLocalDescription("answer");
-      }
-      return;
-    }
-    const candidate = signal.candidate ?? signal;
-    if (candidate) {
-      await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
-    }
-  }
-  send(data) {
-    if (!this.dc || this.dc.readyState !== "open") {
-      throw new Error("Data channel not open");
-    }
-    this.dc.send(data);
-  }
-  destroy() {
-    if (this.destroyed) return;
-    this.destroyed = true;
-    try {
-      if (this.dc && this.dc.readyState !== "closed") this.dc.close();
-    } catch {
-    }
-    try {
-      this.pc.close();
-    } catch {
-    }
-    this.emitter.emit("close");
-  }
-  attachDataChannel(channel) {
-    this.dc = channel;
-    this.emitDebugSnapshot("datachannel-attached");
-    channel.onopen = () => {
-      this.emitDebugSnapshot("datachannel-open");
-      if (!this.connectedEmitted) {
-        this.connectedEmitted = true;
-        this.emitter.emit("connect");
-      }
-    };
-    channel.onmessage = (event) => {
-      this.emitter.emit("data", event.data);
-    };
-    channel.onerror = (event) => {
-      this.emitDebugSnapshot("datachannel-error");
-      this.emitter.emit("error", event);
-    };
-    channel.onclose = () => {
-      this.emitDebugSnapshot("datachannel-close");
-      this.destroy();
-    };
-  }
-  async createOffer() {
-    const offer = await this.pc.createOffer();
-    await this.pc.setLocalDescription(offer);
-    await this.emitLocalDescription("offer");
-  }
-  async emitLocalDescription(kind) {
-    if (this.trickleIce) {
-      this.emitter.emit("signal", this.pc.localDescription);
-      this.emitDebugSnapshot(`local-${kind}`);
-      return;
-    }
-    await this.waitForIceGatheringComplete();
-    this.emitter.emit("signal", this.pc.localDescription);
-    this.emitDebugSnapshot(`local-${kind}-ice-complete`);
-  }
-  async waitForIceGatheringComplete() {
-    await new Promise((resolve) => {
-      if (this.pc.iceGatheringState === "complete") {
-        resolve();
-        return;
-      }
-      const onIce = () => {
-        if (this.pc.iceGatheringState === "complete") {
-          this.pc.removeEventListener("icegatheringstatechange", onIce);
-          resolve();
-        }
-      };
-      this.pc.addEventListener("icegatheringstatechange", onIce);
-    });
-  }
-  emitDebugSnapshot(reason) {
-    this.emitter.emit("debug", {
-      reason,
-      signalingState: this.pc.signalingState,
-      iceConnectionState: this.pc.iceConnectionState,
-      connectionState: this.pc.connectionState,
-      dataChannelState: this.dc?.readyState ?? "missing"
-    });
-  }
-};
-
 // src/freertc-client-adapter.ts
-function generatePeerId() {
-  const bytes = new Uint8Array(32);
+var import_client = require("freertc/client");
+function generateMessageId(bytesLength = 8) {
+  const bytes = new Uint8Array(bytesLength);
   const webCrypto = globalThis.window?.crypto ?? globalThis.crypto;
   webCrypto.getRandomValues(bytes);
   return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
@@ -218,519 +59,264 @@ var FreeRTCClientAdapter = class {
   constructor(signalUrl, options) {
     this.emitter = new Emitter();
     this.knownPeers = /* @__PURE__ */ new Set();
-    this.pendingCandidates = /* @__PURE__ */ new Map();
-    this.offerQueues = /* @__PURE__ */ new Map();
-    this.lastRemoteOfferSdp = /* @__PURE__ */ new Map();
-    this.lastAppliedAnswerSdp = /* @__PURE__ */ new Map();
     this.selfAliases = /* @__PURE__ */ new Set();
-    this.peerEntries = /* @__PURE__ */ new Map();
+    this.connectedPeers = /* @__PURE__ */ new Set();
+    this.openChannelTimers = /* @__PURE__ */ new Map();
     this.client = null;
     this.joinedOnce = false;
-    this.socket = null;
-    this.pingTimer = null;
-    this.announceTimer = null;
-    this.reconnectTimer = null;
-    this.reconnectBackoffMs = 1e3;
     this.intentionallyDisconnected = false;
+    this.signalingConnected = false;
     this.signalUrl = signalUrl;
     this.networkId = options?.networkId ?? "default-session";
-    this.requestedPeerId = options?.peerId ?? generatePeerId();
+    this.roomId = options?.roomId ?? this.networkId;
+    this.requestedPeerId = options?.peerId ?? generateMessageId(32);
+    this.previousPeerId = this.normalizePeerId(options?.previousPeerId) || null;
+    this.retiredPeerIds = Array.from(new Set(
+      (options?.retiredPeerIds ?? []).map((peerId) => this.normalizePeerId(peerId)).filter((peerId) => peerId && peerId !== this.requestedPeerId)
+    ));
     this.defaultIceServers = options?.iceServers ?? null;
-    this.defaultTrickleIce = options?.trickleIce ?? true;
     this.addSelfAlias(this.requestedPeerId);
-    this.client = {
-      mesh: { connections: this.peerEntries },
-      peerId: this.requestedPeerId,
-      isRegistered: true
-    };
-    this._pageUnloadHandler = () => {
-      this._sendWithdraw();
-      this.intentionallyDisconnected = true;
-      if (this.reconnectTimer) {
-        clearTimeout(this.reconnectTimer);
-        this.reconnectTimer = null;
-      }
-      this.stopLoops();
-      try {
-        this.socket?.close(1e3, "page_unload");
-      } catch {
-      }
-      this.socket = null;
-    };
-    if (typeof window !== "undefined") {
-      window.addEventListener("beforeunload", this._pageUnloadHandler);
-      window.addEventListener("pagehide", this._pageUnloadHandler);
-    }
+    this.addSelfAlias(this.previousPeerId);
+    for (const peerId of this.retiredPeerIds) this.addSelfAlias(peerId);
   }
   on(event, handler) {
     this.emitter.on(event, handler);
   }
   connect() {
     this.intentionallyDisconnected = false;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
+    if (this.client) {
+      this.client.connect?.();
       return;
     }
-    const wsUrl = new URL(this.signalUrl, typeof location !== "undefined" ? location.href : void 0);
-    if (!wsUrl.searchParams.get("networkId")) {
-      wsUrl.searchParams.set("networkId", this.networkId);
-    }
-    this.socket = new WebSocket(wsUrl.toString());
-    this.socket.onopen = () => {
-      this.reconnectBackoffMs = 1e3;
-      this.emitter.emit("signaling:log", { message: "[signal] connected" });
-      this.sendEnvelope("announce", {
-        ttl_ms: 3e4,
-        body: { instance_id: this.networkId, hints: { wants_peers: true } }
-      });
-      this.startPingLoop();
-      this.startAnnounceLoop();
-      this.emitter.emit("connected", {
-        clientId: this.requestedPeerId,
-        requestedClientId: this.requestedPeerId,
-        previousClientId: null
-      });
-    };
-    this.socket.onmessage = (event) => {
-      this.handleSocketMessage(event.data);
-    };
-    this.socket.onclose = () => {
-      this.stopLoops();
-      this.socket = null;
-      this.closeAllPeerEntries();
-      this.emitter.emit("disconnected");
-      this.scheduleReconnect();
-    };
-    this.socket.onerror = () => {
-      this.emitter.emit("error", new Error("WebSocket error"));
-    };
+    this.withdrawRetiredPeerIds();
+    this.client = (0, import_client.createSignalingClient)({
+      peerId: this.requestedPeerId,
+      networkId: this.networkId,
+      roomId: this.roomId,
+      signalUrl: this.signalUrl,
+      iceServers: this.defaultIceServers ?? void 0,
+      autoConnect: false,
+      onLog: (message) => {
+        this.emitter.emit("signaling:log", { message: String(message ?? "") });
+      },
+      onRegistered: () => {
+        this.signalingConnected = true;
+        this.emitter.emit("connected", {
+          clientId: this.requestedPeerId,
+          requestedClientId: this.requestedPeerId,
+          previousClientId: this.previousPeerId
+        });
+        this.client?.requestBootstrap?.(Array.from(this.selfAliases));
+      },
+      onBootstrap: (candidates) => {
+        this.handleBootstrapCandidates(candidates);
+      },
+      onConnectionStateChange: (data) => {
+        this.handleConnectionState(data);
+      },
+      onDataMessage: (data) => {
+        const peerId = this.normalizePeerId(data?.peerId);
+        if (!peerId || this.isSelfAlias(peerId)) return;
+        this.emitter.emit("rtc:data", { peerId, data: data.data });
+      },
+      onNegotiationFailure: (data) => {
+        this.emitter.emit("signaling:log", {
+          message: `[webrtc] ${this.normalizePeerId(data?.peerId)} negotiation failed: ${String(data?.reason ?? "unknown")}`
+        });
+      },
+      onStatusChange: (status) => {
+        if (!String(status).startsWith("disconnected")) return;
+        const wasConnected = this.signalingConnected;
+        this.signalingConnected = false;
+        if (wasConnected && !this.intentionallyDisconnected) {
+          this.emitter.emit("disconnected");
+        }
+      }
+    });
+    this.client.connect();
   }
-  scheduleReconnect() {
-    if (this.intentionallyDisconnected) return;
-    if (this.reconnectTimer) return;
-    const delay = this.reconnectBackoffMs;
-    this.reconnectBackoffMs = Math.min(15e3, Math.floor(this.reconnectBackoffMs * 1.5));
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
-    }, delay);
+  disconnect() {
+    this.intentionallyDisconnected = true;
+    this.signalingConnected = false;
+    this.clearOpenChannelTimers();
+    try {
+      this.client?.disconnect?.();
+    } catch {
+    }
+    this.client = null;
+    this.connectedPeers.clear();
+    this.knownPeers.clear();
+    this.joinedOnce = false;
+  }
+  isConnected() {
+    return Boolean(this.client?.isRegistered);
+  }
+  joinSession(sessionId) {
+    if (sessionId && sessionId !== this.roomId) {
+      this.emitter.emit("error", new Error("FreeRTC adapter does not support changing room after initialization"));
+      return;
+    }
+    this.client?.requestBootstrap?.(Array.from(this.selfAliases));
+  }
+  async initiateConnection(peerId, iceServers) {
+    const id = this.normalizePeerId(peerId);
+    if (!id || this.isSelfAlias(id)) {
+      throw new Error("Cannot connect to a current or retired local peer ID");
+    }
+    if (!this.client?.isRegistered) {
+      throw new Error("Not connected");
+    }
+    await this.client.initiateConnection(id, iceServers ?? this.defaultIceServers ?? void 0);
+  }
+  nudgeSignaling() {
+    this.client?.advertise?.({});
+    this.client?.requestBootstrap?.(Array.from(this.selfAliases));
+  }
+  closeConnection(peerId) {
+    const id = this.normalizePeerId(peerId);
+    if (!id) return;
+    this.clearOpenChannelTimer(id);
+    const entry = this.client?.mesh?.connections?.get?.(id);
+    try {
+      entry?.channel?.close?.();
+    } catch {
+    }
+    try {
+      entry?.connection?.close?.();
+    } catch {
+    }
+    this.client?.mesh?.connections?.delete?.(id);
+    if (this.connectedPeers.delete(id)) {
+      this.emitter.emit("rtc:disconnected", { peerId: id });
+    }
+  }
+  send(peerId, data) {
+    this.client?.sendData(data, peerId);
+  }
+  broadcast(data) {
+    for (const peerId of this.connectedPeers) {
+      try {
+        this.client?.sendData(data, peerId);
+      } catch {
+      }
+    }
   }
   normalizePeerId(peerId) {
     return String(peerId ?? "").trim();
   }
   addSelfAlias(peerId) {
     const id = this.normalizePeerId(peerId);
-    if (!id) return;
-    this.selfAliases.add(id);
+    if (id) this.selfAliases.add(id);
   }
   isSelfAlias(peerId) {
     const id = this.normalizePeerId(peerId);
-    if (!id) return false;
-    return this.selfAliases.has(id);
+    return Boolean(id && this.selfAliases.has(id));
   }
-  startPingLoop() {
-    if (this.pingTimer) return;
-    this.pingTimer = setInterval(() => {
-      this.sendEnvelope("ping", { body: { nonce: generatePeerId().slice(0, 16) } });
-    }, 1e3);
-  }
-  startAnnounceLoop() {
-    if (this.announceTimer) return;
-    this.announceTimer = setInterval(() => {
-      this.sendEnvelope("announce", {
-        ttl_ms: 3e4,
-        body: { instance_id: this.networkId, hints: { wants_peers: true } }
-      });
-    }, 12e3);
-  }
-  stopLoops() {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
+  handleBootstrapCandidates(candidates) {
+    const nextPeers = new Set(
+      (Array.isArray(candidates) ? candidates : []).map((candidate) => this.normalizePeerId(candidate?.peerId)).filter((peerId) => peerId && !this.isSelfAlias(peerId))
+    );
+    const peerList = Array.from(nextPeers);
+    if (!this.joinedOnce) {
+      this.joinedOnce = true;
+      this.emitter.emit("joined", { sessionId: this.roomId, clients: peerList });
     }
-    if (this.announceTimer) {
-      clearInterval(this.announceTimer);
-      this.announceTimer = null;
+    for (const peerId of peerList) {
+      if (!this.knownPeers.has(peerId)) this.emitter.emit("peer-joined", { peerId });
     }
-  }
-  sendEnvelope(type, options = {}) {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    this.socket.send(JSON.stringify({
-      psp_version: "1.0",
-      type,
-      network: this.networkId,
-      from: this.requestedPeerId,
-      to: options.to ?? null,
-      session_id: options.session_id ?? this.networkId,
-      message_id: generatePeerId().slice(0, 16),
-      timestamp: Date.now(),
-      ttl_ms: options.ttl_ms ?? null,
-      body: options.body ?? {}
-    }));
-  }
-  handleSocketMessage(raw) {
-    let message;
-    try {
-      message = JSON.parse(raw);
-    } catch {
-      return;
+    for (const peerId of this.knownPeers) {
+      if (!nextPeers.has(peerId)) this.emitter.emit("peer-left", { peerId });
     }
-    switch (message?.type) {
-      case "peer_list": {
-        const peers = Array.isArray(message?.body?.peers) ? message.body.peers : [];
-        const nextPeers = new Set(
-          peers.map((peer) => this.normalizePeerId(peer?.peer_id)).filter((peerId) => peerId && !this.isSelfAlias(peerId))
-        );
-        const peerList = Array.from(nextPeers);
-        if (!this.joinedOnce) {
-          this.joinedOnce = true;
-          this.emitter.emit("joined", { sessionId: this.networkId, clients: peerList });
-        }
-        for (const peerId of peerList) {
-          if (!this.knownPeers.has(peerId)) {
-            this.emitter.emit("peer-joined", { peerId });
-          }
-        }
-        for (const peerId of this.knownPeers) {
-          if (!nextPeers.has(peerId)) {
-            this.emitter.emit("peer-left", { peerId });
-          }
-        }
-        this.knownPeers.clear();
-        for (const peerId of nextPeers) {
-          this.knownPeers.add(peerId);
-        }
-        return;
-      }
-      case "offer":
-        this.enqueueIncomingOffer(this.normalizePeerId(message?.from), message?.body);
-        return;
-      case "answer":
-        this.handleSignal(this.normalizePeerId(message?.from), { type: "answer", sdp: message?.body?.sdp }).catch((error) => {
-          this.emitter.emit("signaling:log", { message: `[webrtc] answer handling error: ${String(error?.message ?? error ?? "")}` });
-        });
-        return;
-      case "ice_candidate": {
-        const candidate = this.normalizeCandidate(message?.body?.candidate);
-        if (!candidate) {
-          return;
-        }
-        this.handleSignal(this.normalizePeerId(message?.from), { candidate }).catch((error) => {
-          this.emitter.emit("signaling:log", { message: `[webrtc] candidate handling error: ${String(error?.message ?? error ?? "")}` });
-        });
-        return;
-      }
-      case "bye":
-        this.closeConnection(this.normalizePeerId(message?.from));
-        return;
-      case "pong":
-        return;
-      case "error":
-        this.emitter.emit("signaling:log", { message: `[signal] error: ${String(message?.body?.error ?? "")}` });
-        return;
-      default:
-        return;
-    }
-  }
-  normalizeCandidate(candidate) {
-    if (!candidate || typeof candidate !== "object") {
-      return null;
-    }
-    const candidateText = String(candidate.candidate ?? "").trim();
-    if (!candidateText) {
-      return null;
-    }
-    return {
-      candidate: candidateText,
-      sdpMid: candidate.sdpMid ?? null,
-      sdpMLineIndex: typeof candidate.sdpMLineIndex === "number" ? candidate.sdpMLineIndex : null,
-      usernameFragment: candidate.usernameFragment
-    };
-  }
-  attachPeer(peerId, peer, initiator) {
-    const entry = {
-      peer,
-      initiator,
-      trickleIce: this.defaultTrickleIce,
-      connected: false,
-      state: "connecting",
-      connection: peer.pc,
-      channel: peer.dc ?? null
-    };
-    this.peerEntries.set(peerId, entry);
-    peer.on("signal", (signal) => {
-      entry.connection = peer.pc;
-      entry.channel = peer.dc ?? null;
-      if (signal?.type === "offer" || signal?.type === "answer") {
-        this.sendEnvelope(signal.type, {
-          to: peerId,
-          body: { sdp: signal.sdp, trickle_ice: entry.trickleIce }
-        });
-      } else if (signal?.candidate) {
-        this.sendEnvelope("ice_candidate", {
-          to: peerId,
-          body: { candidate: signal.candidate }
-        });
-      }
-    });
-    peer.on("connect", () => {
-      const current = this.peerEntries.get(peerId);
-      if (!current || current.connected) return;
-      current.connected = true;
-      current.state = "connected";
-      current.connection = peer.pc;
-      current.channel = peer.dc ?? null;
-      this.emitter.emit("rtc:connected", { peerId });
-    });
-    peer.on("debug", (snapshot) => {
-      const current = this.peerEntries.get(peerId);
-      if (current) {
-        current.connection = peer.pc;
-        current.channel = peer.dc ?? null;
-        current.state = snapshot.connectionState;
-      }
-      this.emitter.emit("signaling:log", {
-        message: `[webrtc] ${peerId} ${snapshot.reason} signaling=${snapshot.signalingState} ice=${snapshot.iceConnectionState} pc=${snapshot.connectionState} dc=${snapshot.dataChannelState}`
-      });
-    });
-    peer.on("data", (data) => {
-      this.emitter.emit("rtc:data", { peerId, data });
-    });
-    peer.on("close", () => {
-      const current = this.peerEntries.get(peerId);
-      if (!current || current.peer !== peer) return;
-      this.peerEntries.delete(peerId);
-      this.pendingCandidates.delete(peerId);
-      this.emitter.emit("rtc:disconnected", { peerId });
-    });
-    peer.on("error", (error) => {
-      this.emitter.emit("signaling:log", { message: `[webrtc] ${peerId} error: ${String(error?.message ?? error ?? "")}` });
-    });
-  }
-  async handleIncomingOffer(peerId, body) {
-    if (!peerId) return;
-    const incomingOfferSdp = String(body?.sdp ?? "");
-    if (!incomingOfferSdp) return;
-    const trickleIce = body?.trickle_ice ?? this.defaultTrickleIce;
-    let entry = this.peerEntries.get(peerId);
-    const pc = entry?.connection;
-    const localPeerId = this.normalizePeerId(this.client?.peerId ?? this.requestedPeerId);
-    const shouldPreferRemoteOffer = !!localPeerId && localPeerId > peerId;
-    const shouldYieldToRemoteOffer = Boolean(entry) && !entry?.connected && shouldPreferRemoteOffer && (entry?.initiator === true || pc?.signalingState === "have-local-offer");
-    if (shouldYieldToRemoteOffer) {
-      try {
-        entry?.peer?.destroy?.();
-      } catch {
-      }
-      this.peerEntries.delete(peerId);
-      this.pendingCandidates.delete(peerId);
-      entry = void 0;
-      this.lastAppliedAnswerSdp.delete(peerId);
-    }
-    if (!entry) {
-      const peer = new RtcPeer({
-        initiator: false,
-        trickleIce,
-        config: this.defaultIceServers ? { iceServers: this.defaultIceServers } : void 0
-      });
-      this.attachPeer(peerId, peer, false);
-      entry = this.peerEntries.get(peerId);
-      if (entry) {
-        entry.trickleIce = trickleIce;
-      }
-    }
-    const nextPc = entry?.connection;
-    if (entry?.connected) {
-      return;
-    }
-    const lastSdp = this.lastRemoteOfferSdp.get(peerId);
-    if (lastSdp && lastSdp === incomingOfferSdp) {
-      return;
-    }
-    if (nextPc?.signalingState === "have-remote-offer" || nextPc?.remoteDescription?.sdp === incomingOfferSdp) {
-      return;
-    }
-    if (entry?.initiator === false && nextPc?.signalingState === "stable" && !!nextPc?.remoteDescription && nextPc?.connectionState !== "failed" && nextPc?.connectionState !== "closed") {
-      return;
-    }
-    await entry.peer.signal({ type: "offer", sdp: incomingOfferSdp });
-    this.lastRemoteOfferSdp.set(peerId, incomingOfferSdp);
-    await this.flushPendingCandidates(peerId);
-  }
-  enqueueIncomingOffer(peerId, body) {
-    if (!peerId) return;
-    const prior = this.offerQueues.get(peerId) ?? Promise.resolve();
-    const next = prior.then(async () => {
-      await this.handleIncomingOffer(peerId, body);
-    }).catch(() => {
-    });
-    this.offerQueues.set(peerId, next);
-  }
-  async handleSignal(peerId, signal) {
-    const entry = this.peerEntries.get(peerId);
-    if (!entry) {
-      if (signal?.candidate) {
-        const queued = this.pendingCandidates.get(peerId) ?? [];
-        queued.push(signal);
-        this.pendingCandidates.set(peerId, queued);
-      }
-      return;
-    }
-    const pc = entry.connection;
-    if (signal?.candidate) {
-      if (!pc?.remoteDescription) {
-        const queued = this.pendingCandidates.get(peerId) ?? [];
-        queued.push(signal);
-        this.pendingCandidates.set(peerId, queued);
-        return;
-      }
-    }
-    if (signal?.type === "answer") {
-      const answerSdp = String(signal?.sdp ?? "");
-      const lastAnswer = this.lastAppliedAnswerSdp.get(peerId);
-      if (!pc || pc.signalingState === "stable" || pc.remoteDescription?.type === "answer") {
-        return;
-      }
-      if (answerSdp && lastAnswer && lastAnswer === answerSdp) {
-        return;
-      }
-    }
-    try {
-      await entry.peer.signal(signal);
-      if (signal?.type === "answer") {
-        if (signal?.sdp) {
-          this.lastAppliedAnswerSdp.set(peerId, String(signal.sdp));
-        }
-        await this.flushPendingCandidates(peerId);
-      }
-    } catch (error) {
-      const message = String(error?.message ?? error ?? "");
-      if (/wrong state|remote description was null|expected candidate got/i.test(message)) {
-        return;
-      }
-      throw error;
-    }
-  }
-  async flushPendingCandidates(peerId) {
-    const entry = this.peerEntries.get(peerId);
-    if (!entry?.connection?.remoteDescription) return;
-    const queued = this.pendingCandidates.get(peerId) ?? [];
-    this.pendingCandidates.delete(peerId);
-    for (const candidate of queued) {
-      try {
-        await entry.peer.signal(candidate);
-      } catch {
-      }
-    }
-  }
-  disconnect() {
-    if (typeof window !== "undefined") {
-      window.removeEventListener("beforeunload", this._pageUnloadHandler);
-      window.removeEventListener("pagehide", this._pageUnloadHandler);
-    }
-    this._sendWithdraw();
-    this.intentionallyDisconnected = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    this.stopLoops();
-    if (this.socket) {
-      try {
-        this.socket.close(1e3, "user_disconnect");
-      } catch {
-      }
-      this.socket = null;
-    }
-    this.closeAllPeerEntries();
-    this.joinedOnce = false;
     this.knownPeers.clear();
+    for (const peerId of nextPeers) this.knownPeers.add(peerId);
+    this.emitter.emit("peers-updated", { peers: peerList });
   }
-  _sendWithdraw() {
-    this.sendEnvelope("withdraw", {
-      body: { reason: "shutdown" }
-    });
-  }
-  isConnected() {
-    return !!this.socket && this.socket.readyState === WebSocket.OPEN;
-  }
-  closeAllPeerEntries() {
-    const entries = Array.from(this.peerEntries.entries());
-    for (const [peerId, entry] of entries) {
-      this.peerEntries.delete(peerId);
-      this.pendingCandidates.delete(peerId);
-      this.offerQueues.delete(peerId);
-      this.lastRemoteOfferSdp.delete(peerId);
-      this.lastAppliedAnswerSdp.delete(peerId);
-      try {
-        entry.peer?.destroy?.();
-      } catch {
-      }
-      this.emitter.emit("rtc:disconnected", { peerId });
-    }
-  }
-  joinSession(sessionId) {
-    if (sessionId && sessionId !== this.networkId) {
-      this.emitter.emit("error", new Error("FreeRTC adapter does not support changing networkId after initialization"));
+  handleConnectionState(data) {
+    const peerId = this.normalizePeerId(data?.peerId);
+    const state = String(data?.state ?? "").toLowerCase();
+    if (!peerId || this.isSelfAlias(peerId)) {
+      if (peerId) this.closeConnection(peerId);
       return;
     }
-    this.sendEnvelope("discover", {
-      body: { exclude_peers: [], limit: 50 }
-    });
-  }
-  async initiateConnection(peerId, iceServers, trickleIce) {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      throw new Error("Not connected");
+    if (state === "connected") {
+      this.waitForOpenDataChannel(peerId);
+      return;
     }
-    this.closeConnection(peerId);
-    const resolvedTrickleIce = trickleIce ?? this.defaultTrickleIce;
-    const peer = new RtcPeer({
-      initiator: true,
-      trickleIce: resolvedTrickleIce,
-      config: iceServers ?? this.defaultIceServers ? { iceServers: iceServers ?? this.defaultIceServers ?? void 0 } : void 0
-    });
-    this.attachPeer(peerId, peer, true);
-    const entry = this.peerEntries.get(peerId);
-    if (entry) {
-      entry.trickleIce = resolvedTrickleIce;
+    if (state === "failed" || state === "closed") {
+      this.clearOpenChannelTimer(peerId);
+      if (this.connectedPeers.delete(peerId)) {
+        this.emitter.emit("rtc:disconnected", { peerId });
+      }
     }
   }
-  nudgeSignaling() {
-    this.sendEnvelope("announce", {
-      ttl_ms: 3e4,
-      body: { instance_id: this.networkId, hints: { wants_peers: true } }
-    });
-    this.joinSession(this.networkId);
+  waitForOpenDataChannel(peerId) {
+    if (this.connectedPeers.has(peerId) || this.openChannelTimers.has(peerId)) return;
+    const startedAt = Date.now();
+    const check = () => {
+      const entry = this.client?.mesh?.connections?.get?.(peerId);
+      if (entry?.channel?.readyState === "open") {
+        this.clearOpenChannelTimer(peerId);
+        if (!this.connectedPeers.has(peerId)) {
+          this.connectedPeers.add(peerId);
+          this.emitter.emit("rtc:connected", { peerId });
+        }
+        return;
+      }
+      if (!entry || entry?.connection?.connectionState === "failed" || entry?.connection?.connectionState === "closed" || Date.now() - startedAt > 15e3) {
+        this.clearOpenChannelTimer(peerId);
+      }
+    };
+    const timer = setInterval(check, 50);
+    this.openChannelTimers.set(peerId, timer);
+    check();
   }
-  closeConnection(peerId) {
-    const entry = this.peerEntries.get(peerId);
-    if (!entry) return;
-    this.peerEntries.delete(peerId);
-    this.pendingCandidates.delete(peerId);
-    this.offerQueues.delete(peerId);
-    this.lastRemoteOfferSdp.delete(peerId);
-    this.lastAppliedAnswerSdp.delete(peerId);
-    try {
-      entry.peer?.destroy?.();
-    } catch {
-    }
+  clearOpenChannelTimer(peerId) {
+    const timer = this.openChannelTimers.get(peerId);
+    if (timer) clearInterval(timer);
+    this.openChannelTimers.delete(peerId);
   }
-  send(peerId, data) {
-    const entry = this.peerEntries.get(peerId);
-    if (!entry?.connected) {
-      throw new Error("WebRTC not yet connected");
-    }
-    entry.peer.send(data);
+  clearOpenChannelTimers() {
+    for (const timer of this.openChannelTimers.values()) clearInterval(timer);
+    this.openChannelTimers.clear();
   }
-  broadcast(data) {
-    for (const [, entry] of this.peerEntries.entries()) {
-      if (!entry?.connected) continue;
+  withdrawRetiredPeerIds() {
+    for (const peerId of this.retiredPeerIds) {
+      let socket = null;
+      const timeout = setTimeout(() => {
+        try {
+          socket?.close();
+        } catch {
+        }
+      }, 3e3);
       try {
-        entry.peer.send(data);
+        const url = new URL(this.signalUrl, typeof location !== "undefined" ? location.href : void 0);
+        url.searchParams.set("networkId", this.networkId);
+        url.searchParams.set("room", this.roomId);
+        socket = new WebSocket(url.toString());
+        socket.onopen = () => {
+          socket?.send(JSON.stringify({
+            psp_version: "1.0",
+            type: "withdraw",
+            network: this.networkId,
+            from: peerId,
+            to: null,
+            session_id: this.roomId,
+            message_id: generateMessageId(),
+            timestamp: Date.now(),
+            ttl_ms: null,
+            body: { reason: "identity_replaced" }
+          }));
+          setTimeout(() => {
+            clearTimeout(timeout);
+            try {
+              socket?.close(1e3, "identity_replaced");
+            } catch {
+            }
+          }, 100);
+        };
+        socket.onerror = () => clearTimeout(timeout);
       } catch {
+        clearTimeout(timeout);
       }
     }
   }
@@ -1367,6 +953,7 @@ var PeerPigeonStorage = class {
     this.storeName = "records";
     this.driver = null;
     this.listeners = /* @__PURE__ */ new Set();
+    this.subscribedKeys = /* @__PURE__ */ new Set();
     this.pendingRetrieveRequests = /* @__PURE__ */ new Map();
     this.closed = false;
     this.instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
@@ -1377,6 +964,7 @@ var PeerPigeonStorage = class {
       throw new Error("PeerPigeonStorage requires a non-empty userId");
     }
     this.userId = userId;
+    this.peerId = String(options.peerId ?? "").trim();
     this.gossip = options.gossip ?? null;
     this.sessionId = String(options.sessionId ?? "default-session").trim() || "default-session";
     this.syncSecret = String(options.syncSecret ?? "").trim();
@@ -1414,6 +1002,27 @@ var PeerPigeonStorage = class {
       this.off("change", listener);
     };
   }
+  /** Subscribe to remote updates for one exact storage-space/key pair. */
+  subscribeKey(space, key) {
+    const normalizedKey = this.normalizeKey(key);
+    const subscriptionKey = this.makePk(space, normalizedKey);
+    this.subscribedKeys.add(subscriptionKey);
+    return () => this.unsubscribeKey(space, normalizedKey);
+  }
+  /** Stop accepting remote updates for one exact storage-space/key pair. */
+  unsubscribeKey(space, key) {
+    const normalizedKey = this.normalizeKey(key);
+    this.subscribedKeys.delete(this.makePk(space, normalizedKey));
+  }
+  /** Return whether this instance accepts remote updates for a key. */
+  isSubscribed(space, key) {
+    const normalizedKey = this.normalizeKey(key);
+    return this.subscribedKeys.has(this.makePk(space, normalizedKey));
+  }
+  /** Update the mesh peer ID recorded on subsequent local mutations. */
+  setPeerId(peerId) {
+    this.peerId = String(peerId ?? "").trim();
+  }
   off(event, listener) {
     if (event !== "change") return;
     this.listeners.delete(listener);
@@ -1450,6 +1059,7 @@ var PeerPigeonStorage = class {
       key: persisted.key,
       value,
       ownerId: persisted.ownerId,
+      modifiedBy: persisted.modifiedBy ?? null,
       createdAt: persisted.createdAt,
       updatedAt: persisted.updatedAt,
       version: this.normalizeStorageVersion(persisted.version, this.versionSourceToken(persisted.ownerId ?? this.userId))
@@ -1457,6 +1067,7 @@ var PeerPigeonStorage = class {
   }
   async retrieve(space, key, options = {}) {
     const normalizedKey = this.normalizeKey(key);
+    this.subscribeKey(space, normalizedKey);
     const existing = await this.get(space, normalizedKey);
     if (space === "private") return existing;
     if (!this.gossip) return existing;
@@ -1517,6 +1128,7 @@ var PeerPigeonStorage = class {
         key: record.key,
         value,
         ownerId: record.ownerId,
+        modifiedBy: record.modifiedBy ?? null,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
         version: this.normalizeStorageVersion(record.version, this.versionSourceToken(record.ownerId ?? this.userId))
@@ -1535,6 +1147,7 @@ var PeerPigeonStorage = class {
     this.driver = null;
     this.teardownCrossTabSync();
     this.listeners.clear();
+    this.subscribedKeys.clear();
     for (const pending of this.pendingRetrieveRequests.values()) {
       clearTimeout(pending.timeout);
       pending.resolve(null);
@@ -1550,13 +1163,15 @@ var PeerPigeonStorage = class {
     const now = Date.now();
     this.assertCanWrite(space, existing, actorId, options.ownerId, allowSystemWrite);
     const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
-    const nextVersion = this.nextStorageVersion(existing?.version, ownerId || actorId);
+    const modifiedBy = this.peerId || null;
+    const nextVersion = this.nextStorageVersion(existing?.version, modifiedBy || ownerId || actorId);
     const encoded = await this.encodeValueForStore(space, value);
     const persisted = {
       pk,
       space,
       key: normalizedKey,
       ownerId,
+      modifiedBy,
       value: encoded.value,
       valueCipher: encoded.valueCipher,
       createdAt: existing?.createdAt ?? now,
@@ -1583,6 +1198,7 @@ var PeerPigeonStorage = class {
         key: normalizedKey,
         value,
         ownerId,
+        modifiedBy,
         createdAt: persisted.createdAt,
         updatedAt: persisted.updatedAt,
         version: persisted.version
@@ -1724,6 +1340,7 @@ var PeerPigeonStorage = class {
       ...mutation.record,
       pk,
       ownerId: mutation.space === "user" ? existing?.ownerId ?? mutation.record.ownerId ?? mutation.actorId : mutation.record.ownerId,
+      modifiedBy: mutation.record.modifiedBy ?? null,
       updatedAt: mutation.timestamp,
       createdAt: existing?.createdAt ?? mutation.record.createdAt,
       version: this.normalizeStorageVersion(
@@ -1741,6 +1358,7 @@ var PeerPigeonStorage = class {
         key: incoming.key,
         value,
         ownerId: incoming.ownerId,
+        modifiedBy: incoming.modifiedBy,
         createdAt: incoming.createdAt,
         updatedAt: incoming.updatedAt,
         version: incoming.version
@@ -1860,6 +1478,7 @@ var PeerPigeonStorage = class {
         key: persisted.key,
         value,
         ownerId: persisted.ownerId,
+        modifiedBy: persisted.modifiedBy ?? null,
         createdAt: persisted.createdAt,
         updatedAt: persisted.updatedAt,
         version: persisted.version
@@ -1948,6 +1567,9 @@ var PeerPigeonStorage = class {
   }
   shouldAcceptRemoteSync(space, key, context) {
     if (space === "private") return false;
+    if (context.kind !== "retrieve-request" && !this.isSubscribed(space, key)) {
+      return false;
+    }
     if (!this.syncFilter) return true;
     try {
       return this.syncFilter(space, key, context) !== false;
@@ -2065,9 +1687,7 @@ var PeerPigeonStorage = class {
       const requested = String(ownerOverride ?? "").trim();
       return requested || actorId;
     }
-    if (space === "public" || space === "frozen" || space === "epublic") {
-      return actorId;
-    }
+    if (space === "public" || space === "frozen" || space === "epublic") return null;
     return existing?.ownerId ?? null;
   }
   assertCanWrite(space, existing, actorId, ownerOverride, allowSystemWrite = false) {
@@ -2252,6 +1872,7 @@ var PartialMesh = class {
     this.discoveredPeers = /* @__PURE__ */ new Set();
     this.clientId = null;
     this.selfAliases = /* @__PURE__ */ new Set();
+    this.retiredPeerIds = /* @__PURE__ */ new Set();
     this.eventHandlers = /* @__PURE__ */ new Map();
     this.connecting = /* @__PURE__ */ new Set();
     this.connectionTimers = /* @__PURE__ */ new Map();
@@ -2276,6 +1897,7 @@ var PartialMesh = class {
       maxPeers: config.maxPeers ?? 10,
       tolerantPeers: config.tolerantPeers ?? Math.max(1, Math.min(2, Math.floor((config.maxPeers ?? 10) * 0.25))),
       signalingServer: config.signalingServer ?? "wss://peer.ooo/ws",
+      networkId: config.networkId ?? config.sessionId ?? "peerpigeon",
       sessionId: config.sessionId ?? "default-session",
       autoDiscover: config.autoDiscover ?? true,
       autoConnect: config.autoConnect ?? true,
@@ -2307,6 +1929,18 @@ var PartialMesh = class {
   normalizePeerId(peerId) {
     return (peerId ?? "").trim();
   }
+  normalizeSignalingUrl(rawUrl) {
+    const url = new URL(rawUrl);
+    const hostname = url.hostname.toLowerCase();
+    const isLocalDevelopmentHost = hostname === "localhost" || hostname === "::1" || hostname.endsWith(".local") || /^127\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^169\.254\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
+    if (url.protocol === "https:") url.protocol = "wss:";
+    if (url.protocol === "http:") url.protocol = isLocalDevelopmentHost ? "ws:" : "wss:";
+    if (url.protocol === "ws:" && !isLocalDevelopmentHost) url.protocol = "wss:";
+    if (url.protocol !== "ws:" && url.protocol !== "wss:") {
+      throw new Error(`Unsupported signaling protocol: ${url.protocol}`);
+    }
+    return url.toString();
+  }
   addSelfAlias(peerId) {
     const id = this.normalizePeerId(peerId);
     if (!id) return;
@@ -2321,11 +1955,75 @@ var PartialMesh = class {
   }
   addDiscoveredPeer(peerId) {
     const id = this.normalizePeerId(peerId);
-    if (!id || this.isSelfAlias(id)) return;
+    if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) return;
     if (this.discoveredPeers.has(id)) return;
     this.discoveredPeers.add(id);
     this.discoveredAtMs.set(id, Date.now());
     this.emit("peer:discovered", id);
+  }
+  rotateBrowserPeerId(signalingUrl) {
+    const requestedPeerId = Array.from(
+      (globalThis.window?.crypto ?? globalThis.crypto).getRandomValues(new Uint8Array(32)),
+      (value) => value.toString(16).padStart(2, "0")
+    ).join("");
+    let previousPeerId = null;
+    let retiredPeerIds = [];
+    try {
+      const storage = globalThis.window?.sessionStorage;
+      if (storage) {
+        const relayScope = new URL(signalingUrl).origin;
+        const key = `peerpigeon:previous-peer-id:${relayScope}:${this.config.networkId}:${this.config.sessionId}`;
+        const retiredKey = `${key}:retired`;
+        previousPeerId = this.normalizePeerId(storage.getItem(key)) || null;
+        try {
+          const storedRetired = JSON.parse(storage.getItem(retiredKey) || "[]");
+          if (Array.isArray(storedRetired)) {
+            retiredPeerIds = storedRetired.map((peerId) => this.normalizePeerId(peerId)).filter(Boolean);
+          }
+        } catch {
+          retiredPeerIds = [];
+        }
+        if (previousPeerId) retiredPeerIds.push(previousPeerId);
+        retiredPeerIds = Array.from(new Set(retiredPeerIds)).filter((peerId) => peerId !== requestedPeerId).slice(-64);
+        storage.setItem(key, requestedPeerId);
+        storage.setItem(retiredKey, JSON.stringify(retiredPeerIds));
+      }
+    } catch {
+    }
+    return { requestedPeerId, previousPeerId, retiredPeerIds };
+  }
+  retirePeerId(peerId) {
+    const id = this.normalizePeerId(peerId);
+    if (!id || id === this.clientId || this.retiredPeerIds.has(id)) return false;
+    this.retiredPeerIds.add(id);
+    this.selfAliases.add(id);
+    const removedDiscovered = this.discoveredPeers.delete(id);
+    const removedGlobal = this.globalPeers.delete(id);
+    const changed = removedDiscovered || removedGlobal;
+    this.discoveredAtMs.delete(id);
+    this.dialFailureCount.delete(id);
+    this.dialBackoffUntilMs.delete(id);
+    if (this.peers.has(id) || this.connecting.has(id)) {
+      this.removePeer(id, true);
+    } else {
+      try {
+        this.signalingClient?.closeConnection?.(id);
+      } catch {
+      }
+    }
+    return changed;
+  }
+  reconcileSignalingPeers(rawPeerIds) {
+    const nextPeers = new Set(
+      rawPeerIds.map((peerId) => this.normalizePeerId(peerId)).filter((peerId) => peerId && !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId))
+    );
+    for (const peerId of Array.from(this.discoveredPeers)) {
+      if (!nextPeers.has(peerId)) {
+        this.discoveredPeers.delete(peerId);
+        this.discoveredAtMs.delete(peerId);
+      }
+    }
+    for (const peerId of nextPeers) this.addDiscoveredPeer(peerId);
   }
   getConnectedPeerCount() {
     let count = 0;
@@ -2478,18 +2176,19 @@ var PartialMesh = class {
    * Initialize and connect to the signaling server
    */
   async init() {
-    const url = new URL(this.config.signalingServer);
-    if (url.protocol === "https:") url.protocol = "wss:";
-    if (url.protocol === "http:") url.protocol = "ws:";
-    const signalingUrl = url.toString();
-    const requestedPeerId = Array.from(
-      (globalThis.window?.crypto ?? globalThis.crypto).getRandomValues(new Uint8Array(32)),
-      (value) => value.toString(16).padStart(2, "0")
-    ).join("");
+    const signalingUrl = this.normalizeSignalingUrl(this.config.signalingServer);
+    const { requestedPeerId, previousPeerId, retiredPeerIds } = this.rotateBrowserPeerId(signalingUrl);
     this.addSelfAlias(requestedPeerId);
+    for (const peerId of retiredPeerIds) {
+      this.retiredPeerIds.add(peerId);
+      this.addSelfAlias(peerId);
+    }
     this.signalingClient = new freertc_client_adapter_default(signalingUrl, {
-      networkId: this.config.sessionId,
+      networkId: this.config.networkId,
+      roomId: this.config.sessionId,
       peerId: requestedPeerId,
+      previousPeerId,
+      retiredPeerIds,
       iceServers: this.config.iceServers,
       trickleIce: this.config.trickleIce
     });
@@ -2539,9 +2238,18 @@ var PartialMesh = class {
       this.dialBackoffUntilMs.delete(peerId);
       this.removePeer(peerId, true);
     });
+    this.signalingClient.on("peers-updated", (data) => {
+      this.reconcileSignalingPeers(Array.isArray(data?.peers) ? data.peers : []);
+    });
     this.signalingClient.on("rtc:connected", (data) => {
       const peerId = this.normalizePeerId(data.peerId);
-      if (!peerId || this.isSelfAlias(peerId)) return;
+      if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) {
+        try {
+          this.signalingClient?.closeConnection?.(peerId);
+        } catch {
+        }
+        return;
+      }
       let peerConnection = this.peers.get(peerId);
       if (!peerConnection) {
         peerConnection = { id: peerId, connected: false, initiator: false };
@@ -2616,7 +2324,7 @@ var PartialMesh = class {
     this.signalingClient.on("rtc:data", (data) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
-        this.mergeMembership(msg.peers, data.peerId);
+        this.mergeMembership(msg.peers, msg.retiredPeers, data.peerId);
       } else {
         this.emit("peer:data", data);
       }
@@ -2929,18 +2637,16 @@ var PartialMesh = class {
     if (!selfId) {
       return;
     }
-    if (!normalizedPeerId || this.peers.has(normalizedPeerId) || this.connecting.has(normalizedPeerId) || this.isSelfAlias(normalizedPeerId) || normalizedPeerId === selfId) {
+    if (!normalizedPeerId || this.peers.has(normalizedPeerId) || this.connecting.has(normalizedPeerId) || this.isSelfAlias(normalizedPeerId) || this.retiredPeerIds.has(normalizedPeerId) || normalizedPeerId === selfId) {
       return;
     }
     const existingRtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(normalizedPeerId);
-    if (existingRtcEntry && !emergencyIsolated) {
+    if (existingRtcEntry) {
       const existingState = String(existingRtcEntry.state ?? existingRtcEntry.connection?.connectionState ?? "").toLowerCase();
       const isDefinitelyDead = existingState === "failed" || existingState === "closed";
       if (!isDefinitelyDead) {
         return;
       }
-    }
-    if (existingRtcEntry && emergencyIsolated) {
       try {
         this.signalingClient?.closeConnection?.(normalizedPeerId);
       } catch {
@@ -3022,14 +2728,12 @@ var PartialMesh = class {
             return;
           }
           const fallbackRtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(normalizedPeerId);
-          if (fallbackRtcEntry && !emergencyIsolated) {
+          if (fallbackRtcEntry) {
             const fallbackRtcState = String(fallbackRtcEntry.state ?? fallbackRtcEntry.connection?.connectionState ?? "").toLowerCase();
             const isFallbackDead = fallbackRtcState === "failed" || fallbackRtcState === "closed";
             if (!isFallbackDead) {
               return;
             }
-          }
-          if (fallbackRtcEntry && emergencyIsolated) {
             try {
               this.signalingClient?.closeConnection?.(normalizedPeerId);
             } catch {
@@ -3129,13 +2833,13 @@ var PartialMesh = class {
    * Get list of discovered peer IDs
    */
   getDiscoveredPeers() {
-    return Array.from(this.discoveredPeers);
+    return Array.from(this.discoveredPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
   }
   /**
    * Get the converged global peer set (all peers known via membership gossip).
    */
   getGlobalPeers() {
-    return Array.from(this.globalPeers);
+    return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
   }
   /**
    * Get current peer count
@@ -3188,7 +2892,12 @@ var PartialMesh = class {
     const all = new Set(this.globalPeers);
     if (self) all.add(self);
     for (const p of this.discoveredPeers) all.add(p);
-    const payload = JSON.stringify({ __membership: true, peers: Array.from(all) });
+    for (const retiredPeerId of this.retiredPeerIds) all.delete(retiredPeerId);
+    const payload = JSON.stringify({
+      __membership: true,
+      peers: Array.from(all),
+      retiredPeers: Array.from(this.retiredPeerIds)
+    });
     try {
       this.signalingClient?.send(toPeerId, payload);
     } catch {
@@ -3198,21 +2907,26 @@ var PartialMesh = class {
     try {
       const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
       if (obj?.__membership === true && Array.isArray(obj.peers)) {
-        return { peers: obj.peers };
+        return {
+          peers: obj.peers,
+          retiredPeers: Array.isArray(obj.retiredPeers) ? obj.retiredPeers : []
+        };
       }
     } catch {
     }
     return null;
   }
-  mergeMembership(incoming, fromPeerId) {
+  mergeMembership(incoming, retired, fromPeerId) {
     let changed = false;
+    for (const raw of retired) {
+      if (this.retirePeerId(raw)) changed = true;
+    }
     for (const raw of incoming) {
       const id = this.normalizePeerId(raw);
-      if (!id || this.isSelfAlias(id)) continue;
+      if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) continue;
       if (!this.globalPeers.has(id)) {
         this.globalPeers.add(id);
         changed = true;
-        this.addDiscoveredPeer(id);
       }
     }
     if (changed) {
@@ -3269,6 +2983,7 @@ var PartialMesh = class {
     this.pendingRebalanceDropByTarget.clear();
     this.globalPeers.clear();
     this.selfAliases.clear();
+    this.retiredPeerIds.clear();
     this.clientId = null;
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;

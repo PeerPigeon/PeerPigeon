@@ -20,6 +20,12 @@ export interface PartialMeshConfig {
     * FreeRTC signaling server URL
    */
   signalingServer?: string;
+
+  /**
+   * FreeRTC network/application namespace. Peers must match both networkId and
+   * sessionId (room) even when they use different federated relay domains.
+   */
+  networkId?: string;
   
   /**
    * Session/room ID for peer discovery
@@ -111,6 +117,7 @@ export class PartialMesh {
   private discoveredPeers: Set<string> = new Set();
   private clientId: string | null = null;
   private selfAliases: Set<string> = new Set();
+  private retiredPeerIds: Set<string> = new Set();
   private eventHandlers: Map<keyof PartialMeshEvents, Set<Function>> = new Map();
   private connecting: Set<string> = new Set();
   private connectionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -137,6 +144,7 @@ export class PartialMesh {
       maxPeers: config.maxPeers ?? 10,
       tolerantPeers: config.tolerantPeers ?? Math.max(1, Math.min(2, Math.floor((config.maxPeers ?? 10) * 0.25))),
       signalingServer: config.signalingServer ?? 'wss://peer.ooo/ws',
+      networkId: config.networkId ?? config.sessionId ?? 'peerpigeon',
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
       autoConnect: config.autoConnect ?? true,
@@ -172,6 +180,27 @@ export class PartialMesh {
     return (peerId ?? '').trim();
   }
 
+  private normalizeSignalingUrl(rawUrl: string): string {
+    const url = new URL(rawUrl);
+    const hostname = url.hostname.toLowerCase();
+    const isLocalDevelopmentHost = hostname === 'localhost'
+      || hostname === '::1'
+      || hostname.endsWith('.local')
+      || /^127\./.test(hostname)
+      || /^10\./.test(hostname)
+      || /^192\.168\./.test(hostname)
+      || /^169\.254\./.test(hostname)
+      || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
+
+    if (url.protocol === 'https:') url.protocol = 'wss:';
+    if (url.protocol === 'http:') url.protocol = isLocalDevelopmentHost ? 'ws:' : 'wss:';
+    if (url.protocol === 'ws:' && !isLocalDevelopmentHost) url.protocol = 'wss:';
+    if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+      throw new Error(`Unsupported signaling protocol: ${url.protocol}`);
+    }
+    return url.toString();
+  }
+
   private addSelfAlias(peerId: string | null | undefined): void {
     const id = this.normalizePeerId(peerId);
     if (!id) return;
@@ -188,11 +217,81 @@ export class PartialMesh {
 
   private addDiscoveredPeer(peerId: string): void {
     const id = this.normalizePeerId(peerId);
-    if (!id || this.isSelfAlias(id)) return;
+    if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) return;
     if (this.discoveredPeers.has(id)) return;
     this.discoveredPeers.add(id);
     this.discoveredAtMs.set(id, Date.now());
     this.emit('peer:discovered', id);
+  }
+
+  private rotateBrowserPeerId(signalingUrl: string): { requestedPeerId: string; previousPeerId: string | null; retiredPeerIds: string[] } {
+    const requestedPeerId = Array.from(
+      (globalThis.window?.crypto ?? globalThis.crypto).getRandomValues(new Uint8Array(32)),
+      (value) => value.toString(16).padStart(2, '0')
+    ).join('');
+    let previousPeerId: string | null = null;
+    let retiredPeerIds: string[] = [];
+
+    try {
+      const storage = globalThis.window?.sessionStorage;
+      if (storage) {
+        const relayScope = new URL(signalingUrl).origin;
+        const key = `peerpigeon:previous-peer-id:${relayScope}:${this.config.networkId}:${this.config.sessionId}`;
+        const retiredKey = `${key}:retired`;
+        previousPeerId = this.normalizePeerId(storage.getItem(key)) || null;
+        try {
+          const storedRetired = JSON.parse(storage.getItem(retiredKey) || '[]');
+          if (Array.isArray(storedRetired)) {
+            retiredPeerIds = storedRetired.map((peerId) => this.normalizePeerId(peerId)).filter(Boolean);
+          }
+        } catch {
+          retiredPeerIds = [];
+        }
+        if (previousPeerId) retiredPeerIds.push(previousPeerId);
+        retiredPeerIds = Array.from(new Set(retiredPeerIds)).filter((peerId) => peerId !== requestedPeerId).slice(-64);
+        storage.setItem(key, requestedPeerId);
+        storage.setItem(retiredKey, JSON.stringify(retiredPeerIds));
+      }
+    } catch {
+      // sessionStorage can be unavailable in privacy-restricted contexts.
+    }
+
+    return { requestedPeerId, previousPeerId, retiredPeerIds };
+  }
+
+  private retirePeerId(peerId: string): boolean {
+    const id = this.normalizePeerId(peerId);
+    if (!id || id === this.clientId || this.retiredPeerIds.has(id)) return false;
+    this.retiredPeerIds.add(id);
+    this.selfAliases.add(id);
+    const removedDiscovered = this.discoveredPeers.delete(id);
+    const removedGlobal = this.globalPeers.delete(id);
+    const changed = removedDiscovered || removedGlobal;
+    this.discoveredAtMs.delete(id);
+    this.dialFailureCount.delete(id);
+    this.dialBackoffUntilMs.delete(id);
+    if (this.peers.has(id) || this.connecting.has(id)) {
+      this.removePeer(id, true);
+    } else {
+      try { this.signalingClient?.closeConnection?.(id); } catch { /* ignore */ }
+    }
+    return changed;
+  }
+
+  private reconcileSignalingPeers(rawPeerIds: string[]): void {
+    const nextPeers = new Set(
+      rawPeerIds
+        .map((peerId) => this.normalizePeerId(peerId))
+        .filter((peerId) => peerId && !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId))
+    );
+
+    for (const peerId of Array.from(this.discoveredPeers)) {
+      if (!nextPeers.has(peerId)) {
+        this.discoveredPeers.delete(peerId);
+        this.discoveredAtMs.delete(peerId);
+      }
+    }
+    for (const peerId of nextPeers) this.addDiscoveredPeer(peerId);
   }
 
   private getConnectedPeerCount(): number {
@@ -397,20 +496,21 @@ export class PartialMesh {
    */
   async init(): Promise<void> {
     // Let FreeRTC client manage query params such as networkId.
-    const url = new URL(this.config.signalingServer);
-    if (url.protocol === 'https:') url.protocol = 'wss:';
-    if (url.protocol === 'http:') url.protocol = 'ws:';
-    const signalingUrl = url.toString();
+    const signalingUrl = this.normalizeSignalingUrl(this.config.signalingServer);
 
-    const requestedPeerId = Array.from(
-      (globalThis.window?.crypto ?? globalThis.crypto).getRandomValues(new Uint8Array(32)),
-      (value) => value.toString(16).padStart(2, '0')
-    ).join('');
+    const { requestedPeerId, previousPeerId, retiredPeerIds } = this.rotateBrowserPeerId(signalingUrl);
     this.addSelfAlias(requestedPeerId);
+    for (const peerId of retiredPeerIds) {
+      this.retiredPeerIds.add(peerId);
+      this.addSelfAlias(peerId);
+    }
 
     this.signalingClient = new FreeRTCClientAdapter(signalingUrl, {
-      networkId: this.config.sessionId,
+      networkId: this.config.networkId,
+      roomId: this.config.sessionId,
       peerId: requestedPeerId,
+      previousPeerId,
+      retiredPeerIds,
       iceServers: this.config.iceServers,
       trickleIce: this.config.trickleIce
     });
@@ -471,9 +571,16 @@ export class PartialMesh {
       this.removePeer(peerId, true);
     });
 
+    this.signalingClient.on('peers-updated', (data: { peers: string[] }) => {
+      this.reconcileSignalingPeers(Array.isArray(data?.peers) ? data.peers : []);
+    });
+
     this.signalingClient.on('rtc:connected', (data: { peerId: string }) => {
       const peerId = this.normalizePeerId(data.peerId);
-      if (!peerId || this.isSelfAlias(peerId)) return;
+      if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) {
+        try { this.signalingClient?.closeConnection?.(peerId); } catch { /* ignore */ }
+        return;
+      }
       let peerConnection = this.peers.get(peerId);
       if (!peerConnection) {
         // Inbound connection — FreeRTC accepted and fully established without us initiating.
@@ -561,7 +668,7 @@ export class PartialMesh {
     this.signalingClient.on('rtc:data', (data: { peerId: string; data: any }) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
-        this.mergeMembership(msg.peers, data.peerId);
+        this.mergeMembership(msg.peers, msg.retiredPeers, data.peerId);
       } else {
         this.emit('peer:data', data);
       }
@@ -978,12 +1085,13 @@ export class PartialMesh {
         this.peers.has(normalizedPeerId) || 
         this.connecting.has(normalizedPeerId) || 
         this.isSelfAlias(normalizedPeerId) ||
+        this.retiredPeerIds.has(normalizedPeerId) ||
         normalizedPeerId === selfId) {
       return;
     }
 
     const existingRtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(normalizedPeerId);
-    if (existingRtcEntry && !emergencyIsolated) {
+    if (existingRtcEntry) {
       // Treat any entry as live unless explicitly failed/closed.
       // state='new' is set by the debug handler right after an inbound offer is answered
       // (RTCPeerConnection.connectionState='new' during early ICE). If we don't guard this
@@ -993,9 +1101,6 @@ export class PartialMesh {
       if (!isDefinitelyDead) {
         return;
       }
-    }
-
-    if (existingRtcEntry && emergencyIsolated) {
       try {
         this.signalingClient?.closeConnection?.(normalizedPeerId);
       } catch {
@@ -1112,15 +1217,12 @@ export class PartialMesh {
           }
 
           const fallbackRtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(normalizedPeerId);
-          if (fallbackRtcEntry && !emergencyIsolated) {
+          if (fallbackRtcEntry) {
             const fallbackRtcState = String(fallbackRtcEntry.state ?? fallbackRtcEntry.connection?.connectionState ?? '').toLowerCase();
             const isFallbackDead = fallbackRtcState === 'failed' || fallbackRtcState === 'closed';
             if (!isFallbackDead) {
               return;
             }
-          }
-
-          if (fallbackRtcEntry && emergencyIsolated) {
             try {
               this.signalingClient?.closeConnection?.(normalizedPeerId);
             } catch {
@@ -1244,14 +1346,14 @@ export class PartialMesh {
    * Get list of discovered peer IDs
    */
   public getDiscoveredPeers(): string[] {
-    return Array.from(this.discoveredPeers);
+    return Array.from(this.discoveredPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
   }
 
   /**
    * Get the converged global peer set (all peers known via membership gossip).
    */
   public getGlobalPeers(): string[] {
-    return Array.from(this.globalPeers);
+    return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
   }
 
   /**
@@ -1311,7 +1413,12 @@ export class PartialMesh {
       const all = new Set<string>(this.globalPeers);
       if (self) all.add(self);
       for (const p of this.discoveredPeers) all.add(p);
-      const payload = JSON.stringify({ __membership: true, peers: Array.from(all) });
+      for (const retiredPeerId of this.retiredPeerIds) all.delete(retiredPeerId);
+      const payload = JSON.stringify({
+        __membership: true,
+        peers: Array.from(all),
+        retiredPeers: Array.from(this.retiredPeerIds)
+      });
       try {
         this.signalingClient?.send(toPeerId, payload);
       } catch {
@@ -1319,11 +1426,14 @@ export class PartialMesh {
       }
     }
 
-    private tryParseMembership(raw: any): { peers: string[] } | null {
+    private tryParseMembership(raw: any): { peers: string[]; retiredPeers: string[] } | null {
       try {
         const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
         if (obj?.__membership === true && Array.isArray(obj.peers)) {
-          return { peers: obj.peers };
+          return {
+            peers: obj.peers,
+            retiredPeers: Array.isArray(obj.retiredPeers) ? obj.retiredPeers : []
+          };
         }
       } catch {
         // not a membership message
@@ -1331,15 +1441,17 @@ export class PartialMesh {
       return null;
     }
 
-    private mergeMembership(incoming: string[], fromPeerId: string): void {
+    private mergeMembership(incoming: string[], retired: string[], fromPeerId: string): void {
       let changed = false;
+      for (const raw of retired) {
+        if (this.retirePeerId(raw)) changed = true;
+      }
       for (const raw of incoming) {
         const id = this.normalizePeerId(raw);
-        if (!id || this.isSelfAlias(id)) continue;
+        if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) continue;
         if (!this.globalPeers.has(id)) {
           this.globalPeers.add(id);
           changed = true;
-          this.addDiscoveredPeer(id);
         }
       }
       if (changed) {
@@ -1402,6 +1514,7 @@ export class PartialMesh {
     this.pendingRebalanceDropByTarget.clear();
     this.globalPeers.clear();
     this.selfAliases.clear();
+    this.retiredPeerIds.clear();
     this.clientId = null;
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;

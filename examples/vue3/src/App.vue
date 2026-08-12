@@ -1,7 +1,10 @@
 <template>
   <div id="app">
     <header>
-      <h1>🕊️ PeerPigeon Demo</h1>
+      <div class="header-brand">
+        <img src="/pigeonlogo.svg" alt="PeerPigeon" class="header-logo" />
+        <h1>PeerPigeon Demo</h1>
+      </div>
       <p>Distributed peer messaging using WebRTC and PartialMesh</p>
     </header>
 
@@ -255,11 +258,11 @@
 
           <div v-else-if="activeTab === 'storage'" class="tab-panel feature-panel" role="tabpanel" aria-label="Storage panel">
             <h3>🗄 Storage</h3>
-            <p class="feature-copy">Key/value storage synced across peers over gossip.</p>
+            <p class="feature-copy">Key/value storage stays local until you Get a key and subscribe to its peer updates.</p>
 
             <div class="storage-head">
               <div class="storage-badge" :class="storageReady ? 'ready' : 'idle'">
-                {{ storageReady ? 'Synced' : 'Waiting for mesh identity' }}
+                {{ storageReady ? 'Ready' : 'Waiting for mesh identity' }}
               </div>
               <div class="storage-help">Session: <span class="mono">{{ effectiveSessionId }}</span></div>
             </div>
@@ -290,12 +293,6 @@
                 <span class="field-label">Key</span>
                 <div class="storage-key-row">
                   <input v-model="storageFormKey" class="input" placeholder="e.g. profile.theme" />
-                  <button
-                    class="btn btn-small storage-get-sync-btn"
-                    :class="{ active: isStorageKeyInterested(storageActiveSpace, storageFormKey) }"
-                    :disabled="!storageFormKey.trim() || !isRunning || !storageReady"
-                    @click="getSyncStorageKey"
-                  >GET &amp; SYNC</button>
                 </div>
               </label>
 
@@ -311,8 +308,8 @@
                 <button class="btn btn-danger" :disabled="storageActiveSpace === 'epublic' || !isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="deleteStorageEntry">
                   Delete
                 </button>
-                <button class="btn" :disabled="!isRunning || storageBusy" @click="refreshStorageList">
-                  Refresh
+                <button class="btn storage-get-sync-btn" :class="{ active: isStorageKeyInterested(storageActiveSpace, storageFormKey) }" :disabled="!storageFormKey.trim() || !isRunning || !storageReady || storageBusy" @click="getStorageKey">
+                  Get
                 </button>
               </div>
             </div>
@@ -321,7 +318,7 @@
 
             <div class="storage-interest-list" v-if="interestedKeysForSpace(storageActiveSpace).length">
               <div class="storage-interest-head">
-                <span class="storage-interest-title">Interested keys ({{ storageActiveSpace }})</span>
+                <span class="storage-interest-title">Subscribed keys ({{ storageActiveSpace }})</span>
                 <button class="btn btn-small" @click="clearStorageKeyInterestForSpace(storageActiveSpace)">Clear all</button>
               </div>
               <div class="storage-interest-chips">
@@ -358,7 +355,7 @@
                   <tr v-for="record in storageRecords" :key="`${record.space}:${record.key}`" @click="selectStorageRecord(record)">
                     <td class="mono">{{ record.key }}</td>
                     <td class="mono storage-value-cell">{{ storageRecordPreview(record.value) }}</td>
-                    <td class="mono">{{ record.ownerId ? `${record.ownerId}${record.ownerId === storageUserId() ? ' (You)' : ''}` : '-' }}</td>
+                    <td class="mono">{{ storageModifiedBy(record) }}</td>
                     <td>{{ formatStorageVersion(record.version) }}</td>
                     <td>{{ formatTime(record.updatedAt) }}</td>
                   </tr>
@@ -477,6 +474,26 @@ const MESH_PEERS_STALE_AFTER_MS = MESH_PEERS_HEARTBEAT_MS * 6;
 const MESH_PEERS_MAX_SNAPSHOTS = 80;
 const DEBUG_MONITOR_INTERVAL_MS = 1000;
 const DEBUG_MONITOR_PEER_LOG_MIN_GAP_MS = 2500;
+const STORAGE_PEER_SCOPE_SESSION_KEY = 'peerpigeon:storage-peer-scope:v1';
+
+function getOrCreateStoragePeerScopeId() {
+  const createScopeId = () => {
+    if (globalThis.crypto?.randomUUID) {
+      return globalThis.crypto.randomUUID();
+    }
+    return `peer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  };
+
+  try {
+    const existing = String(sessionStorage.getItem(STORAGE_PEER_SCOPE_SESSION_KEY) || '').trim();
+    if (existing) return existing;
+    const created = createScopeId();
+    sessionStorage.setItem(STORAGE_PEER_SCOPE_SESSION_KEY, created);
+    return created;
+  } catch {
+    return createScopeId();
+  }
+}
 
 function toBase64Url(buffer) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
@@ -534,6 +551,7 @@ export default {
       cryptoAnnounceTimer: null,
       storage: null,
       storageIdentity: '',
+      storagePeerScopeId: getOrCreateStoragePeerScopeId(),
       storageReady: false,
       storageBusy: false,
       storageError: '',
@@ -1149,17 +1167,20 @@ export default {
         ...this.storageInterestedKeys,
         [pk]: Boolean(enabled),
       };
-      this.saveUiState();
-      if (enabled === true) {
-        this.requestInterestedKeySync('interest-added', [space]);
+      const wireKey = this.storageWireKey(space, key, ownerId);
+      if (wireKey && enabled === true) {
+        this.storage?.subscribeKey?.(space, wireKey);
+      } else if (wireKey) {
+        this.storage?.unsubscribeKey?.(space, wireKey);
       }
+      this.saveUiState();
 
       if (this.activeTab === 'storage') {
-        this.refreshStorageList();
+        this.refreshStorageList({ syncInterested: false });
       }
     },
 
-    getSyncStorageKey() {
+    async getStorageKey() {
       if (!this.storage) return;
       const space = this.storageActiveSpace;
       const key = String(this.storageFormKey || '').trim();
@@ -1177,23 +1198,39 @@ export default {
 
       const wireKey = this.storageWireKey(space, key, ownerId);
       if (!wireKey) return;
-      this.storage.retrieve(space, wireKey, { timeoutMs: 2500 })
-        .then(() => {
-          this.refreshStorageList({ silent: true });
-          // go-wasm retrieve runs network fetch in background to avoid main-thread stalls.
-          // Do a couple of delayed refreshes so newly fetched values surface even if no event races in.
-          if (isGoWasm) {
-            setTimeout(() => {
-              this.refreshStorageList({ silent: true });
-            }, 250);
-            setTimeout(() => {
-              this.refreshStorageList({ silent: true });
-            }, 900);
-          }
-        })
-        .catch((error) => {
-          this.storageError = String(error?.message || error || 'Failed to sync storage key');
-        });
+      this.storageBusy = true;
+      this.storageError = '';
+
+      const showCurrentValue = async () => {
+        const current = await this.storage?.get(space, wireKey);
+        if (current) {
+          this.storageFormValue = typeof current.value === 'string'
+            ? current.value
+            : JSON.stringify(current.value);
+        }
+        await this.refreshStorageList({ silent: true, syncInterested: false });
+      };
+
+      try {
+        const current = await this.storage.retrieve(space, wireKey, { timeoutMs: 2500 });
+        if (current) {
+          this.storageFormValue = typeof current.value === 'string'
+            ? current.value
+            : JSON.stringify(current.value);
+        }
+        await showCurrentValue();
+
+        // Go/WASM retrieval is intentionally backgrounded to avoid blocking
+        // the browser main thread. Re-read after its response can arrive.
+        if (isGoWasm) {
+          setTimeout(() => showCurrentValue().catch(() => {}), 300);
+          setTimeout(() => showCurrentValue().catch(() => {}), 1000);
+        }
+      } catch (error) {
+        this.storageError = String(error?.message || error || 'Failed to get storage key');
+      } finally {
+        this.storageBusy = false;
+      }
     },
 
     async syncInterestedKeysForSpace(space, options = {}) {
@@ -1289,10 +1326,19 @@ export default {
         for (const pk of Object.keys(next)) {
           if (!pk.startsWith('user:')) continue;
           if (!owner) {
+            const rest = pk.slice('user:'.length);
+            const splitAt = rest.indexOf(':');
+            const keyOwner = splitAt >= 0 ? rest.slice(0, splitAt) : this.storageLookupUserId();
+            const logicalKey = splitAt >= 0 ? rest.slice(splitAt + 1) : rest;
+            const wireKey = this.storageWireKey('user', logicalKey, keyOwner);
+            if (wireKey) this.storage?.unsubscribeKey?.('user', wireKey);
             delete next[pk];
             continue;
           }
           if (pk.startsWith(`user:${owner}:`)) {
+            const logicalKey = pk.slice(`user:${owner}:`.length);
+            const wireKey = this.storageWireKey('user', logicalKey, owner);
+            if (wireKey) this.storage?.unsubscribeKey?.('user', wireKey);
             delete next[pk];
           }
         }
@@ -1300,6 +1346,8 @@ export default {
         const prefix = `${normalizedSpace}:`;
         for (const pk of Object.keys(next)) {
           if (pk.startsWith(prefix)) {
+            const logicalKey = pk.slice(prefix.length);
+            if (logicalKey) this.storage?.unsubscribeKey?.(normalizedSpace, logicalKey);
             delete next[pk];
           }
         }
@@ -1307,10 +1355,9 @@ export default {
 
       this.storageInterestedKeys = next;
       this.saveUiState();
-      this.requestInterestedKeySync('interest-cleared', [normalizedSpace], { timeoutMs: 1000 });
 
       if (this.activeTab === 'storage') {
-        this.refreshStorageList();
+        this.refreshStorageList({ syncInterested: false });
       }
     },
 
@@ -1337,10 +1384,7 @@ export default {
     },
 
     storageOwnerLabel() {
-      if (this.storageActiveSpace === 'public' || this.storageActiveSpace === 'frozen' || this.storageActiveSpace === 'epublic') {
-        return 'Modified By';
-      }
-      return 'Owner';
+      return 'Modified By';
     },
 
     parseStorageVersionParts(version) {
@@ -1423,6 +1467,30 @@ export default {
       return String(this.cryptoKeys?.epub || this.mesh?.getClientId?.() || this.clientId || '').trim();
     },
 
+    storagePeerId() {
+      return String(this.clientId || this.mesh?.getClientId?.() || '').trim();
+    },
+
+    storageModifiedBy(record) {
+      let peerId = String(record?.modifiedBy || '').trim();
+      const legacyIdentity = String(record?.ownerId || '').trim();
+      // Resolve records written before modifiedBy was persisted. Those records
+      // stored the modifying crypto identity in ownerId.
+      if (!peerId && /^[0-9a-f]{64}$/i.test(legacyIdentity)) {
+        peerId = legacyIdentity;
+      }
+      if (!peerId && legacyIdentity && legacyIdentity === String(this.cryptoKeys?.epub || '').trim()) {
+        peerId = this.storagePeerId();
+      }
+      if (!peerId && legacyIdentity) {
+        const match = Object.entries(this.cryptoPublicDirectory || {})
+          .find(([, info]) => String(info?.epub || '').trim() === legacyIdentity);
+        peerId = String(match?.[0] || '').trim();
+      }
+      if (!peerId) return '-';
+      return `${peerId}${peerId === this.storagePeerId() ? ' (You)' : ''}`;
+    },
+
     storageOpId() {
       return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
     },
@@ -1471,7 +1539,8 @@ export default {
       }
 
       const gossipAttached = this.gossip ? '1' : '0';
-      const nextIdentity = `js-storage::${this.effectiveSessionId}::${userId}::gossip:${gossipAttached}`;
+      const peerId = this.storagePeerId();
+      const nextIdentity = `js-storage::${this.effectiveSessionId}::${this.storagePeerScopeId}::${userId}::peer:${peerId}::gossip:${gossipAttached}`;
       if (this.storageReady && this.storage && this.storageIdentity === nextIdentity) {
         if (!fastPath && this.gossip) {
           this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
@@ -1497,14 +1566,28 @@ export default {
         }
       }
 
-      const dbName = `peerpigeon-storage-v2:${this.effectiveSessionId}`;
+      // A browser tab is one peer. Keep its IndexedDB separate from other
+      // same-origin tabs so a local write cannot bypass network subscriptions
+      // through a shared backing database. The session-scoped ID survives a
+      // reload of this tab but is distinct for independently opened peers.
+      const dbName = `peerpigeon-storage-v3:${this.effectiveSessionId}:${this.storagePeerScopeId}`;
       this.storage = new PeerPigeonStorage({
         userId,
+        peerId,
         gossip: this.gossip || undefined,
         sessionId: this.effectiveSessionId,
         dbName,
       });
       await this.storage.init();
+      for (const space of ['public', 'user', 'frozen', 'private', 'epublic']) {
+        for (const interest of this.interestedKeysForSpace(space)) {
+          const ownerId = space === 'user'
+            ? String(interest?.ownerId || this.storageLookupUserId() || '').trim()
+            : null;
+          const wireKey = this.storageWireKey(space, interest.key, ownerId);
+          if (wireKey) this.storage.subscribeKey?.(space, wireKey);
+        }
+      }
       this.storageIdentity = nextIdentity;
       this.storageChangeUnsubscribe = this.storage.subscribe((event) => {
         if (event?.space === this.meshPeersStorageSpace && event?.key === this.meshPeersStorageKey) {
@@ -1562,7 +1645,9 @@ export default {
 
     async refreshStorageList(options = {}) {
       const silent = options && options.silent === true;
-      const syncInterested = !(options && options.syncInterested === false);
+      // Listing renders local state only. Network reads happen through Get or
+      // through the explicit subscription refresh queue.
+      const syncInterested = options && options.syncInterested === true;
       if (!silent) this.storageBusy = true;
       this.storageError = '';
       try {
@@ -1609,6 +1694,7 @@ export default {
             key: this.storageLogicalKey(this.storageActiveSpace, record.key, record),
             value: record.value,
             ownerId: record.ownerId ?? null,
+            modifiedBy: record.modifiedBy ?? null,
             createdAt: Number(record.createdAt ?? 0),
             updatedAt: Number(record.updatedAt ?? 0),
             version: this.normalizeStorageVersion(record.version, record.ownerId || this.storageUserId()),
@@ -1645,6 +1731,7 @@ export default {
               key: this.storageLogicalKey(this.storageActiveSpace, localRecord.key, localRecord),
               value: localRecord.value,
               ownerId: localRecord.ownerId ?? null,
+              modifiedBy: localRecord.modifiedBy ?? null,
               createdAt: Number(localRecord.createdAt ?? 0),
               updatedAt: Number(localRecord.updatedAt ?? 0),
               version: this.normalizeStorageVersion(localRecord.version, localRecord.ownerId || this.storageUserId()),
@@ -2303,6 +2390,13 @@ export default {
         retrieve: async (space, key, options = {}) => {
           return invoke('peerpigeonStorageRetrieve', this.goWasmNodeId, space, key, options || {});
         },
+        subscribeKey: (space, key) => {
+          invoke('peerpigeonStorageSubscribe', this.goWasmNodeId, space, key);
+          return () => invoke('peerpigeonStorageUnsubscribe', this.goWasmNodeId, space, key);
+        },
+        unsubscribeKey: (space, key) => {
+          invoke('peerpigeonStorageUnsubscribe', this.goWasmNodeId, space, key);
+        },
         put: async (space, key, value, _options = {}) => {
           return invoke('peerpigeonStoragePut', this.goWasmNodeId, space, key, value);
         },
@@ -2331,6 +2425,24 @@ export default {
           this.roomSessionId = this.generateRandomRoomSessionId();
         }
         this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
+        try {
+          const signalingUrl = new URL(this.signalingServer);
+          const hostname = signalingUrl.hostname.toLowerCase();
+          const isLocalDevelopmentHost = hostname === 'localhost'
+            || hostname === '::1'
+            || hostname.endsWith('.local')
+            || /^127\./.test(hostname)
+            || /^10\./.test(hostname)
+            || /^192\.168\./.test(hostname)
+            || /^169\.254\./.test(hostname)
+            || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
+          if (signalingUrl.protocol === 'https:') signalingUrl.protocol = 'wss:';
+          if (signalingUrl.protocol === 'http:') signalingUrl.protocol = isLocalDevelopmentHost ? 'ws:' : 'wss:';
+          if (signalingUrl.protocol === 'ws:' && !isLocalDevelopmentHost) signalingUrl.protocol = 'wss:';
+          this.signalingServer = signalingUrl.toString();
+        } catch {
+          throw new Error(`Invalid signaling server URL: ${this.signalingServer}`);
+        }
         this.updateUrlState();
         await this.ensureCryptoKeys();
         if (this.runtimeMode === 'go-wasm') {
@@ -2344,7 +2456,8 @@ export default {
 
         this.mesh = new PartialMesh({
           signalingServer: this.signalingServer,
-          sessionId: this.effectiveSessionId,
+          networkId: this.activeNetworkName,
+          sessionId: this.activeRoomSessionId,
           minPeers: this.minPeers,
           maxPeers: this.maxPeers,
           tolerantPeers: this.tolerantPeers,
@@ -2531,6 +2644,8 @@ export default {
       clearTimeout(this.meshConnectWarnTimer);
       this.meshConnectWarnTimer = null;
       this.teardownStorage();
+      const stoppedMesh = this.mesh;
+      const stoppedGossip = this.gossip;
       if (this.mesh) {
         this.mesh.destroy();
         this.mesh = null;
@@ -2539,6 +2654,8 @@ export default {
         this.gossip.destroy();
         this.gossip = null;
       }
+      if (window.__mesh === stoppedMesh) window.__mesh = null;
+      if (window.__gossip === stoppedGossip) window.__gossip = null;
       this.isRunning = false;
       this.signalingConnected = false;
       this.messageLog = [];
@@ -4034,20 +4151,25 @@ export default {
           showPrivateCrypto: !!this.showPrivateCrypto,
           storageActiveSpace: this.storageActiveSpace || 'user',
           storageLookupOwnerId: String(this.storageLookupOwnerId || '').trim(),
-          storageInterestedKeys: interested,
         });
 
         localStorage.setItem(this.uiStateKey, serialized);
+        // Subscriptions belong to this peer/tab, never to every same-origin
+        // peer. sessionStorage also preserves them when this tab reloads.
+        sessionStorage.setItem(this.storageInterestStateKey(), JSON.stringify(interested));
       } catch {
         // ignore storage failures
       }
     },
 
+    storageInterestStateKey() {
+      return `${this.uiStateKey}:storage-interests:${this.effectiveSessionId}`;
+    },
+
     loadUiState() {
       try {
         const raw = localStorage.getItem(this.uiStateKey);
-        if (!raw) return;
-        const parsed = JSON.parse(raw);
+        const parsed = raw ? JSON.parse(raw) : {};
         const allowedTabs = new Set(this.uiTabs.map((tab) => tab.id));
         if (typeof parsed.activeTab === 'string' && allowedTabs.has(parsed.activeTab)) {
           this.activeTab = parsed.activeTab;
@@ -4068,9 +4190,16 @@ export default {
         if (typeof parsed.storageLookupOwnerId === 'string') {
           this.storageLookupOwnerId = parsed.storageLookupOwnerId;
         }
-        if (parsed.storageInterestedKeys && typeof parsed.storageInterestedKeys === 'object') {
+        let persistedInterests = null;
+        try {
+          const rawInterests = sessionStorage.getItem(this.storageInterestStateKey());
+          persistedInterests = rawInterests ? JSON.parse(rawInterests) : null;
+        } catch {
+          persistedInterests = null;
+        }
+        if (persistedInterests && typeof persistedInterests === 'object') {
           const next = {};
-          for (const [pk, enabled] of Object.entries(parsed.storageInterestedKeys)) {
+          for (const [pk, enabled] of Object.entries(persistedInterests)) {
             if (typeof pk !== 'string' || !pk) continue;
             if (enabled === true) {
               next[pk] = true;
@@ -4108,6 +4237,18 @@ export default {
     this.stopMesh();
   }
 };
+
+// Vue preserves component instances during Vite hot updates. Explicitly tear
+// down network singletons so editing the demo cannot leave an older peer ID
+// heartbeating beside its replacement in the same browser tab.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    try { window.__gossip?.destroy?.(); } catch { /* ignore HMR teardown failures */ }
+    try { window.__mesh?.destroy?.(); } catch { /* ignore HMR teardown failures */ }
+    window.__gossip = null;
+    window.__mesh = null;
+  });
+}
 </script>
 
 <style scoped>
@@ -4133,11 +4274,26 @@ header {
 
 header h1 {
   font-size: 2.5rem;
-  margin-bottom: 0.5rem;
+  margin: 0;
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   background-clip: text;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
+}
+
+.header-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.8rem;
+  margin-bottom: 0.5rem;
+}
+
+.header-logo {
+  width: 3.25rem;
+  height: 3.25rem;
+  display: block;
+  flex: 0 0 auto;
 }
 
 header p {
@@ -5144,6 +5300,11 @@ section {
 @media (max-width: 768px) {
   header h1 {
     font-size: 1.8rem;
+  }
+
+  .header-logo {
+    width: 2.5rem;
+    height: 2.5rem;
   }
 
   .message-input {
