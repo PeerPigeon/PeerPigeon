@@ -1,108 +1,72 @@
 {
   "name": "peerpigeon",
-  "version": "1.1.3",
-  "description": "WebRTC-based peer-to-peer mesh networking library with intelligent routing and signaling server",
-  "main": "index.js",
+  "version": "1.0.0",
+  "description": "PeerPigeon: WebRTC partial-mesh networking with gossip broadcast and direct messaging",
   "type": "module",
-  "bin": {
-    "peerpigeon": "cli.js"
-  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "browser": "./dist/peerpigeon-browser.js",
-      "import": "./index.js"
-    }
-  },
-  "scripts": {
-    "build": "npm run build:browser && npm run build:examples",
-    "build:browser": "node scripts/build-browser.js",
-    "build:examples": "npm run build:vanilla && npm run build:vue",
-    "build:vanilla": "mkdir -p examples/browser/vanilla && cp dist/peerpigeon-browser.js examples/browser/vanilla/peerpigeon-browser.js",
-    "build:vue": "cd examples/browser/vue && npm run build",
-    "prebuild": "mkdir -p dist",
-    "cli": "node cli.js",
-    "cli:server": "node cli.js server",
-    "cli:interactive": "node cli.js interactive",
-    "dev": "npm run build && concurrently -n \"HUB,HTTP\" -c \"cyan,green\" \"npm run hub\" \"npm run http\"",
-    "dev:hub": "npm run build && node scripts/start-hub.js",
-    "dev:http": "npm run build && node dev-server.js",
-    "start": "node server/start.js",
-    "server": "node server/start.js",
-    "hub": "node scripts/start-hub.js",
-    "http": "node dev-server.js",
-    "lint": "node -c src/*.js examples/**/*.js server/*.js",
-    "lint:fix": "eslint --cache --cache-location .eslintcache src/ examples/ server/ --ext .js --fix",
-    "test": "node test/browser-integration-test.js",
-    "test:hub-mesh": "node test/test-hub-mesh.js",
-    "test:cross-browser": "npm run build && node test/cross-browser-hub-test.js",
-    "test:cross-browser:5": "npm run build && node scripts/run-cross-browser-multiple.js",
-    "test:simple-cross": "npm run build && node test/simple-cross-browser-test.js",
-    "test:storage": "node examples/node/storage-test.js",
-    "test:browser:visual": "HEADLESS=false node test/browser-integration-test.js",
-    "test:video": "node test/video-streaming-test.js",
-    "test:video:visual": "HEADLESS=false node test/video-streaming-test.js",
-    "test:video:manual": "node test/manual-video-streaming-test.js",
-    "test:video:manual:visual": "HEADLESS=false node test/manual-video-streaming-test.js",
-    "ci": "npm run lint && npm run test",
-    "prepublishOnly": "npm run build && npm run ci"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
-    "index.js",
-    "cli.js",
-    "cli-examples.js",
-    "src/",
-    "server/",
-    "examples/",
-    "dist/",
-    "docs/",
-    "README.md",
-    "LICENSE"
+    "dist",
+    "README.md"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/PeerPigeon/PeerPigeon.git"
+  "scripts": {
+    "wasm:build": "node scripts/build-wasm.mjs",
+    "freertc:sync": "node scripts/sync-freertc-head.mjs",
+    "prebuild": "npm run freertc:sync",
+    "predev": "npm run freertc:sync",
+    "predev:raw": "npm run freertc:sync",
+    "prebuild:browser": "npm run freertc:sync",
+    "pretest": "npm run freertc:sync",
+    "preexample:basic": "npm run freertc:sync",
+    "preexample:vue3": "npm run freertc:sync",
+    "build": "tsup src/index.ts --format esm,cjs --dts",
+    "build:browser": "tsup --config tsup.browser.config.ts",
+    "dev:tls:generate": "node scripts/dev-with-mdns.mjs --generate-tls",
+    "dev": "node scripts/dev-with-mdns.mjs",
+    "dev:raw": "cd examples/vue3 && npm run dev:raw --",
+    "prepare": "npm run build",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build",
+    "example:basic": "cd examples/basic && npm run dev",
+    "example:vue3": "cd examples/vue3 && npm run dev",
+    "test": "node scripts/run-e2e-loop.mjs"
   },
   "keywords": [
     "webrtc",
     "p2p",
+    "peer-to-peer",
     "mesh",
     "networking",
-    "decentralized",
-    "kademlia",
+    "partial-mesh",
     "signaling",
-    "websocket",
-    "peer-to-peer",
-    "dht",
-    "gossip",
-    "mesh-network",
-    "xor-routing",
-    "webrtc-mesh",
-    "nativescript"
+    "auto-discovery",
+    "freertc"
   ],
-  "author": "Daniel Raeder",
-  "license": "MIT",
-  "bugs": {
-    "url": "https://github.com/PeerPigeon/PeerPigeon/issues"
+  "author": "",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/draeder/peerpigeon.git"
   },
-  "homepage": "https://github.com/PeerPigeon/PeerPigeon#readme",
   "dependencies": {
-    "@koush/wrtc": "^0.5.3",
-    "pigeonrtc": "^0.0.5",
-    "unsea": "^1.1.2",
-    "ws": "^8.18.0"
+    "freertc": "github:draeder/freertc#d6ce3ea0dfccdbafb17ee16cd80ef2d39e76c876",
+    "unsea": "^1.1.2"
   },
   "devDependencies": {
-    "concurrently": "^9.2.0",
-    "esbuild": "^0.25.8",
-    "eslint": "^8.57.1",
-    "eslint-config-standard": "^17.1.0",
-    "express": "^4.19.2",
-    "jsdoc": "^4.0.4",
-    "nodemon": "^3.1.10",
-    "playwright": "^1.56.1",
-    "puppeteer": "^22.0.0"
-  },
-  "engines": {
-    "node": ">=14.0.0"
+    "@playwright/test": "^1.55.0",
+    "@types/node": "^25.0.3",
+    "multicast-dns": "^7.2.5",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.0"
   }
 }

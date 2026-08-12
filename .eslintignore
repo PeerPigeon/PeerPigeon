@@ -1,9 +1,0 @@
-node_modules/
-dist/
-build/
-coverage/
-docs/
-test/reports/
-*.min.js
-*.bundle.js
-.eslintcache
