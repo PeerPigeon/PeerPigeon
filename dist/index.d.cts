@@ -500,6 +500,13 @@ declare class PartialMesh {
     init(): Promise<void>;
     private startMaintenanceLoop;
     private maybeRefreshDiscovery;
+    /**
+     * Revalidate transports after browser suspension, network changes, or focus
+     * restoration. Browsers do not always deliver every lifecycle event, so the
+     * maintenance loop also calls the same stale-channel check.
+     */
+    recoverAfterInactivity(reason?: string): void;
+    private recoverStaleConnectedPeers;
     private maybeRecoverStalledNegotiations;
     private maybeHardResetUnderConnected;
     private isPeerBackedOff;
