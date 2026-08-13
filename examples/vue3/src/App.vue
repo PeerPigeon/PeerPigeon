@@ -428,9 +428,14 @@
       <section v-if="isRunning" class="network-viz">
         <h3>📊 Network Graph</h3>
         <div ref="networkGraphContainer" class="network-graph-container" data-testid="mesh-visualizer">
-          <svg ref="networkGraphSvg" class="network-graph-svg"></svg>
+          <PeerNetworkGraph
+            ref="peerNetworkGraph"
+            :nodes="networkGraphModel.nodes"
+            :links="networkGraphModel.links"
+            :activity-by-peer="networkGraphActivityByPeer"
+          />
         </div>
-        <div class="mesh-visualizer-caption">Live connected topology from <code>epublic/mesh:peers</code>; labels are each peer ID's first 4 characters (hover for the full ID)</div>
+        <div class="mesh-visualizer-caption">Live connected topology from <code>epublic/mesh:peers</code>; a node glow marks real peer join/connect activity (hover for the full peer ID)</div>
       </section>
 
       <!-- Diagnostics -->
@@ -460,6 +465,7 @@ import { GossipProtocol } from 'peerpigeon';
 import { PeerPigeonStorage } from 'peerpigeon';
 import { generateRandomPair, encryptMessageWithMeta, decryptMessageWithMeta } from 'unsea';
 import * as d3 from 'd3';
+import PeerNetworkGraph from './components/PeerNetworkGraph.vue';
 
 const DEFAULT_TOPOLOGY = 'token-ring';
 const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
@@ -513,6 +519,9 @@ function fromBase64Url(base64url) {
 
 export default {
   name: 'PeerPigeonDemo',
+  components: {
+    PeerNetworkGraph,
+  },
   data() {
     return {
       mesh: null,
@@ -586,6 +595,7 @@ export default {
       meshConnectWarnTimer: null,
       graphLastSignature: '',
       networkGraphState: null,
+      networkGraphActivityByPeer: {},
       networkGraphResizeHandler: null,
       networkGraphResizeObserver: null,
       networkGraphResizeObservedElement: null,
@@ -700,6 +710,13 @@ export default {
     window.addEventListener('resize', this.networkGraphResizeHandler);
   },
   computed: {
+    networkGraphModel() {
+      // Track the reactive list even though networkGraphData reads the mesh API.
+      // This makes a newly-open WebRTC connection appear on the same Vue tick.
+      void this.connectedPeersList.length;
+      return this.networkGraphData();
+    },
+
     effectiveSessionId() {
       const network = this.activeNetworkName;
       const room = this.activeRoomSessionId;
@@ -2532,6 +2549,7 @@ export default {
             this.callGoWasm('peerpigeonSetGlobalPeers', this.goWasmNodeId, this.mesh.getGlobalPeers());
           }
           this.addLog('connected', `Connected to peer`, peerId);
+          this.markNetworkGraphPeerActivity(peerId);
           this.announceCryptoPublicInfo();
           this.requestInterestedKeySync('peer-connected');
           this.updateStats();
@@ -3238,6 +3256,15 @@ export default {
       const mostSignificant = Number.parseInt(hex || '00', 16);
       const percent = Number.isFinite(mostSignificant) ? mostSignificant / 255 : 0;
       return Math.round(percent * 360);
+    },
+
+    markNetworkGraphPeerActivity(peerId) {
+      const id = String(peerId || '').trim();
+      if (!id) return;
+      this.networkGraphActivityByPeer = {
+        ...this.networkGraphActivityByPeer,
+        [id]: Date.now(),
+      };
     },
 
     networkTolerantPeerIds(connectedPeerIds) {
@@ -5093,15 +5120,13 @@ section {
 .network-graph-container {
   position: relative;
   margin: 0.9rem auto 0;
-  max-width: 920px;
-  min-height: 340px;
-  border: 1px solid rgba(96, 165, 250, 0.32);
-  border-radius: 14px;
-  box-shadow: 0 20px 40px rgba(2, 6, 23, 0.35), inset 0 1px 0 rgba(186, 230, 253, 0.08);
-  background:
-    radial-gradient(circle at 14% 16%, rgba(56, 189, 248, 0.22), rgba(56, 189, 248, 0) 30%),
-    radial-gradient(circle at 88% 84%, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0) 34%),
-    linear-gradient(180deg, #0b1222 0%, #0a1328 100%);
+  max-width: 1040px;
+  height: 410px;
+  min-height: 410px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 18px;
+  box-shadow: 0 24px 55px rgba(38, 20, 88, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   overflow: hidden;
 }
 
@@ -5110,11 +5135,10 @@ section {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  background-image:
-    linear-gradient(rgba(96, 165, 250, 0.06) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(96, 165, 250, 0.06) 1px, transparent 1px);
-  background-size: 22px 22px;
-  mask-image: radial-gradient(circle at 50% 52%, rgba(0, 0, 0, 0.92) 0%, rgba(0, 0, 0, 0.28) 100%);
+  z-index: 1;
+  background:
+    radial-gradient(circle at 18% 20%, rgba(117, 249, 255, 0.12), transparent 32%),
+    radial-gradient(circle at 84% 78%, rgba(255, 128, 225, 0.11), transparent 35%);
 }
 
 .network-graph-svg {
@@ -5326,7 +5350,8 @@ section {
   }
 
   .network-graph-container {
-    min-height: 260px;
+    height: 300px;
+    min-height: 300px;
   }
 
   .network-graph-svg {
