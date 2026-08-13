@@ -5,7 +5,7 @@
         <img src="/pigeonlogo.svg" alt="PeerPigeon" class="header-logo" />
         <h1>PeerPigeon Demo</h1>
       </div>
-      <p>Distributed peer messaging using WebRTC and PartialMesh</p>
+      <p>Distributed peer networking using WebRTC, partial mesh and gossip</p>
     </header>
 
     <main>
