@@ -2759,12 +2759,6 @@ var PartialMesh = class {
     } else if (connectedCount > this.getMaxPeersWithTolerance()) {
       this.trimExcessPeers();
     } else if (connectedCount >= this.config.maxPeers && pendingCount === 0 && available.length > 0) {
-      if (connectedCount < this.getMaxPeersWithTolerance()) {
-        for (const peerId of pickCandidates(1)) {
-          this.connectToPeer(peerId);
-        }
-        return;
-      }
       if (this.maybeRebalanceForCloserPeer(available)) {
         return;
       }
@@ -2813,7 +2807,7 @@ var PartialMesh = class {
       this.clearDialBackoff(normalizedPeerId);
     }
     const connectedCount = this.getConnectedPeerCount();
-    const maxAllowed = allowTemporaryOverflow ? this.config.maxPeers + 1 : this.getMaxPeersWithTolerance();
+    const maxAllowed = allowTemporaryOverflow ? this.config.maxPeers + 1 : this.config.maxPeers;
     if (connectedCount >= maxAllowed) {
       console.warn("Max peers reached, cannot connect to more peers");
       return;
@@ -2894,7 +2888,7 @@ var PartialMesh = class {
             }
           }
           const currentConnectedCount = this.getConnectedPeerCount();
-          const fallbackMaxAllowed = allowTemporaryOverflow ? this.config.maxPeers + 1 : this.getMaxPeersWithTolerance();
+          const fallbackMaxAllowed = allowTemporaryOverflow ? this.config.maxPeers + 1 : this.config.maxPeers;
           if (currentConnectedCount >= fallbackMaxAllowed) {
             return;
           }
