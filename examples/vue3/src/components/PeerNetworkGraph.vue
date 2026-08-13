@@ -24,8 +24,6 @@
 </template>
 
 <script>
-const NODE_PALETTE = ['#42b883', '#36d1dc', '#667eea', '#8b5cf6', '#f472b6', '#ffd166'];
-
 function hashPeerId(value) {
   const text = String(value || 'peer');
   let hash = 2166136261;
@@ -34,6 +32,55 @@ function hashPeerId(value) {
     hash = Math.imul(hash, 16777619);
   }
   return hash >>> 0;
+}
+
+function avalancheHash(hash) {
+  let mixed = hash >>> 0;
+  mixed ^= mixed >>> 16;
+  mixed = Math.imul(mixed, 0x7feb352d);
+  mixed ^= mixed >>> 15;
+  mixed = Math.imul(mixed, 0x846ca68b);
+  mixed ^= mixed >>> 16;
+  return mixed >>> 0;
+}
+
+function peerColorSeed(peerId) {
+  const prefix = String(peerId || '').trim().slice(0, 4).toLowerCase();
+  if (/^[0-9a-f]{4}$/.test(prefix)) return Number.parseInt(prefix, 16);
+  return avalancheHash(hashPeerId(prefix)) & 0xffff;
+}
+
+function peerPastelColor(peerId) {
+  const seed = peerColorSeed(peerId);
+  // Golden-ratio spacing sends even adjacent four-character prefixes to distant
+  // parts of the color wheel while keeping the visible short ID tied to color.
+  const distributedHue = ((seed * 0.618033988749895) % 1) * 270;
+  // The canvas background occupies the indigo/violet range. Reserve that band
+  // so translucent peer circles never blend into it: [0, 215) U [305, 360).
+  const hue = distributedHue < 215 ? distributedHue : distributedHue + 90;
+  // Canvas renders the core at 50% opacity, so retain enough chroma here for
+  // distinct hues while keeping the displayed circles soft and pastel.
+  const saturation = 80 + ((seed >>> 8) % 9);
+  const lightness = 59 + ((seed >>> 4) % 7);
+  const normalizedHue = hue / 60;
+  const normalizedSaturation = saturation / 100;
+  const normalizedLightness = lightness / 100;
+  const chroma = (1 - Math.abs(2 * normalizedLightness - 1)) * normalizedSaturation;
+  const secondary = chroma * (1 - Math.abs((normalizedHue % 2) - 1));
+  const offset = normalizedLightness - chroma / 2;
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+
+  if (normalizedHue < 1) [red, green] = [chroma, secondary];
+  else if (normalizedHue < 2) [red, green] = [secondary, chroma];
+  else if (normalizedHue < 3) [green, blue] = [chroma, secondary];
+  else if (normalizedHue < 4) [green, blue] = [secondary, chroma];
+  else if (normalizedHue < 5) [red, blue] = [secondary, chroma];
+  else [red, blue] = [chroma, secondary];
+
+  const toHex = (channel) => Math.round((channel + offset) * 255).toString(16).padStart(2, '0');
+  return `#${toHex(red)}${toHex(green)}${toHex(blue)}`;
 }
 
 function normalizedPeerPosition(peerId, isSelf) {
@@ -130,10 +177,9 @@ export default {
       links: [],
       nodeIds: new Set(),
       nodes: [],
-      pointerX: 0,
-      pointerY: 0,
       projectedNodes: [],
       reducedMotion: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false,
+      rotationDirection: Math.random() < 0.5 ? -1 : 1,
       rotationY: 0,
       width: 1,
     };
@@ -177,12 +223,11 @@ export default {
           if (!id) return null;
           const previous = previousById.get(id);
           const position = previous || normalizedPeerPosition(id, Boolean(input.isSelf));
-          const paletteIndex = hashPeerId(`${id}:color`) % NODE_PALETTE.length;
           return {
             ...input,
             id,
             short: String(input.short || id.slice(0, 4)).toUpperCase(),
-            color: input.isSelf ? '#6ee7ff' : (input.isTolerant ? '#ffd166' : NODE_PALETTE[paletteIndex]),
+            color: peerPastelColor(id),
             bornAt: previous?.bornAt || Date.now(),
             x: position.x,
             y: position.y,
@@ -253,12 +298,9 @@ export default {
     projectNodes(scene, now) {
       const cosY = Math.cos(scene.rotationY);
       const sinY = Math.sin(scene.rotationY);
-      const tiltX = Math.sin(scene.rotationY * 0.32) * 0.11 + scene.pointerY * 0.18;
-      const tiltY = scene.pointerX * 0.16;
+      const tiltX = Math.sin(scene.rotationY * 0.32) * 0.11;
       const cosX = Math.cos(tiltX);
       const sinX = Math.sin(tiltX);
-      const cosPointerY = Math.cos(tiltY);
-      const sinPointerY = Math.sin(tiltY);
       const scale = Math.min(scene.width, scene.height) * 0.34;
       const centerX = scene.width / 2;
       const centerY = scene.height / 2;
@@ -266,10 +308,8 @@ export default {
       return scene.nodes.map((node) => {
         const autoX = node.x * cosY + node.z * sinY;
         const autoZ = -node.x * sinY + node.z * cosY;
-        const pointerX = autoX * cosPointerY + autoZ * sinPointerY;
-        const pointerZ = -autoX * sinPointerY + autoZ * cosPointerY;
-        const rotatedY = node.y * cosX - pointerZ * sinX;
-        const rotatedZ = node.y * sinX + pointerZ * cosX;
+        const rotatedY = node.y * cosX - autoZ * sinX;
+        const rotatedZ = node.y * sinX + autoZ * cosX;
         const perspective = 3.2 / (3.2 + rotatedZ);
         const activity = this.activityStrength(node.id, now);
         const intro = Math.min(1, Math.max(0.18, (now - node.bornAt) / 520));
@@ -282,7 +322,7 @@ export default {
           activity,
           depth: rotatedZ,
           radius,
-          screenX: centerX + pointerX * scale * perspective,
+          screenX: centerX + autoX * scale * perspective,
           screenY: centerY + rotatedY * scale * perspective,
         };
       });
@@ -354,7 +394,7 @@ export default {
 
       const elapsed = scene.lastFrameAt ? Math.min(50, timestamp - scene.lastFrameAt) : 16;
       scene.lastFrameAt = timestamp;
-      if (!scene.reducedMotion) scene.rotationY += elapsed * 0.00012;
+      if (!scene.reducedMotion) scene.rotationY += elapsed * 0.00012 * scene.rotationDirection;
 
       const ctx = scene.ctx;
       ctx.setTransform(scene.dpr, 0, 0, scene.dpr, 0, 0);
@@ -377,8 +417,6 @@ export default {
       const rect = scene.canvas.getBoundingClientRect();
       const x = event.clientX - rect.left;
       const y = event.clientY - rect.top;
-      scene.pointerX = Math.max(-1, Math.min(1, (x / Math.max(1, rect.width) - 0.5) * 2));
-      scene.pointerY = Math.max(-1, Math.min(1, (y / Math.max(1, rect.height) - 0.5) * 2));
 
       const hovered = scene.projectedNodes
         .slice()
@@ -404,8 +442,6 @@ export default {
 
     handlePointerLeave() {
       if (this._scene) {
-        this._scene.pointerX = 0;
-        this._scene.pointerY = 0;
         if (this._scene.canvas) this._scene.canvas.style.cursor = 'default';
       }
       this.tooltip.visible = false;
