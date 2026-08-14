@@ -38,6 +38,7 @@
     "prepublishOnly": "npm run build",
     "example:basic": "cd examples/basic && npm run dev",
     "example:vue3": "cd examples/vue3 && npm run dev",
+    "test:delivery": "node --test tests/gossip-delivery.test.mjs",
     "test": "node scripts/run-e2e-loop.mjs"
   },
   "keywords": [

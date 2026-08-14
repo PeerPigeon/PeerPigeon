@@ -195,6 +195,7 @@ func main() {
 	register("peerpigeonCreateNode", jsCreateNode)
 	register("peerpigeonDestroyNode", jsDestroyNode)
 	register("peerpigeonBroadcast", jsBroadcast)
+	register("peerpigeonGetDeliveryStatus", jsGetDeliveryStatus)
 	register("peerpigeonSendDirect", jsSendDirect)
 	register("peerpigeonStoragePut", jsStoragePut)
 	register("peerpigeonStorageGet", jsStorageGet)
@@ -279,12 +280,24 @@ func jsCreateNode(_ js.Value, args []js.Value) interface{} {
 
 	g.OnMessageReceived(func(ev gossip.MessageReceivedEvent) {
 		notifyBridgeEvent(node.bridge, "onMessageReceived", map[string]interface{}{
+			"id":       ev.Message.ID,
 			"fromPeer": ev.FromPeer,
 			"local":    ev.Local,
 			"hops":     ev.Message.Hops,
 			"sender":   ev.Message.Sender,
 			"data":     ev.Message.Data,
+			"delivery": ev.Message.Delivery,
+			"metadata": ev.Message.Metadata,
 		})
+	})
+	g.OnDeliveryProgress(func(status gossip.DeliveryStatus) {
+		notifyBridgeEvent(node.bridge, "onDeliveryProgress", deliveryStatusMap(status))
+	})
+	g.OnDeliveryComplete(func(status gossip.DeliveryStatus) {
+		notifyBridgeEvent(node.bridge, "onDeliveryComplete", deliveryStatusMap(status))
+	})
+	g.OnDeliveryTimeout(func(status gossip.DeliveryStatus) {
+		notifyBridgeEvent(node.bridge, "onDeliveryTimeout", deliveryStatusMap(status))
 	})
 	g.OnDirectMessageReceived(func(ev gossip.DirectMessageReceivedEvent) {
 		notifyBridgeEvent(node.bridge, "onDirectMessageReceived", map[string]interface{}{
@@ -331,8 +344,31 @@ func jsBroadcast(_ js.Value, args []js.Value) interface{} {
 			metadata = m
 		}
 	}
-	msgID := n.gossip.Broadcast(jsValueToAny(args[1]), metadata)
+	opts := gossip.BroadcastOptions{}
+	if len(args) >= 4 {
+		if value, ok := jsValueToAny(args[3]).(map[string]interface{}); ok {
+			if track, ok := value["trackDelivery"].(bool); ok {
+				opts.TrackDelivery = track
+			}
+			if timeout, ok := value["deliveryTimeoutMs"].(float64); ok {
+				opts.DeliveryTimeoutMs = int64(timeout)
+			}
+		}
+	}
+	msgID := n.gossip.BroadcastWithOptions(jsValueToAny(args[1]), metadata, opts)
 	return msgID
+}
+
+func jsGetDeliveryStatus(_ js.Value, args []js.Value) interface{} {
+	n, ok := getNodeArg(args)
+	if !ok || len(args) < 2 {
+		return jsError("peerpigeonGetDeliveryStatus(nodeId, messageId) expects 2 arguments")
+	}
+	status, found := n.gossip.GetDeliveryStatus(stringsOrEmpty(args[1]))
+	if !found {
+		return js.Null()
+	}
+	return toJSObject(deliveryStatusMap(status))
 }
 
 func jsSendDirect(_ js.Value, args []js.Value) interface{} {
@@ -707,6 +743,24 @@ func notifyBridgeEvent(bridge js.Value, fnName string, payload map[string]interf
 		return
 	}
 	fn.Invoke(toJSObject(payload))
+}
+
+func deliveryStatusMap(status gossip.DeliveryStatus) map[string]interface{} {
+	return map[string]interface{}{
+		"messageId":        status.MessageID,
+		"sender":           status.Sender,
+		"membershipHash":   status.MembershipHash,
+		"audiencePeerIds":  status.AudiencePeerIDs,
+		"deliveredPeerIds": status.DeliveredPeerIDs,
+		"pendingPeerIds":   status.PendingPeerIDs,
+		"audienceCount":    status.AudienceCount,
+		"deliveredCount":   status.DeliveredCount,
+		"complete":         status.Complete,
+		"timedOut":         status.TimedOut,
+		"createdAt":        status.CreatedAt,
+		"updatedAt":        status.UpdatedAt,
+		"deadlineAt":       status.DeadlineAt,
+	}
 }
 
 func toJSObject(v interface{}) js.Value {
