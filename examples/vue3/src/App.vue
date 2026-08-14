@@ -27,20 +27,13 @@
               >
                 Copy Link
               </button>
-              <button
-                type="button"
-                class="btn btn-small"
-                data-testid="copy-perf-dump-link"
-                @click="copyPerfDumpLink"
-              >
-                Perf Dump
-              </button>
             </div>
           </div>
           <label class="field field-topology-inline">
             <span class="field-label">Topology</span>
             <select
-              v-model="topology"
+              ref="topologySelect"
+              :value="topology"
               @change="onTopologyChange"
               :disabled="isConnecting"
               class="input"
@@ -114,6 +107,7 @@
           <label class="field field-number">
             <span class="field-label">Min Peers</span>
             <input
+              ref="minPeersInput"
               v-model.number="minPeers"
               @input="onPeerBoundsInput"
               type="number"
@@ -456,6 +450,41 @@
       </section>
 
     </main>
+
+    <div
+      v-if="customTopologyModalOpen"
+      class="modal-backdrop"
+      @click.self="cancelCustomTopology"
+      @keydown.esc="cancelCustomTopology"
+    >
+      <div
+        class="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="custom-topology-modal-title"
+        aria-describedby="custom-topology-modal-description"
+      >
+        <h2 id="custom-topology-modal-title">Stop mesh and customize?</h2>
+        <p id="custom-topology-modal-description">
+          Switching to Custom will stop the active mesh. You can then change Min Peers,
+          Max Peers, and Tolerant before starting the mesh again.
+        </p>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-small" @click="cancelCustomTopology">
+            Cancel
+          </button>
+          <button
+            ref="confirmCustomTopologyButton"
+            type="button"
+            class="btn btn-danger btn-small"
+            data-testid="confirm-custom-topology"
+            @click="confirmCustomTopology"
+          >
+            Stop Mesh &amp; Customize
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -543,6 +572,7 @@ export default {
       minPeers: 2,
       tolerantPeers: 1,
       topology: DEFAULT_TOPOLOGY,
+      customTopologyModalOpen: false,
       networkName: 'peerpigeon',
       roomSessionId: '',
       signalingServer: 'wss://peer.ooo/ws',
@@ -834,228 +864,6 @@ export default {
         this.showStatus('Share link copied', 'Copied current session link to clipboard.', 'info');
       } catch (error) {
         this.showStatus('Copy failed', String(error?.message || error || 'Clipboard write failed'), 'error');
-      }
-    },
-
-    perfNowMs() {
-      if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
-        return Math.round(performance.now());
-      }
-      return 0;
-    },
-
-    getBrowserMemorySnapshot() {
-      const out = {
-        memory: null,
-        uaSpecificMemory: null,
-      };
-
-      try {
-        if (typeof performance !== 'undefined' && performance && performance.memory) {
-          const memory = performance.memory;
-          out.memory = {
-            jsHeapSizeLimit: Number(memory.jsHeapSizeLimit || 0),
-            totalJSHeapSize: Number(memory.totalJSHeapSize || 0),
-            usedJSHeapSize: Number(memory.usedJSHeapSize || 0),
-          };
-        }
-      } catch {
-        // ignore unsupported memory API
-      }
-
-      return out;
-    },
-
-    summarizeResourceEntries() {
-      try {
-        if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
-          return null;
-        }
-
-        const resources = performance.getEntriesByType('resource') || [];
-        if (!Array.isArray(resources) || resources.length === 0) {
-          return {
-            count: 0,
-            transferSizeTotal: 0,
-            decodedBodySizeTotal: 0,
-            topSlow: [],
-          };
-        }
-
-        let transferSizeTotal = 0;
-        let decodedBodySizeTotal = 0;
-        const slowest = [];
-
-        for (const entry of resources) {
-          const transferSize = Number(entry?.transferSize || 0);
-          const decodedBodySize = Number(entry?.decodedBodySize || 0);
-          transferSizeTotal += Number.isFinite(transferSize) ? transferSize : 0;
-          decodedBodySizeTotal += Number.isFinite(decodedBodySize) ? decodedBodySize : 0;
-
-          slowest.push({
-            name: String(entry?.name || '').slice(0, 180),
-            initiatorType: String(entry?.initiatorType || ''),
-            duration: Math.round(Number(entry?.duration || 0)),
-            transferSize: Math.round(transferSize),
-          });
-        }
-
-        slowest.sort((a, b) => b.duration - a.duration);
-
-        return {
-          count: resources.length,
-          transferSizeTotal: Math.round(transferSizeTotal),
-          decodedBodySizeTotal: Math.round(decodedBodySizeTotal),
-          topSlow: slowest.slice(0, 8),
-        };
-      } catch {
-        return null;
-      }
-    },
-
-    summarizeNavigationEntry() {
-      try {
-        if (typeof performance === 'undefined' || typeof performance.getEntriesByType !== 'function') {
-          return null;
-        }
-        const navEntries = performance.getEntriesByType('navigation') || [];
-        const nav = navEntries[0];
-        if (!nav) return null;
-
-        return {
-          type: String(nav.type || ''),
-          duration: Math.round(Number(nav.duration || 0)),
-          domComplete: Math.round(Number(nav.domComplete || 0)),
-          domContentLoaded: Math.round(Number(nav.domContentLoadedEventEnd || 0)),
-          loadEventEnd: Math.round(Number(nav.loadEventEnd || 0)),
-        };
-      } catch {
-        return null;
-      }
-    },
-
-    async measureUaSpecificMemory() {
-      try {
-        const fn = globalThis?.performance?.measureUserAgentSpecificMemory;
-        if (typeof fn !== 'function') return null;
-        const sample = await Promise.race([
-          fn.call(globalThis.performance),
-          new Promise((resolve) => setTimeout(() => resolve(null), 1200)),
-        ]);
-        if (!sample) return null;
-
-        return {
-          bytes: Number(sample?.bytes || 0),
-          breakdownCount: Array.isArray(sample?.breakdown) ? sample.breakdown.length : 0,
-        };
-      } catch {
-        return null;
-      }
-    },
-
-    toBase64UrlJson(payload) {
-      const json = JSON.stringify(payload);
-      const bytes = new TextEncoder().encode(json);
-      let binary = '';
-      const chunkSize = 0x8000;
-      for (let i = 0; i < bytes.length; i += chunkSize) {
-        const chunk = bytes.subarray(i, i + chunkSize);
-        binary += String.fromCharCode(...chunk);
-      }
-      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-    },
-
-    async buildPerfDumpLink() {
-      const startedAtMs = Date.now();
-      const memory = this.getBrowserMemorySnapshot();
-      memory.uaSpecificMemory = await this.measureUaSpecificMemory();
-
-      const networkGraphNodeCount = Number(
-        Object.keys(this.networkGraphState?.positions || {}).length || 0
-      );
-
-      const payload = {
-        v: 1,
-        kind: 'peerpigeon-perf-dump',
-        createdAt: new Date().toISOString(),
-        href: window.location.href,
-        runtimeMode: this.runtimeMode,
-        build: {
-          mode: import.meta.env.MODE,
-          dev: Boolean(import.meta.env.DEV),
-          prod: Boolean(import.meta.env.PROD),
-          baseUrl: import.meta.env.BASE_URL,
-        },
-        browser: {
-          userAgent: navigator.userAgent,
-          language: navigator.language,
-          languages: Array.isArray(navigator.languages) ? navigator.languages.slice(0, 8) : [],
-          platform: navigator.platform,
-          vendor: navigator.vendor,
-          onLine: navigator.onLine,
-          hardwareConcurrency: Number(navigator.hardwareConcurrency || 0),
-          deviceMemory: Number(navigator.deviceMemory || 0),
-          maxTouchPoints: Number(navigator.maxTouchPoints || 0),
-          isSafariLike: /Safari\//.test(navigator.userAgent) && !/Chrome\//.test(navigator.userAgent),
-        },
-        viewport: {
-          innerWidth: Number(window.innerWidth || 0),
-          innerHeight: Number(window.innerHeight || 0),
-          pixelRatio: Number(window.devicePixelRatio || 1),
-          visibilityState: document.visibilityState,
-        },
-        memory,
-        perf: {
-          nowMs: this.perfNowMs(),
-          eventLoopHintMs: Date.now() - startedAtMs,
-          navigation: this.summarizeNavigationEntry(),
-          resources: this.summarizeResourceEntries(),
-        },
-        app: {
-          isRunning: this.isRunning,
-          isConnecting: this.isConnecting,
-          signalingConnected: this.signalingConnected,
-          status: {
-            title: String(this.status?.title || ''),
-            message: String(this.status?.message || ''),
-            type: String(this.status?.type || ''),
-          },
-          activeTab: this.activeTab,
-          connectedPeers: this.connectedPeersList.length,
-          discoveredPeers: this.discoveredPeersList.length,
-          globalPeers: this.globalPeersList.length,
-          messagesSeen: Number(this.messagesSeen || 0),
-          messageLogSize: this.messageLog.length,
-          diagLogSize: this.diagnosticMessages.length,
-          chatLogSize: this.chatMessages.length,
-          storageReady: this.storageReady,
-          storageSpace: this.storageActiveSpace,
-          storageRecords: this.storageRecords.length,
-          storageError: String(this.storageError || ''),
-          meshSnapshots: Object.keys(this.sharedMeshPeerSnapshots || {}).length,
-          graph: {
-            hasState: Boolean(this.networkGraphState),
-            width: Number(this.networkGraphState?.width || 0),
-            height: Number(this.networkGraphState?.height || 0),
-            nodeCount: networkGraphNodeCount,
-            layoutVersion: Number(this.networkGraphState?.layoutVersion || 0),
-          },
-        },
-      };
-
-      const encoded = this.toBase64UrlJson(payload);
-      const url = new URL(window.location.href);
-      url.searchParams.set('ppPerfDump', encoded);
-      return url.toString();
-    },
-
-    async copyPerfDumpLink() {
-      try {
-        const link = await this.buildPerfDumpLink();
-        await navigator.clipboard.writeText(link);
-        this.showStatus('Perf dump copied', 'Copied perf dump link to clipboard. Paste it in chat.', 'info');
-      } catch (error) {
-        this.showStatus('Perf dump failed', String(error?.message || error || 'Failed to build perf dump link'), 'error');
       }
     },
 
@@ -2165,15 +1973,43 @@ export default {
       this.topology = 'custom';
     },
 
-    onTopologyChange() {
+    onTopologyChange(event) {
+      const nextTopology = String(event?.target?.value || this.topology || '').trim();
+      if (!this.isKnownTopology(nextTopology)) return;
+
+      if (nextTopology === 'custom' && (this.isRunning || this.isConnecting)) {
+        this.customTopologyModalOpen = true;
+        this.$nextTick(() => this.$refs.confirmCustomTopologyButton?.focus());
+        return;
+      }
+
       const shouldRestart = this.isRunning && !this.isConnecting;
-      if (this.topology !== 'custom') {
-        this.applyTopologyPreset(this.topology);
+      this.topology = nextTopology;
+      if (nextTopology !== 'custom') {
+        this.applyTopologyPreset(nextTopology);
       }
       this.updateUrlState();
       if (shouldRestart) {
         this.restartMeshForTopologyChange();
       }
+    },
+
+    cancelCustomTopology() {
+      this.customTopologyModalOpen = false;
+      this.$nextTick(() => {
+        if (this.$refs.topologySelect) this.$refs.topologySelect.value = this.topology;
+        this.$refs.topologySelect?.focus();
+      });
+    },
+
+    confirmCustomTopology() {
+      this.customTopologyModalOpen = false;
+      if (this.isRunning || this.isConnecting) {
+        this.stopMesh();
+      }
+      this.topology = 'custom';
+      this.updateUrlState();
+      this.$nextTick(() => this.$refs.minPeersInput?.focus());
     },
 
     async restartMeshForTopologyChange() {
@@ -3966,12 +3802,6 @@ export default {
       this.destroyNetworkGraph();
     },
 
-    requiredConnectedPeersForGossip() {
-      const min = Number.isFinite(this.minPeers) ? this.minPeers : 1;
-      const tolerant = Number.isFinite(this.tolerantPeers) ? this.tolerantPeers : 0;
-      return Math.max(1, min - tolerant);
-    },
-
     syncGossipStatus() {
       if (!this.isRunning) return;
 
@@ -3981,20 +3811,33 @@ export default {
       }
 
       const connected = this.connectedPeersList.length;
-      const minPeers = Number.isFinite(this.minPeers) ? this.minPeers : 1;
-      const required = this.requiredConnectedPeersForGossip();
+      const minPeers = Math.max(1, Number.isFinite(this.minPeers) ? this.minPeers : 1);
+      const maxPeers = Math.max(minPeers, Number.isFinite(this.maxPeers) ? this.maxPeers : minPeers);
+      const ratioToMinimum = connected / minPeers;
+      let quality = 'Poor';
+      let statusType = 'connecting';
 
-      if (connected >= minPeers) {
-        this.showStatus('Ready', `Gossip OK (${connected}/${minPeers} connected)`, 'success');
-      } else if (connected >= required) {
-        this.showStatus(
-          'Ready (Degraded)',
-          `Gossip active but under-connected (${connected}/${minPeers} connected, tolerant ${this.tolerantPeers})`,
-          'success'
-        );
-      } else {
-        this.showStatus('Connecting', `Waiting for peers (${connected}/${required} connected)`, 'connecting');
+      if (connected >= maxPeers) {
+        quality = 'Excellent';
+        statusType = 'success';
+      } else if (connected >= minPeers) {
+        quality = 'Good';
+        statusType = 'success';
+      } else if (ratioToMinimum >= 0.5) {
+        quality = 'OK';
+        statusType = 'success';
+      } else if (ratioToMinimum > 0.25) {
+        quality = 'Fair';
+        statusType = 'info';
+      } else if (ratioToMinimum > 0.1) {
+        quality = 'Degraded';
       }
+
+      this.showStatus(
+        `Gossip ${quality}`,
+        `Gossip ${quality} (${connected}/${minPeers} connected)`,
+        statusType
+      );
     },
 
     entryBubbleClass(entry) {
@@ -5328,6 +5171,46 @@ section {
   font-size: 0.75rem;
   opacity: 0.7;
 }
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(15, 8, 48, 0.66);
+  backdrop-filter: blur(5px);
+}
+
+.modal-card {
+  width: min(100%, 460px);
+  padding: 1.25rem;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 14px;
+  background: #ffffff;
+  box-shadow: 0 24px 70px rgba(15, 8, 48, 0.4);
+  color: #1f2937;
+}
+
+.modal-card h2 {
+  margin: 0 0 0.55rem;
+  font-size: 1.2rem;
+}
+
+.modal-card p {
+  margin: 0;
+  color: #4b5563;
+  line-height: 1.5;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.55rem;
+  margin-top: 1rem;
+}
+
 /* legacy message log helpers no longer used in chat bubbles */
 
 /* Responsive */
