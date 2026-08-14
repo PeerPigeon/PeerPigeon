@@ -249,7 +249,7 @@ export default {
           const source = String(typeof link.source === 'object' ? link.source?.id : link.source || '').trim();
           const target = String(typeof link.target === 'object' ? link.target?.id : link.target || '').trim();
           if (!source || !target || !nextIds.has(source) || !nextIds.has(target)) return null;
-          return { source, target, halfDuplex: Boolean(link.halfDuplex) };
+          return { source, target, direct: Boolean(link.direct) };
         })
         .filter(Boolean);
 
@@ -350,7 +350,7 @@ export default {
       ctx.lineTo(target.screenX, target.screenY);
       ctx.strokeStyle = `rgba(255, 255, 255, ${0.15 + activity * 0.35})`;
       ctx.lineWidth = 1;
-      if (link.halfDuplex) ctx.setLineDash([5, 5]);
+      if (!link.direct) ctx.setLineDash([5, 5]);
       ctx.stroke();
       ctx.restore();
     },
@@ -436,7 +436,11 @@ export default {
         y: Math.max(12, Math.min(rect.height - 72, y + 14)),
         short: hovered.short,
         peerId: hovered.id,
-        detail: hovered.isSelf ? 'This peer' : (hovered.isTolerant ? 'Tolerant connection' : 'Mesh peer'),
+        detail: hovered.isSelf
+          ? 'This peer'
+          : (hovered.isDirect
+            ? (hovered.isTolerant ? 'Tolerant direct connection' : 'Direct connection')
+            : 'Indirect peer'),
       };
     },
 

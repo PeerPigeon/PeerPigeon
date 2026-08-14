@@ -429,7 +429,7 @@
             :activity-by-peer="networkGraphActivityByPeer"
           />
         </div>
-        <div class="mesh-visualizer-caption">Live connected topology from <code>epublic/mesh:peers</code>; a node glow marks real peer join/connect activity (hover for the full peer ID)</div>
+        <div class="mesh-visualizer-caption">Solid lines are this peer's direct WebRTC connections; dashed lines are indirect topology learned through <code>epublic/mesh:peers</code>. A node glow marks real peer join/connect activity (hover for the full peer ID).</div>
       </section>
 
       <!-- Diagnostics -->
@@ -741,9 +741,11 @@ export default {
   },
   computed: {
     networkGraphModel() {
-      // Track the reactive list even though networkGraphData reads the mesh API.
-      // This makes a newly-open WebRTC connection appear on the same Vue tick.
-      void this.connectedPeersList.length;
+      // Direct line state must use the same reactive peer IDs as the Connected
+      // counter. Track the IDs, not only length, so same-count peer swaps repaint.
+      void this.connectedPeersList.join('|');
+      void this.discoveredPeersList.join('|');
+      void this.globalPeersList.join('|');
       return this.networkGraphData();
     },
 
@@ -1739,6 +1741,7 @@ export default {
         }
         this.meshPeersLastSignature = signature;
         this.sharedMeshPeerSnapshots = snapshots;
+        this.syncGossipStatus();
         this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'mesh-storage' }));
       } catch {
         // ignore mesh snapshot sync failures
@@ -1799,6 +1802,7 @@ export default {
         this.meshPeersLastSignature = this.meshPeersSnapshotSignature(snapshots);
         this.sharedMeshPeerSnapshots = snapshots;
         this.meshPeersLastLocalSignature = localSignature;
+        this.syncGossipStatus();
 
         const shouldRefreshTimestamp = now - priorUpdatedAt > MESH_PEERS_HEARTBEAT_MS;
         const needsWrite = priorSignature !== localSignature || !priorUpdatedAt || shouldRefreshTimestamp;
@@ -3113,69 +3117,69 @@ export default {
       return new Set(sortedPeers.slice(-overflow));
     },
 
+    activeMeshPeerIds() {
+      const activePeerIds = new Set();
+      const addPeer = (peerId) => {
+        const id = String(peerId || '').trim();
+        if (id) activePeerIds.add(id);
+      };
+
+      addPeer(this.mesh?.getClientId?.() || this.clientId);
+      for (const peerId of this.connectedPeersList || []) addPeer(peerId);
+      for (const peerId of this.discoveredPeersList || []) addPeer(peerId);
+      for (const peerId of this.globalPeersList || []) addPeer(peerId);
+      return activePeerIds;
+    },
+
     networkGraphData() {
       const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
       const edgeMap = new Map();
-      const participants = new Set();
+      const activePeerIds = this.activeMeshPeerIds();
+      const participants = new Set(activePeerIds);
 
       const snapshots = this.activeMeshPeerSnapshots();
       const localSnapshot = this.localMeshPeerSnapshot();
-      const localConnectedSet = new Set((localSnapshot?.connectedPeers || []).map((peerId) => String(peerId || '').trim()).filter(Boolean));
+      const localConnectedSet = new Set((this.connectedPeersList || []).map((peerId) => String(peerId || '').trim()).filter(Boolean));
       if (localSnapshot) {
         snapshots[localSnapshot.peerId] = localSnapshot;
       }
-      const knownSnapshotPeers = new Set(Object.keys(snapshots).map((peerId) => String(peerId || '').trim()).filter(Boolean));
 
-      const tolerantPeerIds = this.networkTolerantPeerIds(localSnapshot?.connectedPeers || []);
+      const tolerantPeerIds = this.networkTolerantPeerIds(this.connectedPeersList || []);
 
       for (const [sourcePeerId, snapshot] of Object.entries(snapshots)) {
         const source = String(sourcePeerId || '').trim();
-        if (!source) continue;
+        if (!source || !activePeerIds.has(source)) continue;
 
         const connectedPeers = Array.isArray(snapshot?.connectedPeers) ? snapshot.connectedPeers : [];
         for (const peerId of connectedPeers) {
           const target = String(peerId || '').trim();
-          if (!target || target === source) continue;
-
-          // Trust connectedPeers edges even if target snapshot hasn't arrived yet.
-          // This prevents temporary gaps where connections show as missing nodes.
+          if (!target || target === source || !activePeerIds.has(target)) continue;
 
           participants.add(source);
           participants.add(target);
 
           const edgeId = [source, target].sort().join('|');
-          const direction = `${source}>${target}`;
-          const reverse = `${target}>${source}`;
-
           const entry = edgeMap.get(edgeId) || {
             source: [source, target].sort()[0],
             target: [source, target].sort()[1],
-            halfDuplex: true,
-            directions: new Set(),
+            direct: false,
           };
-          entry.directions.add(direction);
 
-          // WebRTC data channels are full-duplex; when local mesh confirms a link,
-          // render it as full immediately even if remote snapshot has not arrived yet.
-          const localConfirmsLink = Boolean(localSelf) && (
+          // A solid edge means exactly what the Connected counter means: this
+          // browser currently has that peer in its direct WebRTC peer list.
+          const localDirectLink = Boolean(localSelf) && (
             (source === localSelf && localConnectedSet.has(target)) ||
             (target === localSelf && localConnectedSet.has(source))
           );
-          if (localConfirmsLink) {
-            entry.directions.add(reverse);
-          }
-
-          if (entry.directions.has(reverse)) {
-            entry.halfDuplex = false;
-          }
+          entry.direct = entry.direct || localDirectLink;
           edgeMap.set(edgeId, entry);
         }
       }
 
-      let links = Array.from(edgeMap.values()).map((entry) => ({
+      const links = Array.from(edgeMap.values()).map((entry) => ({
         source: entry.source,
         target: entry.target,
-        halfDuplex: Boolean(entry.halfDuplex),
+        direct: Boolean(entry.direct),
       }));
 
       // Render the full merged topology from epublic mesh:peers, not only
@@ -3194,6 +3198,7 @@ export default {
           id: peerId,
           short: peerId.slice(0, 4).toUpperCase(),
           isSelf: Boolean(localSelf) && peerId === localSelf,
+          isDirect: localConnectedSet.has(peerId),
           isTolerant: tolerantPeerIds.has(peerId),
           hue: this.networkNodeHue(peerId),
         }));
@@ -3208,7 +3213,7 @@ export default {
           const source = String(typeof link.source === 'object' ? link.source?.id : link.source || '').trim();
           const target = String(typeof link.target === 'object' ? link.target?.id : link.target || '').trim();
           if (!source || !target) return '';
-          const mode = link.halfDuplex ? 'half' : 'full';
+          const mode = link.direct ? 'direct' : 'indirect';
           return `${[source, target].sort().join('|')}:${mode}`;
         })
         .filter(Boolean)
@@ -3634,8 +3639,8 @@ export default {
         .attr('class', 'network-link')
         .attr('stroke', 'url(#network-link-gradient)')
         .attr('stroke-width', 2.2)
-        .attr('stroke-opacity', (d) => (d.halfDuplex ? 0.5 : 0.95))
-        .attr('stroke-dasharray', (d) => (d.halfDuplex ? '6 4' : null))
+        .attr('stroke-opacity', (d) => (d.direct ? 0.95 : 0.5))
+        .attr('stroke-dasharray', (d) => (d.direct ? null : '6 4'))
         .attr('filter', 'url(#network-link-glow)');
 
       const node = root
@@ -3802,6 +3807,79 @@ export default {
       this.destroyNetworkGraph();
     },
 
+    gossipCoverageSnapshot() {
+      const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      const activePeerIds = this.activeMeshPeerIds();
+      const snapshots = this.activeMeshPeerSnapshots();
+      const localSnapshot = this.localMeshPeerSnapshot();
+      if (localSnapshot) snapshots[localSnapshot.peerId] = localSnapshot;
+
+      const knownPeers = new Set();
+      const adjacency = new Map();
+      const addPeer = (peerId) => {
+        const id = String(peerId || '').trim();
+        if (!id) return '';
+        knownPeers.add(id);
+        if (!adjacency.has(id)) adjacency.set(id, new Set());
+        return id;
+      };
+      const addConnection = (leftPeerId, rightPeerId) => {
+        const left = addPeer(leftPeerId);
+        const right = addPeer(rightPeerId);
+        if (!left || !right || left === right) return;
+        adjacency.get(left).add(right);
+        adjacency.get(right).add(left);
+      };
+
+      for (const peerId of activePeerIds) addPeer(peerId);
+      for (const [peerId, snapshot] of Object.entries(snapshots)) {
+        const source = String(peerId || snapshot?.peerId || '').trim();
+        if (!source || !activePeerIds.has(source)) continue;
+        for (const target of snapshot?.connectedPeers || []) {
+          if (!activePeerIds.has(String(target || '').trim())) continue;
+          addConnection(source, target);
+        }
+      }
+
+      if (!self) {
+        return { reachablePeers: 0, knownPeers: Math.max(0, knownPeers.size), coverage: 0 };
+      }
+
+      const visited = new Set([self]);
+      const queue = [self];
+      while (queue.length > 0) {
+        const peerId = queue.shift();
+        for (const neighbor of adjacency.get(peerId) || []) {
+          if (visited.has(neighbor)) continue;
+          visited.add(neighbor);
+          queue.push(neighbor);
+        }
+      }
+
+      const knownRemotePeers = Math.max(0, knownPeers.size - 1);
+      const reachableRemotePeers = Math.max(0, visited.size - 1);
+      let reachableEdges = 0;
+      for (const peerId of visited) {
+        for (const neighbor of adjacency.get(peerId) || []) {
+          if (visited.has(neighbor)) reachableEdges++;
+        }
+      }
+      reachableEdges /= 2;
+
+      const reachability = knownRemotePeers > 0 ? reachableRemotePeers / knownRemotePeers : 0;
+      // A fully connected tree (including Star) is exactly 100%: every peer is
+      // reachable, but there is no redundant gossip route. Extra live edges can
+      // raise the score above 100% only when the entire known graph is reachable.
+      const coverage = reachability >= 1
+        ? Math.max(1, reachableEdges / Math.max(1, knownRemotePeers))
+        : reachability;
+      return {
+        reachablePeers: reachableRemotePeers,
+        knownPeers: knownRemotePeers,
+        coverage,
+      };
+    },
+
     syncGossipStatus() {
       if (!this.isRunning) return;
 
@@ -3810,32 +3888,30 @@ export default {
         return;
       }
 
-      const connected = this.connectedPeersList.length;
-      const minPeers = Math.max(1, Number.isFinite(this.minPeers) ? this.minPeers : 1);
-      const maxPeers = Math.max(minPeers, Number.isFinite(this.maxPeers) ? this.maxPeers : minPeers);
-      const ratioToMinimum = connected / minPeers;
+      const coverageSnapshot = this.gossipCoverageSnapshot();
+      const coverage = coverageSnapshot.coverage;
       let quality = 'Poor';
       let statusType = 'connecting';
 
-      if (connected >= maxPeers) {
+      if (coverage >= 2) {
         quality = 'Excellent';
         statusType = 'success';
-      } else if (connected >= minPeers) {
+      } else if (coverage >= 1) {
         quality = 'Good';
         statusType = 'success';
-      } else if (ratioToMinimum >= 0.5) {
+      } else if (coverage >= 0.5) {
         quality = 'OK';
         statusType = 'success';
-      } else if (ratioToMinimum > 0.25) {
+      } else if (coverage >= 0.25) {
         quality = 'Fair';
         statusType = 'info';
-      } else if (ratioToMinimum > 0.1) {
+      } else if (coverage >= 0.1) {
         quality = 'Degraded';
       }
 
       this.showStatus(
         `Gossip ${quality}`,
-        `Gossip ${quality} (${connected}/${minPeers} connected)`,
+        `Gossip ${quality} (${coverageSnapshot.reachablePeers}/${coverageSnapshot.knownPeers} reachable)`,
         statusType
       );
     },
