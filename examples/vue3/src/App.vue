@@ -4387,6 +4387,13 @@ section {
   min-width: 0;
 }
 
+.storage-space-field .input,
+.storage-key-field .input,
+.storage-value-field .input {
+  box-sizing: border-box;
+  height: 2.375rem;
+}
+
 .storage-key-row {
   display: flex;
   gap: 0.4rem;
