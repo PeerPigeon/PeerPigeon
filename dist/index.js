@@ -443,6 +443,10 @@ var FreeRTCClientAdapter = class {
 var freertc_client_adapter_default = FreeRTCClientAdapter;
 
 // src/gossip.ts
+var RELIABLE_REPAIR_TYPE = "pp-gossip-repair-v1";
+var MAX_RECEIPT_DELTAS_PER_SYNC = 32;
+var MAX_DELIVERY_PEERS = 4096;
+var MAX_REPAIR_ATTEMPTS_PER_TARGET = 3;
 var GossipProtocol = class {
   constructor(mesh, options = {}) {
     this.messageLog = /* @__PURE__ */ new Map();
@@ -455,6 +459,8 @@ var GossipProtocol = class {
     this.cecrSyncTimer = null;
     this.trackingCleanupTimer = null;
     this.seenDirectIds = /* @__PURE__ */ new Map();
+    this.deliveryStates = /* @__PURE__ */ new Map();
+    this.dirtyDeliveryReceiptIds = /* @__PURE__ */ new Set();
     this.callbacks = {};
     this.peers = /* @__PURE__ */ new Map();
     this.mesh = mesh;
@@ -464,6 +470,9 @@ var GossipProtocol = class {
     this.cecrExtremaMaxAgeMs = Math.max(1e3, options.cecrExtremaMaxAgeMs ?? 2e4);
     this.cecrMaxAcceptedDrift = Math.max(0.01, Math.min(1, options.cecrMaxAcceptedDrift ?? 0.18));
     this.cecrRequireConsensus = options.cecrRequireConsensus ?? true;
+    this.deliveryTimeoutMs = Math.max(2e3, options.deliveryTimeoutMs ?? 3e4);
+    this.deliveryRepairDelayMs = Math.max(1e3, options.deliveryRepairDelayMs ?? 4e3);
+    this.deliveryRepairIntervalMs = Math.max(1e3, options.deliveryRepairIntervalMs ?? 5e3);
     this.setupMeshListeners();
     this.startCecrSyncLoop();
     this.startTrackingCleanupLoop();
@@ -482,6 +491,9 @@ var GossipProtocol = class {
     });
     this.mesh.on("peer:connected", (peerId) => {
       this.peers.set(peerId, { connected: true, timestamp: Date.now() });
+      for (const messageId of this.deliveryStates.keys()) {
+        this.dirtyDeliveryReceiptIds.add(messageId);
+      }
       this.publishCecrState();
       this.emit("peerConnected", { peerId });
     });
@@ -495,25 +507,42 @@ var GossipProtocol = class {
   startCecrSyncLoop() {
     if (this.cecrSyncTimer) return;
     this.cecrSyncTimer = setInterval(() => {
+      this.maintainTrackedDeliveries();
       this.publishCecrState();
     }, 2e3);
   }
   startTrackingCleanupLoop() {
     if (this.trackingCleanupTimer) return;
     this.trackingCleanupTimer = setInterval(() => {
+      this.maintainTrackedDeliveries();
       this.pruneTracking();
     }, 3e4);
   }
   /**
    * Broadcast an application payload using gossip-style re-propagation.
    */
-  broadcast(data, metadata = {}) {
+  broadcast(data, metadata = {}, options = {}) {
     const sender = this.mesh.getClientId();
     const connected = this.mesh.getConnectedPeers();
     const global = this.mesh.getGlobalPeers?.() ?? connected;
     const networkSize = Math.max(connected.length, global.length, 1);
+    const messageId = this.generateMessageId(sender);
+    let delivery;
+    let deliveryPeers = null;
+    if (options.trackDelivery && sender) {
+      deliveryPeers = this.canonicalPeerSet();
+      const senderIndex = deliveryPeers.indexOf(sender);
+      const bits = this.createDeliveryBits(deliveryPeers.length);
+      if (senderIndex >= 0) this.setDeliveryBit(bits, senderIndex);
+      delivery = {
+        setHash: this.canonicalSetHash(deliveryPeers),
+        size: deliveryPeers.length,
+        bits: this.deliveryBitsToHex(bits),
+        deadlineAt: Date.now() + Math.max(2e3, options.deliveryTimeoutMs ?? this.deliveryTimeoutMs)
+      };
+    }
     const message = {
-      id: this.generateMessageId(sender),
+      id: messageId,
       timestamp: Date.now(),
       hops: 0,
       // Ensure messages can cross long sparse paths (e.g. saturation/rebalance chains).
@@ -521,7 +550,8 @@ var GossipProtocol = class {
       sender,
       data,
       metadata,
-      type: "gossip"
+      type: "gossip",
+      ...delivery ? { delivery } : {}
     };
     this.messageLog.set(message.id, {
       timestamp: message.timestamp,
@@ -531,21 +561,40 @@ var GossipProtocol = class {
     if (this.messageLog.size > this.maxTrackedMessages) {
       this.pruneTracking(message.timestamp);
     }
+    if (delivery && deliveryPeers) {
+      this.registerTrackedDelivery(message, deliveryPeers, true);
+    }
     this.propagate(message);
     this.emit("messageReceived", { message, local: true });
     return message.id;
+  }
+  /**
+   * Broadcast with delivery tracking enabled for the known-peer snapshot.
+   */
+  broadcastReliable(data, metadata = {}, options = {}) {
+    return this.broadcast(data, metadata, { ...options, trackDelivery: true });
+  }
+  /**
+   * Return the sender-visible delivery state for a tracked gossip message.
+   */
+  getDeliveryStatus(messageId) {
+    const state = this.deliveryStates.get(messageId);
+    if (!state) return null;
+    return this.deliveryStatusForState(state);
   }
   /**
    * Propagate a message to all currently-connected peers.
    */
   propagate(message, exceptPeerId) {
     const connectedPeers = this.mesh.getConnectedPeers();
+    const deliveryState = this.deliveryStates.get(message.id);
     for (const peerId of connectedPeers) {
       if (peerId === message.sender) continue;
       if (exceptPeerId && peerId === exceptPeerId) continue;
       const forwarded = {
         ...message,
-        hops: message.hops + 1
+        hops: message.hops + 1,
+        ...deliveryState ? { delivery: this.deliveryEnvelopeForState(deliveryState) } : {}
       };
       try {
         this.mesh.send(peerId, JSON.stringify(forwarded));
@@ -558,6 +607,9 @@ var GossipProtocol = class {
    */
   handleIncomingMessage(message, fromPeerId) {
     const alreadySeen = this.messageLog.has(message.id);
+    if (message.delivery) {
+      this.registerTrackedDelivery(message, null, true);
+    }
     if (alreadySeen) return;
     this.messageLog.set(message.id, {
       timestamp: Date.now(),
@@ -571,6 +623,275 @@ var GossipProtocol = class {
     if (message.hops < message.maxHops) {
       this.propagate(message, fromPeerId);
     }
+  }
+  // ─── Tracked delivery receipts ──────────────────────────────────────────
+  createDeliveryBits(size) {
+    return new Uint8Array(Math.ceil(Math.max(0, size) / 8));
+  }
+  setDeliveryBit(bits, index) {
+    if (index < 0 || index >= bits.length * 8) return false;
+    const byteIndex = Math.floor(index / 8);
+    const mask = 1 << index % 8;
+    const before = bits[byteIndex];
+    bits[byteIndex] |= mask;
+    return bits[byteIndex] !== before;
+  }
+  hasDeliveryBit(bits, index) {
+    if (index < 0 || index >= bits.length * 8) return false;
+    return (bits[Math.floor(index / 8)] & 1 << index % 8) !== 0;
+  }
+  deliveryBitsToHex(bits) {
+    return Array.from(bits, (value) => value.toString(16).padStart(2, "0")).join("");
+  }
+  deliveryBitsFromHex(hex, size) {
+    const normalized = String(hex || "").trim().toLowerCase();
+    const byteLength = Math.ceil(size / 8);
+    if (!/^[0-9a-f]*$/.test(normalized) || normalized.length !== byteLength * 2) return null;
+    const bits = new Uint8Array(byteLength);
+    for (let index = 0; index < byteLength; index += 1) {
+      bits[index] = Number.parseInt(normalized.slice(index * 2, index * 2 + 2), 16);
+    }
+    return bits;
+  }
+  mergeDeliveryBits(target, incoming) {
+    if (target.length !== incoming.length) return false;
+    let changed = false;
+    for (let index = 0; index < target.length; index += 1) {
+      const merged = target[index] | incoming[index];
+      if (merged !== target[index]) {
+        target[index] = merged;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+  deliveryEnvelopeForState(state) {
+    return {
+      setHash: state.setHash,
+      size: state.size,
+      bits: this.deliveryBitsToHex(state.bits),
+      deadlineAt: state.deadlineAt
+    };
+  }
+  deliveryReceiptForState(state) {
+    return {
+      messageId: state.messageId,
+      sender: state.sender,
+      ...this.deliveryEnvelopeForState(state)
+    };
+  }
+  validateDeliveryEnvelope(envelope) {
+    if (!envelope || typeof envelope !== "object") return null;
+    if (typeof envelope.setHash !== "string" || !/^[0-9a-f]{16}$/i.test(envelope.setHash)) return null;
+    if (!Number.isInteger(envelope.size) || envelope.size < 1 || envelope.size > MAX_DELIVERY_PEERS) return null;
+    if (!Number.isFinite(envelope.deadlineAt) || envelope.deadlineAt <= 0) return null;
+    return this.deliveryBitsFromHex(envelope.bits, envelope.size);
+  }
+  reconstructDeliveryPeers(state) {
+    const peers = this.canonicalPeerSet();
+    if (peers.length !== state.size || this.canonicalSetHash(peers) !== state.setHash) return null;
+    state.peerIds = peers;
+    return peers;
+  }
+  registerTrackedDelivery(message, knownPeerIds, receivedLocally) {
+    if (!message.delivery || !message.sender) return null;
+    const incomingBits = this.validateDeliveryEnvelope(message.delivery);
+    if (!incomingBits) return null;
+    let state = this.deliveryStates.get(message.id);
+    let changed = false;
+    if (!state) {
+      state = {
+        messageId: message.id,
+        sender: message.sender,
+        setHash: message.delivery.setHash,
+        size: message.delivery.size,
+        bits: incomingBits,
+        peerIds: knownPeerIds ? knownPeerIds.slice() : null,
+        message,
+        createdAt: message.timestamp,
+        updatedAt: Date.now(),
+        deadlineAt: message.delivery.deadlineAt,
+        completedAt: null,
+        timedOut: false,
+        lastStatusSignature: "",
+        repairAttemptsByPeer: /* @__PURE__ */ new Map()
+      };
+      this.deliveryStates.set(message.id, state);
+      changed = true;
+    } else {
+      if (state.sender !== message.sender || state.setHash !== message.delivery.setHash || state.size !== message.delivery.size || state.deadlineAt !== message.delivery.deadlineAt) {
+        return null;
+      }
+      changed = this.mergeDeliveryBits(state.bits, incomingBits);
+      state.message = state.message ?? message;
+      if (knownPeerIds) state.peerIds = knownPeerIds.slice();
+    }
+    const peers = state.peerIds ?? this.reconstructDeliveryPeers(state);
+    if (receivedLocally && peers) {
+      const self = this.mesh.getClientId();
+      const selfIndex = self ? peers.indexOf(self) : -1;
+      if (selfIndex >= 0 && this.setDeliveryBit(state.bits, selfIndex)) changed = true;
+    }
+    if (changed) {
+      state.updatedAt = Date.now();
+      this.dirtyDeliveryReceiptIds.add(state.messageId);
+      this.emitDeliveryStatus(state);
+    }
+    return state;
+  }
+  mergeDeliveryReceipt(receipt) {
+    if (!receipt || typeof receipt.messageId !== "string" || typeof receipt.sender !== "string") return;
+    const incomingBits = this.validateDeliveryEnvelope(receipt);
+    if (!incomingBits) return;
+    let state = this.deliveryStates.get(receipt.messageId);
+    let changed = false;
+    if (!state) {
+      state = {
+        messageId: receipt.messageId,
+        sender: receipt.sender,
+        setHash: receipt.setHash,
+        size: receipt.size,
+        bits: incomingBits,
+        peerIds: null,
+        message: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        deadlineAt: receipt.deadlineAt,
+        completedAt: null,
+        timedOut: false,
+        lastStatusSignature: "",
+        repairAttemptsByPeer: /* @__PURE__ */ new Map()
+      };
+      this.deliveryStates.set(receipt.messageId, state);
+      changed = true;
+    } else {
+      if (state.sender !== receipt.sender || state.setHash !== receipt.setHash || state.size !== receipt.size || state.deadlineAt !== receipt.deadlineAt) return;
+      changed = this.mergeDeliveryBits(state.bits, incomingBits);
+    }
+    if (!state.peerIds) this.reconstructDeliveryPeers(state);
+    if (changed) {
+      state.updatedAt = Date.now();
+      this.dirtyDeliveryReceiptIds.add(state.messageId);
+      this.emitDeliveryStatus(state);
+    }
+  }
+  deliveryStatusForState(state) {
+    const peers = state.peerIds ?? this.reconstructDeliveryPeers(state) ?? [];
+    const audiencePeerIds = peers.filter((peerId) => peerId !== state.sender);
+    const deliveredPeerIds = audiencePeerIds.filter((peerId) => {
+      const index = peers.indexOf(peerId);
+      return index >= 0 && this.hasDeliveryBit(state.bits, index);
+    });
+    const deliveredSet = new Set(deliveredPeerIds);
+    const pendingPeerIds = audiencePeerIds.filter((peerId) => !deliveredSet.has(peerId));
+    return {
+      messageId: state.messageId,
+      sender: state.sender,
+      membershipHash: state.setHash,
+      audiencePeerIds,
+      deliveredPeerIds,
+      pendingPeerIds,
+      audienceCount: audiencePeerIds.length,
+      deliveredCount: deliveredPeerIds.length,
+      complete: peers.length === state.size && pendingPeerIds.length === 0,
+      timedOut: state.timedOut,
+      createdAt: state.createdAt,
+      updatedAt: state.updatedAt,
+      deadlineAt: state.deadlineAt
+    };
+  }
+  emitDeliveryStatus(state) {
+    if (state.sender !== this.mesh.getClientId()) return;
+    const status = this.deliveryStatusForState(state);
+    const signature = `${status.deliveredPeerIds.join("|")}::${status.pendingPeerIds.join("|")}::${status.timedOut}`;
+    if (signature !== state.lastStatusSignature) {
+      state.lastStatusSignature = signature;
+      this.emit("deliveryProgress", status);
+    }
+    if (status.complete && state.completedAt == null) {
+      state.completedAt = Date.now();
+      this.emit("deliveryComplete", status);
+    }
+  }
+  selectRepairOwner(state, targetPeerId) {
+    const peers = state.peerIds ?? this.reconstructDeliveryPeers(state);
+    if (!peers) return null;
+    const delivered = peers.filter((_, index) => this.hasDeliveryBit(state.bits, index));
+    let owner = null;
+    let ownerScore = null;
+    for (const candidate of delivered) {
+      const score = this.canonicalSetHash([state.messageId, targetPeerId, candidate]);
+      if (ownerScore == null || score < ownerScore) {
+        owner = candidate;
+        ownerScore = score;
+      }
+    }
+    return owner;
+  }
+  maintainTrackedDeliveries(now = Date.now()) {
+    const self = this.mesh.getClientId();
+    if (!self) return;
+    for (const state of this.deliveryStates.values()) {
+      const peers = state.peerIds ?? this.reconstructDeliveryPeers(state);
+      if (state.message && peers) {
+        const selfIndex = peers.indexOf(self);
+        if (selfIndex >= 0 && this.setDeliveryBit(state.bits, selfIndex)) {
+          state.updatedAt = now;
+          this.dirtyDeliveryReceiptIds.add(state.messageId);
+          this.emitDeliveryStatus(state);
+        }
+      }
+      const status = this.deliveryStatusForState(state);
+      if (status.complete) continue;
+      if (now >= state.deadlineAt) {
+        if (!state.timedOut) {
+          state.timedOut = true;
+          state.updatedAt = now;
+          this.emitDeliveryStatus(state);
+          if (state.sender === self) this.emit("deliveryTimeout", this.deliveryStatusForState(state));
+        }
+        continue;
+      }
+      if (!state.message || !peers || now - state.createdAt < this.deliveryRepairDelayMs) continue;
+      for (const targetPeerId of status.pendingPeerIds) {
+        if (this.selectRepairOwner(state, targetPeerId) !== self) continue;
+        const attempt = state.repairAttemptsByPeer.get(targetPeerId) ?? { attempts: 0, lastAttemptAt: 0 };
+        if (attempt.attempts >= MAX_REPAIR_ATTEMPTS_PER_TARGET) continue;
+        if (now - attempt.lastAttemptAt < this.deliveryRepairIntervalMs) continue;
+        const repairMessage = {
+          ...state.message,
+          delivery: this.deliveryEnvelopeForState(state)
+        };
+        const repairId = this.sendDirect(targetPeerId, {
+          __peerPigeonType: RELIABLE_REPAIR_TYPE,
+          message: repairMessage
+        });
+        if (repairId) {
+          state.repairAttemptsByPeer.set(targetPeerId, {
+            attempts: attempt.attempts + 1,
+            lastAttemptAt: now
+          });
+        }
+      }
+    }
+  }
+  reliableRepairMessage(data) {
+    let candidate = data;
+    if (typeof candidate === "string") {
+      try {
+        candidate = JSON.parse(candidate);
+      } catch {
+        return null;
+      }
+    }
+    if (!candidate || typeof candidate !== "object") return null;
+    const value = candidate;
+    if (value.__peerPigeonType !== RELIABLE_REPAIR_TYPE || !value.message || typeof value.message !== "object") {
+      return null;
+    }
+    const message = value.message;
+    if (message.type !== "gossip" || typeof message.id !== "string" || !message.delivery) return null;
+    return message;
   }
   // ─── Direct / XOR-routed messaging ───────────────────────────────────────
   /**
@@ -712,22 +1033,32 @@ var GossipProtocol = class {
     const self = this.mesh.getClientId();
     if (!self) return;
     const extrema = this.updateCecrExtremaSnapshot();
-    if (!extrema) return;
+    const receiptIds = Array.from(this.dirtyDeliveryReceiptIds).slice(0, MAX_RECEIPT_DELTAS_PER_SYNC);
+    if (!extrema && receiptIds.length === 0) return;
+    const canonicalPeers = extrema ? null : this.canonicalPeerSet();
     const message = {
       id: this.generateMessageId(self),
       type: "cecr-state",
       from: self,
       timestamp: Date.now(),
-      setHash: extrema.setHash,
-      minHex: extrema.min.toString(16),
-      maxHex: extrema.max.toString(16),
-      size: extrema.size
+      setHash: extrema?.setHash ?? this.canonicalSetHash(canonicalPeers ?? []),
+      minHex: extrema?.min.toString(16) ?? "0",
+      maxHex: extrema?.max.toString(16) ?? "0",
+      size: extrema?.size ?? canonicalPeers?.length ?? 0
     };
+    if (receiptIds.length) {
+      message.receipts = receiptIds.map((messageId) => this.deliveryStates.get(messageId)).filter((state) => !!state).map((state) => this.deliveryReceiptForState(state));
+    }
+    let sent = false;
     for (const peerId of this.mesh.getConnectedPeers()) {
       try {
         this.mesh.send(peerId, JSON.stringify(message));
+        sent = true;
       } catch {
       }
+    }
+    if (sent) {
+      for (const messageId of receiptIds) this.dirtyDeliveryReceiptIds.delete(messageId);
     }
   }
   handleIncomingCecrState(message, fromPeerId) {
@@ -745,6 +1076,11 @@ var GossipProtocol = class {
         size: Math.floor(message.size),
         updatedAtMs: Date.now()
       });
+      if (Array.isArray(message.receipts)) {
+        for (const receipt of message.receipts.slice(0, MAX_RECEIPT_DELTAS_PER_SYNC)) {
+          this.mergeDeliveryReceipt(receipt);
+        }
+      }
     } catch {
     }
   }
@@ -817,6 +1153,11 @@ var GossipProtocol = class {
   routeDirect(message, fromPeerId) {
     const self = this.mesh.getClientId();
     if (message.to === self) {
+      const repairedMessage = this.reliableRepairMessage(message.data);
+      if (repairedMessage) {
+        this.handleIncomingMessage(repairedMessage, fromPeerId ?? message.from);
+        return;
+      }
       this.emit("directMessageReceived", { message });
       return;
     }
@@ -900,6 +1241,13 @@ var GossipProtocol = class {
       if (!oldest) break;
       this.seenDirectIds.delete(oldest);
     }
+    for (const [id, state] of this.deliveryStates.entries()) {
+      const terminalAt = state.completedAt ?? (state.timedOut ? state.deadlineAt : null);
+      const expired = terminalAt != null ? now - terminalAt > this.trackingRetentionMs : now - state.createdAt > this.trackingRetentionMs;
+      if (!expired) continue;
+      this.deliveryStates.delete(id);
+      this.dirtyDeliveryReceiptIds.delete(id);
+    }
   }
   on(event, callback) {
     const existing = this.callbacks[event];
@@ -918,6 +1266,8 @@ var GossipProtocol = class {
     this.messageLog.clear();
     this.peers.clear();
     this.seenDirectIds.clear();
+    this.deliveryStates.clear();
+    this.dirtyDeliveryReceiptIds.clear();
     this.cecrRemoteStates.clear();
     if (this.cecrSyncTimer) {
       clearInterval(this.cecrSyncTimer);
@@ -2011,6 +2361,9 @@ var PartialMesh = class {
     this.pendingRebalanceDropByTarget = /* @__PURE__ */ new Map();
     /** Converged global peer membership — populated via in-band membership gossip. */
     this.globalPeers = /* @__PURE__ */ new Set();
+    /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
+    this.peerCapacityById = /* @__PURE__ */ new Map();
+    this.localCapacityUpdatedAtMs = Date.now();
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
@@ -2118,6 +2471,7 @@ var PartialMesh = class {
     this.selfAliases.add(id);
     const removedDiscovered = this.discoveredPeers.delete(id);
     const removedGlobal = this.globalPeers.delete(id);
+    this.peerCapacityById.delete(id);
     const changed = removedDiscovered || removedGlobal;
     this.discoveredAtMs.delete(id);
     this.dialFailureCount.delete(id);
@@ -2160,13 +2514,54 @@ var PartialMesh = class {
     }
     return pending.size;
   }
-  getMaxPeersWithTolerance() {
-    const tolerance = Math.max(0, Math.floor(this.config.tolerantPeers));
-    return this.config.maxPeers + tolerance;
+  noteLocalCapacityChanged() {
+    this.localCapacityUpdatedAtMs = Math.max(Date.now(), this.localCapacityUpdatedAtMs + 1);
+  }
+  freshPeerCapacity(peerId) {
+    const state = this.peerCapacityById.get(peerId);
+    if (!state || Date.now() - state.updatedAt > 6e4) return null;
+    return state;
+  }
+  /**
+   * Known underfilled peers sort first, with lower-capacity peers ahead of
+   * high-capacity peers. Unknown peers remain eligible; known-full peers sort last.
+   */
+  compareCapacityPriority(a, b) {
+    const capacityA = this.freshPeerCapacity(a);
+    const capacityB = this.freshPeerCapacity(b);
+    const bucket = (capacity) => {
+      if (!capacity) return 1;
+      return capacity.connectedPeers < capacity.maxPeers ? 0 : 2;
+    };
+    const bucketA = bucket(capacityA);
+    const bucketB = bucket(capacityB);
+    if (bucketA !== bucketB) return bucketA - bucketB;
+    if (bucketA === 0 && capacityA && capacityB) {
+      if (capacityA.maxPeers !== capacityB.maxPeers) return capacityA.maxPeers - capacityB.maxPeers;
+      const remainingA = capacityA.maxPeers - capacityA.connectedPeers;
+      const remainingB = capacityB.maxPeers - capacityB.connectedPeers;
+      if (remainingA !== remainingB) return remainingA - remainingB;
+    }
+    return 0;
+  }
+  compareDialCandidates(a, b) {
+    const capacityOrder = this.compareCapacityPriority(a, b);
+    if (capacityOrder !== 0) return capacityOrder;
+    const failA = this.dialFailureCount.get(a) ?? 0;
+    const failB = this.dialFailureCount.get(b) ?? 0;
+    if (failA !== failB) return failA - failB;
+    const discoveredA = this.discoveredAtMs.get(a) ?? 0;
+    const discoveredB = this.discoveredAtMs.get(b) ?? 0;
+    if (discoveredA !== discoveredB) return discoveredA - discoveredB;
+    const self = this.normalizePeerId(this.clientId);
+    const scoreA = this.fastIdHash(`${self}:${a}`);
+    const scoreB = this.fastIdHash(`${self}:${b}`);
+    if (scoreA !== scoreB) return scoreA - scoreB;
+    return a.localeCompare(b);
   }
   trimExcessPeers() {
     const connectedPeers = this.getConnectedPeers();
-    const overflow = connectedPeers.length - this.getMaxPeersWithTolerance();
+    const overflow = connectedPeers.length - this.config.maxPeers;
     if (overflow <= 0) return;
     this.rebalanceCooldownUntilMs = Math.max(this.rebalanceCooldownUntilMs, Date.now() + 2e3);
     const dropOrder = connectedPeers.map((peerId) => ({
@@ -2250,7 +2645,11 @@ var PartialMesh = class {
       distance: this.peerDistance(selfId, peerId),
       discoveredAt: this.discoveredAtMs.get(peerId) ?? 0,
       lastAttemptAt: this.rebalanceAttemptAtMs.get(peerId) ?? 0
-    })).sort((a, b) => a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId));
+    })).sort((a, b) => {
+      const capacityOrder = this.compareCapacityPriority(a.peerId, b.peerId);
+      if (capacityOrder !== 0) return capacityOrder;
+      return a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId);
+    });
     const farthestConnected = connectedByDistance[connectedByDistance.length - 1];
     const closestCandidate = candidateByDistance.find((candidate) => {
       const discoveredAgeMs = now - candidate.discoveredAt;
@@ -2282,7 +2681,7 @@ var PartialMesh = class {
     this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now);
     this.pendingRebalanceDropByTarget.set(closestCandidate.peerId, farthestConnected.peerId);
     this.emit("signaling:log", {
-      message: `[rebalance] dial closer ${closestCandidate.peerId.slice(0, 8)} then drop ${farthestConnected.peerId.slice(0, 8)}`
+      message: `[rebalance] dial priority ${closestCandidate.peerId.slice(0, 8)} then drop ${farthestConnected.peerId.slice(0, 8)}`
     });
     this.connectToPeerInternal(closestCandidate.peerId, true);
     if (!this.peers.has(closestCandidate.peerId) && !this.connecting.has(closestCandidate.peerId)) {
@@ -2385,6 +2784,7 @@ var PartialMesh = class {
       this.peerConnectedAtMs.set(peerId, Date.now());
       this.connecting.delete(peerId);
       this.noteDialSuccess(peerId);
+      this.noteLocalCapacityChanged();
       const fallbackTimer = this.nonInitiatorFallbackTimers.get(peerId);
       if (fallbackTimer) {
         clearTimeout(fallbackTimer);
@@ -2407,7 +2807,7 @@ var PartialMesh = class {
       if (this.getConnectedPeers().length >= this.config.minPeers) {
         this.emit("mesh:ready");
       }
-      this.sendMembership(peerId);
+      this.broadcastMembership();
     });
     this.signalingClient.on("rtc:disconnected", (data) => {
       const peerId = this.normalizePeerId(data.peerId);
@@ -2433,7 +2833,9 @@ var PartialMesh = class {
         this.peerConnectedAtMs.delete(peerId);
         this.connecting.delete(peerId);
         if (wasConnected) {
+          this.noteLocalCapacityChanged();
           this.emit("peer:disconnected", peerId);
+          this.broadcastMembership();
         }
         if (this.config.autoConnect) {
           this.maintainPeerConnections();
@@ -2443,7 +2845,7 @@ var PartialMesh = class {
     this.signalingClient.on("rtc:data", (data) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
-        this.mergeMembership(msg.peers, msg.retiredPeers, data.peerId);
+        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, data.peerId);
       } else {
         this.emit("peer:data", data);
       }
@@ -2719,27 +3121,9 @@ var PartialMesh = class {
     const available = emergencyIsolated ? allCandidates : allCandidates.filter((peerId) => !this.isPeerBackedOff(peerId));
     const pickCandidates = (count) => {
       if (available.length === 0 && allCandidates.length === 0 || count <= 0) return [];
-      const selfId = this.normalizePeerId(this.clientId);
       const source = available.length > 0 ? available : allCandidates;
-      const sorted = source.slice().sort((a, b) => {
-        const failA = this.dialFailureCount.get(a) ?? 0;
-        const failB = this.dialFailureCount.get(b) ?? 0;
-        if (failA !== failB) return failA - failB;
-        return a.localeCompare(b);
-      });
-      let offset = 0;
-      if (selfId) {
-        let hash = 0;
-        for (let i = 0; i < selfId.length; i++) {
-          hash = hash * 31 + selfId.charCodeAt(i) >>> 0;
-        }
-        offset = sorted.length ? hash % sorted.length : 0;
-      }
-      const selected = [];
-      for (let i = 0; i < Math.min(count, sorted.length); i++) {
-        selected.push(sorted[(offset + i) % sorted.length]);
-      }
-      return selected;
+      const sorted = source.slice().sort((a, b) => this.compareDialCandidates(a, b));
+      return sorted.slice(0, Math.min(count, sorted.length));
     };
     if (totalInProgress < this.config.minPeers) {
       const needed = this.config.minPeers - totalInProgress;
@@ -2756,7 +3140,7 @@ var PartialMesh = class {
       for (const peerId of pickCandidates(1)) {
         this.connectToPeer(peerId);
       }
-    } else if (connectedCount > this.getMaxPeersWithTolerance()) {
+    } else if (connectedCount > this.config.maxPeers) {
       this.trimExcessPeers();
     } else if (connectedCount >= this.config.maxPeers && pendingCount === 0 && available.length > 0) {
       if (this.maybeRebalanceForCloserPeer(available)) {
@@ -2828,19 +3212,11 @@ var PartialMesh = class {
       if (candidatePeers.some((id) => selfId < id)) {
         return;
       }
-      const fallbackTargets = candidatePeers.filter((id) => selfId > id).sort((a, b) => a.localeCompare(b));
+      const fallbackTargets = candidatePeers.filter((id) => selfId > id).sort((a, b) => this.compareDialCandidates(a, b));
       if (fallbackTargets.length === 0) {
         return;
       }
-      const selectedFallbackTarget = fallbackTargets.slice().sort((a, b) => {
-        const failA = this.dialFailureCount.get(a) ?? 0;
-        const failB = this.dialFailureCount.get(b) ?? 0;
-        if (failA !== failB) return failA - failB;
-        const discoveredA = this.discoveredAtMs.get(a) ?? 0;
-        const discoveredB = this.discoveredAtMs.get(b) ?? 0;
-        if (discoveredA !== discoveredB) return discoveredA - discoveredB;
-        return a.localeCompare(b);
-      })[0];
+      const selectedFallbackTarget = fallbackTargets.slice().sort((a, b) => this.compareDialCandidates(a, b))[0];
       if (selectedFallbackTarget !== normalizedPeerId) {
         return;
       }
@@ -2859,19 +3235,11 @@ var PartialMesh = class {
           if (refreshedCandidates.some((id) => selfId < id)) {
             return;
           }
-          const refreshedTargets = refreshedCandidates.filter((id) => selfId > id).sort((a, b) => a.localeCompare(b));
+          const refreshedTargets = refreshedCandidates.filter((id) => selfId > id).sort((a, b) => this.compareDialCandidates(a, b));
           if (refreshedTargets.length === 0) {
             return;
           }
-          const refreshedSelectedTarget = refreshedTargets.slice().sort((a, b) => {
-            const failA = this.dialFailureCount.get(a) ?? 0;
-            const failB = this.dialFailureCount.get(b) ?? 0;
-            if (failA !== failB) return failA - failB;
-            const discoveredA = this.discoveredAtMs.get(a) ?? 0;
-            const discoveredB = this.discoveredAtMs.get(b) ?? 0;
-            if (discoveredA !== discoveredB) return discoveredA - discoveredB;
-            return a.localeCompare(b);
-          })[0];
+          const refreshedSelectedTarget = refreshedTargets.slice().sort((a, b) => this.compareDialCandidates(a, b))[0];
           if (refreshedSelectedTarget !== normalizedPeerId) {
             return;
           }
@@ -2947,7 +3315,9 @@ var PartialMesh = class {
         this.discoveredPeers.delete(peerId);
       }
       if (wasConnected) {
+        this.noteLocalCapacityChanged();
         this.emit("peer:disconnected", peerId);
+        this.broadcastMembership();
       }
       if (this.config.autoConnect) {
         this.maintainPeerConnections();
@@ -3041,14 +3411,29 @@ var PartialMesh = class {
     if (self) all.add(self);
     for (const p of this.discoveredPeers) all.add(p);
     for (const retiredPeerId of this.retiredPeerIds) all.delete(retiredPeerId);
+    const capacities = {};
+    const now = Date.now();
+    for (const [peerId, state] of this.peerCapacityById.entries()) {
+      if (!all.has(peerId) || now - state.updatedAt > 6e4) continue;
+      capacities[peerId] = [state.maxPeers, state.connectedPeers, state.updatedAt];
+    }
+    if (self) {
+      capacities[self] = [this.config.maxPeers, this.getConnectedPeerCount(), this.localCapacityUpdatedAtMs];
+    }
     const payload = JSON.stringify({
       __membership: true,
       peers: Array.from(all),
-      retiredPeers: Array.from(this.retiredPeerIds)
+      retiredPeers: Array.from(this.retiredPeerIds),
+      capacities
     });
     try {
       this.signalingClient?.send(toPeerId, payload);
     } catch {
+    }
+  }
+  broadcastMembership(exceptPeerId) {
+    for (const peerId of this.getConnectedPeers()) {
+      if (peerId !== exceptPeerId) this.sendMembership(peerId);
     }
   }
   tryParseMembership(raw) {
@@ -3057,33 +3442,44 @@ var PartialMesh = class {
       if (obj?.__membership === true && Array.isArray(obj.peers)) {
         return {
           peers: obj.peers,
-          retiredPeers: Array.isArray(obj.retiredPeers) ? obj.retiredPeers : []
+          retiredPeers: Array.isArray(obj.retiredPeers) ? obj.retiredPeers : [],
+          capacities: obj.capacities && typeof obj.capacities === "object" && !Array.isArray(obj.capacities) ? obj.capacities : {}
         };
       }
     } catch {
     }
     return null;
   }
-  mergeMembership(incoming, retired, fromPeerId) {
-    let changed = false;
+  mergeMembership(incoming, retired, capacities, fromPeerId) {
+    let membershipChanged = false;
+    let capacityChanged = false;
     for (const raw of retired) {
-      if (this.retirePeerId(raw)) changed = true;
+      if (this.retirePeerId(raw)) membershipChanged = true;
     }
     for (const raw of incoming) {
       const id = this.normalizePeerId(raw);
       if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) continue;
       if (!this.globalPeers.has(id)) {
         this.globalPeers.add(id);
-        changed = true;
+        membershipChanged = true;
       }
     }
-    if (changed) {
+    for (const [rawPeerId, rawState] of Object.entries(capacities || {})) {
+      const peerId = this.normalizePeerId(rawPeerId);
+      if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
+      if (!Array.isArray(rawState) || rawState.length < 3) continue;
+      const maxPeers = Math.floor(Number(rawState[0]));
+      const connectedPeers = Math.floor(Number(rawState[1]));
+      const updatedAt = Math.floor(Number(rawState[2]));
+      if (!Number.isFinite(maxPeers) || maxPeers < 1 || maxPeers > 4096 || !Number.isFinite(connectedPeers) || connectedPeers < 0 || connectedPeers > 4096 || !Number.isFinite(updatedAt) || updatedAt <= 0) continue;
+      const existing = this.peerCapacityById.get(peerId);
+      if (existing && existing.updatedAt >= updatedAt) continue;
+      this.peerCapacityById.set(peerId, { maxPeers, connectedPeers, updatedAt });
+      capacityChanged = true;
+    }
+    if (membershipChanged || capacityChanged) {
       this.emit("mesh:membership", Array.from(this.globalPeers));
-      for (const peerId of this.getConnectedPeers()) {
-        if (peerId !== fromPeerId) {
-          this.sendMembership(peerId);
-        }
-      }
+      this.broadcastMembership(fromPeerId);
       if (this.config.autoConnect) {
         this.maintainPeerConnections();
       }
@@ -3091,6 +3487,7 @@ var PartialMesh = class {
   }
   removeFromGlobalMembership(peerId) {
     const removed = this.globalPeers.delete(peerId);
+    this.peerCapacityById.delete(peerId);
     if (!removed) return;
     this.emit("mesh:membership", Array.from(this.globalPeers));
     for (const connectedPeerId of this.getConnectedPeers()) {
@@ -3130,6 +3527,7 @@ var PartialMesh = class {
     this.rebalanceAttemptAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
     this.globalPeers.clear();
+    this.peerCapacityById.clear();
     this.selfAliases.clear();
     this.retiredPeerIds.clear();
     this.clientId = null;

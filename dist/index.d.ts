@@ -11,6 +11,39 @@ type GossipProtocolOptions = {
     cecrMaxAcceptedDrift?: number;
     /** Require canonical global-set/extrema agreement across connected peers before coordinate routing. */
     cecrRequireConsensus?: boolean;
+    /** Default deadline for opt-in tracked gossip delivery. Default 30 seconds. */
+    deliveryTimeoutMs?: number;
+    /** Delay before a tracked message is eligible for targeted repair. Default 4 seconds. */
+    deliveryRepairDelayMs?: number;
+    /** Minimum delay between repair attempts for the same target. Default 5 seconds. */
+    deliveryRepairIntervalMs?: number;
+};
+type GossipBroadcastOptions = {
+    /** Track delivery to the canonical known-peer snapshot captured at send time. */
+    trackDelivery?: boolean;
+    /** Override the protocol's tracked-delivery deadline for this message. */
+    deliveryTimeoutMs?: number;
+};
+type GossipDeliveryStatus = {
+    messageId: string;
+    sender: string;
+    membershipHash: string;
+    audiencePeerIds: string[];
+    deliveredPeerIds: string[];
+    pendingPeerIds: string[];
+    audienceCount: number;
+    deliveredCount: number;
+    complete: boolean;
+    timedOut: boolean;
+    createdAt: number;
+    updatedAt: number;
+    deadlineAt: number;
+};
+type GossipDeliveryEnvelope = {
+    setHash: string;
+    size: number;
+    bits: string;
+    deadlineAt: number;
 };
 type GossipMessage = {
     id: string;
@@ -21,6 +54,7 @@ type GossipMessage = {
     data: unknown;
     metadata: Record<string, unknown>;
     type: 'gossip';
+    delivery?: GossipDeliveryEnvelope;
 };
 type DirectMessage = {
     id: string;
@@ -71,6 +105,9 @@ type GossipEvents = {
     directMessageReceived: (data: {
         message: DirectMessage;
     }) => void;
+    deliveryProgress: (status: GossipDeliveryStatus) => void;
+    deliveryComplete: (status: GossipDeliveryStatus) => void;
+    deliveryTimeout: (status: GossipDeliveryStatus) => void;
 };
 /**
  * GossipProtocol
@@ -92,12 +129,17 @@ declare class GossipProtocol {
     private cecrExtremaMaxAgeMs;
     private cecrMaxAcceptedDrift;
     private cecrRequireConsensus;
+    private deliveryTimeoutMs;
+    private deliveryRepairDelayMs;
+    private deliveryRepairIntervalMs;
     private cecrCurrentExtrema;
     private cecrPreviousExtrema;
     private cecrRemoteStates;
     private cecrSyncTimer;
     private trackingCleanupTimer;
     private seenDirectIds;
+    private deliveryStates;
+    private dirtyDeliveryReceiptIds;
     private callbacks;
     private peers;
     constructor(mesh: MeshLike, options?: GossipProtocolOptions);
@@ -107,7 +149,15 @@ declare class GossipProtocol {
     /**
      * Broadcast an application payload using gossip-style re-propagation.
      */
-    broadcast(data: unknown, metadata?: Record<string, unknown>): string;
+    broadcast(data: unknown, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): string;
+    /**
+     * Broadcast with delivery tracking enabled for the known-peer snapshot.
+     */
+    broadcastReliable(data: unknown, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): string;
+    /**
+     * Return the sender-visible delivery state for a tracked gossip message.
+     */
+    getDeliveryStatus(messageId: string): GossipDeliveryStatus | null;
     /**
      * Propagate a message to all currently-connected peers.
      */
@@ -116,6 +166,23 @@ declare class GossipProtocol {
      * Handle an incoming message from the mesh.
      */
     handleIncomingMessage(message: GossipMessage, fromPeerId: string): void;
+    private createDeliveryBits;
+    private setDeliveryBit;
+    private hasDeliveryBit;
+    private deliveryBitsToHex;
+    private deliveryBitsFromHex;
+    private mergeDeliveryBits;
+    private deliveryEnvelopeForState;
+    private deliveryReceiptForState;
+    private validateDeliveryEnvelope;
+    private reconstructDeliveryPeers;
+    private registerTrackedDelivery;
+    private mergeDeliveryReceipt;
+    private deliveryStatusForState;
+    private emitDeliveryStatus;
+    private selectRepairOwner;
+    private maintainTrackedDeliveries;
+    private reliableRepairMessage;
     /**
      * XOR distance between two hex-encoded peer IDs.
      * Returns a BigInt (lower = closer).
@@ -476,6 +543,9 @@ declare class PartialMesh {
     private pendingRebalanceDropByTarget;
     /** Converged global peer membership — populated via in-band membership gossip. */
     private globalPeers;
+    /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
+    private peerCapacityById;
+    private localCapacityUpdatedAtMs;
     constructor(config?: PartialMeshConfig);
     private normalizePeerId;
     private normalizeSignalingUrl;
@@ -487,7 +557,14 @@ declare class PartialMesh {
     private reconcileSignalingPeers;
     private getConnectedPeerCount;
     private getPendingPeerCount;
-    private getMaxPeersWithTolerance;
+    private noteLocalCapacityChanged;
+    private freshPeerCapacity;
+    /**
+     * Known underfilled peers sort first, with lower-capacity peers ahead of
+     * high-capacity peers. Unknown peers remain eligible; known-full peers sort last.
+     */
+    private compareCapacityPriority;
+    private compareDialCandidates;
     private trimExcessPeers;
     private getOldestPendingAgeMs;
     private isHexId;
@@ -581,6 +658,7 @@ declare class PartialMesh {
      */
     private emit;
     private sendMembership;
+    private broadcastMembership;
     private tryParseMembership;
     private mergeMembership;
     private removeFromGlobalMembership;
@@ -590,4 +668,4 @@ declare class PartialMesh {
     destroy(): void;
 }
 
-export { type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PeerConnection, PeerPigeonStorage, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };
+export { type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PeerConnection, PeerPigeonStorage, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };
