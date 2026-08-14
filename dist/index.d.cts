@@ -413,6 +413,158 @@ declare class PeerPigeonStorage {
     private fromBase64Url;
 }
 
+declare const ENCRYPTED_BROADCAST_TYPE = "pp-encrypted-broadcast-v1";
+declare const ENCRYPTED_DIRECT_TYPE = "pp-encrypted-direct-v1";
+type PeerPigeonKeyPair = {
+    pub: string;
+    priv: string;
+    epub: string;
+    epriv: string;
+};
+type PeerPublicKey = {
+    peerId: string;
+    pub: string;
+    epub: string;
+    updatedAt: number;
+    local: boolean;
+};
+type RoomCipher = {
+    alg: 'A256GCM';
+    iv: string;
+    ct: string;
+};
+type EncryptedBroadcastPayload = {
+    __ppType: typeof ENCRYPTED_BROADCAST_TYPE;
+    from: string;
+    roomCipher: RoomCipher;
+    timestamp: number;
+};
+type EncryptedDirectPayload = {
+    __ppType: typeof ENCRYPTED_DIRECT_TYPE;
+    from: string;
+    to: string;
+    cipher: unknown;
+    timestamp: number;
+};
+type PeerPigeonCryptoOptions = {
+    /** Room scope mixed into the AES-GCM room key. */
+    roomId: string;
+    /** Optional shared secret mixed into the room key. */
+    roomSecret?: string;
+    /** Supply an identity instead of generating/loading a tab-scoped identity. */
+    keyPair?: PeerPigeonKeyPair;
+    /** Persist generated keys in sessionStorage when available. Default true. */
+    persistKeyPair?: boolean;
+    /** sessionStorage key prefix. */
+    storageKey?: string;
+    /** Key advertisement interval. Default 10 seconds; 0 disables it. */
+    announceIntervalMs?: number;
+    /** Default wait for direct-message key discovery. Default 8 seconds. */
+    keyDiscoveryTimeoutMs?: number;
+};
+type PeerPigeonCryptoEvents = {
+    keyDiscovered: (key: PeerPublicKey) => void;
+    encryptedBroadcastReceived: (data: {
+        plaintext: string;
+        payload: EncryptedBroadcastPayload;
+        message: GossipMessage;
+        local: boolean;
+        fromPeer?: string;
+    }) => void;
+    encryptedDirectReceived: (data: {
+        plaintext: string;
+        payload: EncryptedDirectPayload;
+        message: DirectMessage;
+    }) => void;
+    error: (error: Error) => void;
+};
+interface CryptoMeshLike {
+    on(event: 'peer:connected', handler: (peerId: string) => void): void;
+    on(event: 'signaling:connected', handler: (data: {
+        clientId: string;
+    }) => void): void;
+    off(event: 'peer:connected', handler: (peerId: string) => void): void;
+    off(event: 'signaling:connected', handler: (data: {
+        clientId: string;
+    }) => void): void;
+    getClientId(): string | null;
+    getConnectedPeers(): string[];
+}
+interface CryptoGossipLike {
+    broadcast(data: unknown, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): string;
+    broadcastReliable(data: unknown, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): string;
+    sendDirect(targetPeerId: string, data: unknown): string | null;
+    on(event: 'messageReceived', callback: (data: {
+        message: GossipMessage;
+        local: boolean;
+        fromPeer?: string;
+    }) => void): void;
+    on(event: 'directMessageReceived', callback: (data: {
+        message: DirectMessage;
+    }) => void): void;
+    off(event: 'messageReceived', callback: (data: {
+        message: GossipMessage;
+        local: boolean;
+        fromPeer?: string;
+    }) => void): void;
+    off(event: 'directMessageReceived', callback: (data: {
+        message: DirectMessage;
+    }) => void): void;
+}
+declare class PeerPigeonCryptoProtocol {
+    private readonly mesh;
+    private readonly gossip;
+    private readonly options;
+    private keyPair;
+    private readonly publicKeys;
+    private readonly callbacks;
+    private announceTimer;
+    private initialized;
+    private readonly onGossipMessageBound;
+    private readonly onDirectMessageBound;
+    private readonly onPeerConnectedBound;
+    private readonly onSignalingConnectedBound;
+    constructor(mesh: CryptoMeshLike, gossip: CryptoGossipLike, options: PeerPigeonCryptoOptions);
+    init(): Promise<void>;
+    getKeyPair(): Readonly<PeerPigeonKeyPair>;
+    getPublicKey(peerId: string): PeerPublicKey | null;
+    getKnownPeerKeys(): PeerPublicKey[];
+    announcePublicKey(): void;
+    requestPeerKey(peerId: string): void;
+    waitForPeerKey(peerId: string, timeoutMs?: number): Promise<PeerPublicKey>;
+    encryptRoom(plaintext: string): Promise<RoomCipher>;
+    decryptRoom(cipher: RoomCipher): Promise<string>;
+    createEncryptedBroadcast(plaintext: string): Promise<EncryptedBroadcastPayload>;
+    createEncryptedDirect(peerId: string, plaintext: string, timeoutMs?: number): Promise<EncryptedDirectPayload>;
+    broadcastEncrypted(plaintext: string, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): Promise<string>;
+    sendEncryptedDirect(peerId: string, plaintext: string, timeoutMs?: number): Promise<string>;
+    decryptEncryptedBroadcast(payload: EncryptedBroadcastPayload): Promise<string>;
+    decryptEncryptedDirect(payload: EncryptedDirectPayload): Promise<string>;
+    on<K extends keyof PeerPigeonCryptoEvents>(event: K, callback: PeerPigeonCryptoEvents[K]): void;
+    off<K extends keyof PeerPigeonCryptoEvents>(event: K, callback: PeerPigeonCryptoEvents[K]): void;
+    destroy(): void;
+    static isProtocolPayload(value: unknown): boolean;
+    private validateKeyPair;
+    private loadStoredKeyPair;
+    private persistKeyPair;
+    private registerLocalKey;
+    private localPublicInfoPayload;
+    private sendPublicInfoDirect;
+    private upsertPublicKey;
+    private isPublicInfo;
+    private isPublicRequest;
+    private isEncryptedBroadcast;
+    private isEncryptedDirect;
+    private handleGossipMessage;
+    private handleDirectMessage;
+    private deriveRoomKey;
+    private cryptoApi;
+    private toBase64Url;
+    private fromBase64Url;
+    private emitError;
+    private emit;
+}
+
 interface PartialMeshConfig {
     /**
      * Minimum number of peers to maintain connections with
@@ -477,6 +629,11 @@ interface PartialMeshConfig {
      */
     nonInitiatorFallbackDialMs?: number;
     /**
+     * Age after which a relayed capacity advertisement stops influencing dial
+     * priority. The last advertised value remains available in API snapshots.
+     */
+    peerStateMaxAgeMs?: number;
+    /**
      * Whether SDP should be sent before ICE gathering completes.
      * Disable to emit full offer/answer payloads after ICE gathering finishes.
      */
@@ -487,6 +644,41 @@ interface PeerConnection {
     connected: boolean;
     initiator: boolean;
 }
+type PeerCapacityAdvertisement = {
+    maxPeers: number;
+    connectedPeers: number;
+    updatedAt: number;
+};
+type PeerCapacitySnapshot = PeerCapacityAdvertisement & {
+    peerId: string;
+    availableSlots: number;
+    fresh: boolean;
+    local: boolean;
+};
+type PeerGraphNode = {
+    peerId: string;
+    local: boolean;
+    directlyConnected: boolean;
+    discovered: boolean;
+    capacity: PeerCapacitySnapshot | null;
+};
+type PeerGraphEdge = {
+    source: string;
+    target: string;
+    direct: boolean;
+    observedBy: string[];
+    updatedAt: number;
+};
+type PeerGraphSnapshot = {
+    localPeerId: string | null;
+    nodes: PeerGraphNode[];
+    edges: PeerGraphEdge[];
+    /** True once every known peer has supplied at least one adjacency snapshot. */
+    complete: boolean;
+    missingTopologyPeerIds: string[];
+    generatedAt: number;
+};
+type PartialMeshRuntimeConfig = Pick<Required<PartialMeshConfig>, 'minPeers' | 'maxPeers' | 'tolerantPeers' | 'autoDiscover' | 'autoConnect' | 'connectionTimeoutMs' | 'maintenanceIntervalMs' | 'underConnectedResetMs' | 'nonInitiatorFallbackDialMs' | 'peerStateMaxAgeMs'>;
 type PartialMeshEvents = {
     'signaling:connected': (data: {
         clientId: string;
@@ -510,6 +702,8 @@ type PartialMeshEvents = {
     'peer:discovered': (peerId: string) => void;
     'mesh:ready': () => void;
     'mesh:membership': (peers: string[]) => void;
+    'mesh:capacity': (capacities: PeerCapacitySnapshot[]) => void;
+    'mesh:graph': (snapshot: PeerGraphSnapshot) => void;
 };
 /**
  * PartialMesh - WebRTC peer-to-peer partial mesh networking library
@@ -545,8 +739,12 @@ declare class PartialMesh {
     private globalPeers;
     /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
     private peerCapacityById;
+    /** Relayed adjacency snapshots used to reconstruct the known network graph. */
+    private peerTopologyById;
     private localCapacityUpdatedAtMs;
+    private localTopologyUpdatedAtMs;
     constructor(config?: PartialMeshConfig);
+    private validatePeerLimits;
     private normalizePeerId;
     private normalizeSignalingUrl;
     private addSelfAlias;
@@ -637,6 +835,20 @@ declare class PartialMesh {
      * Get the converged global peer set (all peers known via membership gossip).
      */
     getGlobalPeers(): string[];
+    /** Return the effective configuration, including constructor defaults. */
+    getConfig(): Readonly<Required<PartialMeshConfig>>;
+    /**
+     * Update connection-policy knobs without rebuilding the node. Signaling,
+     * network/session identity, ICE, and trickle settings remain constructor-time
+     * values because changing them requires reconnecting the transport.
+     */
+    updateConfig(patch: Partial<PartialMeshRuntimeConfig>): Readonly<Required<PartialMeshConfig>>;
+    /** Return capacity and available connection slots for one known peer. */
+    getPeerCapacity(peerId: string): PeerCapacitySnapshot | null;
+    /** Return advertised capacity for every known peer, including this node. */
+    getPeerCapacities(): PeerCapacitySnapshot[];
+    /** Reconstruct the complete currently-known node and undirected edge snapshot. */
+    getGraphSnapshot(): PeerGraphSnapshot;
     /**
      * Get current peer count
      */
@@ -667,5 +879,86 @@ declare class PartialMesh {
      */
     destroy(): void;
 }
+type PeerPigeonNodeStorageOptions = Omit<StorageOptions, 'gossip' | 'peerId' | 'userId'> & {
+    userId?: string;
+};
+type PeerPigeonNodeOptions = PartialMeshConfig & {
+    gossip?: GossipProtocolOptions;
+    /** Enabled by default. Pass false to construct a node without crypto. */
+    crypto?: false | (Omit<PeerPigeonCryptoOptions, 'roomId'> & {
+        roomId?: string;
+    });
+    /** Disabled by default. Pass options to attach encrypted synchronized storage. */
+    storage?: false | PeerPigeonNodeStorageOptions;
+};
+type PeerPigeonNodeMessage = {
+    kind: 'broadcast' | 'direct';
+    data: unknown;
+    encrypted: boolean;
+    local: boolean;
+    fromPeerId: string | null;
+    messageId: string;
+    hops: number;
+    message: GossipMessage | DirectMessage;
+};
+type PeerPigeonNodeEvents = {
+    ready: () => void;
+    peerConnected: (peerId: string) => void;
+    peerDisconnected: (peerId: string) => void;
+    graphChanged: (snapshot: PeerGraphSnapshot) => void;
+    capacityChanged: (capacities: PeerCapacitySnapshot[]) => void;
+    keyDiscovered: (key: PeerPublicKey) => void;
+    message: (message: PeerPigeonNodeMessage) => void;
+    deliveryProgress: (status: GossipDeliveryStatus) => void;
+    deliveryComplete: (status: GossipDeliveryStatus) => void;
+    deliveryTimeout: (status: GossipDeliveryStatus) => void;
+    error: (error: Error) => void;
+};
+/**
+ * Unified high-level node API. Advanced callers can still access `mesh`,
+ * `gossip`, `crypto`, and `storage`, while normal applications need only this
+ * facade for topology, messaging, encryption, keys, capacity, and config.
+ */
+declare class PeerPigeonNode {
+    readonly mesh: PartialMesh;
+    readonly gossip: GossipProtocol;
+    readonly crypto: PeerPigeonCryptoProtocol | null;
+    storage: PeerPigeonStorage | null;
+    private readonly storageOptions;
+    private readonly callbacks;
+    private started;
+    constructor(options?: PeerPigeonNodeOptions);
+    init(): Promise<void>;
+    start(): Promise<void>;
+    getConfig(): Readonly<Required<PartialMeshConfig>>;
+    updateConfig(patch: Partial<PartialMeshRuntimeConfig>): Readonly<Required<PartialMeshConfig>>;
+    getGraphSnapshot(): PeerGraphSnapshot;
+    getPeerCapacity(peerId: string): PeerCapacitySnapshot | null;
+    getPeerCapacities(): PeerCapacitySnapshot[];
+    getClientId(): string | null;
+    getConnectedPeers(): string[];
+    getDiscoveredPeers(): string[];
+    getGlobalPeers(): string[];
+    broadcast(data: unknown, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): string;
+    broadcastReliable(data: unknown, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): string;
+    sendDirect(peerId: string, data: unknown): string | null;
+    getDeliveryStatus(messageId: string): GossipDeliveryStatus | null;
+    broadcastEncrypted(plaintext: string, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): Promise<string>;
+    broadcastEncryptedReliable(plaintext: string, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): Promise<string>;
+    sendEncryptedDirect(peerId: string, plaintext: string, timeoutMs?: number): Promise<string>;
+    getKeyPair(): Readonly<PeerPigeonKeyPair>;
+    getPublicKey(peerId: string): PeerPublicKey | null;
+    getKnownPeerKeys(): PeerPublicKey[];
+    requestPeerKey(peerId: string): void;
+    waitForPeerKey(peerId: string, timeoutMs?: number): Promise<PeerPublicKey>;
+    recoverAfterInactivity(reason?: string): void;
+    on<K extends keyof PeerPigeonNodeEvents>(event: K, callback: PeerPigeonNodeEvents[K]): void;
+    off<K extends keyof PeerPigeonNodeEvents>(event: K, callback: PeerPigeonNodeEvents[K]): void;
+    destroy(): Promise<void>;
+    private bindComponentEvents;
+    private isReservedPayload;
+    private emitError;
+    private emit;
+}
 
-export { type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PeerConnection, PeerPigeonStorage, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };
+export { type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };

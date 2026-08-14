@@ -1,4 +1,20 @@
 import FreeRTCClientAdapter from './freertc-client-adapter.js';
+import { GossipProtocol } from './gossip.js';
+import type {
+  DirectMessage,
+  GossipBroadcastOptions,
+  GossipDeliveryStatus,
+  GossipMessage,
+  GossipProtocolOptions,
+} from './gossip.js';
+import { PeerPigeonStorage } from './storage.js';
+import type { StorageOptions } from './storage.js';
+import { PeerPigeonCryptoProtocol } from './crypto.js';
+import type {
+  PeerPigeonCryptoOptions,
+  PeerPigeonKeyPair,
+  PeerPublicKey,
+} from './crypto.js';
 
 export interface PartialMeshConfig {
   /**
@@ -79,6 +95,12 @@ export interface PartialMeshConfig {
   nonInitiatorFallbackDialMs?: number;
 
   /**
+   * Age after which a relayed capacity advertisement stops influencing dial
+   * priority. The last advertised value remains available in API snapshots.
+   */
+  peerStateMaxAgeMs?: number;
+
+  /**
    * Whether SDP should be sent before ICE gathering completes.
    * Disable to emit full offer/answer payloads after ICE gathering finishes.
    */
@@ -91,11 +113,62 @@ export interface PeerConnection {
   initiator: boolean;
 }
 
-type PeerCapacityAdvertisement = {
+export type PeerCapacityAdvertisement = {
   maxPeers: number;
   connectedPeers: number;
   updatedAt: number;
 };
+
+export type PeerCapacitySnapshot = PeerCapacityAdvertisement & {
+  peerId: string;
+  availableSlots: number;
+  fresh: boolean;
+  local: boolean;
+};
+
+type PeerTopologyAdvertisement = {
+  connectedPeerIds: string[];
+  updatedAt: number;
+};
+
+export type PeerGraphNode = {
+  peerId: string;
+  local: boolean;
+  directlyConnected: boolean;
+  discovered: boolean;
+  capacity: PeerCapacitySnapshot | null;
+};
+
+export type PeerGraphEdge = {
+  source: string;
+  target: string;
+  direct: boolean;
+  observedBy: string[];
+  updatedAt: number;
+};
+
+export type PeerGraphSnapshot = {
+  localPeerId: string | null;
+  nodes: PeerGraphNode[];
+  edges: PeerGraphEdge[];
+  /** True once every known peer has supplied at least one adjacency snapshot. */
+  complete: boolean;
+  missingTopologyPeerIds: string[];
+  generatedAt: number;
+};
+
+export type PartialMeshRuntimeConfig = Pick<Required<PartialMeshConfig>,
+  | 'minPeers'
+  | 'maxPeers'
+  | 'tolerantPeers'
+  | 'autoDiscover'
+  | 'autoConnect'
+  | 'connectionTimeoutMs'
+  | 'maintenanceIntervalMs'
+  | 'underConnectedResetMs'
+  | 'nonInitiatorFallbackDialMs'
+  | 'peerStateMaxAgeMs'
+>;
 
 export type PartialMeshEvents = {
   'signaling:connected': (data: { clientId: string; rawClientId?: string }) => void;
@@ -109,6 +182,8 @@ export type PartialMeshEvents = {
   'peer:discovered': (peerId: string) => void;
   'mesh:ready': () => void;
   'mesh:membership': (peers: string[]) => void;
+  'mesh:capacity': (capacities: PeerCapacitySnapshot[]) => void;
+  'mesh:graph': (snapshot: PeerGraphSnapshot) => void;
 };
 
 /**
@@ -145,7 +220,10 @@ export class PartialMesh {
   private globalPeers: Set<string> = new Set();
   /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
   private peerCapacityById: Map<string, PeerCapacityAdvertisement> = new Map();
+  /** Relayed adjacency snapshots used to reconstruct the known network graph. */
+  private peerTopologyById: Map<string, PeerTopologyAdvertisement> = new Map();
   private localCapacityUpdatedAtMs: number = Date.now();
+  private localTopologyUpdatedAtMs: number = Date.now();
 
   constructor(config: PartialMeshConfig = {}) {
     this.config = {
@@ -165,8 +243,11 @@ export class PartialMesh {
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 1_000,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
       nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 2_500,
+      peerStateMaxAgeMs: config.peerStateMaxAgeMs ?? 60_000,
       trickleIce: config.trickleIce ?? true
     };
+
+    this.validatePeerLimits(this.config.minPeers, this.config.maxPeers, this.config.tolerantPeers);
 
     // Initialize event handler maps
     const events: (keyof PartialMeshEvents)[] = [
@@ -180,9 +261,26 @@ export class PartialMesh {
       'peer:error',
       'peer:discovered',
       'mesh:ready',
-      'mesh:membership'
+      'mesh:membership',
+      'mesh:capacity',
+      'mesh:graph'
     ];
     events.forEach(event => this.eventHandlers.set(event, new Set()));
+  }
+
+  private validatePeerLimits(minPeers: number, maxPeers: number, tolerantPeers: number): void {
+    if (!Number.isSafeInteger(minPeers) || minPeers < 0) {
+      throw new RangeError('minPeers must be a non-negative safe integer');
+    }
+    if (!Number.isSafeInteger(maxPeers) || maxPeers < 1) {
+      throw new RangeError('maxPeers must be a positive safe integer');
+    }
+    if (minPeers > maxPeers) {
+      throw new RangeError('minPeers cannot exceed maxPeers');
+    }
+    if (!Number.isSafeInteger(tolerantPeers) || tolerantPeers < 0) {
+      throw new RangeError('tolerantPeers must be a non-negative safe integer');
+    }
   }
 
   private normalizePeerId(peerId: string | null | undefined): string {
@@ -231,6 +329,7 @@ export class PartialMesh {
     this.discoveredPeers.add(id);
     this.discoveredAtMs.set(id, Date.now());
     this.emit('peer:discovered', id);
+    this.emit('mesh:graph', this.getGraphSnapshot());
   }
 
   private rotateBrowserPeerId(signalingUrl: string): { requestedPeerId: string; previousPeerId: string | null; retiredPeerIds: string[] } {
@@ -275,8 +374,9 @@ export class PartialMesh {
     this.selfAliases.add(id);
     const removedDiscovered = this.discoveredPeers.delete(id);
     const removedGlobal = this.globalPeers.delete(id);
-    this.peerCapacityById.delete(id);
-    const changed = removedDiscovered || removedGlobal;
+    const removedCapacity = this.peerCapacityById.delete(id);
+    const removedTopology = this.peerTopologyById.delete(id);
+    const changed = removedDiscovered || removedGlobal || removedCapacity || removedTopology;
     this.discoveredAtMs.delete(id);
     this.dialFailureCount.delete(id);
     this.dialBackoffUntilMs.delete(id);
@@ -323,12 +423,16 @@ export class PartialMesh {
   }
 
   private noteLocalCapacityChanged(): void {
-    this.localCapacityUpdatedAtMs = Math.max(Date.now(), this.localCapacityUpdatedAtMs + 1);
+    const updatedAt = Date.now();
+    this.localCapacityUpdatedAtMs = Math.max(updatedAt, this.localCapacityUpdatedAtMs + 1);
+    this.localTopologyUpdatedAtMs = Math.max(updatedAt, this.localTopologyUpdatedAtMs + 1);
+    this.emit('mesh:capacity', this.getPeerCapacities());
+    this.emit('mesh:graph', this.getGraphSnapshot());
   }
 
   private freshPeerCapacity(peerId: string): PeerCapacityAdvertisement | null {
     const state = this.peerCapacityById.get(peerId);
-    if (!state || Date.now() - state.updatedAt > 60_000) return null;
+    if (!state || Date.now() - state.updatedAt > this.config.peerStateMaxAgeMs) return null;
     return state;
   }
 
@@ -451,7 +555,7 @@ export class PartialMesh {
 
   private maybeRebalanceForCloserPeer(candidates: string[]): boolean {
     const selfId = this.normalizePeerId(this.clientId);
-    if (!selfId) return false;
+    if (!selfId || this.config.tolerantPeers <= 0) return false;
 
     const now = Date.now();
     if (now < this.rebalanceCooldownUntilMs) {
@@ -463,16 +567,14 @@ export class PartialMesh {
       return false;
     }
 
-    if (this.pendingRebalanceDropByTarget.size > 0) {
-      return false;
-    }
-
     // Only rebalance from healthy surplus; avoid destabilizing minimally connected nodes.
     if (connectedPeers.length <= this.config.minPeers) {
       return false;
     }
 
+    const reservedDropPeerIds = new Set(this.pendingRebalanceDropByTarget.values());
     const connectedByDistance = connectedPeers
+      .filter((peerId) => !reservedDropPeerIds.has(peerId))
       .map((peerId) => ({
         peerId,
         distance: this.peerDistance(selfId, peerId),
@@ -732,7 +834,7 @@ export class PartialMesh {
     this.signalingClient.on('rtc:data', (data: { peerId: string; data: any }) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
-        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, data.peerId);
+        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, msg.topology, data.peerId);
       } else {
         this.emit('peer:data', data);
       }
@@ -997,8 +1099,13 @@ export class PartialMesh {
       }
     }
 
+    const hadConnectedPeers = this.getConnectedPeerCount() > 0;
     this.peers.clear();
     this.connecting.clear();
+    if (hadConnectedPeers) {
+      this.noteLocalCapacityChanged();
+      this.broadcastMembership();
+    }
 
     // Re-announce/join to refresh discovery state in the signaling layer.
     try {
@@ -1132,10 +1239,14 @@ export class PartialMesh {
       }
     } else if (connectedCount > this.config.maxPeers) {
       this.trimExcessPeers();
-    } else if (connectedCount >= this.config.maxPeers && pendingCount === 0 && available.length > 0) {
-      // Tolerance is inbound admission headroom, not an outbound degree target.
-      // A saturated peer may temporarily accept an overflow edge so a newcomer
-      // can enter the mesh, but the retained degree is always maxPeers.
+    } else if (
+      connectedCount >= this.config.maxPeers
+      && pendingCount < this.config.tolerantPeers
+      && available.length > 0
+    ) {
+      // Each tolerance slot can hold one bounded dial-before-drop attempt. This
+      // makes the configured value a real concurrency budget without ever
+      // raising the steady-state retained degree above maxPeers.
       if (this.maybeRebalanceForCloserPeer(available)) {
         return;
       }
@@ -1204,13 +1315,11 @@ export class PartialMesh {
       this.clearDialBackoff(normalizedPeerId);
     }
 
-    const connectedCount = this.getConnectedPeerCount();
-    // Ordinary outbound dials stop at maxPeers. The extra slot is reserved for
-    // explicit dial-then-drop rebalancing; inbound connections are admitted by
-    // FreeRTC and bounded separately by trimExcessPeers().
-    const maxAllowed = allowTemporaryOverflow ? this.config.maxPeers + 1 : this.config.maxPeers;
-    if (connectedCount >= maxAllowed) {
-      console.warn('Max peers reached, cannot connect to more peers');
+    const totalInProgress = this.getConnectedPeerCount() + this.getPendingPeerCount();
+    // maxPeers is always the retained degree. tolerantPeers is only the bounded
+    // dial-before-drop budget used by explicit rebalancing attempts.
+    const maxAllowed = this.config.maxPeers + (allowTemporaryOverflow ? this.config.tolerantPeers : 0);
+    if (totalInProgress >= maxAllowed) {
       return;
     }
 
@@ -1305,11 +1414,11 @@ export class PartialMesh {
             }
           }
 
-          const currentConnectedCount = this.getConnectedPeerCount();
+          const currentInProgress = this.getConnectedPeerCount() + this.getPendingPeerCount();
           const fallbackMaxAllowed = allowTemporaryOverflow
-            ? this.config.maxPeers + 1
+            ? this.config.maxPeers + this.config.tolerantPeers
             : this.config.maxPeers;
-          if (currentConnectedCount >= fallbackMaxAllowed) {
+          if (currentInProgress >= fallbackMaxAllowed) {
             return;
           }
 
@@ -1433,6 +1542,153 @@ export class PartialMesh {
     return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
   }
 
+  /** Return the effective configuration, including constructor defaults. */
+  public getConfig(): Readonly<Required<PartialMeshConfig>> {
+    return {
+      ...this.config,
+      iceServers: this.config.iceServers ? this.config.iceServers.map((server) => ({ ...server })) : null,
+    };
+  }
+
+  /**
+   * Update connection-policy knobs without rebuilding the node. Signaling,
+   * network/session identity, ICE, and trickle settings remain constructor-time
+   * values because changing them requires reconnecting the transport.
+   */
+  public updateConfig(patch: Partial<PartialMeshRuntimeConfig>): Readonly<Required<PartialMeshConfig>> {
+    const next = { ...this.config };
+    for (const key of Object.keys(patch) as Array<keyof PartialMeshRuntimeConfig>) {
+      const value = patch[key];
+      if (value !== undefined) (next as any)[key] = value;
+    }
+    this.validatePeerLimits(next.minPeers, next.maxPeers, next.tolerantPeers);
+    for (const [name, value] of [
+      ['connectionTimeoutMs', next.connectionTimeoutMs],
+      ['maintenanceIntervalMs', next.maintenanceIntervalMs],
+      ['underConnectedResetMs', next.underConnectedResetMs],
+      ['nonInitiatorFallbackDialMs', next.nonInitiatorFallbackDialMs],
+    ] as const) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new RangeError(`${name} must be a non-negative safe integer`);
+      }
+    }
+    if (!Number.isSafeInteger(next.peerStateMaxAgeMs) || next.peerStateMaxAgeMs < 1_000) {
+      throw new RangeError('peerStateMaxAgeMs must be a safe integer of at least 1000');
+    }
+
+    const maintenanceChanged = next.maintenanceIntervalMs !== this.config.maintenanceIntervalMs
+      || next.autoConnect !== this.config.autoConnect;
+    const capacityChanged = next.maxPeers !== this.config.maxPeers;
+    this.config = next;
+
+    if (maintenanceChanged && this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
+    if (this.config.autoConnect) this.startMaintenanceLoop();
+    this.trimExcessPeers();
+    if (capacityChanged) {
+      this.noteLocalCapacityChanged();
+      this.broadcastMembership();
+    }
+    if (this.config.autoConnect) this.maintainPeerConnections();
+    return this.getConfig();
+  }
+
+  /** Return capacity and available connection slots for one known peer. */
+  public getPeerCapacity(peerId: string): PeerCapacitySnapshot | null {
+    const id = this.normalizePeerId(peerId);
+    if (!id) return null;
+    const local = !!this.clientId && id === this.clientId;
+    const state = local
+      ? { maxPeers: this.config.maxPeers, connectedPeers: this.getConnectedPeerCount(), updatedAt: this.localCapacityUpdatedAtMs }
+      : this.peerCapacityById.get(id);
+    if (!state) return null;
+    return {
+      peerId: id,
+      ...state,
+      availableSlots: Math.max(0, state.maxPeers - state.connectedPeers),
+      fresh: local || Date.now() - state.updatedAt <= this.config.peerStateMaxAgeMs,
+      local,
+    };
+  }
+
+  /** Return advertised capacity for every known peer, including this node. */
+  public getPeerCapacities(): PeerCapacitySnapshot[] {
+    const ids = new Set(this.peerCapacityById.keys());
+    if (this.clientId) ids.add(this.clientId);
+    return Array.from(ids)
+      .map((peerId) => this.getPeerCapacity(peerId))
+      .filter((value): value is PeerCapacitySnapshot => value != null)
+      .sort((a, b) => a.peerId.localeCompare(b.peerId));
+  }
+
+  /** Reconstruct the complete currently-known node and undirected edge snapshot. */
+  public getGraphSnapshot(): PeerGraphSnapshot {
+    const self = this.normalizePeerId(this.clientId) || null;
+    const knownIds = new Set<string>();
+    if (self) knownIds.add(self);
+    for (const peerId of this.globalPeers) knownIds.add(peerId);
+    for (const peerId of this.discoveredPeers) knownIds.add(peerId);
+    for (const peerId of this.getConnectedPeers()) knownIds.add(peerId);
+    for (const peerId of this.peerCapacityById.keys()) knownIds.add(peerId);
+    for (const [peerId, state] of this.peerTopologyById.entries()) {
+      knownIds.add(peerId);
+      for (const connectedPeerId of state.connectedPeerIds) knownIds.add(connectedPeerId);
+    }
+    for (const peerId of Array.from(knownIds)) {
+      if (!peerId || this.isSelfAlias(peerId) && peerId !== self || this.retiredPeerIds.has(peerId)) knownIds.delete(peerId);
+    }
+
+    const connected = new Set(this.getConnectedPeers());
+    const edgeMap = new Map<string, PeerGraphEdge>();
+    const addEdge = (observer: string, left: string, right: string, updatedAt: number): void => {
+      if (!knownIds.has(left) || !knownIds.has(right) || left === right) return;
+      const [source, target] = left < right ? [left, right] : [right, left];
+      const key = `${source}\u0000${target}`;
+      const existing = edgeMap.get(key);
+      const direct = !!self && (source === self && connected.has(target) || target === self && connected.has(source));
+      if (existing) {
+        if (!existing.observedBy.includes(observer)) existing.observedBy.push(observer);
+        existing.updatedAt = Math.max(existing.updatedAt, updatedAt);
+        existing.direct = existing.direct || direct;
+      } else {
+        edgeMap.set(key, { source, target, direct, observedBy: [observer], updatedAt });
+      }
+    };
+
+    if (self) {
+      for (const peerId of connected) addEdge(self, self, peerId, this.localTopologyUpdatedAtMs);
+    }
+    for (const [peerId, state] of this.peerTopologyById.entries()) {
+      for (const connectedPeerId of state.connectedPeerIds) {
+        addEdge(peerId, peerId, connectedPeerId, state.updatedAt);
+      }
+    }
+
+    const missingTopologyPeerIds = Array.from(knownIds)
+      .filter((peerId) => peerId !== self && !this.peerTopologyById.has(peerId))
+      .sort();
+    const nodes = Array.from(knownIds).sort().map((peerId): PeerGraphNode => ({
+      peerId,
+      local: peerId === self,
+      directlyConnected: connected.has(peerId),
+      discovered: this.discoveredPeers.has(peerId),
+      capacity: this.getPeerCapacity(peerId),
+    }));
+    const edges = Array.from(edgeMap.values())
+      .map((edge) => ({ ...edge, observedBy: edge.observedBy.sort() }))
+      .sort((a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target));
+    return {
+      localPeerId: self,
+      nodes,
+      edges,
+      complete: missingTopologyPeerIds.length === 0,
+      missingTopologyPeerIds,
+      generatedAt: Date.now(),
+    };
+  }
+
   /**
    * Get current peer count
    */
@@ -1490,21 +1746,28 @@ export class PartialMesh {
       const all = new Set<string>(this.globalPeers);
       if (self) all.add(self);
       for (const p of this.discoveredPeers) all.add(p);
+      for (const p of this.getConnectedPeers()) all.add(p);
       for (const retiredPeerId of this.retiredPeerIds) all.delete(retiredPeerId);
       const capacities: Record<string, [number, number, number]> = {};
-      const now = Date.now();
+      const topology: Record<string, [string[], number]> = {};
       for (const [peerId, state] of this.peerCapacityById.entries()) {
-        if (!all.has(peerId) || now - state.updatedAt > 60_000) continue;
+        if (!all.has(peerId)) continue;
         capacities[peerId] = [state.maxPeers, state.connectedPeers, state.updatedAt];
+      }
+      for (const [peerId, state] of this.peerTopologyById.entries()) {
+        if (!all.has(peerId)) continue;
+        topology[peerId] = [state.connectedPeerIds, state.updatedAt];
       }
       if (self) {
         capacities[self] = [this.config.maxPeers, this.getConnectedPeerCount(), this.localCapacityUpdatedAtMs];
+        topology[self] = [this.getConnectedPeers().slice().sort(), this.localTopologyUpdatedAtMs];
       }
       const payload = JSON.stringify({
         __membership: true,
         peers: Array.from(all),
         retiredPeers: Array.from(this.retiredPeerIds),
         capacities,
+        topology,
       });
       try {
         this.signalingClient?.send(toPeerId, payload);
@@ -1523,6 +1786,7 @@ export class PartialMesh {
       peers: string[];
       retiredPeers: string[];
       capacities: Record<string, unknown>;
+      topology: Record<string, unknown>;
     } | null {
       try {
         const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -1532,6 +1796,9 @@ export class PartialMesh {
             retiredPeers: Array.isArray(obj.retiredPeers) ? obj.retiredPeers : [],
             capacities: obj.capacities && typeof obj.capacities === 'object' && !Array.isArray(obj.capacities)
               ? obj.capacities
+              : {},
+            topology: obj.topology && typeof obj.topology === 'object' && !Array.isArray(obj.topology)
+              ? obj.topology
               : {},
           };
         }
@@ -1545,10 +1812,14 @@ export class PartialMesh {
       incoming: string[],
       retired: string[],
       capacities: Record<string, unknown>,
-      fromPeerId: string
+      topologyInput: Record<string, unknown> | string = {},
+      fromPeerId: string = ''
     ): void {
+      const topology = typeof topologyInput === 'string' ? {} : topologyInput;
+      if (typeof topologyInput === 'string') fromPeerId = topologyInput;
       let membershipChanged = false;
       let capacityChanged = false;
+      let topologyChanged = false;
       for (const raw of retired) {
         if (this.retirePeerId(raw)) membershipChanged = true;
       }
@@ -1568,17 +1839,35 @@ export class PartialMesh {
         const connectedPeers = Math.floor(Number(rawState[1]));
         const updatedAt = Math.floor(Number(rawState[2]));
         if (
-          !Number.isFinite(maxPeers) || maxPeers < 1 || maxPeers > 4096 ||
-          !Number.isFinite(connectedPeers) || connectedPeers < 0 || connectedPeers > 4096 ||
-          !Number.isFinite(updatedAt) || updatedAt <= 0
+          !Number.isSafeInteger(maxPeers) || maxPeers < 1 ||
+          !Number.isSafeInteger(connectedPeers) || connectedPeers < 0 ||
+          !Number.isSafeInteger(updatedAt) || updatedAt <= 0
         ) continue;
         const existing = this.peerCapacityById.get(peerId);
         if (existing && existing.updatedAt >= updatedAt) continue;
         this.peerCapacityById.set(peerId, { maxPeers, connectedPeers, updatedAt });
         capacityChanged = true;
       }
-      if (membershipChanged || capacityChanged) {
+      for (const [rawPeerId, rawState] of Object.entries(topology || {})) {
+        const peerId = this.normalizePeerId(rawPeerId);
+        if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
+        if (!Array.isArray(rawState) || rawState.length < 2 || !Array.isArray(rawState[0])) continue;
+        const updatedAt = Math.floor(Number(rawState[1]));
+        if (!Number.isSafeInteger(updatedAt) || updatedAt <= 0) continue;
+        const connectedPeerIds = Array.from(new Set(
+          rawState[0]
+            .map((value: unknown) => this.normalizePeerId(typeof value === 'string' ? value : ''))
+            .filter((id: string) => id && id !== peerId && !this.retiredPeerIds.has(id))
+        )).sort();
+        const existing = this.peerTopologyById.get(peerId);
+        if (existing && existing.updatedAt >= updatedAt) continue;
+        this.peerTopologyById.set(peerId, { connectedPeerIds, updatedAt });
+        topologyChanged = true;
+      }
+      if (membershipChanged || capacityChanged || topologyChanged) {
         this.emit('mesh:membership', Array.from(this.globalPeers));
+        if (capacityChanged) this.emit('mesh:capacity', this.getPeerCapacities());
+        if (membershipChanged || topologyChanged) this.emit('mesh:graph', this.getGraphSnapshot());
         this.broadcastMembership(fromPeerId);
         if (this.config.autoConnect) {
           this.maintainPeerConnections();
@@ -1588,9 +1877,12 @@ export class PartialMesh {
 
     private removeFromGlobalMembership(peerId: string): void {
       const removed = this.globalPeers.delete(peerId);
-      this.peerCapacityById.delete(peerId);
-      if (!removed) return;
+      const removedCapacity = this.peerCapacityById.delete(peerId);
+      const removedTopology = this.peerTopologyById.delete(peerId);
+      if (!removed && !removedCapacity && !removedTopology) return;
       this.emit('mesh:membership', Array.from(this.globalPeers));
+      if (removedCapacity) this.emit('mesh:capacity', this.getPeerCapacities());
+      this.emit('mesh:graph', this.getGraphSnapshot());
       for (const connectedPeerId of this.getConnectedPeers()) {
         if (connectedPeerId !== peerId) {
           this.sendMembership(connectedPeerId);
@@ -1634,6 +1926,7 @@ export class PartialMesh {
     this.pendingRebalanceDropByTarget.clear();
     this.globalPeers.clear();
     this.peerCapacityById.clear();
+    this.peerTopologyById.clear();
     this.selfAliases.clear();
     this.retiredPeerIds.clear();
     this.clientId = null;
@@ -1657,9 +1950,319 @@ export class PartialMesh {
   }
 }
 
+export type PeerPigeonNodeStorageOptions = Omit<StorageOptions, 'gossip' | 'peerId' | 'userId'> & {
+  userId?: string;
+};
+
+export type PeerPigeonNodeOptions = PartialMeshConfig & {
+  gossip?: GossipProtocolOptions;
+  /** Enabled by default. Pass false to construct a node without crypto. */
+  crypto?: false | (Omit<PeerPigeonCryptoOptions, 'roomId'> & { roomId?: string });
+  /** Disabled by default. Pass options to attach encrypted synchronized storage. */
+  storage?: false | PeerPigeonNodeStorageOptions;
+};
+
+export type PeerPigeonNodeMessage = {
+  kind: 'broadcast' | 'direct';
+  data: unknown;
+  encrypted: boolean;
+  local: boolean;
+  fromPeerId: string | null;
+  messageId: string;
+  hops: number;
+  message: GossipMessage | DirectMessage;
+};
+
+export type PeerPigeonNodeEvents = {
+  ready: () => void;
+  peerConnected: (peerId: string) => void;
+  peerDisconnected: (peerId: string) => void;
+  graphChanged: (snapshot: PeerGraphSnapshot) => void;
+  capacityChanged: (capacities: PeerCapacitySnapshot[]) => void;
+  keyDiscovered: (key: PeerPublicKey) => void;
+  message: (message: PeerPigeonNodeMessage) => void;
+  deliveryProgress: (status: GossipDeliveryStatus) => void;
+  deliveryComplete: (status: GossipDeliveryStatus) => void;
+  deliveryTimeout: (status: GossipDeliveryStatus) => void;
+  error: (error: Error) => void;
+};
+
+/**
+ * Unified high-level node API. Advanced callers can still access `mesh`,
+ * `gossip`, `crypto`, and `storage`, while normal applications need only this
+ * facade for topology, messaging, encryption, keys, capacity, and config.
+ */
+export class PeerPigeonNode {
+  public readonly mesh: PartialMesh;
+  public readonly gossip: GossipProtocol;
+  public readonly crypto: PeerPigeonCryptoProtocol | null;
+  public storage: PeerPigeonStorage | null = null;
+
+  private readonly storageOptions: false | PeerPigeonNodeStorageOptions;
+  private readonly callbacks: Partial<Record<keyof PeerPigeonNodeEvents, Set<Function>>> = {};
+  private started = false;
+
+  constructor(options: PeerPigeonNodeOptions = {}) {
+    const { gossip = {}, crypto = {}, storage = false, ...meshOptions } = options;
+    this.mesh = new PartialMesh(meshOptions);
+    this.gossip = new GossipProtocol(this.mesh, gossip);
+    this.storageOptions = storage;
+
+    if (crypto === false) {
+      this.crypto = null;
+    } else {
+      const networkId = String(meshOptions.networkId ?? meshOptions.sessionId ?? 'peerpigeon').trim();
+      const sessionId = String(meshOptions.sessionId ?? 'default-session').trim();
+      this.crypto = new PeerPigeonCryptoProtocol(this.mesh, this.gossip, {
+        ...crypto,
+        roomId: String(crypto.roomId ?? `${networkId}:${sessionId}`).trim(),
+      });
+    }
+
+    this.bindComponentEvents();
+  }
+
+  async init(): Promise<void> {
+    return await this.start();
+  }
+
+  async start(): Promise<void> {
+    if (this.started) return;
+    this.started = true;
+    try {
+      if (this.crypto) await this.crypto.init();
+      if (this.storageOptions !== false) {
+        const userId = String(
+          this.storageOptions.userId
+          ?? (this.crypto ? this.crypto.getKeyPair().epub : '')
+        ).trim();
+        if (!userId) throw new Error('storage.userId is required when crypto is disabled');
+        const { userId: _ignoredUserId, ...storageOptions } = this.storageOptions;
+        const config = this.mesh.getConfig();
+        this.storage = new PeerPigeonStorage({
+          ...storageOptions,
+          userId,
+          peerId: this.mesh.getClientId() ?? '',
+          sessionId: storageOptions.sessionId ?? `${config.networkId}:${config.sessionId}`,
+          gossip: this.gossip,
+        });
+        await this.storage.init();
+      }
+      await this.mesh.init();
+    } catch (error) {
+      this.started = false;
+      throw error;
+    }
+  }
+
+  getConfig(): Readonly<Required<PartialMeshConfig>> {
+    return this.mesh.getConfig();
+  }
+
+  updateConfig(patch: Partial<PartialMeshRuntimeConfig>): Readonly<Required<PartialMeshConfig>> {
+    return this.mesh.updateConfig(patch);
+  }
+
+  getGraphSnapshot(): PeerGraphSnapshot {
+    return this.mesh.getGraphSnapshot();
+  }
+
+  getPeerCapacity(peerId: string): PeerCapacitySnapshot | null {
+    return this.mesh.getPeerCapacity(peerId);
+  }
+
+  getPeerCapacities(): PeerCapacitySnapshot[] {
+    return this.mesh.getPeerCapacities();
+  }
+
+  getClientId(): string | null { return this.mesh.getClientId(); }
+  getConnectedPeers(): string[] { return this.mesh.getConnectedPeers(); }
+  getDiscoveredPeers(): string[] { return this.mesh.getDiscoveredPeers(); }
+  getGlobalPeers(): string[] { return this.mesh.getGlobalPeers(); }
+
+  broadcast(data: unknown, metadata: Record<string, unknown> = {}, options: GossipBroadcastOptions = {}): string {
+    return this.gossip.broadcast(data, metadata, options);
+  }
+
+  broadcastReliable(
+    data: unknown,
+    metadata: Record<string, unknown> = {},
+    options: Omit<GossipBroadcastOptions, 'trackDelivery'> = {}
+  ): string {
+    return this.gossip.broadcastReliable(data, metadata, options);
+  }
+
+  sendDirect(peerId: string, data: unknown): string | null {
+    return this.gossip.sendDirect(peerId, data);
+  }
+
+  getDeliveryStatus(messageId: string): GossipDeliveryStatus | null {
+    return this.gossip.getDeliveryStatus(messageId);
+  }
+
+  async broadcastEncrypted(
+    plaintext: string,
+    metadata: Record<string, unknown> = {},
+    options: GossipBroadcastOptions = {}
+  ): Promise<string> {
+    if (!this.crypto) throw new Error('Crypto is disabled for this node');
+    return await this.crypto.broadcastEncrypted(plaintext, metadata, options);
+  }
+
+  async broadcastEncryptedReliable(
+    plaintext: string,
+    metadata: Record<string, unknown> = {},
+    options: Omit<GossipBroadcastOptions, 'trackDelivery'> = {}
+  ): Promise<string> {
+    return await this.broadcastEncrypted(plaintext, metadata, { ...options, trackDelivery: true });
+  }
+
+  async sendEncryptedDirect(peerId: string, plaintext: string, timeoutMs?: number): Promise<string> {
+    if (!this.crypto) throw new Error('Crypto is disabled for this node');
+    return await this.crypto.sendEncryptedDirect(peerId, plaintext, timeoutMs);
+  }
+
+  getKeyPair(): Readonly<PeerPigeonKeyPair> {
+    if (!this.crypto) throw new Error('Crypto is disabled for this node');
+    return this.crypto.getKeyPair();
+  }
+
+  getPublicKey(peerId: string): PeerPublicKey | null {
+    return this.crypto?.getPublicKey(peerId) ?? null;
+  }
+
+  getKnownPeerKeys(): PeerPublicKey[] {
+    return this.crypto?.getKnownPeerKeys() ?? [];
+  }
+
+  requestPeerKey(peerId: string): void {
+    if (!this.crypto) throw new Error('Crypto is disabled for this node');
+    this.crypto.requestPeerKey(peerId);
+  }
+
+  waitForPeerKey(peerId: string, timeoutMs?: number): Promise<PeerPublicKey> {
+    if (!this.crypto) return Promise.reject(new Error('Crypto is disabled for this node'));
+    return timeoutMs === undefined
+      ? this.crypto.waitForPeerKey(peerId)
+      : this.crypto.waitForPeerKey(peerId, timeoutMs);
+  }
+
+  recoverAfterInactivity(reason?: string): void {
+    this.mesh.recoverAfterInactivity(reason);
+  }
+
+  on<K extends keyof PeerPigeonNodeEvents>(event: K, callback: PeerPigeonNodeEvents[K]): void {
+    const callbacks = this.callbacks[event];
+    if (callbacks) callbacks.add(callback);
+    else this.callbacks[event] = new Set([callback]);
+  }
+
+  off<K extends keyof PeerPigeonNodeEvents>(event: K, callback: PeerPigeonNodeEvents[K]): void {
+    this.callbacks[event]?.delete(callback);
+  }
+
+  async destroy(): Promise<void> {
+    if (this.storage) await this.storage.close();
+    this.storage = null;
+    this.crypto?.destroy();
+    this.gossip.destroy();
+    this.mesh.destroy();
+    this.started = false;
+    for (const callbacks of Object.values(this.callbacks)) callbacks?.clear();
+  }
+
+  private bindComponentEvents(): void {
+    this.mesh.on('mesh:ready', () => this.emit('ready', undefined));
+    this.mesh.on('peer:connected', (peerId) => this.emit('peerConnected', peerId));
+    this.mesh.on('peer:disconnected', (peerId) => this.emit('peerDisconnected', peerId));
+    this.mesh.on('mesh:graph', (snapshot) => this.emit('graphChanged', snapshot));
+    this.mesh.on('mesh:capacity', (capacities) => this.emit('capacityChanged', capacities));
+    this.mesh.on('signaling:connected', ({ clientId }) => this.storage?.setPeerId(clientId));
+    this.mesh.on('signaling:error', (error) => this.emitError(error));
+    this.mesh.on('peer:error', ({ error }) => this.emitError(error));
+
+    this.gossip.on('messageReceived', ({ message, local, fromPeer }) => {
+      if (this.isReservedPayload(message.data)) return;
+      this.emit('message', {
+        kind: 'broadcast',
+        data: message.data,
+        encrypted: false,
+        local,
+        fromPeerId: fromPeer ?? message.sender,
+        messageId: message.id,
+        hops: message.hops,
+        message,
+      });
+    });
+    this.gossip.on('directMessageReceived', ({ message }) => {
+      if (this.isReservedPayload(message.data)) return;
+      this.emit('message', {
+        kind: 'direct',
+        data: message.data,
+        encrypted: false,
+        local: false,
+        fromPeerId: message.from,
+        messageId: message.id,
+        hops: message.hops,
+        message,
+      });
+    });
+    this.gossip.on('deliveryProgress', (status) => this.emit('deliveryProgress', status));
+    this.gossip.on('deliveryComplete', (status) => this.emit('deliveryComplete', status));
+    this.gossip.on('deliveryTimeout', (status) => this.emit('deliveryTimeout', status));
+
+    this.crypto?.on('keyDiscovered', (key) => this.emit('keyDiscovered', key));
+    this.crypto?.on('encryptedBroadcastReceived', ({ plaintext, message, local, fromPeer }) => {
+      this.emit('message', {
+        kind: 'broadcast',
+        data: plaintext,
+        encrypted: true,
+        local,
+        fromPeerId: fromPeer ?? message.sender,
+        messageId: message.id,
+        hops: message.hops,
+        message,
+      });
+    });
+    this.crypto?.on('encryptedDirectReceived', ({ plaintext, message }) => {
+      this.emit('message', {
+        kind: 'direct',
+        data: plaintext,
+        encrypted: true,
+        local: false,
+        fromPeerId: message.from,
+        messageId: message.id,
+        hops: message.hops,
+        message,
+      });
+    });
+    this.crypto?.on('error', (error) => this.emitError(error));
+  }
+
+  private isReservedPayload(data: unknown): boolean {
+    if (PeerPigeonCryptoProtocol.isProtocolPayload(data)) return true;
+    if (!data || typeof data !== 'object') return false;
+    const type = (data as { __ppType?: unknown }).__ppType;
+    return typeof type === 'string' && type.startsWith('pp-storage-');
+  }
+
+  private emitError(error: unknown): void {
+    this.emit('error', error instanceof Error ? error : new Error(String(error)));
+  }
+
+  private emit<K extends keyof PeerPigeonNodeEvents>(
+    event: K,
+    data: Parameters<PeerPigeonNodeEvents[K]>[0]
+  ): void {
+    for (const callback of this.callbacks[event] ?? []) {
+      try { (callback as (value: typeof data) => void)(data); } catch { /* isolate application listeners */ }
+    }
+  }
+}
+
 export default PartialMesh;
 
-export { GossipProtocol } from './gossip.js';
+export { GossipProtocol };
 export type {
   GossipBroadcastOptions,
   GossipDeliveryStatus,
@@ -1667,7 +2270,7 @@ export type {
   GossipProtocolOptions,
   GossipStats,
 } from './gossip.js';
-export { PeerPigeonStorage } from './storage.js';
+export { PeerPigeonStorage };
 export type {
   StorageSpace,
   StorageRecord,
@@ -1680,3 +2283,13 @@ export type {
   StorageUnsubscribe,
   StorageEvents,
 } from './storage.js';
+export { PeerPigeonCryptoProtocol };
+export type {
+  EncryptedBroadcastPayload,
+  EncryptedDirectPayload,
+  PeerPigeonCryptoEvents,
+  PeerPigeonCryptoOptions,
+  PeerPigeonKeyPair,
+  PeerPublicKey,
+  RoomCipher,
+} from './crypto.js';

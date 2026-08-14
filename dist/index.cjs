@@ -22,6 +22,8 @@ var index_exports = {};
 __export(index_exports, {
   GossipProtocol: () => GossipProtocol,
   PartialMesh: () => PartialMesh,
+  PeerPigeonCryptoProtocol: () => PeerPigeonCryptoProtocol,
+  PeerPigeonNode: () => PeerPigeonNode,
   PeerPigeonStorage: () => PeerPigeonStorage,
   default: () => index_default
 });
@@ -2362,6 +2364,336 @@ var PeerPigeonStorage = class {
   }
 };
 
+// src/crypto.ts
+var import_unsea = require("unsea");
+var CRYPTO_PUBLIC_INFO_TYPE = "pp-crypto-public-info-v1";
+var CRYPTO_PUBLIC_REQUEST_TYPE = "pp-crypto-public-request-v1";
+var ENCRYPTED_BROADCAST_TYPE = "pp-encrypted-broadcast-v1";
+var ENCRYPTED_DIRECT_TYPE = "pp-encrypted-direct-v1";
+var PeerPigeonCryptoProtocol = class {
+  constructor(mesh, gossip, options) {
+    this.keyPair = null;
+    this.publicKeys = /* @__PURE__ */ new Map();
+    this.callbacks = {};
+    this.announceTimer = null;
+    this.initialized = false;
+    this.onGossipMessageBound = (data) => {
+      this.handleGossipMessage(data).catch((error) => this.emitError(error));
+    };
+    this.onDirectMessageBound = (data) => {
+      this.handleDirectMessage(data.message).catch((error) => this.emitError(error));
+    };
+    this.onPeerConnectedBound = (peerId) => {
+      this.sendPublicInfoDirect(peerId);
+      if (!this.publicKeys.has(peerId)) this.requestPeerKey(peerId);
+    };
+    this.onSignalingConnectedBound = () => {
+      this.registerLocalKey();
+      this.announcePublicKey();
+    };
+    const roomId = String(options.roomId ?? "").trim();
+    if (!roomId) throw new Error("PeerPigeonCryptoProtocol requires a non-empty roomId");
+    this.mesh = mesh;
+    this.gossip = gossip;
+    this.options = {
+      roomId,
+      roomSecret: String(options.roomSecret ?? ""),
+      keyPair: options.keyPair,
+      persistKeyPair: options.persistKeyPair ?? true,
+      storageKey: String(options.storageKey ?? "peerpigeon:crypto-keys:v1"),
+      announceIntervalMs: options.announceIntervalMs ?? 1e4,
+      keyDiscoveryTimeoutMs: options.keyDiscoveryTimeoutMs ?? 8e3
+    };
+  }
+  async init() {
+    if (this.initialized) return;
+    this.keyPair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await (0, import_unsea.generateRandomPair)();
+    this.validateKeyPair(this.keyPair);
+    this.persistKeyPair(this.keyPair);
+    this.initialized = true;
+    this.gossip.on("messageReceived", this.onGossipMessageBound);
+    this.gossip.on("directMessageReceived", this.onDirectMessageBound);
+    this.mesh.on("peer:connected", this.onPeerConnectedBound);
+    this.mesh.on("signaling:connected", this.onSignalingConnectedBound);
+    this.registerLocalKey();
+    this.announcePublicKey();
+    if (this.options.announceIntervalMs > 0) {
+      this.announceTimer = setInterval(() => this.announcePublicKey(), this.options.announceIntervalMs);
+    }
+  }
+  getKeyPair() {
+    if (!this.keyPair) throw new Error("Crypto protocol has not been initialized");
+    return { ...this.keyPair };
+  }
+  getPublicKey(peerId) {
+    const value = this.publicKeys.get(String(peerId ?? "").trim());
+    return value ? { ...value } : null;
+  }
+  getKnownPeerKeys() {
+    return Array.from(this.publicKeys.values()).map((value) => ({ ...value })).sort((a, b) => a.peerId.localeCompare(b.peerId));
+  }
+  announcePublicKey() {
+    const payload = this.localPublicInfoPayload();
+    if (!payload) return;
+    this.gossip.broadcast(payload, { sender: payload.from, timestamp: payload.timestamp, internal: true });
+    for (const peerId of this.mesh.getConnectedPeers()) this.sendPublicInfoDirect(peerId, payload);
+  }
+  requestPeerKey(peerId) {
+    const self = String(this.mesh.getClientId() ?? "").trim();
+    const target = String(peerId ?? "").trim();
+    if (!self || !target || target === self) return;
+    const payload = {
+      __ppType: CRYPTO_PUBLIC_REQUEST_TYPE,
+      from: self,
+      to: target,
+      timestamp: Date.now()
+    };
+    this.gossip.sendDirect(target, payload);
+    this.gossip.broadcast(payload, { sender: self, timestamp: payload.timestamp, internal: true });
+  }
+  async waitForPeerKey(peerId, timeoutMs = this.options.keyDiscoveryTimeoutMs) {
+    const target = String(peerId ?? "").trim();
+    const existing = this.getPublicKey(target);
+    if (existing) return existing;
+    this.requestPeerKey(target);
+    return await new Promise((resolve, reject) => {
+      const handler = (key) => {
+        if (key.peerId !== target) return;
+        clearTimeout(timer);
+        this.off("keyDiscovered", handler);
+        resolve({ ...key });
+      };
+      const timer = setTimeout(() => {
+        this.off("keyDiscovered", handler);
+        reject(new Error(`Timed out discovering encryption key for peer ${target}`));
+      }, Math.max(0, timeoutMs));
+      this.on("keyDiscovered", handler);
+    });
+  }
+  async encryptRoom(plaintext) {
+    const cryptoApi = this.cryptoApi();
+    const key = await this.deriveRoomKey();
+    const iv = cryptoApi.getRandomValues(new Uint8Array(12));
+    const cipher = await cryptoApi.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      key,
+      new TextEncoder().encode(String(plaintext))
+    );
+    return { alg: "A256GCM", iv: this.toBase64Url(iv), ct: this.toBase64Url(new Uint8Array(cipher)) };
+  }
+  async decryptRoom(cipher) {
+    if (!cipher || cipher.alg !== "A256GCM") throw new Error("Unsupported room cipher");
+    const cryptoApi = this.cryptoApi();
+    const plaintext = await cryptoApi.subtle.decrypt(
+      { name: "AES-GCM", iv: this.fromBase64Url(cipher.iv) },
+      await this.deriveRoomKey(),
+      this.fromBase64Url(cipher.ct)
+    );
+    return new TextDecoder().decode(plaintext);
+  }
+  async createEncryptedBroadcast(plaintext) {
+    return {
+      __ppType: ENCRYPTED_BROADCAST_TYPE,
+      from: String(this.mesh.getClientId() ?? "").trim(),
+      roomCipher: await this.encryptRoom(plaintext),
+      timestamp: Date.now()
+    };
+  }
+  async createEncryptedDirect(peerId, plaintext, timeoutMs) {
+    if (!this.keyPair) throw new Error("Crypto protocol has not been initialized");
+    const target = String(peerId ?? "").trim();
+    const recipient = this.getPublicKey(target) ?? await this.waitForPeerKey(target, timeoutMs);
+    return {
+      __ppType: ENCRYPTED_DIRECT_TYPE,
+      from: String(this.mesh.getClientId() ?? "").trim(),
+      to: target,
+      cipher: await (0, import_unsea.encryptMessageWithMeta)(String(plaintext), { epub: recipient.epub }),
+      timestamp: Date.now()
+    };
+  }
+  async broadcastEncrypted(plaintext, metadata = {}, options = {}) {
+    const payload = await this.createEncryptedBroadcast(plaintext);
+    const messageMetadata = { ...metadata, encrypted: true, sender: payload.from, timestamp: payload.timestamp };
+    return options.trackDelivery ? this.gossip.broadcastReliable(payload, messageMetadata, options) : this.gossip.broadcast(payload, messageMetadata, options);
+  }
+  async sendEncryptedDirect(peerId, plaintext, timeoutMs) {
+    const payload = await this.createEncryptedDirect(peerId, plaintext, timeoutMs);
+    const messageId = this.gossip.sendDirect(payload.to, payload);
+    if (!messageId) throw new Error(`No route to peer ${payload.to}`);
+    return messageId;
+  }
+  async decryptEncryptedBroadcast(payload) {
+    return await this.decryptRoom(payload.roomCipher);
+  }
+  async decryptEncryptedDirect(payload) {
+    if (!this.keyPair) throw new Error("Crypto protocol has not been initialized");
+    return await (0, import_unsea.decryptMessageWithMeta)(payload.cipher, this.keyPair.epriv);
+  }
+  on(event, callback) {
+    const callbacks = this.callbacks[event];
+    if (callbacks) callbacks.add(callback);
+    else this.callbacks[event] = /* @__PURE__ */ new Set([callback]);
+  }
+  off(event, callback) {
+    this.callbacks[event]?.delete(callback);
+  }
+  destroy() {
+    if (this.announceTimer) clearInterval(this.announceTimer);
+    this.announceTimer = null;
+    if (this.initialized) {
+      this.gossip.off("messageReceived", this.onGossipMessageBound);
+      this.gossip.off("directMessageReceived", this.onDirectMessageBound);
+      this.mesh.off("peer:connected", this.onPeerConnectedBound);
+      this.mesh.off("signaling:connected", this.onSignalingConnectedBound);
+    }
+    this.initialized = false;
+    this.publicKeys.clear();
+    for (const callbacks of Object.values(this.callbacks)) callbacks?.clear();
+  }
+  static isProtocolPayload(value) {
+    if (!value || typeof value !== "object") return false;
+    const type = value.__ppType;
+    return type === CRYPTO_PUBLIC_INFO_TYPE || type === CRYPTO_PUBLIC_REQUEST_TYPE || type === ENCRYPTED_BROADCAST_TYPE || type === ENCRYPTED_DIRECT_TYPE;
+  }
+  validateKeyPair(value) {
+    if (!value || ["pub", "priv", "epub", "epriv"].some((key) => typeof value[key] !== "string")) {
+      throw new Error("Invalid PeerPigeon key pair");
+    }
+  }
+  loadStoredKeyPair() {
+    if (!this.options.persistKeyPair) return null;
+    try {
+      const raw = globalThis.sessionStorage?.getItem(`${this.options.storageKey}:${this.options.roomId}`);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      this.validateKeyPair(parsed);
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+  persistKeyPair(value) {
+    if (!this.options.persistKeyPair) return;
+    try {
+      globalThis.sessionStorage?.setItem(`${this.options.storageKey}:${this.options.roomId}`, JSON.stringify(value));
+    } catch {
+    }
+  }
+  registerLocalKey() {
+    const payload = this.localPublicInfoPayload();
+    if (payload) this.upsertPublicKey(payload.from, payload);
+  }
+  localPublicInfoPayload() {
+    const peerId = String(this.mesh.getClientId() ?? "").trim();
+    if (!peerId || !this.keyPair) return null;
+    return {
+      __ppType: CRYPTO_PUBLIC_INFO_TYPE,
+      from: peerId,
+      pub: this.keyPair.pub,
+      epub: this.keyPair.epub,
+      timestamp: Date.now()
+    };
+  }
+  sendPublicInfoDirect(peerId, payload = this.localPublicInfoPayload()) {
+    if (!payload || !peerId || peerId === payload.from) return;
+    this.gossip.sendDirect(peerId, payload);
+  }
+  upsertPublicKey(peerId, payload) {
+    const id = String(peerId ?? "").trim();
+    if (!id || typeof payload.pub !== "string" || typeof payload.epub !== "string") return;
+    const existing = this.publicKeys.get(id);
+    if (existing && existing.updatedAt > payload.timestamp) return;
+    const value = {
+      peerId: id,
+      pub: payload.pub,
+      epub: payload.epub,
+      updatedAt: Number.isFinite(payload.timestamp) ? payload.timestamp : Date.now(),
+      local: id === this.mesh.getClientId()
+    };
+    this.publicKeys.set(id, value);
+    this.emit("keyDiscovered", { ...value });
+  }
+  isPublicInfo(value) {
+    const payload = value;
+    return !!payload && payload.__ppType === CRYPTO_PUBLIC_INFO_TYPE && typeof payload.from === "string" && typeof payload.pub === "string" && typeof payload.epub === "string";
+  }
+  isPublicRequest(value) {
+    const payload = value;
+    return !!payload && payload.__ppType === CRYPTO_PUBLIC_REQUEST_TYPE && typeof payload.from === "string" && typeof payload.to === "string";
+  }
+  isEncryptedBroadcast(value) {
+    const payload = value;
+    return !!payload && payload.__ppType === ENCRYPTED_BROADCAST_TYPE && !!payload.roomCipher;
+  }
+  isEncryptedDirect(value) {
+    const payload = value;
+    return !!payload && payload.__ppType === ENCRYPTED_DIRECT_TYPE && typeof payload.from === "string" && typeof payload.to === "string" && payload.cipher != null;
+  }
+  async handleGossipMessage(data) {
+    const payload = data.message.data;
+    if (this.isPublicInfo(payload)) {
+      if (data.local || !data.message.sender || payload.from === data.message.sender) this.upsertPublicKey(payload.from, payload);
+      return;
+    }
+    if (this.isPublicRequest(payload)) {
+      if (payload.to === this.mesh.getClientId()) this.sendPublicInfoDirect(payload.from);
+      return;
+    }
+    if (!this.isEncryptedBroadcast(payload)) return;
+    const plaintext = await this.decryptEncryptedBroadcast(payload);
+    this.emit("encryptedBroadcastReceived", { plaintext, payload, ...data });
+  }
+  async handleDirectMessage(message) {
+    const payload = message.data;
+    if (this.isPublicInfo(payload)) {
+      if (payload.from === message.from) this.upsertPublicKey(payload.from, payload);
+      return;
+    }
+    if (this.isPublicRequest(payload)) {
+      if (payload.from === message.from && payload.to === this.mesh.getClientId()) this.sendPublicInfoDirect(payload.from);
+      return;
+    }
+    if (!this.isEncryptedDirect(payload) || payload.to !== this.mesh.getClientId() || payload.from !== message.from) return;
+    const plaintext = await this.decryptEncryptedDirect(payload);
+    this.emit("encryptedDirectReceived", { plaintext, payload, message });
+  }
+  async deriveRoomKey() {
+    const cryptoApi = this.cryptoApi();
+    const roomScope = this.options.roomSecret ? `${this.options.roomId}:${this.options.roomSecret}` : this.options.roomId;
+    const seed = new TextEncoder().encode(
+      `peerpigeon:room-broadcast:v1:${roomScope}`
+    );
+    const hash = await cryptoApi.subtle.digest("SHA-256", seed);
+    return await cryptoApi.subtle.importKey("raw", hash, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  }
+  cryptoApi() {
+    if (!globalThis.crypto?.subtle) throw new Error("WebCrypto is unavailable");
+    return globalThis.crypto;
+  }
+  toBase64Url(bytes) {
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+  fromBase64Url(value) {
+    const normalized = String(value ?? "").replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const binary = atob(padded);
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  }
+  emitError(error) {
+    this.emit("error", error instanceof Error ? error : new Error(String(error)));
+  }
+  emit(event, data) {
+    for (const callback of this.callbacks[event] ?? []) {
+      try {
+        callback(data);
+      } catch {
+      }
+    }
+  }
+};
+
 // src/index.ts
 var PartialMesh = class {
   constructor(config = {}) {
@@ -2392,7 +2724,10 @@ var PartialMesh = class {
     this.globalPeers = /* @__PURE__ */ new Set();
     /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
     this.peerCapacityById = /* @__PURE__ */ new Map();
+    /** Relayed adjacency snapshots used to reconstruct the known network graph. */
+    this.peerTopologyById = /* @__PURE__ */ new Map();
     this.localCapacityUpdatedAtMs = Date.now();
+    this.localTopologyUpdatedAtMs = Date.now();
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
@@ -2410,8 +2745,10 @@ var PartialMesh = class {
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 1e3,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
       nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 2500,
+      peerStateMaxAgeMs: config.peerStateMaxAgeMs ?? 6e4,
       trickleIce: config.trickleIce ?? true
     };
+    this.validatePeerLimits(this.config.minPeers, this.config.maxPeers, this.config.tolerantPeers);
     const events = [
       "signaling:connected",
       "signaling:disconnected",
@@ -2423,9 +2760,25 @@ var PartialMesh = class {
       "peer:error",
       "peer:discovered",
       "mesh:ready",
-      "mesh:membership"
+      "mesh:membership",
+      "mesh:capacity",
+      "mesh:graph"
     ];
     events.forEach((event) => this.eventHandlers.set(event, /* @__PURE__ */ new Set()));
+  }
+  validatePeerLimits(minPeers, maxPeers, tolerantPeers) {
+    if (!Number.isSafeInteger(minPeers) || minPeers < 0) {
+      throw new RangeError("minPeers must be a non-negative safe integer");
+    }
+    if (!Number.isSafeInteger(maxPeers) || maxPeers < 1) {
+      throw new RangeError("maxPeers must be a positive safe integer");
+    }
+    if (minPeers > maxPeers) {
+      throw new RangeError("minPeers cannot exceed maxPeers");
+    }
+    if (!Number.isSafeInteger(tolerantPeers) || tolerantPeers < 0) {
+      throw new RangeError("tolerantPeers must be a non-negative safe integer");
+    }
   }
   normalizePeerId(peerId) {
     return (peerId ?? "").trim();
@@ -2461,6 +2814,7 @@ var PartialMesh = class {
     this.discoveredPeers.add(id);
     this.discoveredAtMs.set(id, Date.now());
     this.emit("peer:discovered", id);
+    this.emit("mesh:graph", this.getGraphSnapshot());
   }
   rotateBrowserPeerId(signalingUrl) {
     const requestedPeerId = Array.from(
@@ -2500,8 +2854,9 @@ var PartialMesh = class {
     this.selfAliases.add(id);
     const removedDiscovered = this.discoveredPeers.delete(id);
     const removedGlobal = this.globalPeers.delete(id);
-    this.peerCapacityById.delete(id);
-    const changed = removedDiscovered || removedGlobal;
+    const removedCapacity = this.peerCapacityById.delete(id);
+    const removedTopology = this.peerTopologyById.delete(id);
+    const changed = removedDiscovered || removedGlobal || removedCapacity || removedTopology;
     this.discoveredAtMs.delete(id);
     this.dialFailureCount.delete(id);
     this.dialBackoffUntilMs.delete(id);
@@ -2544,11 +2899,15 @@ var PartialMesh = class {
     return pending.size;
   }
   noteLocalCapacityChanged() {
-    this.localCapacityUpdatedAtMs = Math.max(Date.now(), this.localCapacityUpdatedAtMs + 1);
+    const updatedAt = Date.now();
+    this.localCapacityUpdatedAtMs = Math.max(updatedAt, this.localCapacityUpdatedAtMs + 1);
+    this.localTopologyUpdatedAtMs = Math.max(updatedAt, this.localTopologyUpdatedAtMs + 1);
+    this.emit("mesh:capacity", this.getPeerCapacities());
+    this.emit("mesh:graph", this.getGraphSnapshot());
   }
   freshPeerCapacity(peerId) {
     const state = this.peerCapacityById.get(peerId);
-    if (!state || Date.now() - state.updatedAt > 6e4) return null;
+    if (!state || Date.now() - state.updatedAt > this.config.peerStateMaxAgeMs) return null;
     return state;
   }
   /**
@@ -2649,7 +3008,7 @@ var PartialMesh = class {
   }
   maybeRebalanceForCloserPeer(candidates) {
     const selfId = this.normalizePeerId(this.clientId);
-    if (!selfId) return false;
+    if (!selfId || this.config.tolerantPeers <= 0) return false;
     const now = Date.now();
     if (now < this.rebalanceCooldownUntilMs) {
       return false;
@@ -2658,13 +3017,11 @@ var PartialMesh = class {
     if (connectedPeers.length < this.config.maxPeers || connectedPeers.length === 0 || candidates.length === 0) {
       return false;
     }
-    if (this.pendingRebalanceDropByTarget.size > 0) {
-      return false;
-    }
     if (connectedPeers.length <= this.config.minPeers) {
       return false;
     }
-    const connectedByDistance = connectedPeers.map((peerId) => ({
+    const reservedDropPeerIds = new Set(this.pendingRebalanceDropByTarget.values());
+    const connectedByDistance = connectedPeers.filter((peerId) => !reservedDropPeerIds.has(peerId)).map((peerId) => ({
       peerId,
       distance: this.peerDistance(selfId, peerId),
       connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0
@@ -2874,7 +3231,7 @@ var PartialMesh = class {
     this.signalingClient.on("rtc:data", (data) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
-        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, data.peerId);
+        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, msg.topology, data.peerId);
       } else {
         this.emit("peer:data", data);
       }
@@ -3076,8 +3433,13 @@ var PartialMesh = class {
       } catch {
       }
     }
+    const hadConnectedPeers = this.getConnectedPeerCount() > 0;
     this.peers.clear();
     this.connecting.clear();
+    if (hadConnectedPeers) {
+      this.noteLocalCapacityChanged();
+      this.broadcastMembership();
+    }
     try {
       if (this.signalingClient && this.config.sessionId) {
         this.signalingClient.joinSession(this.config.sessionId);
@@ -3171,7 +3533,7 @@ var PartialMesh = class {
       }
     } else if (connectedCount > this.config.maxPeers) {
       this.trimExcessPeers();
-    } else if (connectedCount >= this.config.maxPeers && pendingCount === 0 && available.length > 0) {
+    } else if (connectedCount >= this.config.maxPeers && pendingCount < this.config.tolerantPeers && available.length > 0) {
       if (this.maybeRebalanceForCloserPeer(available)) {
         return;
       }
@@ -3219,10 +3581,9 @@ var PartialMesh = class {
     if (emergencyIsolated) {
       this.clearDialBackoff(normalizedPeerId);
     }
-    const connectedCount = this.getConnectedPeerCount();
-    const maxAllowed = allowTemporaryOverflow ? this.config.maxPeers + 1 : this.config.maxPeers;
-    if (connectedCount >= maxAllowed) {
-      console.warn("Max peers reached, cannot connect to more peers");
+    const totalInProgress = this.getConnectedPeerCount() + this.getPendingPeerCount();
+    const maxAllowed = this.config.maxPeers + (allowTemporaryOverflow ? this.config.tolerantPeers : 0);
+    if (totalInProgress >= maxAllowed) {
       return;
     }
     const initiator = selfId < normalizedPeerId;
@@ -3284,9 +3645,9 @@ var PartialMesh = class {
             } catch {
             }
           }
-          const currentConnectedCount = this.getConnectedPeerCount();
-          const fallbackMaxAllowed = allowTemporaryOverflow ? this.config.maxPeers + 1 : this.config.maxPeers;
-          if (currentConnectedCount >= fallbackMaxAllowed) {
+          const currentInProgress = this.getConnectedPeerCount() + this.getPendingPeerCount();
+          const fallbackMaxAllowed = allowTemporaryOverflow ? this.config.maxPeers + this.config.tolerantPeers : this.config.maxPeers;
+          if (currentInProgress >= fallbackMaxAllowed) {
             return;
           }
           this.connecting.add(normalizedPeerId);
@@ -3388,6 +3749,133 @@ var PartialMesh = class {
   getGlobalPeers() {
     return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
   }
+  /** Return the effective configuration, including constructor defaults. */
+  getConfig() {
+    return {
+      ...this.config,
+      iceServers: this.config.iceServers ? this.config.iceServers.map((server) => ({ ...server })) : null
+    };
+  }
+  /**
+   * Update connection-policy knobs without rebuilding the node. Signaling,
+   * network/session identity, ICE, and trickle settings remain constructor-time
+   * values because changing them requires reconnecting the transport.
+   */
+  updateConfig(patch) {
+    const next = { ...this.config };
+    for (const key of Object.keys(patch)) {
+      const value = patch[key];
+      if (value !== void 0) next[key] = value;
+    }
+    this.validatePeerLimits(next.minPeers, next.maxPeers, next.tolerantPeers);
+    for (const [name, value] of [
+      ["connectionTimeoutMs", next.connectionTimeoutMs],
+      ["maintenanceIntervalMs", next.maintenanceIntervalMs],
+      ["underConnectedResetMs", next.underConnectedResetMs],
+      ["nonInitiatorFallbackDialMs", next.nonInitiatorFallbackDialMs]
+    ]) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new RangeError(`${name} must be a non-negative safe integer`);
+      }
+    }
+    if (!Number.isSafeInteger(next.peerStateMaxAgeMs) || next.peerStateMaxAgeMs < 1e3) {
+      throw new RangeError("peerStateMaxAgeMs must be a safe integer of at least 1000");
+    }
+    const maintenanceChanged = next.maintenanceIntervalMs !== this.config.maintenanceIntervalMs || next.autoConnect !== this.config.autoConnect;
+    const capacityChanged = next.maxPeers !== this.config.maxPeers;
+    this.config = next;
+    if (maintenanceChanged && this.maintenanceTimer) {
+      clearInterval(this.maintenanceTimer);
+      this.maintenanceTimer = null;
+    }
+    if (this.config.autoConnect) this.startMaintenanceLoop();
+    this.trimExcessPeers();
+    if (capacityChanged) {
+      this.noteLocalCapacityChanged();
+      this.broadcastMembership();
+    }
+    if (this.config.autoConnect) this.maintainPeerConnections();
+    return this.getConfig();
+  }
+  /** Return capacity and available connection slots for one known peer. */
+  getPeerCapacity(peerId) {
+    const id = this.normalizePeerId(peerId);
+    if (!id) return null;
+    const local = !!this.clientId && id === this.clientId;
+    const state = local ? { maxPeers: this.config.maxPeers, connectedPeers: this.getConnectedPeerCount(), updatedAt: this.localCapacityUpdatedAtMs } : this.peerCapacityById.get(id);
+    if (!state) return null;
+    return {
+      peerId: id,
+      ...state,
+      availableSlots: Math.max(0, state.maxPeers - state.connectedPeers),
+      fresh: local || Date.now() - state.updatedAt <= this.config.peerStateMaxAgeMs,
+      local
+    };
+  }
+  /** Return advertised capacity for every known peer, including this node. */
+  getPeerCapacities() {
+    const ids = new Set(this.peerCapacityById.keys());
+    if (this.clientId) ids.add(this.clientId);
+    return Array.from(ids).map((peerId) => this.getPeerCapacity(peerId)).filter((value) => value != null).sort((a, b) => a.peerId.localeCompare(b.peerId));
+  }
+  /** Reconstruct the complete currently-known node and undirected edge snapshot. */
+  getGraphSnapshot() {
+    const self = this.normalizePeerId(this.clientId) || null;
+    const knownIds = /* @__PURE__ */ new Set();
+    if (self) knownIds.add(self);
+    for (const peerId of this.globalPeers) knownIds.add(peerId);
+    for (const peerId of this.discoveredPeers) knownIds.add(peerId);
+    for (const peerId of this.getConnectedPeers()) knownIds.add(peerId);
+    for (const peerId of this.peerCapacityById.keys()) knownIds.add(peerId);
+    for (const [peerId, state] of this.peerTopologyById.entries()) {
+      knownIds.add(peerId);
+      for (const connectedPeerId of state.connectedPeerIds) knownIds.add(connectedPeerId);
+    }
+    for (const peerId of Array.from(knownIds)) {
+      if (!peerId || this.isSelfAlias(peerId) && peerId !== self || this.retiredPeerIds.has(peerId)) knownIds.delete(peerId);
+    }
+    const connected = new Set(this.getConnectedPeers());
+    const edgeMap = /* @__PURE__ */ new Map();
+    const addEdge = (observer, left, right, updatedAt) => {
+      if (!knownIds.has(left) || !knownIds.has(right) || left === right) return;
+      const [source, target] = left < right ? [left, right] : [right, left];
+      const key = `${source}\0${target}`;
+      const existing = edgeMap.get(key);
+      const direct = !!self && (source === self && connected.has(target) || target === self && connected.has(source));
+      if (existing) {
+        if (!existing.observedBy.includes(observer)) existing.observedBy.push(observer);
+        existing.updatedAt = Math.max(existing.updatedAt, updatedAt);
+        existing.direct = existing.direct || direct;
+      } else {
+        edgeMap.set(key, { source, target, direct, observedBy: [observer], updatedAt });
+      }
+    };
+    if (self) {
+      for (const peerId of connected) addEdge(self, self, peerId, this.localTopologyUpdatedAtMs);
+    }
+    for (const [peerId, state] of this.peerTopologyById.entries()) {
+      for (const connectedPeerId of state.connectedPeerIds) {
+        addEdge(peerId, peerId, connectedPeerId, state.updatedAt);
+      }
+    }
+    const missingTopologyPeerIds = Array.from(knownIds).filter((peerId) => peerId !== self && !this.peerTopologyById.has(peerId)).sort();
+    const nodes = Array.from(knownIds).sort().map((peerId) => ({
+      peerId,
+      local: peerId === self,
+      directlyConnected: connected.has(peerId),
+      discovered: this.discoveredPeers.has(peerId),
+      capacity: this.getPeerCapacity(peerId)
+    }));
+    const edges = Array.from(edgeMap.values()).map((edge) => ({ ...edge, observedBy: edge.observedBy.sort() })).sort((a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target));
+    return {
+      localPeerId: self,
+      nodes,
+      edges,
+      complete: missingTopologyPeerIds.length === 0,
+      missingTopologyPeerIds,
+      generatedAt: Date.now()
+    };
+  }
   /**
    * Get current peer count
    */
@@ -3439,21 +3927,28 @@ var PartialMesh = class {
     const all = new Set(this.globalPeers);
     if (self) all.add(self);
     for (const p of this.discoveredPeers) all.add(p);
+    for (const p of this.getConnectedPeers()) all.add(p);
     for (const retiredPeerId of this.retiredPeerIds) all.delete(retiredPeerId);
     const capacities = {};
-    const now = Date.now();
+    const topology = {};
     for (const [peerId, state] of this.peerCapacityById.entries()) {
-      if (!all.has(peerId) || now - state.updatedAt > 6e4) continue;
+      if (!all.has(peerId)) continue;
       capacities[peerId] = [state.maxPeers, state.connectedPeers, state.updatedAt];
+    }
+    for (const [peerId, state] of this.peerTopologyById.entries()) {
+      if (!all.has(peerId)) continue;
+      topology[peerId] = [state.connectedPeerIds, state.updatedAt];
     }
     if (self) {
       capacities[self] = [this.config.maxPeers, this.getConnectedPeerCount(), this.localCapacityUpdatedAtMs];
+      topology[self] = [this.getConnectedPeers().slice().sort(), this.localTopologyUpdatedAtMs];
     }
     const payload = JSON.stringify({
       __membership: true,
       peers: Array.from(all),
       retiredPeers: Array.from(this.retiredPeerIds),
-      capacities
+      capacities,
+      topology
     });
     try {
       this.signalingClient?.send(toPeerId, payload);
@@ -3472,16 +3967,20 @@ var PartialMesh = class {
         return {
           peers: obj.peers,
           retiredPeers: Array.isArray(obj.retiredPeers) ? obj.retiredPeers : [],
-          capacities: obj.capacities && typeof obj.capacities === "object" && !Array.isArray(obj.capacities) ? obj.capacities : {}
+          capacities: obj.capacities && typeof obj.capacities === "object" && !Array.isArray(obj.capacities) ? obj.capacities : {},
+          topology: obj.topology && typeof obj.topology === "object" && !Array.isArray(obj.topology) ? obj.topology : {}
         };
       }
     } catch {
     }
     return null;
   }
-  mergeMembership(incoming, retired, capacities, fromPeerId) {
+  mergeMembership(incoming, retired, capacities, topologyInput = {}, fromPeerId = "") {
+    const topology = typeof topologyInput === "string" ? {} : topologyInput;
+    if (typeof topologyInput === "string") fromPeerId = topologyInput;
     let membershipChanged = false;
     let capacityChanged = false;
+    let topologyChanged = false;
     for (const raw of retired) {
       if (this.retirePeerId(raw)) membershipChanged = true;
     }
@@ -3500,14 +3999,30 @@ var PartialMesh = class {
       const maxPeers = Math.floor(Number(rawState[0]));
       const connectedPeers = Math.floor(Number(rawState[1]));
       const updatedAt = Math.floor(Number(rawState[2]));
-      if (!Number.isFinite(maxPeers) || maxPeers < 1 || maxPeers > 4096 || !Number.isFinite(connectedPeers) || connectedPeers < 0 || connectedPeers > 4096 || !Number.isFinite(updatedAt) || updatedAt <= 0) continue;
+      if (!Number.isSafeInteger(maxPeers) || maxPeers < 1 || !Number.isSafeInteger(connectedPeers) || connectedPeers < 0 || !Number.isSafeInteger(updatedAt) || updatedAt <= 0) continue;
       const existing = this.peerCapacityById.get(peerId);
       if (existing && existing.updatedAt >= updatedAt) continue;
       this.peerCapacityById.set(peerId, { maxPeers, connectedPeers, updatedAt });
       capacityChanged = true;
     }
-    if (membershipChanged || capacityChanged) {
+    for (const [rawPeerId, rawState] of Object.entries(topology || {})) {
+      const peerId = this.normalizePeerId(rawPeerId);
+      if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
+      if (!Array.isArray(rawState) || rawState.length < 2 || !Array.isArray(rawState[0])) continue;
+      const updatedAt = Math.floor(Number(rawState[1]));
+      if (!Number.isSafeInteger(updatedAt) || updatedAt <= 0) continue;
+      const connectedPeerIds = Array.from(new Set(
+        rawState[0].map((value) => this.normalizePeerId(typeof value === "string" ? value : "")).filter((id) => id && id !== peerId && !this.retiredPeerIds.has(id))
+      )).sort();
+      const existing = this.peerTopologyById.get(peerId);
+      if (existing && existing.updatedAt >= updatedAt) continue;
+      this.peerTopologyById.set(peerId, { connectedPeerIds, updatedAt });
+      topologyChanged = true;
+    }
+    if (membershipChanged || capacityChanged || topologyChanged) {
       this.emit("mesh:membership", Array.from(this.globalPeers));
+      if (capacityChanged) this.emit("mesh:capacity", this.getPeerCapacities());
+      if (membershipChanged || topologyChanged) this.emit("mesh:graph", this.getGraphSnapshot());
       this.broadcastMembership(fromPeerId);
       if (this.config.autoConnect) {
         this.maintainPeerConnections();
@@ -3516,9 +4031,12 @@ var PartialMesh = class {
   }
   removeFromGlobalMembership(peerId) {
     const removed = this.globalPeers.delete(peerId);
-    this.peerCapacityById.delete(peerId);
-    if (!removed) return;
+    const removedCapacity = this.peerCapacityById.delete(peerId);
+    const removedTopology = this.peerTopologyById.delete(peerId);
+    if (!removed && !removedCapacity && !removedTopology) return;
     this.emit("mesh:membership", Array.from(this.globalPeers));
+    if (removedCapacity) this.emit("mesh:capacity", this.getPeerCapacities());
+    this.emit("mesh:graph", this.getGraphSnapshot());
     for (const connectedPeerId of this.getConnectedPeers()) {
       if (connectedPeerId !== peerId) {
         this.sendMembership(connectedPeerId);
@@ -3557,6 +4075,7 @@ var PartialMesh = class {
     this.pendingRebalanceDropByTarget.clear();
     this.globalPeers.clear();
     this.peerCapacityById.clear();
+    this.peerTopologyById.clear();
     this.selfAliases.clear();
     this.retiredPeerIds.clear();
     this.clientId = null;
@@ -3576,10 +4095,234 @@ var PartialMesh = class {
     }
   }
 };
+var PeerPigeonNode = class {
+  constructor(options = {}) {
+    this.storage = null;
+    this.callbacks = {};
+    this.started = false;
+    const { gossip = {}, crypto = {}, storage = false, ...meshOptions } = options;
+    this.mesh = new PartialMesh(meshOptions);
+    this.gossip = new GossipProtocol(this.mesh, gossip);
+    this.storageOptions = storage;
+    if (crypto === false) {
+      this.crypto = null;
+    } else {
+      const networkId = String(meshOptions.networkId ?? meshOptions.sessionId ?? "peerpigeon").trim();
+      const sessionId = String(meshOptions.sessionId ?? "default-session").trim();
+      this.crypto = new PeerPigeonCryptoProtocol(this.mesh, this.gossip, {
+        ...crypto,
+        roomId: String(crypto.roomId ?? `${networkId}:${sessionId}`).trim()
+      });
+    }
+    this.bindComponentEvents();
+  }
+  async init() {
+    return await this.start();
+  }
+  async start() {
+    if (this.started) return;
+    this.started = true;
+    try {
+      if (this.crypto) await this.crypto.init();
+      if (this.storageOptions !== false) {
+        const userId = String(
+          this.storageOptions.userId ?? (this.crypto ? this.crypto.getKeyPair().epub : "")
+        ).trim();
+        if (!userId) throw new Error("storage.userId is required when crypto is disabled");
+        const { userId: _ignoredUserId, ...storageOptions } = this.storageOptions;
+        const config = this.mesh.getConfig();
+        this.storage = new PeerPigeonStorage({
+          ...storageOptions,
+          userId,
+          peerId: this.mesh.getClientId() ?? "",
+          sessionId: storageOptions.sessionId ?? `${config.networkId}:${config.sessionId}`,
+          gossip: this.gossip
+        });
+        await this.storage.init();
+      }
+      await this.mesh.init();
+    } catch (error) {
+      this.started = false;
+      throw error;
+    }
+  }
+  getConfig() {
+    return this.mesh.getConfig();
+  }
+  updateConfig(patch) {
+    return this.mesh.updateConfig(patch);
+  }
+  getGraphSnapshot() {
+    return this.mesh.getGraphSnapshot();
+  }
+  getPeerCapacity(peerId) {
+    return this.mesh.getPeerCapacity(peerId);
+  }
+  getPeerCapacities() {
+    return this.mesh.getPeerCapacities();
+  }
+  getClientId() {
+    return this.mesh.getClientId();
+  }
+  getConnectedPeers() {
+    return this.mesh.getConnectedPeers();
+  }
+  getDiscoveredPeers() {
+    return this.mesh.getDiscoveredPeers();
+  }
+  getGlobalPeers() {
+    return this.mesh.getGlobalPeers();
+  }
+  broadcast(data, metadata = {}, options = {}) {
+    return this.gossip.broadcast(data, metadata, options);
+  }
+  broadcastReliable(data, metadata = {}, options = {}) {
+    return this.gossip.broadcastReliable(data, metadata, options);
+  }
+  sendDirect(peerId, data) {
+    return this.gossip.sendDirect(peerId, data);
+  }
+  getDeliveryStatus(messageId) {
+    return this.gossip.getDeliveryStatus(messageId);
+  }
+  async broadcastEncrypted(plaintext, metadata = {}, options = {}) {
+    if (!this.crypto) throw new Error("Crypto is disabled for this node");
+    return await this.crypto.broadcastEncrypted(plaintext, metadata, options);
+  }
+  async broadcastEncryptedReliable(plaintext, metadata = {}, options = {}) {
+    return await this.broadcastEncrypted(plaintext, metadata, { ...options, trackDelivery: true });
+  }
+  async sendEncryptedDirect(peerId, plaintext, timeoutMs) {
+    if (!this.crypto) throw new Error("Crypto is disabled for this node");
+    return await this.crypto.sendEncryptedDirect(peerId, plaintext, timeoutMs);
+  }
+  getKeyPair() {
+    if (!this.crypto) throw new Error("Crypto is disabled for this node");
+    return this.crypto.getKeyPair();
+  }
+  getPublicKey(peerId) {
+    return this.crypto?.getPublicKey(peerId) ?? null;
+  }
+  getKnownPeerKeys() {
+    return this.crypto?.getKnownPeerKeys() ?? [];
+  }
+  requestPeerKey(peerId) {
+    if (!this.crypto) throw new Error("Crypto is disabled for this node");
+    this.crypto.requestPeerKey(peerId);
+  }
+  waitForPeerKey(peerId, timeoutMs) {
+    if (!this.crypto) return Promise.reject(new Error("Crypto is disabled for this node"));
+    return timeoutMs === void 0 ? this.crypto.waitForPeerKey(peerId) : this.crypto.waitForPeerKey(peerId, timeoutMs);
+  }
+  recoverAfterInactivity(reason) {
+    this.mesh.recoverAfterInactivity(reason);
+  }
+  on(event, callback) {
+    const callbacks = this.callbacks[event];
+    if (callbacks) callbacks.add(callback);
+    else this.callbacks[event] = /* @__PURE__ */ new Set([callback]);
+  }
+  off(event, callback) {
+    this.callbacks[event]?.delete(callback);
+  }
+  async destroy() {
+    if (this.storage) await this.storage.close();
+    this.storage = null;
+    this.crypto?.destroy();
+    this.gossip.destroy();
+    this.mesh.destroy();
+    this.started = false;
+    for (const callbacks of Object.values(this.callbacks)) callbacks?.clear();
+  }
+  bindComponentEvents() {
+    this.mesh.on("mesh:ready", () => this.emit("ready", void 0));
+    this.mesh.on("peer:connected", (peerId) => this.emit("peerConnected", peerId));
+    this.mesh.on("peer:disconnected", (peerId) => this.emit("peerDisconnected", peerId));
+    this.mesh.on("mesh:graph", (snapshot) => this.emit("graphChanged", snapshot));
+    this.mesh.on("mesh:capacity", (capacities) => this.emit("capacityChanged", capacities));
+    this.mesh.on("signaling:connected", ({ clientId }) => this.storage?.setPeerId(clientId));
+    this.mesh.on("signaling:error", (error) => this.emitError(error));
+    this.mesh.on("peer:error", ({ error }) => this.emitError(error));
+    this.gossip.on("messageReceived", ({ message, local, fromPeer }) => {
+      if (this.isReservedPayload(message.data)) return;
+      this.emit("message", {
+        kind: "broadcast",
+        data: message.data,
+        encrypted: false,
+        local,
+        fromPeerId: fromPeer ?? message.sender,
+        messageId: message.id,
+        hops: message.hops,
+        message
+      });
+    });
+    this.gossip.on("directMessageReceived", ({ message }) => {
+      if (this.isReservedPayload(message.data)) return;
+      this.emit("message", {
+        kind: "direct",
+        data: message.data,
+        encrypted: false,
+        local: false,
+        fromPeerId: message.from,
+        messageId: message.id,
+        hops: message.hops,
+        message
+      });
+    });
+    this.gossip.on("deliveryProgress", (status) => this.emit("deliveryProgress", status));
+    this.gossip.on("deliveryComplete", (status) => this.emit("deliveryComplete", status));
+    this.gossip.on("deliveryTimeout", (status) => this.emit("deliveryTimeout", status));
+    this.crypto?.on("keyDiscovered", (key) => this.emit("keyDiscovered", key));
+    this.crypto?.on("encryptedBroadcastReceived", ({ plaintext, message, local, fromPeer }) => {
+      this.emit("message", {
+        kind: "broadcast",
+        data: plaintext,
+        encrypted: true,
+        local,
+        fromPeerId: fromPeer ?? message.sender,
+        messageId: message.id,
+        hops: message.hops,
+        message
+      });
+    });
+    this.crypto?.on("encryptedDirectReceived", ({ plaintext, message }) => {
+      this.emit("message", {
+        kind: "direct",
+        data: plaintext,
+        encrypted: true,
+        local: false,
+        fromPeerId: message.from,
+        messageId: message.id,
+        hops: message.hops,
+        message
+      });
+    });
+    this.crypto?.on("error", (error) => this.emitError(error));
+  }
+  isReservedPayload(data) {
+    if (PeerPigeonCryptoProtocol.isProtocolPayload(data)) return true;
+    if (!data || typeof data !== "object") return false;
+    const type = data.__ppType;
+    return typeof type === "string" && type.startsWith("pp-storage-");
+  }
+  emitError(error) {
+    this.emit("error", error instanceof Error ? error : new Error(String(error)));
+  }
+  emit(event, data) {
+    for (const callback of this.callbacks[event] ?? []) {
+      try {
+        callback(data);
+      } catch {
+      }
+    }
+  }
+};
 var index_default = PartialMesh;
 // Annotate the CommonJS export names for ESM import in node:
 0 && (module.exports = {
   GossipProtocol,
   PartialMesh,
+  PeerPigeonCryptoProtocol,
+  PeerPigeonNode,
   PeerPigeonStorage
 });
