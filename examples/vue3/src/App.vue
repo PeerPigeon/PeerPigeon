@@ -529,6 +529,7 @@
 import { PartialMesh } from 'peerpigeon';
 import { GossipProtocol } from 'peerpigeon';
 import { PeerPigeonStorage } from 'peerpigeon';
+import { PeerPigeonCryptoProtocol } from 'peerpigeon';
 import { generateRandomPair, encryptMessageWithMeta, decryptMessageWithMeta } from 'unsea';
 import * as d3 from 'd3';
 import {
@@ -583,7 +584,6 @@ const MESH_PEERS_STORAGE_KEY = 'mesh:peers';
 const MESH_PEERS_STORAGE_SPACE = 'epublic';
 const MESH_PEERS_HEARTBEAT_MS = 12_000;
 const MESH_PEERS_STALE_AFTER_MS = MESH_PEERS_HEARTBEAT_MS * 6;
-const MESH_PEERS_MAX_SNAPSHOTS = 80;
 const DEBUG_MONITOR_INTERVAL_MS = 1000;
 const DEBUG_MONITOR_PEER_LOG_MIN_GAP_MS = 2500;
 const STORAGE_PEER_SCOPE_SESSION_KEY = 'peerpigeon:storage-peer-scope:v1';
@@ -634,6 +634,7 @@ export default {
       mesh: null,
       icons: APP_ICONS,
       gossip: null,
+      cryptoProtocol: null,
       isRunning: false,
       isConnecting: false,
       signalingConnected: false,
@@ -703,6 +704,7 @@ export default {
       graphUpdateTimer: null,
       meshConnectWarnTimer: null,
       graphLastSignature: '',
+      networkGraphRevision: 0,
       networkGraphState: null,
       networkGraphActivityByPeer: {},
       networkGraphResizeHandler: null,
@@ -829,6 +831,7 @@ export default {
       void this.connectedPeersList.join('|');
       void this.discoveredPeersList.join('|');
       void this.globalPeersList.join('|');
+      void this.networkGraphRevision;
       return this.networkGraphData();
     },
 
@@ -1720,16 +1723,6 @@ export default {
         };
       }
 
-      const entries = Object.entries(out);
-      if (entries.length > MESH_PEERS_MAX_SNAPSHOTS) {
-        entries
-          .sort((a, b) => Number(b[1]?.updatedAt || 0) - Number(a[1]?.updatedAt || 0))
-          .slice(MESH_PEERS_MAX_SNAPSHOTS)
-          .forEach(([id]) => {
-            delete out[id];
-          });
-      }
-
       return out;
     },
 
@@ -2285,6 +2278,10 @@ export default {
           if (!this.goWasmHandlers[name]) return;
           this.goWasmHandlers[name].add(fn);
         },
+        off: (name, fn) => {
+          if (!this.goWasmHandlers[name]) return;
+          this.goWasmHandlers[name].delete(fn);
+        },
         broadcast: (data, metadata, options) => {
           return this.callGoWasm('peerpigeonBroadcast', this.goWasmNodeId, data, metadata || null, options || null);
         },
@@ -2440,6 +2437,38 @@ export default {
           this.gossip = new GossipProtocol(this.mesh);
         }
 
+        this.cryptoProtocol = new PeerPigeonCryptoProtocol(this.mesh, this.gossip, {
+          roomId: this.effectiveSessionId,
+          keyPair: this.cryptoKeys,
+          persistKeyPair: false,
+          // The demo owns the visible announce cadence; the protocol still
+          // handles discovery requests and connection-triggered exchange.
+          announceIntervalMs: 0,
+        });
+        this.cryptoProtocol.on('keyDiscovered', (key) => {
+          this.upsertRemoteCryptoInfo(key.peerId, key);
+        });
+        this.cryptoProtocol.on('encryptedBroadcastReceived', ({ plaintext, message, local, fromPeer }) => {
+          if (local) return;
+          const sourcePeer = String(fromPeer || message?.sender || 'peer');
+          this.messagesSeen++;
+          const hopLabel = message.hops === 1 ? 'hop' : 'hops';
+          this.addLog('received', `[${message.hops} ${hopLabel}] ${plaintext}`, sourcePeer.slice(0, 6), message.hops, false, {
+            icon: 'received',
+          });
+          if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+        });
+        this.cryptoProtocol.on('encryptedDirectReceived', ({ plaintext, message }) => {
+          this.messagesSeen++;
+          this.addLog('received', `[DM] ${plaintext}`, String(message.from || 'peer'), 0, false, {
+            direct: true,
+            icon: 'directReceive',
+          });
+          this.saveUiState();
+          if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+        });
+        await this.cryptoProtocol.init();
+
         if (this.activeTab === 'storage') {
           this.ensureStorageReady({ fastPath: true }).catch(() => {
             // best-effort: signaling lifecycle will retry initialization
@@ -2542,6 +2571,11 @@ export default {
           this.updateStats();
         });
 
+        this.mesh.on('mesh:graph', () => {
+          this.networkGraphRevision += 1;
+          this.scheduleNetworkGraphRender({ reason: 'mesh:graph' });
+        });
+
         this.mesh.on('mesh:ready', () => {
           this.addLog('info', 'Gossip reached ready state', 'System');
           this.requestInterestedKeySync('mesh-ready');
@@ -2622,6 +2656,10 @@ export default {
       this.teardownStorage();
       const stoppedMesh = this.mesh;
       const stoppedGossip = this.gossip;
+      if (this.cryptoProtocol) {
+        this.cryptoProtocol.destroy();
+        this.cryptoProtocol = null;
+      }
       if (this.mesh) {
         this.mesh.destroy();
         this.mesh = null;
@@ -2769,6 +2807,10 @@ export default {
     },
 
     announceCryptoPublicInfo() {
+      if (this.cryptoProtocol) {
+        this.cryptoProtocol.announcePublicKey();
+        return;
+      }
       if (!this.gossip || !this.localPublicCryptoInfo) return;
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
       if (!self) return;
@@ -2877,6 +2919,10 @@ export default {
     },
 
     requestCryptoPublicInfo(targetPeerId) {
+      if (this.cryptoProtocol) {
+        this.cryptoProtocol.requestPeerKey(targetPeerId);
+        return;
+      }
       if (!this.gossip) return;
 
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
@@ -2972,6 +3018,9 @@ export default {
     },
 
     async encryptBroadcastForRoom(plaintext) {
+      if (this.cryptoProtocol) {
+        return await this.cryptoProtocol.encryptRoom(String(plaintext));
+      }
       const key = await this.deriveRoomBroadcastKey();
       const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
       const plainBytes = new TextEncoder().encode(String(plaintext));
@@ -2989,6 +3038,9 @@ export default {
     },
 
     async decryptBroadcastFromRoom(roomCipher) {
+      if (this.cryptoProtocol) {
+        return await this.cryptoProtocol.decryptRoom(roomCipher);
+      }
       if (!roomCipher || typeof roomCipher !== 'object') {
         throw new Error('Missing room cipher payload');
       }
@@ -3004,6 +3056,9 @@ export default {
     },
 
     async buildEncryptedBroadcastPayload(plaintext) {
+      if (this.cryptoProtocol) {
+        return await this.cryptoProtocol.createEncryptedBroadcast(String(plaintext));
+      }
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
       const roomCipher = await this.encryptBroadcastForRoom(String(plaintext));
 
@@ -3016,6 +3071,9 @@ export default {
     },
 
     async buildEncryptedDirectPayload(targetPeerId, plaintext) {
+      if (this.cryptoProtocol) {
+        return await this.cryptoProtocol.createEncryptedDirect(targetPeerId, String(plaintext));
+      }
       if (!this.localPublicCryptoInfo || !this.localPrivateCryptoInfo) {
         throw new Error('Local crypto keys are not ready yet');
       }
@@ -3068,6 +3126,7 @@ export default {
       }
 
       if (this.isCryptoPublicInfoPayload(payload)) {
+        if (this.cryptoProtocol) return;
         const from = String(payload.from || sourcePeer || '').trim();
         if (from) {
           this.upsertRemoteCryptoInfo(from, payload);
@@ -3076,6 +3135,7 @@ export default {
       }
 
       if (this.isCryptoPublicRequestPayload(payload)) {
+        if (this.cryptoProtocol) return;
         const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
         const target = String(payload.to || '').trim();
         const requester = String(payload.from || '').trim();
@@ -3098,6 +3158,7 @@ export default {
       }
 
       if (this.isEncryptedBroadcastPayload(payload)) {
+        if (this.cryptoProtocol) return;
         // Sender already logs local broadcast on send(); only decrypt remote deliveries.
         if (local) return;
 
@@ -3149,6 +3210,7 @@ export default {
       const payload = normalizeMessagePayload(message?.data);
 
       if (this.isCryptoPublicInfoPayload(payload)) {
+        if (this.cryptoProtocol) return;
         const sender = String(payload.from || from || '').trim();
         if (sender) {
           this.upsertRemoteCryptoInfo(sender, payload);
@@ -3157,6 +3219,7 @@ export default {
       }
 
       if (this.isCryptoPublicRequestPayload(payload)) {
+        if (this.cryptoProtocol) return;
         const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
         const target = String(payload.to || '').trim();
         const requester = String(payload.from || from || '').trim();
@@ -3179,7 +3242,10 @@ export default {
       }
 
       if (this.isEncryptedDirectPayload(payload)) {
-        const decrypted = await this.decryptCipherText(payload.cipher);
+        if (this.cryptoProtocol) return;
+        const decrypted = this.cryptoProtocol
+          ? await this.cryptoProtocol.decryptEncryptedDirect(payload)
+          : await this.decryptCipherText(payload.cipher);
         this.messagesSeen++;
         this.addLog('received', `[DM] ${decrypted}`, from, 0, false, {
           direct: true,
@@ -3277,6 +3343,29 @@ export default {
 
     networkGraphData() {
       const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      const publicGraph = this.mesh?.getGraphSnapshot?.();
+      if (publicGraph && Array.isArray(publicGraph.nodes) && publicGraph.nodes.length > 0) {
+        const localConnectedSet = new Set(
+          (this.connectedPeersList || []).map((peerId) => String(peerId || '').trim()).filter(Boolean)
+        );
+        const tolerantPeerIds = this.networkTolerantPeerIds(this.connectedPeersList || []);
+        const nodes = publicGraph.nodes.map((node) => ({
+          id: node.peerId,
+          short: node.peerId.slice(0, 4).toUpperCase(),
+          isSelf: Boolean(node.local),
+          isDirect: localConnectedSet.has(node.peerId),
+          isTolerant: tolerantPeerIds.has(node.peerId),
+          hue: this.networkNodeHue(node.peerId),
+          capacity: node.capacity,
+        }));
+        const links = publicGraph.edges.map((edge) => ({
+          source: edge.source,
+          target: edge.target,
+          direct: Boolean(edge.direct),
+        }));
+        return { nodes, links };
+      }
+
       const edgeMap = new Map();
       const activePeerIds = this.activeMeshPeerIds();
       const participants = new Set(activePeerIds);

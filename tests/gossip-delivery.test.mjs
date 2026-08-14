@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GossipProtocol, PartialMesh } from '../dist/index.js';
+import {
+  GossipProtocol,
+  PartialMesh,
+  PeerPigeonCryptoProtocol,
+  PeerPigeonNode,
+} from '../dist/index.js';
+import { generateRandomPair } from 'unsea';
 import {
   isInternalChatText,
   isInternalMessagePayload,
@@ -295,5 +301,184 @@ test('tolerant peers never raises the retained degree above maxPeers', () => {
     assert.equal(mesh.getConnectedPeers().includes('newest'), false);
   } finally {
     mesh.destroy();
+  }
+});
+
+test('mesh exposes capacity, slots, graph edges, and runtime configuration', () => {
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    tolerantPeers: 0,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  try {
+    const now = Date.now();
+    mesh.clientId = 'self';
+    mesh.selfAliases.add('self');
+    mesh.peers.set('a', { id: 'a', connected: true, initiator: false });
+    mesh.mergeMembership(
+      ['a', 'b'],
+      [],
+      { a: [2, 1, now], b: [20, 1, now] },
+      { a: [['self', 'b'], now], b: [['a'], now] },
+      'a',
+    );
+
+    assert.equal(mesh.getPeerCapacity('a').availableSlots, 1);
+    assert.equal(mesh.getPeerCapacity('b').availableSlots, 19);
+    assert.equal(mesh.getPeerCapacity('self').availableSlots, 1);
+
+    const graph = mesh.getGraphSnapshot();
+    assert.deepEqual(graph.nodes.map((node) => node.peerId), ['a', 'b', 'self']);
+    assert.deepEqual(graph.edges.map((edge) => [edge.source, edge.target]), [['a', 'b'], ['a', 'self']]);
+    assert.equal(graph.complete, true);
+
+    const updated = mesh.updateConfig({ maxPeers: 3, tolerantPeers: 2 });
+    assert.equal(updated.maxPeers, 3);
+    assert.equal(updated.tolerantPeers, 2);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('tolerantPeers is a real temporary connected-plus-pending overflow budget', () => {
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    tolerantPeers: 0,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  try {
+    mesh.clientId = '00';
+    mesh.selfAliases.add('00');
+    mesh.discoveredPeers.add('ff');
+    mesh.peers.set('01', { id: '01', connected: true, initiator: false });
+    mesh.peers.set('02', { id: '02', connected: true, initiator: false });
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      initiateConnection: () => new Promise(() => {}),
+      closeConnection() {},
+      disconnect() {},
+      client: { mesh: { connections: new Map() } },
+    };
+
+    mesh.connectToPeerInternal('ff', true);
+    assert.equal(mesh.connecting.has('ff'), false);
+
+    mesh.updateConfig({ tolerantPeers: 1 });
+    mesh.connectToPeerInternal('ff', true);
+    assert.equal(mesh.connecting.has('ff'), true);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+class CryptoTestMesh {
+  constructor(id) {
+    this.id = id;
+    this.connected = [];
+    this.handlers = new Map();
+  }
+  on(event, handler) {
+    const handlers = this.handlers.get(event) ?? new Set();
+    handlers.add(handler);
+    this.handlers.set(event, handlers);
+  }
+  off(event, handler) { this.handlers.get(event)?.delete(handler); }
+  getClientId() { return this.id; }
+  getConnectedPeers() { return [...this.connected]; }
+}
+
+class CryptoTestNetwork {
+  constructor(ids) {
+    this.gossips = new Map(ids.map((id) => [id, new CryptoTestGossip(id, this)]));
+  }
+}
+
+class CryptoTestGossip {
+  constructor(id, network) {
+    this.id = id;
+    this.network = network;
+    this.handlers = new Map();
+    this.sequence = 0;
+  }
+  on(event, handler) {
+    const handlers = this.handlers.get(event) ?? new Set();
+    handlers.add(handler);
+    this.handlers.set(event, handlers);
+  }
+  off(event, handler) { this.handlers.get(event)?.delete(handler); }
+  emit(event, value) { for (const handler of this.handlers.get(event) ?? []) handler(value); }
+  broadcast(data, metadata = {}) {
+    const id = `${this.id}-${++this.sequence}`;
+    for (const [peerId, gossip] of this.network.gossips) {
+      gossip.emit('messageReceived', {
+        message: { id, type: 'gossip', sender: this.id, data, metadata, hops: peerId === this.id ? 0 : 1, maxHops: 5, timestamp: Date.now() },
+        local: peerId === this.id,
+        ...(peerId === this.id ? {} : { fromPeer: this.id }),
+      });
+    }
+    return id;
+  }
+  broadcastReliable(data, metadata = {}) { return this.broadcast(data, metadata); }
+  sendDirect(target, data) {
+    const id = `${this.id}-direct-${++this.sequence}`;
+    this.network.gossips.get(target)?.emit('directMessageReceived', {
+      message: { id, type: 'direct', from: this.id, to: target, data, hops: 1, maxHops: 20, timestamp: Date.now() },
+    });
+    return id;
+  }
+}
+
+test('crypto API exposes room/direct encryption and peer key discovery', async () => {
+  const ids = ['alice', 'bob'];
+  const network = new CryptoTestNetwork(ids);
+  const aliceMesh = new CryptoTestMesh('alice');
+  const bobMesh = new CryptoTestMesh('bob');
+  aliceMesh.connected = ['bob'];
+  bobMesh.connected = ['alice'];
+  const alice = new PeerPigeonCryptoProtocol(aliceMesh, network.gossips.get('alice'), {
+    roomId: 'network:room', keyPair: await generateRandomPair(), persistKeyPair: false, announceIntervalMs: 0,
+  });
+  const bob = new PeerPigeonCryptoProtocol(bobMesh, network.gossips.get('bob'), {
+    roomId: 'network:room', keyPair: await generateRandomPair(), persistKeyPair: false, announceIntervalMs: 0,
+  });
+  try {
+    await alice.init();
+    await bob.init();
+    alice.announcePublicKey();
+    assert.equal(alice.getPublicKey('bob')?.peerId, 'bob');
+    assert.equal(bob.getPublicKey('alice')?.peerId, 'alice');
+
+    const roomCipher = await alice.encryptRoom('hello room');
+    assert.equal(await bob.decryptRoom(roomCipher), 'hello room');
+    const direct = await alice.createEncryptedDirect('bob', 'hello bob');
+    assert.equal(await bob.decryptEncryptedDirect(direct), 'hello bob');
+  } finally {
+    alice.destroy();
+    bob.destroy();
+  }
+});
+
+test('PeerPigeonNode provides the unified JS API', async () => {
+  const node = new PeerPigeonNode({
+    minPeers: 1,
+    maxPeers: 2,
+    tolerantPeers: 1,
+    autoDiscover: false,
+    autoConnect: false,
+    crypto: false,
+  });
+  try {
+    assert.equal(node.mesh instanceof PartialMesh, true);
+    assert.equal(node.gossip instanceof GossipProtocol, true);
+    assert.equal(node.getConfig().tolerantPeers, 1);
+    assert.deepEqual(node.getGraphSnapshot().edges, []);
+    assert.deepEqual(node.getPeerCapacities(), []);
+  } finally {
+    await node.destroy();
   }
 });
