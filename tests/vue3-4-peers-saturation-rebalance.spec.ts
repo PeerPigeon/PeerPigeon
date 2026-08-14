@@ -10,7 +10,7 @@ test('4-peer saturation rebalance: a late joiner gets admitted when maxPeers=2',
   const url = `${baseURL}/?autostart=1&maxPeers=2&minPeers=1&tolerantPeers=1&sessionId=${encodeURIComponent(sessionId)}`;
 
   const browser = await chromium.launch({
-    executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    executablePath: (globalThis as any).process?.env?.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
     args: ['--disable-features=WebRtcHideLocalIpsWithMdns']
   });
 
