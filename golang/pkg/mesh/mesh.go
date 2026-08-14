@@ -92,6 +92,12 @@ type peerConn struct {
 	initiator bool
 }
 
+type peerCapacityAdvertisement struct {
+	maxPeers       int
+	connectedPeers int
+	updatedAt      int64
+}
+
 // ── mesh ───────────────────────────────────────────────────────────────────
 
 // Mesh is the PartialMesh Go equivalent.
@@ -105,6 +111,8 @@ type Mesh struct {
 	peers                  map[string]*peerConn
 	discoveredPeers        map[string]struct{}
 	globalPeers            map[string]struct{}
+	peerCapacityByID       map[string]peerCapacityAdvertisement
+	localCapacityUpdatedAt int64
 	connecting             map[string]struct{}
 	connTimers             map[string]*time.Timer
 	connStartedAt          map[string]int64
@@ -141,22 +149,24 @@ type Mesh struct {
 func New(cfg Config) *Mesh {
 	cfg = defaultConfig(cfg)
 	m := &Mesh{
-		cfg:                   cfg,
-		selfAliases:           make(map[string]struct{}),
-		peers:                 make(map[string]*peerConn),
-		discoveredPeers:       make(map[string]struct{}),
-		globalPeers:           make(map[string]struct{}),
-		connecting:            make(map[string]struct{}),
-		connTimers:            make(map[string]*time.Timer),
-		connStartedAt:         make(map[string]int64),
-		peerConnectedAt:       make(map[string]int64),
-		discoveredAt:          make(map[string]int64),
-		dialFailures:          make(map[string]int),
-		dialBackoffUntil:      make(map[string]int64),
-		nonInitFallbackTimers: make(map[string]*time.Timer),
-		rebalanceAttemptAt:    make(map[string]int64),
-		pendingRebalanceDrop:  make(map[string]string),
-		maintenanceDone:       make(chan struct{}),
+		cfg:                    cfg,
+		selfAliases:            make(map[string]struct{}),
+		peers:                  make(map[string]*peerConn),
+		discoveredPeers:        make(map[string]struct{}),
+		globalPeers:            make(map[string]struct{}),
+		peerCapacityByID:       make(map[string]peerCapacityAdvertisement),
+		localCapacityUpdatedAt: nowMs(),
+		connecting:             make(map[string]struct{}),
+		connTimers:             make(map[string]*time.Timer),
+		connStartedAt:          make(map[string]int64),
+		peerConnectedAt:        make(map[string]int64),
+		discoveredAt:           make(map[string]int64),
+		dialFailures:           make(map[string]int),
+		dialBackoffUntil:       make(map[string]int64),
+		nonInitFallbackTimers:  make(map[string]*time.Timer),
+		rebalanceAttemptAt:     make(map[string]int64),
+		pendingRebalanceDrop:   make(map[string]string),
+		maintenanceDone:        make(chan struct{}),
 	}
 	return m
 }
@@ -294,6 +304,7 @@ func (m *Mesh) Init() {
 		m.mu.Lock()
 		m.removeFromGlobalLocked(id)
 		delete(m.discoveredPeers, id)
+		delete(m.peerCapacityByID, id)
 		delete(m.dialFailures, id)
 		delete(m.dialBackoffUntil, id)
 		m.mu.Unlock()
@@ -326,6 +337,7 @@ func (m *Mesh) Init() {
 		delete(m.connStartedAt, id)
 		pc.connected = true
 		m.peerConnectedAt[id] = nowMs()
+		m.noteLocalCapacityChangedLocked()
 		delete(m.connecting, id)
 		delete(m.dialFailures, id)
 		delete(m.dialBackoffUntil, id)
@@ -339,7 +351,7 @@ func (m *Mesh) Init() {
 		m.mu.Unlock()
 
 		m.firePeerConnected(id)
-		m.sendMembership(id)
+		m.broadcastMembership("")
 
 		if dropTarget != "" {
 			m.mu.Lock()
@@ -395,10 +407,14 @@ func (m *Mesh) Init() {
 			delete(m.peerConnectedAt, id)
 			delete(m.connecting, id)
 		}
+		if wasConnected {
+			m.noteLocalCapacityChangedLocked()
+		}
 		m.mu.Unlock()
 
 		if wasConnected {
 			m.firePeerDisconnected(id)
+			m.broadcastMembership("")
 		}
 		if m.cfg.AutoConnect {
 			m.maintainPeerConnections()
@@ -556,6 +572,7 @@ func (m *Mesh) Destroy() {
 	m.peers = make(map[string]*peerConn)
 	m.connecting = make(map[string]struct{})
 	m.discoveredPeers = make(map[string]struct{})
+	m.peerCapacityByID = make(map[string]peerCapacityAdvertisement)
 	m.clientID = ""
 	m.underConnectedSince = 0
 	m.mu.Unlock()
@@ -621,7 +638,6 @@ func (m *Mesh) maintainPeerConnections() {
 			available = append(available, id)
 		}
 	}
-	selfID := m.clientID
 	m.mu.Unlock()
 
 	pickCandidates := func(count int) []string {
@@ -632,41 +648,21 @@ func (m *Mesh) maintainPeerConnections() {
 		if len(source) == 0 || count <= 0 {
 			return nil
 		}
-		// Sort by failure count then ID for deterministic rotation
+		// Give scarce, underfilled peers their slots before high-capacity peers.
 		m.mu.Lock()
 		sorted := make([]string, len(source))
 		copy(sorted, source)
 		sort.Slice(sorted, func(i, j int) bool {
-			fi, fj := m.dialFailures[sorted[i]], m.dialFailures[sorted[j]]
-			if fi != fj {
-				return fi < fj
-			}
-			return sorted[i] < sorted[j]
+			return m.compareDialCandidatesLocked(sorted[i], sorted[j], now) < 0
 		})
 		m.mu.Unlock()
 
-		offset := 0
-		if selfID != "" {
-			var h uint32
-			for _, c := range selfID {
-				h = h*31 + uint32(c)
-			}
-			if len(sorted) > 0 {
-				offset = int(h) % len(sorted)
-			}
-		}
-		var selected []string
 		max := count
 		if max > len(sorted) {
 			max = len(sorted)
 		}
-		for i := 0; i < max; i++ {
-			selected = append(selected, sorted[(offset+i)%len(sorted)])
-		}
-		return selected
+		return append([]string(nil), sorted[:max]...)
 	}
-
-	maxTolerant := m.cfg.MaxPeers + m.cfg.TolerantPeers
 
 	if totalInProgress < m.cfg.MinPeers {
 		needed := m.cfg.MinPeers - totalInProgress
@@ -692,7 +688,7 @@ func (m *Mesh) maintainPeerConnections() {
 				m.connectToPeer(id)
 			}
 		}
-	} else if connCount > maxTolerant {
+	} else if connCount > m.cfg.MaxPeers {
 		m.trimExcessPeers()
 	} else if connCount >= m.cfg.MaxPeers && pendingCount == 0 && len(available) > 0 {
 		m.maybeRebalance(available)
@@ -916,7 +912,7 @@ func (m *Mesh) connectToPeerInternal(peerID string, allowOverflow bool) {
 		delete(m.dialBackoffUntil, normPeer)
 	}
 
-	maxAllowed := m.cfg.MaxPeers + m.cfg.TolerantPeers
+	maxAllowed := m.cfg.MaxPeers
 	if allowOverflow {
 		maxAllowed = m.cfg.MaxPeers + 1
 	}
@@ -986,13 +982,11 @@ func (m *Mesh) connectToPeerInternal(peerID string, allowOverflow bool) {
 			m.mu.Unlock()
 			return
 		}
-		sort.Strings(fallbackTargets)
+		sort.Slice(fallbackTargets, func(i, j int) bool {
+			return m.compareDialCandidatesLocked(fallbackTargets[i], fallbackTargets[j], now) < 0
+		})
 
-		var h uint32
-		for _, c := range selfID {
-			h = h*31 + uint32(c)
-		}
-		selected := fallbackTargets[int(h)%len(fallbackTargets)]
+		selected := fallbackTargets[0]
 		if selected != normPeer {
 			m.mu.Unlock()
 			return
@@ -1096,6 +1090,10 @@ func (m *Mesh) removePeer(peerID string, forgetDiscovered bool) {
 	}
 	if forgetDiscovered {
 		delete(m.discoveredPeers, peerID)
+		delete(m.peerCapacityByID, peerID)
+	}
+	if wasConnected {
+		m.noteLocalCapacityChangedLocked()
 	}
 	sig := m.sig
 	m.mu.Unlock()
@@ -1106,6 +1104,7 @@ func (m *Mesh) removePeer(peerID string, forgetDiscovered bool) {
 
 	if wasConnected {
 		m.firePeerDisconnected(peerID)
+		m.broadcastMembership("")
 	}
 	if m.cfg.AutoConnect {
 		m.maintainPeerConnections()
@@ -1115,7 +1114,9 @@ func (m *Mesh) removePeer(peerID string, forgetDiscovered bool) {
 func (m *Mesh) trimExcessPeers() {
 	m.mu.Lock()
 	connected := m.connectedPeersLocked()
-	overflow := len(connected) - (m.cfg.MaxPeers + m.cfg.TolerantPeers)
+	// MaxPeers is the steady-state target. TolerantPeers must never increase
+	// the retained degree; it is only transient admission headroom.
+	overflow := len(connected) - m.cfg.MaxPeers
 	if overflow <= 0 {
 		m.mu.Unlock()
 		return
@@ -1198,6 +1199,9 @@ func (m *Mesh) maybeRebalance(candidates []string) bool {
 		candByDist = append(candByDist, candDist{id, d, m.discoveredAt[id], m.rebalanceAttemptAt[id]})
 	}
 	sort.Slice(candByDist, func(i, j int) bool {
+		if order := m.compareCapacityPriorityLocked(candByDist[i].id, candByDist[j].id, now); order != 0 {
+			return order < 0
+		}
 		cmp := candByDist[i].dist.Cmp(candByDist[j].dist)
 		if cmp != 0 {
 			return cmp < 0
@@ -1227,11 +1231,13 @@ func (m *Mesh) maybeRebalance(candidates []string) bool {
 		return false
 	}
 
-	// Require candidate to be 25% closer
-	// closest.dist * 4 >= farthest.dist * 3 means NOT close enough
+	// Prefer genuinely closer candidates, but do not exclude late joiners forever
+	// when random peer IDs produce a stable yet closed cluster.
 	lhs := new(big.Int).Mul(closest.dist, big.NewInt(4))
 	rhs := new(big.Int).Mul(farthest.dist, big.NewInt(3))
-	if lhs.Cmp(rhs) >= 0 {
+	materiallyCloser := lhs.Cmp(rhs) < 0
+	staleExcludedCandidate := now-closest.discoveredAt >= 3_000
+	if !materiallyCloser && !staleExcludedCandidate {
 		m.mu.Unlock()
 		return false
 	}
@@ -1255,7 +1261,7 @@ func (m *Mesh) maybeRebalance(candidates []string) bool {
 	m.pendingRebalanceDrop[closest.id] = farthest.id
 	m.mu.Unlock()
 
-	m.fireSignalingLog(fmt.Sprintf("[rebalance] dial closer %s then drop %s", closest.id[:8], farthest.id[:8]))
+	m.fireSignalingLog(fmt.Sprintf("[rebalance] dial priority %s then drop %s", shortID(closest.id), shortID(farthest.id)))
 	m.connectToPeerInternal(closest.id, true)
 	return true
 }
@@ -1265,6 +1271,7 @@ func (m *Mesh) maybeRebalance(candidates []string) bool {
 func (m *Mesh) sendMembership(toPeerID string) {
 	m.mu.Lock()
 	selfID := normID(m.clientID)
+	now := nowMs()
 	all := make(map[string]struct{})
 	for id := range m.globalPeers {
 		all[id] = struct{}{}
@@ -1279,10 +1286,20 @@ func (m *Mesh) sendMembership(toPeerID string) {
 	for id := range all {
 		peers = append(peers, id)
 	}
+	capacities := make(map[string][]int64)
+	for id, state := range m.peerCapacityByID {
+		if _, included := all[id]; !included || now-state.updatedAt > 60_000 {
+			continue
+		}
+		capacities[id] = []int64{int64(state.maxPeers), int64(state.connectedPeers), state.updatedAt}
+	}
+	if selfID != "" {
+		capacities[selfID] = []int64{int64(m.cfg.MaxPeers), int64(m.connectedCountLocked()), m.localCapacityUpdatedAt}
+	}
 	sig := m.sig
 	m.mu.Unlock()
 
-	payload := map[string]interface{}{"__membership": true, "peers": peers}
+	payload := membershipMsg{Membership: true, Peers: peers, Capacities: capacities}
 	data, err := json.Marshal(payload)
 	if err != nil || sig == nil {
 		return
@@ -1290,9 +1307,21 @@ func (m *Mesh) sendMembership(toPeerID string) {
 	_ = sig.Send(toPeerID, data)
 }
 
+func (m *Mesh) broadcastMembership(exceptPeerID string) {
+	m.mu.Lock()
+	peers := m.connectedPeersLocked()
+	m.mu.Unlock()
+	for _, id := range peers {
+		if id != exceptPeerID {
+			m.sendMembership(id)
+		}
+	}
+}
+
 type membershipMsg struct {
-	Membership bool     `json:"__membership"`
-	Peers      []string `json:"peers"`
+	Membership bool               `json:"__membership"`
+	Peers      []string           `json:"peers"`
+	Capacities map[string][]int64 `json:"capacities,omitempty"`
 }
 
 func tryParseMembership(data []byte) *membershipMsg {
@@ -1308,7 +1337,8 @@ func tryParseMembership(data []byte) *membershipMsg {
 
 func (m *Mesh) mergeMembership(msg *membershipMsg, fromPeerID string) {
 	m.mu.Lock()
-	var changed bool
+	var membershipChanged bool
+	var capacityChanged bool
 	for _, raw := range msg.Peers {
 		id := normID(raw)
 		if id == "" || m.isSelfAliasLocked(id) {
@@ -1316,32 +1346,50 @@ func (m *Mesh) mergeMembership(msg *membershipMsg, fromPeerID string) {
 		}
 		if _, has := m.globalPeers[id]; !has {
 			m.globalPeers[id] = struct{}{}
-			changed = true
+			membershipChanged = true
 			m.addDiscoveredLocked(id)
 		}
+	}
+	for rawPeerID, rawState := range msg.Capacities {
+		peerID := normID(rawPeerID)
+		if peerID == "" || m.isSelfAliasLocked(peerID) || len(rawState) < 3 {
+			continue
+		}
+		maxPeers := rawState[0]
+		connectedPeers := rawState[1]
+		updatedAt := rawState[2]
+		if maxPeers < 1 || maxPeers > 4096 || connectedPeers < 0 || connectedPeers > 4096 || updatedAt <= 0 {
+			continue
+		}
+		existing, hasExisting := m.peerCapacityByID[peerID]
+		if hasExisting && existing.updatedAt >= updatedAt {
+			continue
+		}
+		m.peerCapacityByID[peerID] = peerCapacityAdvertisement{
+			maxPeers:       int(maxPeers),
+			connectedPeers: int(connectedPeers),
+			updatedAt:      updatedAt,
+		}
+		capacityChanged = true
 	}
 	var global []string
 	for id := range m.globalPeers {
 		global = append(global, id)
 	}
-	connPeers := m.connectedPeersLocked()
 	m.mu.Unlock()
 
-	if !changed {
+	if !membershipChanged && !capacityChanged {
 		return
 	}
 	m.fireMeshMembership(global)
-	for _, id := range connPeers {
-		if id != fromPeerID {
-			m.sendMembership(id)
-		}
-	}
+	m.broadcastMembership(normID(fromPeerID))
 	if m.cfg.AutoConnect {
 		m.maintainPeerConnections()
 	}
 }
 
 func (m *Mesh) removeFromGlobalLocked(peerID string) {
+	delete(m.peerCapacityByID, peerID)
 	if _, removed := m.globalPeers[peerID]; !removed {
 		return
 	}
@@ -1397,6 +1445,80 @@ func (m *Mesh) pendingCountLocked() int {
 	return len(pending)
 }
 
+func (m *Mesh) noteLocalCapacityChangedLocked() {
+	now := nowMs()
+	if now <= m.localCapacityUpdatedAt {
+		now = m.localCapacityUpdatedAt + 1
+	}
+	m.localCapacityUpdatedAt = now
+}
+
+func (m *Mesh) freshPeerCapacityLocked(peerID string, now int64) (peerCapacityAdvertisement, bool) {
+	state, ok := m.peerCapacityByID[peerID]
+	if !ok || now-state.updatedAt > 60_000 {
+		return peerCapacityAdvertisement{}, false
+	}
+	return state, true
+}
+
+// compareCapacityPriorityLocked orders known underfilled peers first, with
+// lower-capacity peers ahead of high-capacity peers. Unknown peers remain
+// eligible and known-full peers sort last.
+func (m *Mesh) compareCapacityPriorityLocked(a, b string, now int64) int {
+	capacityA, knownA := m.freshPeerCapacityLocked(a, now)
+	capacityB, knownB := m.freshPeerCapacityLocked(b, now)
+	bucket := func(capacity peerCapacityAdvertisement, known bool) int {
+		if !known {
+			return 1
+		}
+		if capacity.connectedPeers < capacity.maxPeers {
+			return 0
+		}
+		return 2
+	}
+	bucketA := bucket(capacityA, knownA)
+	bucketB := bucket(capacityB, knownB)
+	if bucketA != bucketB {
+		return bucketA - bucketB
+	}
+	if bucketA == 0 && knownA && knownB {
+		if capacityA.maxPeers != capacityB.maxPeers {
+			return capacityA.maxPeers - capacityB.maxPeers
+		}
+		remainingA := capacityA.maxPeers - capacityA.connectedPeers
+		remainingB := capacityB.maxPeers - capacityB.connectedPeers
+		if remainingA != remainingB {
+			return remainingA - remainingB
+		}
+	}
+	return 0
+}
+
+func (m *Mesh) compareDialCandidatesLocked(a, b string, now int64) int {
+	if order := m.compareCapacityPriorityLocked(a, b, now); order != 0 {
+		return order
+	}
+	if m.dialFailures[a] != m.dialFailures[b] {
+		return m.dialFailures[a] - m.dialFailures[b]
+	}
+	if m.discoveredAt[a] != m.discoveredAt[b] {
+		if m.discoveredAt[a] < m.discoveredAt[b] {
+			return -1
+		}
+		return 1
+	}
+	selfID := normID(m.clientID)
+	scoreA := hashID(selfID + ":" + a)
+	scoreB := hashID(selfID + ":" + b)
+	if scoreA < scoreB {
+		return -1
+	}
+	if scoreA > scoreB {
+		return 1
+	}
+	return strings.Compare(a, b)
+}
+
 func (m *Mesh) addSelfAliasLocked(id string) {
 	id = normID(id)
 	if id == "" {
@@ -1405,6 +1527,7 @@ func (m *Mesh) addSelfAliasLocked(id string) {
 	m.selfAliases[id] = struct{}{}
 	delete(m.discoveredPeers, id)
 	delete(m.globalPeers, id)
+	delete(m.peerCapacityByID, id)
 }
 
 func (m *Mesh) isSelfAliasLocked(id string) bool {
@@ -1565,6 +1688,13 @@ func hashID(s string) uint32 {
 }
 
 func nowMs() int64 { return time.Now().UnixMilli() }
+
+func shortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
 
 func normID(s string) string { return strings.TrimSpace(s) }
 

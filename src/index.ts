@@ -91,6 +91,12 @@ export interface PeerConnection {
   initiator: boolean;
 }
 
+type PeerCapacityAdvertisement = {
+  maxPeers: number;
+  connectedPeers: number;
+  updatedAt: number;
+};
+
 export type PartialMeshEvents = {
   'signaling:connected': (data: { clientId: string; rawClientId?: string }) => void;
   'signaling:disconnected': () => void;
@@ -137,6 +143,9 @@ export class PartialMesh {
   private pendingRebalanceDropByTarget: Map<string, string> = new Map();
   /** Converged global peer membership — populated via in-band membership gossip. */
   private globalPeers: Set<string> = new Set();
+  /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
+  private peerCapacityById: Map<string, PeerCapacityAdvertisement> = new Map();
+  private localCapacityUpdatedAtMs: number = Date.now();
 
   constructor(config: PartialMeshConfig = {}) {
     this.config = {
@@ -266,6 +275,7 @@ export class PartialMesh {
     this.selfAliases.add(id);
     const removedDiscovered = this.discoveredPeers.delete(id);
     const removedGlobal = this.globalPeers.delete(id);
+    this.peerCapacityById.delete(id);
     const changed = removedDiscovered || removedGlobal;
     this.discoveredAtMs.delete(id);
     this.dialFailureCount.delete(id);
@@ -312,14 +322,60 @@ export class PartialMesh {
     return pending.size;
   }
 
-  private getMaxPeersWithTolerance(): number {
-    const tolerance = Math.max(0, Math.floor(this.config.tolerantPeers));
-    return this.config.maxPeers + tolerance;
+  private noteLocalCapacityChanged(): void {
+    this.localCapacityUpdatedAtMs = Math.max(Date.now(), this.localCapacityUpdatedAtMs + 1);
+  }
+
+  private freshPeerCapacity(peerId: string): PeerCapacityAdvertisement | null {
+    const state = this.peerCapacityById.get(peerId);
+    if (!state || Date.now() - state.updatedAt > 60_000) return null;
+    return state;
+  }
+
+  /**
+   * Known underfilled peers sort first, with lower-capacity peers ahead of
+   * high-capacity peers. Unknown peers remain eligible; known-full peers sort last.
+   */
+  private compareCapacityPriority(a: string, b: string): number {
+    const capacityA = this.freshPeerCapacity(a);
+    const capacityB = this.freshPeerCapacity(b);
+    const bucket = (capacity: PeerCapacityAdvertisement | null): number => {
+      if (!capacity) return 1;
+      return capacity.connectedPeers < capacity.maxPeers ? 0 : 2;
+    };
+    const bucketA = bucket(capacityA);
+    const bucketB = bucket(capacityB);
+    if (bucketA !== bucketB) return bucketA - bucketB;
+    if (bucketA === 0 && capacityA && capacityB) {
+      if (capacityA.maxPeers !== capacityB.maxPeers) return capacityA.maxPeers - capacityB.maxPeers;
+      const remainingA = capacityA.maxPeers - capacityA.connectedPeers;
+      const remainingB = capacityB.maxPeers - capacityB.connectedPeers;
+      if (remainingA !== remainingB) return remainingA - remainingB;
+    }
+    return 0;
+  }
+
+  private compareDialCandidates(a: string, b: string): number {
+    const capacityOrder = this.compareCapacityPriority(a, b);
+    if (capacityOrder !== 0) return capacityOrder;
+    const failA = this.dialFailureCount.get(a) ?? 0;
+    const failB = this.dialFailureCount.get(b) ?? 0;
+    if (failA !== failB) return failA - failB;
+    const discoveredA = this.discoveredAtMs.get(a) ?? 0;
+    const discoveredB = this.discoveredAtMs.get(b) ?? 0;
+    if (discoveredA !== discoveredB) return discoveredA - discoveredB;
+    const self = this.normalizePeerId(this.clientId);
+    const scoreA = this.fastIdHash(`${self}:${a}`);
+    const scoreB = this.fastIdHash(`${self}:${b}`);
+    if (scoreA !== scoreB) return scoreA - scoreB;
+    return a.localeCompare(b);
   }
 
   private trimExcessPeers(): void {
     const connectedPeers = this.getConnectedPeers();
-    const overflow = connectedPeers.length - this.getMaxPeersWithTolerance();
+    // maxPeers is the steady-state target. tolerantPeers must never increase
+    // the displayed/retained degree; it is only transient admission headroom.
+    const overflow = connectedPeers.length - this.config.maxPeers;
     if (overflow <= 0) return;
 
     // Pause proactive expansion briefly so we do not oscillate around maxPeers.
@@ -431,7 +487,11 @@ export class PartialMesh {
         discoveredAt: this.discoveredAtMs.get(peerId) ?? 0,
         lastAttemptAt: this.rebalanceAttemptAtMs.get(peerId) ?? 0
       }))
-      .sort((a, b) => (a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId)));
+      .sort((a, b) => {
+        const capacityOrder = this.compareCapacityPriority(a.peerId, b.peerId);
+        if (capacityOrder !== 0) return capacityOrder;
+        return a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId);
+      });
 
     const farthestConnected = connectedByDistance[connectedByDistance.length - 1];
     const closestCandidate = candidateByDistance.find((candidate) => {
@@ -480,7 +540,7 @@ export class PartialMesh {
     this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now);
     this.pendingRebalanceDropByTarget.set(closestCandidate.peerId, farthestConnected.peerId);
     this.emit('signaling:log', {
-      message: `[rebalance] dial closer ${closestCandidate.peerId.slice(0, 8)} then drop ${farthestConnected.peerId.slice(0, 8)}`
+      message: `[rebalance] dial priority ${closestCandidate.peerId.slice(0, 8)} then drop ${farthestConnected.peerId.slice(0, 8)}`
     });
 
     this.connectToPeerInternal(closestCandidate.peerId, true);
@@ -598,6 +658,7 @@ export class PartialMesh {
       this.peerConnectedAtMs.set(peerId, Date.now());
       this.connecting.delete(peerId);
       this.noteDialSuccess(peerId);
+      this.noteLocalCapacityChanged();
       const fallbackTimer = this.nonInitiatorFallbackTimers.get(peerId);
       if (fallbackTimer) {
         clearTimeout(fallbackTimer);
@@ -626,8 +687,9 @@ export class PartialMesh {
         this.emit('mesh:ready');
       }
 
-      // Announce our current global peer knowledge to the new peer
-      this.sendMembership(peerId);
+      // Announce the new local degree to every neighbor so scarce-slot
+      // prioritization converges across the network.
+      this.broadcastMembership();
     });
 
     this.signalingClient.on('rtc:disconnected', (data: { peerId: string }) => {
@@ -657,7 +719,9 @@ export class PartialMesh {
         this.peerConnectedAtMs.delete(peerId);
         this.connecting.delete(peerId);
         if (wasConnected) {
+          this.noteLocalCapacityChanged();
           this.emit('peer:disconnected', peerId);
+          this.broadcastMembership();
         }
         if (this.config.autoConnect) {
           this.maintainPeerConnections();
@@ -668,7 +732,7 @@ export class PartialMesh {
     this.signalingClient.on('rtc:data', (data: { peerId: string; data: any }) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
-        this.mergeMembership(msg.peers, msg.retiredPeers, data.peerId);
+        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, data.peerId);
       } else {
         this.emit('peer:data', data);
       }
@@ -1034,30 +1098,11 @@ export class PartialMesh {
     const pickCandidates = (count: number): string[] => {
       if ((available.length === 0 && allCandidates.length === 0) || count <= 0) return [];
 
-      // Avoid all peers picking the same "first" discovered peer by rotating the list.
-      // This reduces thundering-herd behavior and improves overall convergence.
-      const selfId = this.normalizePeerId(this.clientId);
+      // Capacity comes first; the per-peer hash tie-breaker still spreads equal
+      // candidates deterministically instead of creating a shared first target.
       const source = available.length > 0 ? available : allCandidates;
-      const sorted = source.slice().sort((a, b) => {
-        const failA = this.dialFailureCount.get(a) ?? 0;
-        const failB = this.dialFailureCount.get(b) ?? 0;
-        if (failA !== failB) return failA - failB;
-        return a.localeCompare(b);
-      });
-      let offset = 0;
-      if (selfId) {
-        let hash = 0;
-        for (let i = 0; i < selfId.length; i++) {
-          hash = (hash * 31 + selfId.charCodeAt(i)) >>> 0;
-        }
-        offset = sorted.length ? hash % sorted.length : 0;
-      }
-
-      const selected: string[] = [];
-      for (let i = 0; i < Math.min(count, sorted.length); i++) {
-        selected.push(sorted[(offset + i) % sorted.length]);
-      }
-      return selected;
+      const sorted = source.slice().sort((a, b) => this.compareDialCandidates(a, b));
+      return sorted.slice(0, Math.min(count, sorted.length));
     };
 
     if (totalInProgress < this.config.minPeers) {
@@ -1085,12 +1130,12 @@ export class PartialMesh {
       for (const peerId of pickCandidates(1)) {
         this.connectToPeer(peerId);
       }
-    } else if (connectedCount > this.getMaxPeersWithTolerance()) {
+    } else if (connectedCount > this.config.maxPeers) {
       this.trimExcessPeers();
     } else if (connectedCount >= this.config.maxPeers && pendingCount === 0 && available.length > 0) {
       // Tolerance is inbound admission headroom, not an outbound degree target.
-      // A saturated peer may keep an accepted overflow edge so a newcomer can
-      // enter the mesh, but it must not proactively fill maxPeers+tolerantPeers.
+      // A saturated peer may temporarily accept an overflow edge so a newcomer
+      // can enter the mesh, but the retained degree is always maxPeers.
       if (this.maybeRebalanceForCloserPeer(available)) {
         return;
       }
@@ -1199,22 +1244,14 @@ export class PartialMesh {
 
       const fallbackTargets = candidatePeers
         .filter((id) => selfId > id)
-        .sort((a, b) => a.localeCompare(b));
+        .sort((a, b) => this.compareDialCandidates(a, b));
       if (fallbackTargets.length === 0) {
         return;
       }
 
       const selectedFallbackTarget = fallbackTargets
         .slice()
-        .sort((a, b) => {
-          const failA = this.dialFailureCount.get(a) ?? 0;
-          const failB = this.dialFailureCount.get(b) ?? 0;
-          if (failA !== failB) return failA - failB;
-          const discoveredA = this.discoveredAtMs.get(a) ?? 0;
-          const discoveredB = this.discoveredAtMs.get(b) ?? 0;
-          if (discoveredA !== discoveredB) return discoveredA - discoveredB;
-          return a.localeCompare(b);
-        })[0];
+        .sort((a, b) => this.compareDialCandidates(a, b))[0];
       if (selectedFallbackTarget !== normalizedPeerId) {
         return;
       }
@@ -1242,22 +1279,14 @@ export class PartialMesh {
 
           const refreshedTargets = refreshedCandidates
             .filter((id) => selfId > id)
-            .sort((a, b) => a.localeCompare(b));
+            .sort((a, b) => this.compareDialCandidates(a, b));
           if (refreshedTargets.length === 0) {
             return;
           }
 
           const refreshedSelectedTarget = refreshedTargets
             .slice()
-            .sort((a, b) => {
-              const failA = this.dialFailureCount.get(a) ?? 0;
-              const failB = this.dialFailureCount.get(b) ?? 0;
-              if (failA !== failB) return failA - failB;
-              const discoveredA = this.discoveredAtMs.get(a) ?? 0;
-              const discoveredB = this.discoveredAtMs.get(b) ?? 0;
-              if (discoveredA !== discoveredB) return discoveredA - discoveredB;
-              return a.localeCompare(b);
-            })[0];
+            .sort((a, b) => this.compareDialCandidates(a, b))[0];
           if (refreshedSelectedTarget !== normalizedPeerId) {
             return;
           }
@@ -1350,7 +1379,9 @@ export class PartialMesh {
         this.discoveredPeers.delete(peerId);
       }
       if (wasConnected) {
+        this.noteLocalCapacityChanged();
         this.emit('peer:disconnected', peerId);
+        this.broadcastMembership();
       }
 
       // Try to maintain minimum peer count
@@ -1460,10 +1491,20 @@ export class PartialMesh {
       if (self) all.add(self);
       for (const p of this.discoveredPeers) all.add(p);
       for (const retiredPeerId of this.retiredPeerIds) all.delete(retiredPeerId);
+      const capacities: Record<string, [number, number, number]> = {};
+      const now = Date.now();
+      for (const [peerId, state] of this.peerCapacityById.entries()) {
+        if (!all.has(peerId) || now - state.updatedAt > 60_000) continue;
+        capacities[peerId] = [state.maxPeers, state.connectedPeers, state.updatedAt];
+      }
+      if (self) {
+        capacities[self] = [this.config.maxPeers, this.getConnectedPeerCount(), this.localCapacityUpdatedAtMs];
+      }
       const payload = JSON.stringify({
         __membership: true,
         peers: Array.from(all),
-        retiredPeers: Array.from(this.retiredPeerIds)
+        retiredPeers: Array.from(this.retiredPeerIds),
+        capacities,
       });
       try {
         this.signalingClient?.send(toPeerId, payload);
@@ -1472,13 +1513,26 @@ export class PartialMesh {
       }
     }
 
-    private tryParseMembership(raw: any): { peers: string[]; retiredPeers: string[] } | null {
+    private broadcastMembership(exceptPeerId?: string): void {
+      for (const peerId of this.getConnectedPeers()) {
+        if (peerId !== exceptPeerId) this.sendMembership(peerId);
+      }
+    }
+
+    private tryParseMembership(raw: any): {
+      peers: string[];
+      retiredPeers: string[];
+      capacities: Record<string, unknown>;
+    } | null {
       try {
         const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
         if (obj?.__membership === true && Array.isArray(obj.peers)) {
           return {
             peers: obj.peers,
-            retiredPeers: Array.isArray(obj.retiredPeers) ? obj.retiredPeers : []
+            retiredPeers: Array.isArray(obj.retiredPeers) ? obj.retiredPeers : [],
+            capacities: obj.capacities && typeof obj.capacities === 'object' && !Array.isArray(obj.capacities)
+              ? obj.capacities
+              : {},
           };
         }
       } catch {
@@ -1487,26 +1541,45 @@ export class PartialMesh {
       return null;
     }
 
-    private mergeMembership(incoming: string[], retired: string[], fromPeerId: string): void {
-      let changed = false;
+    private mergeMembership(
+      incoming: string[],
+      retired: string[],
+      capacities: Record<string, unknown>,
+      fromPeerId: string
+    ): void {
+      let membershipChanged = false;
+      let capacityChanged = false;
       for (const raw of retired) {
-        if (this.retirePeerId(raw)) changed = true;
+        if (this.retirePeerId(raw)) membershipChanged = true;
       }
       for (const raw of incoming) {
         const id = this.normalizePeerId(raw);
         if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) continue;
         if (!this.globalPeers.has(id)) {
           this.globalPeers.add(id);
-          changed = true;
+          membershipChanged = true;
         }
       }
-      if (changed) {
+      for (const [rawPeerId, rawState] of Object.entries(capacities || {})) {
+        const peerId = this.normalizePeerId(rawPeerId);
+        if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
+        if (!Array.isArray(rawState) || rawState.length < 3) continue;
+        const maxPeers = Math.floor(Number(rawState[0]));
+        const connectedPeers = Math.floor(Number(rawState[1]));
+        const updatedAt = Math.floor(Number(rawState[2]));
+        if (
+          !Number.isFinite(maxPeers) || maxPeers < 1 || maxPeers > 4096 ||
+          !Number.isFinite(connectedPeers) || connectedPeers < 0 || connectedPeers > 4096 ||
+          !Number.isFinite(updatedAt) || updatedAt <= 0
+        ) continue;
+        const existing = this.peerCapacityById.get(peerId);
+        if (existing && existing.updatedAt >= updatedAt) continue;
+        this.peerCapacityById.set(peerId, { maxPeers, connectedPeers, updatedAt });
+        capacityChanged = true;
+      }
+      if (membershipChanged || capacityChanged) {
         this.emit('mesh:membership', Array.from(this.globalPeers));
-        for (const peerId of this.getConnectedPeers()) {
-          if (peerId !== fromPeerId) {
-            this.sendMembership(peerId);
-          }
-        }
+        this.broadcastMembership(fromPeerId);
         if (this.config.autoConnect) {
           this.maintainPeerConnections();
         }
@@ -1515,6 +1588,7 @@ export class PartialMesh {
 
     private removeFromGlobalMembership(peerId: string): void {
       const removed = this.globalPeers.delete(peerId);
+      this.peerCapacityById.delete(peerId);
       if (!removed) return;
       this.emit('mesh:membership', Array.from(this.globalPeers));
       for (const connectedPeerId of this.getConnectedPeers()) {
@@ -1559,6 +1633,7 @@ export class PartialMesh {
     this.rebalanceAttemptAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
     this.globalPeers.clear();
+    this.peerCapacityById.clear();
     this.selfAliases.clear();
     this.retiredPeerIds.clear();
     this.clientId = null;
@@ -1585,7 +1660,13 @@ export class PartialMesh {
 export default PartialMesh;
 
 export { GossipProtocol } from './gossip.js';
-export type { GossipMessage, GossipProtocolOptions, GossipStats } from './gossip.js';
+export type {
+  GossipBroadcastOptions,
+  GossipDeliveryStatus,
+  GossipMessage,
+  GossipProtocolOptions,
+  GossipStats,
+} from './gossip.js';
 export { PeerPigeonStorage } from './storage.js';
 export type {
   StorageSpace,

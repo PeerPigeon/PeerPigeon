@@ -11,6 +11,47 @@ export type GossipProtocolOptions = {
   cecrMaxAcceptedDrift?: number;
   /** Require canonical global-set/extrema agreement across connected peers before coordinate routing. */
   cecrRequireConsensus?: boolean;
+  /** Default deadline for opt-in tracked gossip delivery. Default 30 seconds. */
+  deliveryTimeoutMs?: number;
+  /** Delay before a tracked message is eligible for targeted repair. Default 4 seconds. */
+  deliveryRepairDelayMs?: number;
+  /** Minimum delay between repair attempts for the same target. Default 5 seconds. */
+  deliveryRepairIntervalMs?: number;
+};
+
+export type GossipBroadcastOptions = {
+  /** Track delivery to the canonical known-peer snapshot captured at send time. */
+  trackDelivery?: boolean;
+  /** Override the protocol's tracked-delivery deadline for this message. */
+  deliveryTimeoutMs?: number;
+};
+
+export type GossipDeliveryStatus = {
+  messageId: string;
+  sender: string;
+  membershipHash: string;
+  audiencePeerIds: string[];
+  deliveredPeerIds: string[];
+  pendingPeerIds: string[];
+  audienceCount: number;
+  deliveredCount: number;
+  complete: boolean;
+  timedOut: boolean;
+  createdAt: number;
+  updatedAt: number;
+  deadlineAt: number;
+};
+
+type GossipDeliveryEnvelope = {
+  setHash: string;
+  size: number;
+  bits: string;
+  deadlineAt: number;
+};
+
+type GossipDeliveryReceipt = GossipDeliveryEnvelope & {
+  messageId: string;
+  sender: string;
 };
 
 export type GossipMessage = {
@@ -22,6 +63,7 @@ export type GossipMessage = {
   data: unknown;
   metadata: Record<string, unknown>;
   type: 'gossip';
+  delivery?: GossipDeliveryEnvelope;
 };
 
 export type DirectMessage = {
@@ -44,6 +86,7 @@ type CecrStateMessage = {
   minHex: string;
   maxHex: string;
   size: number;
+  receipts?: GossipDeliveryReceipt[];
 };
 
 export type GossipStats = {
@@ -74,6 +117,9 @@ type GossipEvents = {
   peerConnected: (data: { peerId: string }) => void;
   peerDisconnected: (data: { peerId: string }) => void;
   directMessageReceived: (data: { message: DirectMessage }) => void;
+  deliveryProgress: (status: GossipDeliveryStatus) => void;
+  deliveryComplete: (status: GossipDeliveryStatus) => void;
+  deliveryTimeout: (status: GossipDeliveryStatus) => void;
 };
 
 type CecrExtrema = {
@@ -91,6 +137,28 @@ type CecrRemoteState = {
   size: number;
   updatedAtMs: number;
 };
+
+type GossipDeliveryState = {
+  messageId: string;
+  sender: string;
+  setHash: string;
+  size: number;
+  bits: Uint8Array;
+  peerIds: string[] | null;
+  message: GossipMessage | null;
+  createdAt: number;
+  updatedAt: number;
+  deadlineAt: number;
+  completedAt: number | null;
+  timedOut: boolean;
+  lastStatusSignature: string;
+  repairAttemptsByPeer: Map<string, { attempts: number; lastAttemptAt: number }>;
+};
+
+const RELIABLE_REPAIR_TYPE = 'pp-gossip-repair-v1';
+const MAX_RECEIPT_DELTAS_PER_SYNC = 32;
+const MAX_DELIVERY_PEERS = 4096;
+const MAX_REPAIR_ATTEMPTS_PER_TARGET = 3;
 
 /**
  * GossipProtocol
@@ -112,12 +180,17 @@ export class GossipProtocol {
   private cecrExtremaMaxAgeMs: number;
   private cecrMaxAcceptedDrift: number;
   private cecrRequireConsensus: boolean;
+  private deliveryTimeoutMs: number;
+  private deliveryRepairDelayMs: number;
+  private deliveryRepairIntervalMs: number;
   private cecrCurrentExtrema: CecrExtrema | null = null;
   private cecrPreviousExtrema: CecrExtrema | null = null;
   private cecrRemoteStates: Map<string, CecrRemoteState> = new Map();
   private cecrSyncTimer: ReturnType<typeof setInterval> | null = null;
   private trackingCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private seenDirectIds: Map<string, number> = new Map();
+  private deliveryStates: Map<string, GossipDeliveryState> = new Map();
+  private dirtyDeliveryReceiptIds: Set<string> = new Set();
   private callbacks: Partial<Record<keyof GossipEvents, Set<Function>>> = {};
   private peers: Map<string, { connected: boolean; timestamp: number }> = new Map();
 
@@ -129,6 +202,9 @@ export class GossipProtocol {
     this.cecrExtremaMaxAgeMs = Math.max(1_000, options.cecrExtremaMaxAgeMs ?? 20_000);
     this.cecrMaxAcceptedDrift = Math.max(0.01, Math.min(1, options.cecrMaxAcceptedDrift ?? 0.18));
     this.cecrRequireConsensus = options.cecrRequireConsensus ?? true;
+    this.deliveryTimeoutMs = Math.max(2_000, options.deliveryTimeoutMs ?? 30_000);
+    this.deliveryRepairDelayMs = Math.max(1_000, options.deliveryRepairDelayMs ?? 4_000);
+    this.deliveryRepairIntervalMs = Math.max(1_000, options.deliveryRepairIntervalMs ?? 5_000);
     this.setupMeshListeners();
     this.startCecrSyncLoop();
     this.startTrackingCleanupLoop();
@@ -149,6 +225,9 @@ export class GossipProtocol {
 
     this.mesh.on('peer:connected', (peerId) => {
       this.peers.set(peerId, { connected: true, timestamp: Date.now() });
+      for (const messageId of this.deliveryStates.keys()) {
+        this.dirtyDeliveryReceiptIds.add(messageId);
+      }
       this.publishCecrState();
       this.emit('peerConnected', { peerId });
     });
@@ -164,6 +243,7 @@ export class GossipProtocol {
   private startCecrSyncLoop(): void {
     if (this.cecrSyncTimer) return;
     this.cecrSyncTimer = setInterval(() => {
+      this.maintainTrackedDeliveries();
       this.publishCecrState();
     }, 2_000);
   }
@@ -171,6 +251,7 @@ export class GossipProtocol {
   private startTrackingCleanupLoop(): void {
     if (this.trackingCleanupTimer) return;
     this.trackingCleanupTimer = setInterval(() => {
+      this.maintainTrackedDeliveries();
       this.pruneTracking();
     }, 30_000);
   }
@@ -178,14 +259,34 @@ export class GossipProtocol {
   /**
    * Broadcast an application payload using gossip-style re-propagation.
    */
-  broadcast(data: unknown, metadata: Record<string, unknown> = {}): string {
+  broadcast(
+    data: unknown,
+    metadata: Record<string, unknown> = {},
+    options: GossipBroadcastOptions = {}
+  ): string {
     const sender = this.mesh.getClientId();
     const connected = this.mesh.getConnectedPeers();
     const global = this.mesh.getGlobalPeers?.() ?? connected;
     const networkSize = Math.max(connected.length, global.length, 1);
 
+    const messageId = this.generateMessageId(sender);
+    let delivery: GossipDeliveryEnvelope | undefined;
+    let deliveryPeers: string[] | null = null;
+    if (options.trackDelivery && sender) {
+      deliveryPeers = this.canonicalPeerSet();
+      const senderIndex = deliveryPeers.indexOf(sender);
+      const bits = this.createDeliveryBits(deliveryPeers.length);
+      if (senderIndex >= 0) this.setDeliveryBit(bits, senderIndex);
+      delivery = {
+        setHash: this.canonicalSetHash(deliveryPeers),
+        size: deliveryPeers.length,
+        bits: this.deliveryBitsToHex(bits),
+        deadlineAt: Date.now() + Math.max(2_000, options.deliveryTimeoutMs ?? this.deliveryTimeoutMs),
+      };
+    }
+
     const message: GossipMessage = {
-      id: this.generateMessageId(sender),
+      id: messageId,
       timestamp: Date.now(),
       hops: 0,
       // Ensure messages can cross long sparse paths (e.g. saturation/rebalance chains).
@@ -193,7 +294,8 @@ export class GossipProtocol {
       sender,
       data,
       metadata,
-      type: 'gossip'
+      type: 'gossip',
+      ...(delivery ? { delivery } : {})
     };
 
     this.messageLog.set(message.id, {
@@ -205,6 +307,10 @@ export class GossipProtocol {
       this.pruneTracking(message.timestamp);
     }
 
+    if (delivery && deliveryPeers) {
+      this.registerTrackedDelivery(message, deliveryPeers, true);
+    }
+
     this.propagate(message);
     this.emit('messageReceived', { message, local: true });
 
@@ -212,10 +318,31 @@ export class GossipProtocol {
   }
 
   /**
+   * Broadcast with delivery tracking enabled for the known-peer snapshot.
+   */
+  broadcastReliable(
+    data: unknown,
+    metadata: Record<string, unknown> = {},
+    options: Omit<GossipBroadcastOptions, 'trackDelivery'> = {}
+  ): string {
+    return this.broadcast(data, metadata, { ...options, trackDelivery: true });
+  }
+
+  /**
+   * Return the sender-visible delivery state for a tracked gossip message.
+   */
+  getDeliveryStatus(messageId: string): GossipDeliveryStatus | null {
+    const state = this.deliveryStates.get(messageId);
+    if (!state) return null;
+    return this.deliveryStatusForState(state);
+  }
+
+  /**
    * Propagate a message to all currently-connected peers.
    */
   propagate(message: GossipMessage, exceptPeerId?: string): void {
     const connectedPeers = this.mesh.getConnectedPeers();
+    const deliveryState = this.deliveryStates.get(message.id);
 
     for (const peerId of connectedPeers) {
       if (peerId === message.sender) continue;
@@ -223,7 +350,8 @@ export class GossipProtocol {
 
       const forwarded: GossipMessage = {
         ...message,
-        hops: message.hops + 1
+        hops: message.hops + 1,
+        ...(deliveryState ? { delivery: this.deliveryEnvelopeForState(deliveryState) } : {})
       };
 
       try {
@@ -239,6 +367,13 @@ export class GossipProtocol {
    */
   handleIncomingMessage(message: GossipMessage, fromPeerId: string): void {
     const alreadySeen = this.messageLog.has(message.id);
+
+    if (message.delivery) {
+      // A duplicate still proves that this peer holds the message. Re-asserting
+      // the local bit also repairs receipt loss without re-emitting the payload.
+      this.registerTrackedDelivery(message, null, true);
+    }
+
     if (alreadySeen) return;
 
     this.messageLog.set(message.id, {
@@ -255,6 +390,316 @@ export class GossipProtocol {
     if (message.hops < message.maxHops) {
       this.propagate(message, fromPeerId);
     }
+  }
+
+  // ─── Tracked delivery receipts ──────────────────────────────────────────
+
+  private createDeliveryBits(size: number): Uint8Array {
+    return new Uint8Array(Math.ceil(Math.max(0, size) / 8));
+  }
+
+  private setDeliveryBit(bits: Uint8Array, index: number): boolean {
+    if (index < 0 || index >= bits.length * 8) return false;
+    const byteIndex = Math.floor(index / 8);
+    const mask = 1 << (index % 8);
+    const before = bits[byteIndex];
+    bits[byteIndex] |= mask;
+    return bits[byteIndex] !== before;
+  }
+
+  private hasDeliveryBit(bits: Uint8Array, index: number): boolean {
+    if (index < 0 || index >= bits.length * 8) return false;
+    return (bits[Math.floor(index / 8)] & (1 << (index % 8))) !== 0;
+  }
+
+  private deliveryBitsToHex(bits: Uint8Array): string {
+    return Array.from(bits, (value) => value.toString(16).padStart(2, '0')).join('');
+  }
+
+  private deliveryBitsFromHex(hex: string, size: number): Uint8Array | null {
+    const normalized = String(hex || '').trim().toLowerCase();
+    const byteLength = Math.ceil(size / 8);
+    if (!/^[0-9a-f]*$/.test(normalized) || normalized.length !== byteLength * 2) return null;
+    const bits = new Uint8Array(byteLength);
+    for (let index = 0; index < byteLength; index += 1) {
+      bits[index] = Number.parseInt(normalized.slice(index * 2, index * 2 + 2), 16);
+    }
+    return bits;
+  }
+
+  private mergeDeliveryBits(target: Uint8Array, incoming: Uint8Array): boolean {
+    if (target.length !== incoming.length) return false;
+    let changed = false;
+    for (let index = 0; index < target.length; index += 1) {
+      const merged = target[index] | incoming[index];
+      if (merged !== target[index]) {
+        target[index] = merged;
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  private deliveryEnvelopeForState(state: GossipDeliveryState): GossipDeliveryEnvelope {
+    return {
+      setHash: state.setHash,
+      size: state.size,
+      bits: this.deliveryBitsToHex(state.bits),
+      deadlineAt: state.deadlineAt,
+    };
+  }
+
+  private deliveryReceiptForState(state: GossipDeliveryState): GossipDeliveryReceipt {
+    return {
+      messageId: state.messageId,
+      sender: state.sender,
+      ...this.deliveryEnvelopeForState(state),
+    };
+  }
+
+  private validateDeliveryEnvelope(envelope: GossipDeliveryEnvelope): Uint8Array | null {
+    if (!envelope || typeof envelope !== 'object') return null;
+    if (typeof envelope.setHash !== 'string' || !/^[0-9a-f]{16}$/i.test(envelope.setHash)) return null;
+    if (!Number.isInteger(envelope.size) || envelope.size < 1 || envelope.size > MAX_DELIVERY_PEERS) return null;
+    if (!Number.isFinite(envelope.deadlineAt) || envelope.deadlineAt <= 0) return null;
+    return this.deliveryBitsFromHex(envelope.bits, envelope.size);
+  }
+
+  private reconstructDeliveryPeers(state: GossipDeliveryState): string[] | null {
+    const peers = this.canonicalPeerSet();
+    if (peers.length !== state.size || this.canonicalSetHash(peers) !== state.setHash) return null;
+    state.peerIds = peers;
+    return peers;
+  }
+
+  private registerTrackedDelivery(
+    message: GossipMessage,
+    knownPeerIds: string[] | null,
+    receivedLocally: boolean
+  ): GossipDeliveryState | null {
+    if (!message.delivery || !message.sender) return null;
+    const incomingBits = this.validateDeliveryEnvelope(message.delivery);
+    if (!incomingBits) return null;
+
+    let state = this.deliveryStates.get(message.id);
+    let changed = false;
+    if (!state) {
+      state = {
+        messageId: message.id,
+        sender: message.sender,
+        setHash: message.delivery.setHash,
+        size: message.delivery.size,
+        bits: incomingBits,
+        peerIds: knownPeerIds ? knownPeerIds.slice() : null,
+        message: message,
+        createdAt: message.timestamp,
+        updatedAt: Date.now(),
+        deadlineAt: message.delivery.deadlineAt,
+        completedAt: null,
+        timedOut: false,
+        lastStatusSignature: '',
+        repairAttemptsByPeer: new Map(),
+      };
+      this.deliveryStates.set(message.id, state);
+      changed = true;
+    } else {
+      if (
+        state.sender !== message.sender ||
+        state.setHash !== message.delivery.setHash ||
+        state.size !== message.delivery.size ||
+        state.deadlineAt !== message.delivery.deadlineAt
+      ) {
+        return null;
+      }
+      changed = this.mergeDeliveryBits(state.bits, incomingBits);
+      state.message = state.message ?? message;
+      if (knownPeerIds) state.peerIds = knownPeerIds.slice();
+    }
+
+    const peers = state.peerIds ?? this.reconstructDeliveryPeers(state);
+    if (receivedLocally && peers) {
+      const self = this.mesh.getClientId();
+      const selfIndex = self ? peers.indexOf(self) : -1;
+      if (selfIndex >= 0 && this.setDeliveryBit(state.bits, selfIndex)) changed = true;
+    }
+
+    if (changed) {
+      state.updatedAt = Date.now();
+      this.dirtyDeliveryReceiptIds.add(state.messageId);
+      this.emitDeliveryStatus(state);
+    }
+    return state;
+  }
+
+  private mergeDeliveryReceipt(receipt: GossipDeliveryReceipt): void {
+    if (!receipt || typeof receipt.messageId !== 'string' || typeof receipt.sender !== 'string') return;
+    const incomingBits = this.validateDeliveryEnvelope(receipt);
+    if (!incomingBits) return;
+
+    let state = this.deliveryStates.get(receipt.messageId);
+    let changed = false;
+    if (!state) {
+      state = {
+        messageId: receipt.messageId,
+        sender: receipt.sender,
+        setHash: receipt.setHash,
+        size: receipt.size,
+        bits: incomingBits,
+        peerIds: null,
+        message: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        deadlineAt: receipt.deadlineAt,
+        completedAt: null,
+        timedOut: false,
+        lastStatusSignature: '',
+        repairAttemptsByPeer: new Map(),
+      };
+      this.deliveryStates.set(receipt.messageId, state);
+      changed = true;
+    } else {
+      if (
+        state.sender !== receipt.sender ||
+        state.setHash !== receipt.setHash ||
+        state.size !== receipt.size ||
+        state.deadlineAt !== receipt.deadlineAt
+      ) return;
+      changed = this.mergeDeliveryBits(state.bits, incomingBits);
+    }
+
+    if (!state.peerIds) this.reconstructDeliveryPeers(state);
+    if (changed) {
+      state.updatedAt = Date.now();
+      this.dirtyDeliveryReceiptIds.add(state.messageId);
+      this.emitDeliveryStatus(state);
+    }
+  }
+
+  private deliveryStatusForState(state: GossipDeliveryState): GossipDeliveryStatus {
+    const peers = state.peerIds ?? this.reconstructDeliveryPeers(state) ?? [];
+    const audiencePeerIds = peers.filter((peerId) => peerId !== state.sender);
+    const deliveredPeerIds = audiencePeerIds.filter((peerId) => {
+      const index = peers.indexOf(peerId);
+      return index >= 0 && this.hasDeliveryBit(state.bits, index);
+    });
+    const deliveredSet = new Set(deliveredPeerIds);
+    const pendingPeerIds = audiencePeerIds.filter((peerId) => !deliveredSet.has(peerId));
+    return {
+      messageId: state.messageId,
+      sender: state.sender,
+      membershipHash: state.setHash,
+      audiencePeerIds,
+      deliveredPeerIds,
+      pendingPeerIds,
+      audienceCount: audiencePeerIds.length,
+      deliveredCount: deliveredPeerIds.length,
+      complete: peers.length === state.size && pendingPeerIds.length === 0,
+      timedOut: state.timedOut,
+      createdAt: state.createdAt,
+      updatedAt: state.updatedAt,
+      deadlineAt: state.deadlineAt,
+    };
+  }
+
+  private emitDeliveryStatus(state: GossipDeliveryState): void {
+    if (state.sender !== this.mesh.getClientId()) return;
+    const status = this.deliveryStatusForState(state);
+    const signature = `${status.deliveredPeerIds.join('|')}::${status.pendingPeerIds.join('|')}::${status.timedOut}`;
+    if (signature !== state.lastStatusSignature) {
+      state.lastStatusSignature = signature;
+      this.emit('deliveryProgress', status);
+    }
+    if (status.complete && state.completedAt == null) {
+      state.completedAt = Date.now();
+      this.emit('deliveryComplete', status);
+    }
+  }
+
+  private selectRepairOwner(state: GossipDeliveryState, targetPeerId: string): string | null {
+    const peers = state.peerIds ?? this.reconstructDeliveryPeers(state);
+    if (!peers) return null;
+    const delivered = peers.filter((_, index) => this.hasDeliveryBit(state.bits, index));
+    let owner: string | null = null;
+    let ownerScore: string | null = null;
+    for (const candidate of delivered) {
+      const score = this.canonicalSetHash([state.messageId, targetPeerId, candidate]);
+      if (ownerScore == null || score < ownerScore) {
+        owner = candidate;
+        ownerScore = score;
+      }
+    }
+    return owner;
+  }
+
+  private maintainTrackedDeliveries(now: number = Date.now()): void {
+    const self = this.mesh.getClientId();
+    if (!self) return;
+
+    for (const state of this.deliveryStates.values()) {
+      const peers = state.peerIds ?? this.reconstructDeliveryPeers(state);
+      if (state.message && peers) {
+        const selfIndex = peers.indexOf(self);
+        if (selfIndex >= 0 && this.setDeliveryBit(state.bits, selfIndex)) {
+          state.updatedAt = now;
+          this.dirtyDeliveryReceiptIds.add(state.messageId);
+          this.emitDeliveryStatus(state);
+        }
+      }
+
+      const status = this.deliveryStatusForState(state);
+      if (status.complete) continue;
+      if (now >= state.deadlineAt) {
+        if (!state.timedOut) {
+          state.timedOut = true;
+          state.updatedAt = now;
+          this.emitDeliveryStatus(state);
+          if (state.sender === self) this.emit('deliveryTimeout', this.deliveryStatusForState(state));
+        }
+        continue;
+      }
+      if (!state.message || !peers || now - state.createdAt < this.deliveryRepairDelayMs) continue;
+
+      for (const targetPeerId of status.pendingPeerIds) {
+        if (this.selectRepairOwner(state, targetPeerId) !== self) continue;
+        const attempt = state.repairAttemptsByPeer.get(targetPeerId) ?? { attempts: 0, lastAttemptAt: 0 };
+        if (attempt.attempts >= MAX_REPAIR_ATTEMPTS_PER_TARGET) continue;
+        if (now - attempt.lastAttemptAt < this.deliveryRepairIntervalMs) continue;
+
+        const repairMessage: GossipMessage = {
+          ...state.message,
+          delivery: this.deliveryEnvelopeForState(state),
+        };
+        const repairId = this.sendDirect(targetPeerId, {
+          __peerPigeonType: RELIABLE_REPAIR_TYPE,
+          message: repairMessage,
+        });
+        if (repairId) {
+          state.repairAttemptsByPeer.set(targetPeerId, {
+            attempts: attempt.attempts + 1,
+            lastAttemptAt: now,
+          });
+        }
+      }
+    }
+  }
+
+  private reliableRepairMessage(data: unknown): GossipMessage | null {
+    let candidate = data;
+    if (typeof candidate === 'string') {
+      try {
+        candidate = JSON.parse(candidate);
+      } catch {
+        return null;
+      }
+    }
+    if (!candidate || typeof candidate !== 'object') return null;
+    const value = candidate as Record<string, unknown>;
+    if (value.__peerPigeonType !== RELIABLE_REPAIR_TYPE || !value.message || typeof value.message !== 'object') {
+      return null;
+    }
+    const message = value.message as GossipMessage;
+    if (message.type !== 'gossip' || typeof message.id !== 'string' || !message.delivery) return null;
+    return message;
   }
 
   // ─── Direct / XOR-routed messaging ───────────────────────────────────────
@@ -423,25 +868,43 @@ export class GossipProtocol {
     const self = this.mesh.getClientId();
     if (!self) return;
     const extrema = this.updateCecrExtremaSnapshot();
-    if (!extrema) return;
+
+    const receiptIds = Array.from(this.dirtyDeliveryReceiptIds).slice(0, MAX_RECEIPT_DELTAS_PER_SYNC);
+    // Normal delivery receipts ride the existing CECR frame. If coordinate
+    // routing is unavailable (for example, non-hex peer IDs), send a control
+    // frame only when a receipt is actually pending.
+    if (!extrema && receiptIds.length === 0) return;
+    const canonicalPeers = extrema ? null : this.canonicalPeerSet();
 
     const message: CecrStateMessage = {
       id: this.generateMessageId(self),
       type: 'cecr-state',
       from: self,
       timestamp: Date.now(),
-      setHash: extrema.setHash,
-      minHex: extrema.min.toString(16),
-      maxHex: extrema.max.toString(16),
-      size: extrema.size,
+      setHash: extrema?.setHash ?? this.canonicalSetHash(canonicalPeers ?? []),
+      minHex: extrema?.min.toString(16) ?? '0',
+      maxHex: extrema?.max.toString(16) ?? '0',
+      size: extrema?.size ?? canonicalPeers?.length ?? 0,
     };
 
+    if (receiptIds.length) {
+      message.receipts = receiptIds
+        .map((messageId) => this.deliveryStates.get(messageId))
+        .filter((state): state is GossipDeliveryState => !!state)
+        .map((state) => this.deliveryReceiptForState(state));
+    }
+
+    let sent = false;
     for (const peerId of this.mesh.getConnectedPeers()) {
       try {
         this.mesh.send(peerId, JSON.stringify(message));
+        sent = true;
       } catch {
         // best-effort
       }
+    }
+    if (sent) {
+      for (const messageId of receiptIds) this.dirtyDeliveryReceiptIds.delete(messageId);
     }
   }
 
@@ -461,6 +924,11 @@ export class GossipProtocol {
         size: Math.floor(message.size),
         updatedAtMs: Date.now(),
       });
+      if (Array.isArray(message.receipts)) {
+        for (const receipt of message.receipts.slice(0, MAX_RECEIPT_DELTAS_PER_SYNC)) {
+          this.mergeDeliveryReceipt(receipt);
+        }
+      }
     } catch {
       // ignore malformed state
     }
@@ -550,6 +1018,11 @@ export class GossipProtocol {
 
     // We are the destination
     if (message.to === self) {
+      const repairedMessage = this.reliableRepairMessage(message.data);
+      if (repairedMessage) {
+        this.handleIncomingMessage(repairedMessage, fromPeerId ?? message.from);
+        return;
+      }
       this.emit('directMessageReceived', { message });
       return;
     }
@@ -645,6 +1118,16 @@ export class GossipProtocol {
       if (!oldest) break;
       this.seenDirectIds.delete(oldest);
     }
+
+    for (const [id, state] of this.deliveryStates.entries()) {
+      const terminalAt = state.completedAt ?? (state.timedOut ? state.deadlineAt : null);
+      const expired = terminalAt != null
+        ? now - terminalAt > this.trackingRetentionMs
+        : now - state.createdAt > this.trackingRetentionMs;
+      if (!expired) continue;
+      this.deliveryStates.delete(id);
+      this.dirtyDeliveryReceiptIds.delete(id);
+    }
   }
 
   on<K extends keyof GossipEvents>(event: K, callback: GossipEvents[K]): void {
@@ -666,6 +1149,8 @@ export class GossipProtocol {
     this.messageLog.clear();
     this.peers.clear();
     this.seenDirectIds.clear();
+    this.deliveryStates.clear();
+    this.dirtyDeliveryReceiptIds.clear();
     this.cecrRemoteStates.clear();
     if (this.cecrSyncTimer) {
       clearInterval(this.cecrSyncTimer);
