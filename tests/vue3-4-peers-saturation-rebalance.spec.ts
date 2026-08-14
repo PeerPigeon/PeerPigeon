@@ -64,14 +64,10 @@ test('4-peer saturation rebalance: a late joiner gets admitted when maxPeers=2',
       }, { timeout: rebalanceWaitMs, intervals: [250, 500, 1000, 2000] })
       .toBe(true);
 
-    // Tolerance lets saturated peers admit the newcomer, but it is not a target
-    // that every peer should proactively fill. Give discovery/maintenance time
-    // to settle, then ensure the four-peer mesh did not become a full mesh (3/2
-    // on every peer).
+    // Overflow is transient admission headroom only. No peer may retain 3/2.
     await pages[0].waitForTimeout(5_000);
     const settledCounts = await Promise.all(pages.map((page) => getConnected(page)));
-    expect(settledCounts.every((count) => count > 2)).toBe(false);
-    expect(settledCounts.every((count) => count <= 3)).toBe(true);
+    expect(settledCounts.every((count) => count <= 2)).toBe(true);
   } catch (error) {
     const snapshots = await Promise.all(pages.map((page) => getMeshSnapshot(page)));
     // eslint-disable-next-line no-console

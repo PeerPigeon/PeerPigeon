@@ -14,6 +14,9 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fortawesome/fontawesome-svg-core": "^7.3.1",
+    "@fortawesome/free-solid-svg-icons": "^7.3.1",
+    "@fortawesome/vue-fontawesome": "^3.3.3",
     "d3": "^7.9.0",
     "freertc": "github:draeder/freertc#d6ce3ea0dfccdbafb17ee16cd80ef2d39e76c876",
     "peerpigeon": "file:../..",

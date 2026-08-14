@@ -185,7 +185,10 @@
           </div>
 
           <div v-if="activeTab === 'message'" class="tab-panel chat" role="tabpanel" aria-label="Message panel">
-            <h3>💬 Message</h3>
+            <h3 class="section-heading">
+              <FontAwesomeIcon :icon="icons.message" class="section-heading-icon" aria-hidden="true" />
+              <span>Message</span>
+            </h3>
             <div class="log-controls">
               <button @click="clearLog" class="btn btn-small">Clear</button>
               <label>
@@ -204,7 +207,22 @@
                     <span class="sender">{{ entry.local ? 'You' : entry.sender.slice(0, 6) }}</span>
                     <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
                   </div>
-                  <div class="bubble-text">{{ entry.text }}</div>
+                  <div class="bubble-text">
+                    <FontAwesomeIcon
+                      v-if="entry.icon && icons[entry.icon]"
+                      :icon="icons[entry.icon]"
+                      class="bubble-icon"
+                      aria-hidden="true"
+                    />
+                    <span>{{ entry.text }}</span>
+                  </div>
+                  <div
+                    v-if="entry.messageId && deliveryReceipts[entry.messageId]"
+                    class="bubble-delivery"
+                    :class="deliveryReceiptClass(entry.messageId)"
+                  >
+                    {{ deliveryReceiptLabel(entry.messageId) }}
+                  </div>
                   <div v-if="entry.hops > 0" class="bubble-hops">{{ entry.hops === 1 ? '1 hop' : entry.hops + ' hops' }}</div>
                 </div>
               </div>
@@ -246,12 +264,18 @@
           </div>
 
           <div v-else-if="activeTab === 'media'" class="tab-panel feature-panel" role="tabpanel" aria-label="Media panel">
-            <h3>🎬 Media</h3>
+            <h3 class="section-heading">
+              <FontAwesomeIcon :icon="icons.media" class="section-heading-icon" aria-hidden="true" />
+              <span>Media</span>
+            </h3>
             <p class="feature-copy">Media controls are scaffolded here for upcoming file and stream sharing workflows.</p>
           </div>
 
           <div v-else-if="activeTab === 'storage'" class="tab-panel feature-panel" role="tabpanel" aria-label="Storage panel">
-            <h3>🗄 Storage</h3>
+            <h3 class="section-heading">
+              <FontAwesomeIcon :icon="icons.storage" class="section-heading-icon" aria-hidden="true" />
+              <span>Storage</span>
+            </h3>
             <p class="feature-copy">Key/value storage stays local until you Get a key and subscribe to its peer updates.</p>
 
             <div class="storage-head">
@@ -324,7 +348,7 @@
                   :title="`Stop syncing ${interest.key}`"
                 >
                   <span class="mono">{{ interest.key }}</span>
-                  <span aria-hidden="true">×</span>
+                  <FontAwesomeIcon :icon="icons.close" aria-hidden="true" />
                 </button>
               </div>
             </div>
@@ -359,7 +383,10 @@
           </div>
 
           <div v-else-if="activeTab === 'crypto'" class="tab-panel feature-panel" role="tabpanel" aria-label="Crypto panel">
-            <h3>🔐 Crypto</h3>
+            <h3 class="section-heading">
+              <FontAwesomeIcon :icon="icons.crypto" class="section-heading-icon" aria-hidden="true" />
+              <span>Crypto</span>
+            </h3>
             <p class="feature-copy">Broadcasts use room-scoped encryption. Direct messages use peer-targeted UNSEA envelopes.</p>
 
             <div class="crypto-grid">
@@ -388,7 +415,11 @@
                     @click="showPrivateCrypto = !showPrivateCrypto"
                     :aria-pressed="showPrivateCrypto"
                   >
-                    <span class="icon-eye" aria-hidden="true">{{ showPrivateCrypto ? '🙈' : '👁' }}</span>
+                    <FontAwesomeIcon
+                      :icon="showPrivateCrypto ? icons.eyeSlash : icons.eye"
+                      class="icon-eye"
+                      aria-hidden="true"
+                    />
                     <span>{{ showPrivateCrypto ? 'Hide' : 'Show' }}</span>
                   </button>
                 </div>
@@ -420,7 +451,10 @@
 
       <!-- Peer Network Visualization -->
       <section v-if="isRunning" class="network-viz">
-        <h3>📊 Network Graph</h3>
+        <h3 class="section-heading">
+          <FontAwesomeIcon :icon="icons.network" class="section-heading-icon" aria-hidden="true" />
+          <span>Network Graph</span>
+        </h3>
         <div ref="networkGraphContainer" class="network-graph-container" data-testid="mesh-visualizer">
           <PeerNetworkGraph
             ref="peerNetworkGraph"
@@ -434,7 +468,10 @@
 
       <!-- Diagnostics -->
       <section class="chat diagnostics" v-if="isRunning">
-        <h3>🛠 Diagnostics</h3>
+        <h3 class="section-heading">
+          <FontAwesomeIcon :icon="icons.diagnostics" class="section-heading-icon" aria-hidden="true" />
+          <span>Diagnostics</span>
+        </h3>
         <div ref="diagLogContainer" class="log-container diag-container" data-testid="diag-log">
           <div
             v-for="(entry, idx) in diagnosticMessages"
@@ -494,7 +531,47 @@ import { GossipProtocol } from 'peerpigeon';
 import { PeerPigeonStorage } from 'peerpigeon';
 import { generateRandomPair, encryptMessageWithMeta, decryptMessageWithMeta } from 'unsea';
 import * as d3 from 'd3';
+import {
+  isInternalChatText,
+  isInternalMessagePayload,
+  normalizeMessagePayload,
+} from './message-payloads.js';
+import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome';
+import {
+  faCommentDots,
+  faDatabase,
+  faDiagramProject,
+  faEnvelope,
+  faEye,
+  faEyeSlash,
+  faFilm,
+  faInbox,
+  faLock,
+  faPaperPlane,
+  faSatelliteDish,
+  faScrewdriverWrench,
+  faTriangleExclamation,
+  faXmark,
+} from '@fortawesome/free-solid-svg-icons';
 import PeerNetworkGraph from './components/PeerNetworkGraph.vue';
+
+const APP_ICONS = Object.freeze({
+  message: faCommentDots,
+  media: faFilm,
+  storage: faDatabase,
+  crypto: faLock,
+  network: faDiagramProject,
+  diagnostics: faScrewdriverWrench,
+  eye: faEye,
+  eyeSlash: faEyeSlash,
+  sent: faPaperPlane,
+  directSend: faEnvelope,
+  received: faInbox,
+  directReceive: faEnvelope,
+  broadcast: faSatelliteDish,
+  warning: faTriangleExclamation,
+  close: faXmark,
+});
 
 const DEFAULT_TOPOLOGY = 'token-ring';
 const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
@@ -549,11 +626,13 @@ function fromBase64Url(base64url) {
 export default {
   name: 'PeerPigeonDemo',
   components: {
+    FontAwesomeIcon,
     PeerNetworkGraph,
   },
   data() {
     return {
       mesh: null,
+      icons: APP_ICONS,
       gossip: null,
       isRunning: false,
       isConnecting: false,
@@ -637,7 +716,11 @@ export default {
       goWasmHandlers: {
         messageReceived: new Set(),
         directMessageReceived: new Set(),
+        deliveryProgress: new Set(),
+        deliveryComplete: new Set(),
+        deliveryTimeout: new Set(),
       },
+      deliveryReceipts: {},
       goWasmStorageNotify: null,
       goWasmLoadPromise: null,
       goWasmStarted: false,
@@ -775,10 +858,14 @@ export default {
       return this.discoveredPeersList.length;
     },
     chatMessages() {
-      return this.messageLog.filter(e => e.type === 'sent' || e.type === 'received');
+      return this.messageLog.filter(e => (
+        (e.type === 'sent' || e.type === 'received') &&
+        !e.system &&
+        !isInternalChatText(e.text)
+      ));
     },
     diagnosticMessages() {
-      return this.messageLog.filter(e => e.type !== 'sent' && e.type !== 'received');
+      return this.messageLog.filter(e => (e.type !== 'sent' && e.type !== 'received') || e.system);
     },
     localPublicCryptoInfo() {
       if (!this.cryptoKeys?.pub || !this.cryptoKeys?.epub) return null;
@@ -2150,9 +2237,12 @@ export default {
         onMessageReceived: (event) => {
           invokeHandlers('messageReceived', {
             message: {
+              id: String(event?.id || ''),
               data: event?.data,
               hops: Number(event?.hops || 0),
               sender: String(event?.sender || ''),
+              delivery: event?.delivery || null,
+              metadata: event?.metadata || {},
             },
             local: Boolean(event?.local),
             fromPeer: String(event?.fromPeer || ''),
@@ -2163,6 +2253,9 @@ export default {
             message: event?.message || null,
           });
         },
+        onDeliveryProgress: (status) => invokeHandlers('deliveryProgress', status || {}),
+        onDeliveryComplete: (status) => invokeHandlers('deliveryComplete', status || {}),
+        onDeliveryTimeout: (status) => invokeHandlers('deliveryTimeout', status || {}),
         onStorageChange: (event) => {
           if (typeof this.goWasmStorageNotify === 'function') {
             this.goWasmStorageNotify(event || {});
@@ -2192,8 +2285,17 @@ export default {
           if (!this.goWasmHandlers[name]) return;
           this.goWasmHandlers[name].add(fn);
         },
-        broadcast: (data, metadata) => {
-          return this.callGoWasm('peerpigeonBroadcast', this.goWasmNodeId, data, metadata || null);
+        broadcast: (data, metadata, options) => {
+          return this.callGoWasm('peerpigeonBroadcast', this.goWasmNodeId, data, metadata || null, options || null);
+        },
+        broadcastReliable: (data, metadata, options) => {
+          return this.callGoWasm('peerpigeonBroadcast', this.goWasmNodeId, data, metadata || null, {
+            ...(options || {}),
+            trackDelivery: true,
+          });
+        },
+        getDeliveryStatus: (messageId) => {
+          return this.callGoWasm('peerpigeonGetDeliveryStatus', this.goWasmNodeId, messageId);
         },
         sendDirect: (peerId, data) => {
           return this.callGoWasm('peerpigeonSendDirect', this.goWasmNodeId, peerId, data);
@@ -2205,6 +2307,9 @@ export default {
           this.goWasmNodeId = null;
           this.goWasmHandlers.messageReceived.clear();
           this.goWasmHandlers.directMessageReceived.clear();
+          this.goWasmHandlers.deliveryProgress.clear();
+          this.goWasmHandlers.deliveryComplete.clear();
+          this.goWasmHandlers.deliveryTimeout.clear();
         }
       };
     },
@@ -2431,6 +2536,9 @@ export default {
         });
 
         this.mesh.on('mesh:membership', () => {
+          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
+            this.callGoWasm('peerpigeonSetGlobalPeers', this.goWasmNodeId, this.mesh.getGlobalPeers());
+          }
           this.updateStats();
         });
 
@@ -2445,6 +2553,13 @@ export default {
             this.addLog('info', `Failed to process gossip payload: ${String(error?.message || error || '')}`, 'crypto');
           });
         });
+
+        const updateDeliveryReceipt = (deliveryStatus) => {
+          this.recordDeliveryReceipt(deliveryStatus);
+        };
+        this.gossip.on('deliveryProgress', updateDeliveryReceipt);
+        this.gossip.on('deliveryComplete', updateDeliveryReceipt);
+        this.gossip.on('deliveryTimeout', updateDeliveryReceipt);
 
         this.mesh.on('signaling:error', (error) => {
           const message = `${error?.message || error || 'unknown signaling error'}`;
@@ -2520,6 +2635,7 @@ export default {
       this.isRunning = false;
       this.signalingConnected = false;
       this.messageLog = [];
+      this.deliveryReceipts = {};
       this.dmTarget = '';
       this.directMode = false;
       this.globalPeersList = [];
@@ -2558,25 +2674,33 @@ export default {
           }
 
           this.messagesSeen++;
-          this.addLog('sent', `📨 [DM→${target.slice(0, 6)}] ${message}`, 'You', 0, true, { direct: true });
+          this.addLog('sent', `[DM→${target.slice(0, 6)}] ${message}`, 'You', 0, true, {
+            direct: true,
+            icon: 'directSend'
+          });
         } else {
           const encryptedBroadcastPayload = await this.buildEncryptedBroadcastPayload(message);
-          this.gossip.broadcast(encryptedBroadcastPayload, {
+          const messageId = this.gossip.broadcastReliable(encryptedBroadcastPayload, {
             sender: this.clientId,
             timestamp: Date.now(),
             encrypted: true
+          }, {
+            deliveryTimeoutMs: 30_000
           });
 
           // Local history should not depend on decrypting our own echo envelope.
           this.messagesSeen++;
-          this.addLog('sent', `📤 [0 hops] ${message}`, 'You', 0, true);
+          this.addLog('sent', `[0 hops] ${message}`, 'You', 0, true, {
+            icon: 'sent',
+            messageId
+          });
         }
 
         this.saveUiState();
         if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
       } catch (error) {
         const reason = String(error?.message || error || 'unknown error');
-        this.addLog('sent', `⚠️ Send failed: ${reason}`, 'System', 0, true);
+        this.addLog('sent', `Send failed: ${reason}`, 'System', 0, true, { icon: 'warning' });
       }
     },
 
@@ -2819,7 +2943,10 @@ export default {
         }
 
         this.messagesSeen++;
-        this.addLog('sent', `📨 [DM→${target.slice(0, 6)}] ${message}`, 'You', 0, true, { direct: true });
+        this.addLog('sent', `[DM→${target.slice(0, 6)}] ${message}`, 'You', 0, true, {
+          direct: true,
+          icon: 'directSend'
+        });
       }
     },
 
@@ -2934,23 +3061,24 @@ export default {
 
     async handleGossipPayload({ message, local, fromPeer }) {
       const sourcePeer = String(fromPeer || message?.sender || 'peer');
+      const payload = normalizeMessagePayload(message?.data);
 
-      if (this.isStorageInternalPayload(message?.data)) {
+      if (this.isStorageInternalPayload(payload)) {
         return;
       }
 
-      if (this.isCryptoPublicInfoPayload(message?.data)) {
-        const from = String(message.data.from || sourcePeer || '').trim();
+      if (this.isCryptoPublicInfoPayload(payload)) {
+        const from = String(payload.from || sourcePeer || '').trim();
         if (from) {
-          this.upsertRemoteCryptoInfo(from, message.data);
+          this.upsertRemoteCryptoInfo(from, payload);
         }
         return;
       }
 
-      if (this.isCryptoPublicRequestPayload(message?.data)) {
+      if (this.isCryptoPublicRequestPayload(payload)) {
         const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-        const target = String(message.data.to || '').trim();
-        const requester = String(message.data.from || '').trim();
+        const target = String(payload.to || '').trim();
+        const requester = String(payload.from || '').trim();
         if (self && target === self && requester) {
           const response = this.buildLocalCryptoPublicPayload();
           if (response) {
@@ -2965,31 +3093,36 @@ export default {
         return;
       }
 
-      if (this.isEncryptedBroadcastPayload(message?.data)) {
+      if (message?.metadata?.internal === true || isInternalMessagePayload(payload)) {
+        return;
+      }
+
+      if (this.isEncryptedBroadcastPayload(payload)) {
         // Sender already logs local broadcast on send(); only decrypt remote deliveries.
         if (local) return;
 
         let decrypted = null;
-        if (message?.data?.roomCipher) {
-          decrypted = await this.decryptBroadcastFromRoom(message.data.roomCipher);
+        if (payload.roomCipher) {
+          decrypted = await this.decryptBroadcastFromRoom(payload.roomCipher);
         } else {
           // Backward compatibility for legacy per-peer broadcast envelopes.
           const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-          const myCipher = message?.data?.recipients?.[self];
+          const myCipher = payload.recipients?.[self];
           if (!myCipher) return;
           decrypted = await this.decryptCipherText(myCipher);
         }
 
         this.messagesSeen++;
-        const indicator = local ? '📤' : (sourcePeer ? '📥' : '📡');
+        const icon = local ? 'sent' : (sourcePeer ? 'received' : 'broadcast');
         const source = local ? 'You' : sourcePeer.slice(0, 6);
         const hopLabel = message.hops === 1 ? 'hop' : 'hops';
         this.addLog(
           local ? 'sent' : 'received',
-          `${indicator} [${message.hops} ${hopLabel}] ${decrypted}`,
+          `[${message.hops} ${hopLabel}] ${decrypted}`,
           source,
           message.hops,
-          local
+          local,
+          { icon }
         );
         if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
         return;
@@ -2997,22 +3130,23 @@ export default {
 
       // Backward-compatible path for plaintext messages.
       this.messagesSeen++;
-      const indicator = local ? '📤' : (sourcePeer ? '📥' : '📡');
+      const icon = local ? 'sent' : (sourcePeer ? 'received' : 'broadcast');
       const source = local ? 'You' : sourcePeer.slice(0, 6);
       const hopLabel = message.hops === 1 ? 'hop' : 'hops';
       this.addLog(
         local ? 'sent' : 'received',
-        `${indicator} [${message.hops} ${hopLabel}] ${this.displayPayloadText(message.data)}`,
+        `[${message.hops} ${hopLabel}] ${this.displayPayloadText(payload)}`,
         source,
         message.hops,
-        local
+        local,
+        { icon }
       );
       if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
     },
 
     async handleDirectPayload(message) {
       const from = String(message.from || 'peer');
-      const payload = message?.data;
+      const payload = normalizeMessagePayload(message?.data);
 
       if (this.isCryptoPublicInfoPayload(payload)) {
         const sender = String(payload.from || from || '').trim();
@@ -3040,10 +3174,17 @@ export default {
         return;
       }
 
+      if (isInternalMessagePayload(payload)) {
+        return;
+      }
+
       if (this.isEncryptedDirectPayload(payload)) {
         const decrypted = await this.decryptCipherText(payload.cipher);
         this.messagesSeen++;
-        this.addLog('received', `📩 [DM] ${decrypted}`, from, 0, false, { direct: true });
+        this.addLog('received', `[DM] ${decrypted}`, from, 0, false, {
+          direct: true,
+          icon: 'directReceive'
+        });
         this.saveUiState();
         if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
         return;
@@ -3051,7 +3192,10 @@ export default {
 
       // Backward-compatible path for plaintext direct payloads.
       this.messagesSeen++;
-      this.addLog('received', `📩 [DM] ${this.displayPayloadText(payload)}`, from, 0, false, { direct: true });
+      this.addLog('received', `[DM] ${this.displayPayloadText(payload)}`, from, 0, false, {
+        direct: true,
+        icon: 'directReceive'
+      });
       this.saveUiState();
       if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
     },
@@ -3916,6 +4060,38 @@ export default {
       );
     },
 
+    recordDeliveryReceipt(status) {
+      const messageId = String(status?.messageId || '').trim();
+      if (!messageId) return;
+      this.deliveryReceipts = {
+        ...this.deliveryReceipts,
+        [messageId]: {
+          ...status,
+          deliveredCount: Math.max(0, Number(status?.deliveredCount || 0)),
+          audienceCount: Math.max(0, Number(status?.audienceCount || 0)),
+          complete: Boolean(status?.complete),
+          timedOut: Boolean(status?.timedOut),
+        }
+      };
+    },
+
+    deliveryReceiptLabel(messageId) {
+      const status = this.deliveryReceipts[messageId];
+      if (!status) return '';
+      const count = `${status.deliveredCount}/${status.audienceCount}`;
+      if (status.complete) return `Delivered to all (${count})`;
+      if (status.timedOut) return `Delivery incomplete (${count})`;
+      return `Delivering (${count})`;
+    },
+
+    deliveryReceiptClass(messageId) {
+      const status = this.deliveryReceipts[messageId];
+      if (!status) return '';
+      if (status.complete) return 'complete';
+      if (status.timedOut) return 'timed-out';
+      return 'pending';
+    },
+
     entryBubbleClass(entry) {
       if (entry?.direct) {
         return entry.local ? 'dm-me' : 'dm-peer';
@@ -3931,7 +4107,10 @@ export default {
         hops,
         timestamp: new Date(),
         local,
-        direct: !!options.direct
+        system: options.system === true || sender === 'System',
+        direct: !!options.direct,
+        icon: String(options.icon || ''),
+        messageId: String(options.messageId || '')
       };
 
       this.messageLog.push(entry);
@@ -4208,6 +4387,14 @@ if (import.meta.hot) {
 </script>
 
 <style scoped>
+:global(html),
+:global(body) {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -4269,6 +4456,18 @@ section {
   padding: 1.1rem;
   margin-bottom: 1rem;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+.section-heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.section-heading-icon {
+  width: 1em;
+  color: #667eea;
+  flex: 0 0 auto;
 }
 
 .workspace-tabs {
@@ -4612,6 +4811,7 @@ section {
 }
 
 .icon-eye {
+  width: 1em;
   font-size: 0.92rem;
   line-height: 1;
 }
@@ -5247,6 +5447,30 @@ section {
 .bubble-text {
   margin-top: 0.25rem;
   word-break: break-word;
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
+.bubble-icon {
+  width: 0.95em;
+  flex: 0 0 auto;
+  opacity: 0.9;
+}
+
+.bubble-delivery {
+  margin-top: 0.3rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  opacity: 0.78;
+}
+
+.bubble-delivery.complete {
+  color: #d1fae5;
+}
+
+.bubble-delivery.timed-out {
+  color: #fee2e2;
 }
 
 .bubble-hops {
