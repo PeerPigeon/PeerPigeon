@@ -93,7 +93,7 @@ function maintainDeliveries(protocol, now) {
   protocol.maintainTrackedDeliveries(now);
 }
 
-test('tracked gossip aggregates receipts in CECR frames without ACK packets', () => {
+test('tracked gossip aggregates receipts in the CECR-DR extension without ACK packets', () => {
   const { network, protocols } = makeProtocols(
     ['01', '02', '03'],
     new Map([
@@ -117,7 +117,15 @@ test('tracked gossip aggregates receipts in CECR frames without ACK packets', ()
     assert.equal(status.audienceCount, 2);
     assert.equal(completion?.messageId, messageId);
     assert.equal(network.frames.some((frame) => frame.type === 'direct'), false);
-    assert.equal(network.frames.every((frame) => frame.type === 'gossip' || frame.type === 'cecr-state'), true);
+    assert.equal(
+      network.frames.every((frame) => ['gossip', 'cecr-state', 'cecr-dr'].includes(frame.type)),
+      true,
+    );
+    assert.equal(network.frames.some((frame) => frame.type === 'cecr-dr'), true);
+    assert.equal(
+      network.frames.some((frame) => frame.type === 'cecr-state' && 'receipts' in frame.envelope),
+      false,
+    );
   } finally {
     destroyProtocols(protocols);
   }
@@ -139,27 +147,71 @@ test('ordinary broadcast remains untracked', () => {
   }
 });
 
-test('a deterministic holder repairs one missed gossip delivery', () => {
+test('a late or previously inactive peer recovers a recent ordinary broadcast through epidemic anti-entropy', () => {
   const { network, protocols } = makeProtocols(
     ['01', '02', '03'],
     new Map([
       ['01', ['02']],
-      ['02', ['01', '03']],
-      ['03', ['02']],
+      ['02', ['01']],
+      ['03', []],
     ]),
   );
   try {
-    network.dropNextGossip = { from: '02', to: '03' };
-    const messageId = protocols.get('01').broadcastReliable('repair-me');
+    const received = [];
+    protocols.get('03').on('messageReceived', ({ message, local }) => {
+      if (!local) received.push(message);
+    });
 
-    publishReceipt(protocols.get('02'));
+    const messageId = protocols.get('01').broadcast('sent-while-03-was-inactive');
+    assert.deepEqual(received, []);
+
+    network.meshes.get('02').connected = ['01', '03'];
+    network.meshes.get('03').connected = ['02'];
+    network.meshes.get('02').emit('peer:connected', '03');
+
+    assert.equal(received.length, 1);
+    assert.equal(received[0].id, messageId);
+    assert.equal(received[0].data, 'sent-while-03-was-inactive');
+    assert.equal(
+      network.frames.some((frame) => frame.type === 'gossip-ae' && frame.envelope.mode === 'summary'),
+      true,
+    );
+    assert.equal(
+      network.frames.some((frame) => frame.type === 'gossip-ae' && frame.envelope.mode === 'request'),
+      true,
+    );
+
+    network.meshes.get('02').emit('peer:connected', '03');
+    assert.equal(received.length, 1);
+  } finally {
+    destroyProtocols(protocols);
+  }
+});
+
+test('a deterministic holder repairs one missed gossip delivery', () => {
+  const first = '0'.repeat(63) + '1';
+  const second = '0'.repeat(63) + '2';
+  const third = '0'.repeat(63) + '3';
+  const { network, protocols } = makeProtocols(
+    [first, second, third],
+    new Map([
+      [first, [second]],
+      [second, [first, third]],
+      [third, [second]],
+    ]),
+  );
+  try {
+    network.dropNextGossip = { from: second, to: third };
+    const messageId = protocols.get(first).broadcastReliable('repair-me');
+
+    publishReceipt(protocols.get(second));
     const repairAt = Date.now() + 1_500;
     for (const protocol of protocols.values()) maintainDeliveries(protocol, repairAt);
-    publishReceipt(protocols.get('03'));
-    publishReceipt(protocols.get('02'));
-    publishReceipt(protocols.get('01'));
+    publishReceipt(protocols.get(third));
+    publishReceipt(protocols.get(second));
+    publishReceipt(protocols.get(first));
 
-    const status = protocols.get('01').getDeliveryStatus(messageId);
+    const status = protocols.get(first).getDeliveryStatus(messageId);
     assert.equal(status.complete, true);
     assert.deepEqual(status.pendingPeerIds, []);
     assert.equal(network.frames.some((frame) => frame.type === 'direct'), true);
@@ -314,29 +366,66 @@ test('mesh exposes capacity, slots, graph edges, and runtime configuration', () 
   });
   try {
     const now = Date.now();
-    mesh.clientId = 'self';
-    mesh.selfAliases.add('self');
-    mesh.peers.set('a', { id: 'a', connected: true, initiator: false });
+    mesh.clientId = '00';
+    mesh.selfAliases.add('00');
+    mesh.peers.set('01', { id: '01', connected: true, initiator: false });
+    mesh.discoveredPeers.add('08');
     mesh.mergeMembership(
-      ['a', 'b'],
+      ['01', '08'],
       [],
-      { a: [2, 1, now], b: [20, 1, now] },
-      { a: [['self', 'b'], now], b: [['a'], now] },
-      'a',
+      { '01': [2, 1, now], '08': [20, 1, now] },
+      { '01': [['00', '08'], now], '08': [['01'], now] },
+      '01',
     );
 
-    assert.equal(mesh.getPeerCapacity('a').availableSlots, 1);
-    assert.equal(mesh.getPeerCapacity('b').availableSlots, 19);
-    assert.equal(mesh.getPeerCapacity('self').availableSlots, 1);
+    assert.equal(mesh.getPeerCapacity('01').availableSlots, 1);
+    assert.equal(mesh.getPeerCapacity('08').availableSlots, 19);
+    assert.equal(mesh.getPeerCapacity('00').availableSlots, 1);
 
     const graph = mesh.getGraphSnapshot();
-    assert.deepEqual(graph.nodes.map((node) => node.peerId), ['a', 'b', 'self']);
-    assert.deepEqual(graph.edges.map((edge) => [edge.source, edge.target]), [['a', 'b'], ['a', 'self']]);
+    assert.deepEqual(graph.nodes.map((node) => node.peerId), ['00', '01', '08']);
+    assert.deepEqual(graph.edges.map((edge) => [edge.source, edge.target]), [['00', '01'], ['01', '08']]);
     assert.equal(graph.complete, true);
+    assert.equal(graph.nodes.find((node) => node.peerId === '00').hopDistance, 0);
+    assert.equal(graph.nodes.find((node) => node.peerId === '01').hopDistance, 1);
+    assert.equal(graph.nodes.find((node) => node.peerId === '08').hopDistance, 2);
+    assert.equal(mesh.getHopDistance('08'), 2);
+    assert.equal(graph.nodes.find((node) => node.peerId === '01').xorDistance, '0x1');
+    assert.equal(graph.nodes.find((node) => node.peerId === '01').xorDistanceRank, 0);
+    assert.equal(graph.nodes.find((node) => node.peerId === '01').xorDistanceRatio, 0);
+    assert.equal(graph.nodes.find((node) => node.peerId === '08').xorDistance, '0x8');
+    assert.equal(graph.nodes.find((node) => node.peerId === '08').xorDistanceRank, 1);
+    assert.equal(graph.nodes.find((node) => node.peerId === '08').xorDistanceRatio, 1);
+    assert.equal(mesh.getXorDistance('08'), '0x8');
 
     const updated = mesh.updateConfig({ maxPeers: 3, tolerantPeers: 2 });
     assert.equal(updated.maxPeers, 3);
     assert.equal(updated.tolerantPeers, 2);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('stale capacity and topology cannot manufacture a phantom graph peer', () => {
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  try {
+    const now = Date.now();
+    mesh.clientId = '00';
+    mesh.selfAliases.add('00');
+    mesh.peers.set('01', { id: '01', connected: true, initiator: false });
+    mesh.peerCapacityById.set('ghost', { maxPeers: 10, connectedPeers: 1, updatedAt: now });
+    mesh.peerTopologyById.set('01', { connectedPeerIds: ['00', 'ghost'], updatedAt: now });
+    mesh.peerTopologyById.set('ghost', { connectedPeerIds: ['01'], updatedAt: now });
+
+    const graph = mesh.getGraphSnapshot();
+    assert.deepEqual(graph.nodes.map((node) => node.peerId), ['00', '01']);
+    assert.deepEqual(graph.edges.map((edge) => [edge.source, edge.target]), [['00', '01']]);
+    assert.equal(graph.nodes.some((node) => node.peerId === 'ghost'), false);
   } finally {
     mesh.destroy();
   }
@@ -371,6 +460,184 @@ test('tolerantPeers is a real temporary connected-plus-pending overflow budget',
     mesh.updateConfig({ tolerantPeers: 1 });
     mesh.connectToPeerInternal('ff', true);
     assert.equal(mesh.connecting.has('ff'), true);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('an isolated mesh purges a stale untracked RTC negotiation and immediately redials', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+    connectionTimeoutMs: 45_000,
+  });
+  const connections = new Map([[target, {
+    state: 'connected',
+    lastSeen: Date.now() - 9_000,
+    connection: { connectionState: 'connected', signalingState: 'stable' },
+    channel: { readyState: 'connecting' },
+  }]]);
+  const closed = [];
+  const dials = [];
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.discoveredPeers.add(target);
+    mesh.discoveredAtMs.set(target, Date.now() - 20_000);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      initiateConnection(peerId) {
+        dials.push(peerId);
+        return new Promise(() => {});
+      },
+      closeConnection(peerId) {
+        closed.push(peerId);
+        connections.delete(peerId);
+      },
+      disconnect() {},
+      client: { mesh: { connections } },
+    };
+
+    mesh.maintainPeerConnections();
+
+    assert.deepEqual(closed, [target]);
+    assert.deepEqual(dials, [target]);
+    assert.equal(mesh.connecting.has(target), true);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('repeated signaling cannot keep an isolated orphan negotiation alive forever', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const now = Date.now();
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+    connectionTimeoutMs: 45_000,
+  });
+  const entry = {
+    state: 'connecting',
+    lastSeen: now,
+    connection: { connectionState: 'connecting', signalingState: 'stable' },
+    channel: { readyState: 'connecting' },
+  };
+  const connections = new Map([[target, entry]]);
+  const closed = [];
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.discoveredPeers.add(target);
+    mesh.signalingClient = {
+      closeConnection(peerId) {
+        closed.push(peerId);
+        connections.delete(peerId);
+      },
+      disconnect() {},
+      client: { mesh: { connections } },
+    };
+
+    mesh.recoverOrphanedRtcNegotiations(now);
+    // A retry packet refreshes FreeRTC's activity timestamp, but it does not
+    // reset the independent deadline for opening a usable data channel.
+    entry.lastSeen = now + 9_000;
+    mesh.recoverOrphanedRtcNegotiations(now + 9_000);
+
+    assert.deepEqual(closed, [target]);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('resume immediately clears a fresh orphan negotiation and redials', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const connections = new Map([[target, {
+    state: 'connecting',
+    lastSeen: Date.now(),
+    connection: { connectionState: 'connecting', signalingState: 'stable' },
+    channel: { readyState: 'connecting' },
+  }]]);
+  const closed = [];
+  const dials = [];
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: true,
+  });
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.discoveredPeers.add(target);
+    mesh.dialBackoffUntilMs.set(target, Date.now() + 30_000);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      recoverAfterInactivity: () => false,
+      nudgeSignaling() {},
+      joinSession() {},
+      initiateConnection(peerId) {
+        dials.push(peerId);
+        return new Promise(() => {});
+      },
+      closeConnection(peerId) {
+        closed.push(peerId);
+        connections.delete(peerId);
+      },
+      disconnect() {},
+      client: { mesh: { connections } },
+    };
+
+    mesh.recoverAfterInactivity('visible');
+
+    assert.deepEqual(closed, [target]);
+    assert.deepEqual(dials, [target]);
+    assert.equal(mesh.connecting.has(target), true);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('an isolated mesh can redial a live CECR member missing from signaling discovery', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  const dials = [];
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.mergeMembership([target], [], {}, 'relay');
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      initiateConnection(peerId) {
+        dials.push(peerId);
+        return new Promise(() => {});
+      },
+      closeConnection() {},
+      disconnect() {},
+      client: { mesh: { connections: new Map() } },
+    };
+
+    assert.deepEqual(mesh.getDiscoveredPeers(), []);
+    assert.deepEqual(mesh.getGlobalPeers(), [target]);
+    mesh.maintainPeerConnections();
+
+    assert.deepEqual(dials, [target]);
+    assert.equal(mesh.connecting.has(target), true);
   } finally {
     mesh.destroy();
   }
@@ -478,6 +745,7 @@ test('PeerPigeonNode provides the unified JS API', async () => {
     assert.equal(node.getConfig().tolerantPeers, 1);
     assert.deepEqual(node.getGraphSnapshot().edges, []);
     assert.deepEqual(node.getPeerCapacities(), []);
+    assert.equal(node.getHopDistance('missing'), null);
   } finally {
     await node.destroy();
   }

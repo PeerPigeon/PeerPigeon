@@ -150,9 +150,9 @@
         </div>
 
         <div v-if="isRunning" class="control-stats-row">
-          <div class="control-stat">
+          <div class="control-stat control-stat-peer-id">
             <span class="control-stat-label">Peer ID</span>
-            <span class="control-stat-value mono" :title="clientId" data-testid="client-id">{{ peerIdDisplay }}</span>
+            <span class="control-stat-value peer-id-full mono" :title="clientId" data-testid="client-id">{{ peerIdDisplay }}</span>
           </div>
           <div class="control-stat">
             <span class="control-stat-label">Connected</span>
@@ -166,6 +166,20 @@
             <span class="control-stat-label">Gossips</span>
             <span class="control-stat-value" data-testid="messages-seen">{{ messagesSeen }}</span>
           </div>
+        </div>
+
+        <div
+          v-if="isRunning"
+          ref="networkGraphContainer"
+          class="network-graph-container"
+          data-testid="mesh-visualizer"
+        >
+          <PeerNetworkGraph
+            ref="peerNetworkGraph"
+            :nodes="networkGraphModel.nodes"
+            :links="networkGraphModel.links"
+            :activity-by-peer="networkGraphActivityByPeer"
+          />
         </div>
 
         <div class="workspace-tabs" v-if="isRunning">
@@ -372,7 +386,13 @@
                   </tr>
                   <tr v-for="record in storageRecords" :key="`${record.space}:${record.key}`" @click="selectStorageRecord(record)">
                     <td class="mono">{{ record.key }}</td>
-                    <td class="mono storage-value-cell">{{ storageRecordPreview(record.value) }}</td>
+                    <td class="mono storage-value-cell">
+                      <div
+                        class="storage-value-scroll"
+                        :class="{ 'is-scrolling': storageTableScrollingKey === `${record.space}:${record.key}` }"
+                        @scroll.passive="handleStorageTableValueScroll(record)"
+                      >{{ storageRecordText(record.value) }}</div>
+                    </td>
                     <td class="mono">{{ storageModifiedBy(record) }}</td>
                     <td>{{ formatStorageVersion(record.version) }}</td>
                     <td>{{ formatTime(record.updatedAt) }}</td>
@@ -447,23 +467,6 @@
             </div>
           </div>
         </div>
-      </section>
-
-      <!-- Peer Network Visualization -->
-      <section v-if="isRunning" class="network-viz">
-        <h3 class="section-heading">
-          <FontAwesomeIcon :icon="icons.network" class="section-heading-icon" aria-hidden="true" />
-          <span>Network Graph</span>
-        </h3>
-        <div ref="networkGraphContainer" class="network-graph-container" data-testid="mesh-visualizer">
-          <PeerNetworkGraph
-            ref="peerNetworkGraph"
-            :nodes="networkGraphModel.nodes"
-            :links="networkGraphModel.links"
-            :activity-by-peer="networkGraphActivityByPeer"
-          />
-        </div>
-        <div class="mesh-visualizer-caption">Solid lines are this peer's direct WebRTC connections; dashed lines are indirect topology learned through <code>epublic/mesh:peers</code>. A node glow marks real peer join/connect activity (hover for the full peer ID).</div>
       </section>
 
       <!-- Diagnostics -->
@@ -541,7 +544,6 @@ import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome';
 import {
   faCommentDots,
   faDatabase,
-  faDiagramProject,
   faEnvelope,
   faEye,
   faEyeSlash,
@@ -555,13 +557,13 @@ import {
   faXmark,
 } from '@fortawesome/free-solid-svg-icons';
 import PeerNetworkGraph from './components/PeerNetworkGraph.vue';
+import { canonicalPeerId } from './peer-id.js';
 
 const APP_ICONS = Object.freeze({
   message: faCommentDots,
   media: faFilm,
   storage: faDatabase,
   crypto: faLock,
-  network: faDiagramProject,
   diagnostics: faScrewdriverWrench,
   eye: faEye,
   eyeSlash: faEyeSlash,
@@ -678,6 +680,8 @@ export default {
       storageLookupOwnerId: '',
       storageFormKey: '',
       storageFormValue: '',
+      storageTableScrollingKey: '',
+      storageTableScrollTimer: null,
       storageRecords: [],
       storageChangeUnsubscribe: null,
       storageInterestedKeys: {},
@@ -707,12 +711,14 @@ export default {
       networkGraphRevision: 0,
       networkGraphState: null,
       networkGraphActivityByPeer: {},
+      networkGraphKnownEdgeKeys: [],
       networkGraphResizeHandler: null,
       networkGraphResizeObserver: null,
       networkGraphResizeObservedElement: null,
       debugMonitorTimer: null,
       debugLastByPeer: {},
       debugLastLogAtByPeer: {},
+      unexpectedMeshRestartInFlight: false,
       runtimeMode: 'go-wasm',
       goWasmNodeId: null,
       goWasmHandlers: {
@@ -824,6 +830,19 @@ export default {
     };
     window.addEventListener('resize', this.networkGraphResizeHandler);
   },
+  updated() {
+    // Older HMR cleanup destroyed window.__mesh while Vue retained this
+    // component and its `isRunning` state. Repair that impossible half-state
+    // automatically instead of leaving a dev tab stuck at Connected 0.
+    if (
+      import.meta.env.DEV
+      && this.isRunning
+      && this.mesh
+      && !this.mesh.signalingClient
+    ) {
+      this.restartUnexpectedlyStoppedMesh('hot update');
+    }
+  },
   computed: {
     networkGraphModel() {
       // Direct line state must use the same reactive peer IDs as the Connected
@@ -852,10 +871,7 @@ export default {
       return this.connectedPeersList.length;
     },
     peerIdDisplay() {
-      const id = String(this.clientId || '').trim();
-      if (!id) return '';
-      if (id.length <= 18) return id;
-      return `${id.slice(0, 10)}...${id.slice(-6)}`;
+      return canonicalPeerId(this.clientId);
     },
     discoveredPeers() {
       return this.discoveredPeersList.length;
@@ -1291,13 +1307,10 @@ export default {
       }
     },
 
-    storageRecordPreview(value) {
-      if (typeof value === 'string') {
-        return value.length > 140 ? `${value.slice(0, 137)}...` : value;
-      }
+    storageRecordText(value) {
+      if (typeof value === 'string') return value;
       try {
-        const json = JSON.stringify(value);
-        return json.length > 140 ? `${json.slice(0, 137)}...` : json;
+        return JSON.stringify(value);
       } catch {
         return String(value);
       }
@@ -1912,6 +1925,15 @@ export default {
       }
     },
 
+    handleStorageTableValueScroll(record) {
+      this.storageTableScrollingKey = `${record?.space || ''}:${record?.key || ''}`;
+      clearTimeout(this.storageTableScrollTimer);
+      this.storageTableScrollTimer = setTimeout(() => {
+        this.storageTableScrollingKey = '';
+        this.storageTableScrollTimer = null;
+      }, 650);
+    },
+
     async saveStorageEntry() {
       if (!this.storage) return;
       if (this.storageActiveSpace === 'epublic') {
@@ -2524,6 +2546,7 @@ export default {
           }
           this.addLog('connected', `Connected to peer`, peerId);
           this.markNetworkGraphPeerActivity(peerId);
+          this.markNetworkGraphPeerActivity(this.mesh?.getClientId?.() || this.clientId);
           this.announceCryptoPublicInfo();
           this.requestInterestedKeySync('peer-connected');
           this.updateStats();
@@ -2572,6 +2595,7 @@ export default {
         });
 
         this.mesh.on('mesh:graph', () => {
+          this.syncSelfGlowForGraphConnections();
           this.networkGraphRevision += 1;
           this.scheduleNetworkGraphRender({ reason: 'mesh:graph' });
         });
@@ -2651,6 +2675,7 @@ export default {
       this.meshPeersLastLocalSignature = '';
       this.meshPeersLastPublishedAt = 0;
       this.sharedMeshPeerSnapshots = {};
+      this.networkGraphKnownEdgeKeys = [];
       clearTimeout(this.meshConnectWarnTimer);
       this.meshConnectWarnTimer = null;
       this.teardownStorage();
@@ -3317,6 +3342,28 @@ export default {
       };
     },
 
+    syncSelfGlowForGraphConnections() {
+      const snapshot = this.mesh?.getGraphSnapshot?.();
+      if (!snapshot || !Array.isArray(snapshot.edges)) return;
+
+      const nextEdgeKeys = new Set();
+      for (const edge of snapshot.edges) {
+        const source = String(edge?.source || '').trim();
+        const target = String(edge?.target || '').trim();
+        if (!source || !target || source === target) continue;
+        nextEdgeKeys.add(source < target ? `${source}\u0000${target}` : `${target}\u0000${source}`);
+      }
+
+      const previousEdgeKeys = new Set(this.networkGraphKnownEdgeKeys || []);
+      const gainedConnection = Array.from(nextEdgeKeys)
+        .some((edgeKey) => !previousEdgeKeys.has(edgeKey));
+      this.networkGraphKnownEdgeKeys = Array.from(nextEdgeKeys).sort();
+
+      if (gainedConnection) {
+        this.markNetworkGraphPeerActivity(this.mesh?.getClientId?.() || this.clientId);
+      }
+    },
+
     networkTolerantPeerIds(connectedPeerIds) {
       const peers = [...new Set((connectedPeerIds || []).map((peerId) => String(peerId || '').trim()).filter(Boolean))];
       const maxPeers = Math.max(0, Math.floor(Number(this.maxPeers) || 0));
@@ -3341,6 +3388,38 @@ export default {
       return activePeerIds;
     },
 
+    networkGraphHopDistances(localPeerId, peerIds, links) {
+      const distances = new Map();
+      if (!localPeerId) return distances;
+      const adjacency = new Map((peerIds || []).map((peerId) => [peerId, []]));
+      for (const link of links || []) {
+        const source = String(link?.source || '').trim();
+        const target = String(link?.target || '').trim();
+        if (!adjacency.has(source) || !adjacency.has(target)) continue;
+        adjacency.get(source).push(target);
+        adjacency.get(target).push(source);
+      }
+      distances.set(localPeerId, 0);
+      const queue = [localPeerId];
+      for (let index = 0; index < queue.length; index += 1) {
+        const peerId = queue[index];
+        const nextDistance = distances.get(peerId) + 1;
+        for (const adjacentPeerId of adjacency.get(peerId) || []) {
+          if (distances.has(adjacentPeerId)) continue;
+          distances.set(adjacentPeerId, nextDistance);
+          queue.push(adjacentPeerId);
+        }
+      }
+      return distances;
+    },
+
+    networkGraphDistanceScale(hopDistance, isSelf = false) {
+      if (isSelf) return 1;
+      const distance = Number(hopDistance);
+      if (!Number.isInteger(distance) || distance < 1) return 0.35;
+      return Math.max(0.35, Math.min(1, 1 / Math.sqrt(distance)));
+    },
+
     networkGraphData() {
       const localSelf = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
       const publicGraph = this.mesh?.getGraphSnapshot?.();
@@ -3349,20 +3428,34 @@ export default {
           (this.connectedPeersList || []).map((peerId) => String(peerId || '').trim()).filter(Boolean)
         );
         const tolerantPeerIds = this.networkTolerantPeerIds(this.connectedPeersList || []);
-        const nodes = publicGraph.nodes.map((node) => ({
-          id: node.peerId,
-          short: node.peerId.slice(0, 4).toUpperCase(),
-          isSelf: Boolean(node.local),
-          isDirect: localConnectedSet.has(node.peerId),
-          isTolerant: tolerantPeerIds.has(node.peerId),
-          hue: this.networkNodeHue(node.peerId),
-          capacity: node.capacity,
-        }));
-        const links = publicGraph.edges.map((edge) => ({
-          source: edge.source,
-          target: edge.target,
-          direct: Boolean(edge.direct),
-        }));
+        const nodes = publicGraph.nodes.map((node) => {
+          const advertisedHopDistance = node.hopDistance == null ? Number.NaN : Number(node.hopDistance);
+          const hopDistance = Number.isInteger(advertisedHopDistance) && advertisedHopDistance >= 0
+            ? advertisedHopDistance
+            : (node.local ? 0 : (localConnectedSet.has(node.peerId) ? 1 : null));
+          return {
+            id: node.peerId,
+            isSelf: Boolean(node.local),
+            isDirect: localConnectedSet.has(node.peerId),
+            isDiscovered: Boolean(node.discovered),
+            isTolerant: tolerantPeerIds.has(node.peerId),
+            hue: this.networkNodeHue(node.peerId),
+            capacity: node.capacity,
+            hopDistance,
+            xorDistance: node.xorDistance,
+            xorDistanceRank: node.xorDistanceRank,
+            xorDistanceRatio: node.xorDistanceRatio,
+            distanceScale: this.networkGraphDistanceScale(hopDistance, Boolean(node.local)),
+          };
+        });
+        const visiblePeerIds = new Set(nodes.map((node) => node.id));
+        const links = publicGraph.edges
+          .filter((edge) => visiblePeerIds.has(edge.source) && visiblePeerIds.has(edge.target))
+          .map((edge) => ({
+            source: edge.source,
+            target: edge.target,
+            direct: Boolean(edge.direct),
+          }));
         return { nodes, links };
       }
 
@@ -3373,6 +3466,7 @@ export default {
       const snapshots = this.activeMeshPeerSnapshots();
       const localSnapshot = this.localMeshPeerSnapshot();
       const localConnectedSet = new Set((this.connectedPeersList || []).map((peerId) => String(peerId || '').trim()).filter(Boolean));
+      const localDiscoveredSet = new Set((this.discoveredPeersList || []).map((peerId) => String(peerId || '').trim()).filter(Boolean));
       if (localSnapshot) {
         snapshots[localSnapshot.peerId] = localSnapshot;
       }
@@ -3424,19 +3518,30 @@ export default {
       }
 
       const nodeIds = [...participants];
+      const hopDistances = this.networkGraphHopDistances(localSelf, nodeIds, links);
 
       const nodes = nodeIds
         .sort((a, b) => a.localeCompare(b))
-        .map((peerId) => ({
-          id: peerId,
-          short: peerId.slice(0, 4).toUpperCase(),
-          isSelf: Boolean(localSelf) && peerId === localSelf,
-          isDirect: localConnectedSet.has(peerId),
-          isTolerant: tolerantPeerIds.has(peerId),
-          hue: this.networkNodeHue(peerId),
-        }));
+        .map((peerId) => {
+          const isSelf = Boolean(localSelf) && peerId === localSelf;
+          const hopDistance = hopDistances.get(peerId) ?? null;
+          return {
+            id: peerId,
+            isSelf,
+            isDirect: localConnectedSet.has(peerId),
+            isDiscovered: localDiscoveredSet.has(peerId),
+            isTolerant: tolerantPeerIds.has(peerId),
+            hue: this.networkNodeHue(peerId),
+            hopDistance,
+            distanceScale: this.networkGraphDistanceScale(hopDistance, isSelf),
+          };
+        });
+      const visiblePeerIds = new Set(nodes.map((node) => node.id));
+      const visibleLinks = links.filter(
+        (link) => visiblePeerIds.has(link.source) && visiblePeerIds.has(link.target),
+      );
 
-      return { nodes, links };
+      return { nodes, links: visibleLinks };
     },
 
     networkGraphSignature(nodes, links) {
@@ -4042,6 +4147,9 @@ export default {
 
     gossipCoverageSnapshot() {
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      const localConnectedPeers = new Set(
+        (this.connectedPeersList || []).map((peerId) => String(peerId || '').trim()).filter(Boolean)
+      );
       const activePeerIds = this.activeMeshPeerIds();
       const snapshots = this.activeMeshPeerSnapshots();
       const localSnapshot = this.localMeshPeerSnapshot();
@@ -4065,12 +4173,18 @@ export default {
       };
 
       for (const peerId of activePeerIds) addPeer(peerId);
+      // The local transport is authoritative for every edge incident to self.
+      // A remote snapshot may still describe an edge this browser already lost.
+      for (const peerId of localConnectedPeers) addConnection(self, peerId);
       for (const [peerId, snapshot] of Object.entries(snapshots)) {
         const source = String(peerId || snapshot?.peerId || '').trim();
         if (!source || !activePeerIds.has(source)) continue;
         for (const target of snapshot?.connectedPeers || []) {
-          if (!activePeerIds.has(String(target || '').trim())) continue;
-          addConnection(source, target);
+          const normalizedTarget = String(target || '').trim();
+          if (!activePeerIds.has(normalizedTarget)) continue;
+          // Remote topology cannot resurrect a stale edge to this browser.
+          if (source === self || normalizedTarget === self) continue;
+          addConnection(source, normalizedTarget);
         }
       }
 
@@ -4122,6 +4236,14 @@ export default {
       }
 
       const coverageSnapshot = this.gossipCoverageSnapshot();
+      if ((this.connectedPeersList || []).length === 0) {
+        this.showStatus(
+          'Gossip Offline',
+          `Gossip Offline (0/${coverageSnapshot.knownPeers} reachable; no live connections)`,
+          'connecting'
+        );
+        return;
+      }
       const coverage = coverageSnapshot.coverage;
       let quality = 'Poor';
       let statusType = 'connecting';
@@ -4302,6 +4424,18 @@ export default {
       this.debugLastLogAtByPeer = {};
     },
 
+    restartUnexpectedlyStoppedMesh(reason = 'runtime recovery') {
+      if (this.unexpectedMeshRestartInFlight || !this.isRunning) return;
+      this.unexpectedMeshRestartInFlight = true;
+      this.showStatus('Reconnecting', `Mesh stopped during ${reason}; rebuilding now...`, 'connecting');
+      this.stopMesh();
+      this.$nextTick(() => {
+        Promise.resolve(this.startMesh()).finally(() => {
+          this.unexpectedMeshRestartInFlight = false;
+        });
+      });
+    },
+
     updateUrlState() {
       try {
         const url = new URL(window.location.href);
@@ -4444,6 +4578,8 @@ export default {
   },
 
   beforeUnmount() {
+    clearTimeout(this.storageTableScrollTimer);
+    this.storageTableScrollTimer = null;
     if (this.networkGraphResizeObserver) {
       this.networkGraphResizeObserver.disconnect();
       this.networkGraphResizeObserver = null;
@@ -4462,17 +4598,6 @@ export default {
   }
 };
 
-// Vue preserves component instances during Vite hot updates. Explicitly tear
-// down network singletons so editing the demo cannot leave an older peer ID
-// heartbeating beside its replacement in the same browser tab.
-if (import.meta.hot) {
-  import.meta.hot.dispose(() => {
-    try { window.__gossip?.destroy?.(); } catch { /* ignore HMR teardown failures */ }
-    try { window.__mesh?.destroy?.(); } catch { /* ignore HMR teardown failures */ }
-    window.__gossip = null;
-    window.__mesh = null;
-  });
-}
 </script>
 
 <style scoped>
@@ -4535,8 +4660,12 @@ header p {
 
 main {
   max-width: 1200px;
-  margin: 1rem auto;
+  margin: 1rem auto 0;
   padding: 0 1rem;
+}
+
+main > section:last-child {
+  margin-bottom: 0;
 }
 
 section {
@@ -4817,9 +4946,46 @@ section {
 }
 
 .storage-value-cell {
+  width: 42%;
   max-width: 320px;
+}
+
+.storage-value-scroll {
+  width: 100%;
+  height: 4.5rem;
+  min-height: 4.5rem;
+  max-height: 4.5rem;
+  overflow-x: hidden;
+  overflow-y: scroll;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
+  line-height: 1.3;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  scrollbar-gutter: stable;
+  overscroll-behavior-y: contain;
+}
+
+.storage-value-scroll.is-scrolling {
+  scrollbar-color: rgba(71, 85, 105, 0.7) transparent;
+}
+
+.storage-value-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 0;
+}
+
+.storage-value-scroll::-webkit-scrollbar-track,
+.storage-value-scroll::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+
+.storage-value-scroll.is-scrolling::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(71, 85, 105, 0.7);
+  background-clip: padding-box;
 }
 
 .storage-empty {
@@ -5075,7 +5241,7 @@ section {
   background: #f8fafc;
   padding: 0.28rem 0.45rem;
   display: grid;
-  grid-template-columns: minmax(160px, 1.2fr) repeat(3, minmax(90px, 1fr));
+  grid-template-columns: minmax(0, 3fr) repeat(3, minmax(0, 1fr));
   gap: 0.45rem;
   align-items: center;
   min-height: 1.7rem;
@@ -5090,6 +5256,8 @@ section {
   display: flex;
   flex-direction: column;
   align-items: center;
+  align-self: stretch;
+  justify-content: flex-start;
   text-align: center;
   gap: 0.12rem;
 }
@@ -5110,6 +5278,24 @@ section {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.control-stat-peer-id {
+  width: 100%;
+  justify-self: stretch;
+  align-items: flex-start;
+  padding-left: 0.25rem;
+  text-align: left;
+}
+
+.peer-id-full {
+  display: block;
+  width: 100%;
+  overflow: visible;
+  font-size: clamp(0.58rem, 1.05vw, 0.72rem);
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+  text-overflow: clip;
 }
 
 .message-input {
@@ -5321,27 +5507,18 @@ section {
   border-color: #f1c3c3;
 }
 
-/* Network Visualization */
-.network-viz {
-  text-align: center;
-}
-
-.network-viz h3 {
-  margin-bottom: 0.6rem;
-  color: #000000;
-  letter-spacing: 0.02em;
-}
-
 .network-graph-container {
   position: relative;
-  margin: 0.9rem auto 0;
+  box-sizing: border-box;
+  width: 100%;
+  margin: 0 auto;
   max-width: 1040px;
   height: 410px;
   min-height: 410px;
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 18px;
   box-shadow: 0 24px 55px rgba(38, 20, 88, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.12);
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: linear-gradient(135deg, #151515 0%, #262626 100%);
   overflow: hidden;
 }
 
@@ -5352,8 +5529,8 @@ section {
   pointer-events: none;
   z-index: 1;
   background:
-    radial-gradient(circle at 18% 20%, rgba(117, 249, 255, 0.12), transparent 32%),
-    radial-gradient(circle at 84% 78%, rgba(255, 128, 225, 0.11), transparent 35%);
+    radial-gradient(circle at 18% 20%, rgba(255, 255, 255, 0.055), transparent 32%),
+    radial-gradient(circle at 84% 78%, rgba(255, 255, 255, 0.035), transparent 35%);
 }
 
 .network-graph-svg {
@@ -5391,18 +5568,6 @@ section {
   fill: #93c5fd;
   font-size: 14px;
   font-family: 'Monaco', 'Courier New', monospace;
-}
-
-.mesh-visualizer-caption {
-  margin-top: 0.35rem;
-  font-size: 0.8rem;
-  color: #93c5fd;
-}
-
-.mesh-visualizer-caption code {
-  font-family: 'Monaco', 'Courier New', monospace;
-  font-weight: 700;
-  color: #bfdbfe;
 }
 
 @keyframes self-node-pulse {
@@ -5626,6 +5791,18 @@ section {
 
   .stats {
     grid-template-columns: 1fr;
+  }
+
+  .control-stats-row {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .control-stat-peer-id {
+    grid-column: 1 / -1;
+  }
+
+  .peer-id-full {
+    font-size: clamp(0.55rem, 1.8vw, 0.68rem);
   }
 
   .network-graph-container {
