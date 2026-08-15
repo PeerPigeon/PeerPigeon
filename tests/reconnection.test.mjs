@@ -220,6 +220,75 @@ test('an unacknowledged suspend probe recycles transport without replacing the F
   }]);
 });
 
+test('an unregistered signaling transport recovers without another peer announcing', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  let disconnects = 0;
+  let connects = 0;
+  const client = {
+    isRegistered: false,
+    mesh: { connections: new Map() },
+    advertise() {},
+    requestBootstrap() {},
+    disconnect() { disconnects += 1; },
+    connect() { connects += 1; },
+  };
+  adapter.client = client;
+
+  adapter.recoverAfterInactivity('signaling-watchdog');
+  assert.equal(connects, 1);
+
+  t.mock.timers.tick(4_999);
+  assert.equal(disconnects, 0);
+
+  // A FreeRTC connect call is a no-op while its old WebSocket remains OPEN or
+  // CONNECTING. The registration deadline must therefore recycle that socket.
+  t.mock.timers.tick(1);
+  assert.equal(disconnects, 1);
+  assert.equal(adapter.client, client);
+
+  t.mock.timers.tick(1_000);
+  assert.equal(connects, 2);
+  assert.equal(adapter.client, client);
+
+  // Missing a second acknowledgement must start another bounded recycle;
+  // the adapter cannot remain trapped in "reconnect in progress".
+  t.mock.timers.tick(5_000);
+  assert.equal(disconnects, 2);
+  t.mock.timers.tick(1_000);
+  assert.equal(connects, 3);
+
+  adapter.disconnect();
+});
+
+test('connect resynchronizes adapter state when FreeRTC is already registered', () => {
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  let connectedEvents = 0;
+  let connects = 0;
+  let bootstrapRequests = 0;
+  adapter.client = {
+    isRegistered: true,
+    mesh: { connections: new Map() },
+    advertise() {},
+    requestBootstrap() { bootstrapRequests += 1; },
+    disconnect() {},
+    connect() { connects += 1; },
+  };
+  adapter.on('connected', () => { connectedEvents += 1; });
+
+  adapter.connect();
+
+  assert.equal(connectedEvents, 1);
+  assert.equal(connects, 0);
+  assert.equal(bootstrapRequests, 1);
+
+  adapter.disconnect();
+});
+
 test('periodic relay acknowledgement checks detect zombie sockets without lifecycle events', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
