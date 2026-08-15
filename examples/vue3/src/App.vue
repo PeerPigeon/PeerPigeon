@@ -78,8 +78,18 @@
               :disabled="isRunning || isConnecting"
               class="input"
               data-testid="signaling-server"
-              placeholder="wss://peer.ooo/ws"
+              list="federated-signaling-servers"
+              placeholder="auto"
+              :title="activeSignalingServer || 'Automatic federated relay selection'"
             />
+            <datalist id="federated-signaling-servers">
+              <option value="auto">Automatic</option>
+              <option
+                v-for="relayUrl in signalingServerOptions"
+                :key="relayUrl"
+                :value="relayUrl"
+              ></option>
+            </datalist>
           </label>
 
           <label class="field">
@@ -529,7 +539,7 @@
 </template>
 
 <script>
-import { PartialMesh } from 'peerpigeon';
+import { DEFAULT_SIGNALING_SERVERS, PartialMesh } from 'peerpigeon';
 import { GossipProtocol } from 'peerpigeon';
 import { PeerPigeonStorage } from 'peerpigeon';
 import { PeerPigeonCryptoProtocol } from 'peerpigeon';
@@ -657,7 +667,9 @@ export default {
       customTopologyModalOpen: false,
       networkName: 'peerpigeon',
       roomSessionId: '',
-      signalingServer: 'wss://peer.ooo/ws',
+      signalingServer: 'auto',
+      activeSignalingServer: '',
+      signalingServerOptions: [...DEFAULT_SIGNALING_SERVERS],
       messageLog: [],
       autoScroll: true,
       status: {
@@ -719,7 +731,7 @@ export default {
       debugLastByPeer: {},
       debugLastLogAtByPeer: {},
       unexpectedMeshRestartInFlight: false,
-      runtimeMode: 'go-wasm',
+      runtimeMode: 'typescript',
       goWasmNodeId: null,
       goWasmHandlers: {
         messageReceived: new Set(),
@@ -803,7 +815,9 @@ export default {
 
     const signalingServerParam = params.get('signalingServer') || params.get('signalUrl');
     if (signalingServerParam) {
-      this.signalingServer = signalingServerParam;
+      this.signalingServer = this.usesAutomaticSignalingServer(signalingServerParam)
+        ? 'auto'
+        : signalingServerParam;
     }
 
     // Restore persisted UI state before any autostart/network events can write defaults.
@@ -817,8 +831,10 @@ export default {
       });
     }
 
-    const autostart = (params.get('autostart') || '1').toLowerCase();
-    if (autostart === '1' || autostart === 'true' || autostart === 'yes') {
+    const autostartParam = params.get('autostart');
+    const autostart = autostartParam == null
+      || !['0', 'false', 'no', 'off'].includes(autostartParam.trim().toLowerCase());
+    if (autostart) {
       this.startMesh();
     }
 
@@ -831,6 +847,16 @@ export default {
     window.addEventListener('resize', this.networkGraphResizeHandler);
   },
   updated() {
+    // HMR preserves data from tabs opened with the former explicit peer.ooo
+    // default. Migrate that live state too, not only fresh page loads.
+    if (this.usesAutomaticSignalingServer(this.signalingServer) && this.signalingServer !== 'auto') {
+      this.signalingServer = 'auto';
+      this.updateUrlState();
+      if (import.meta.env.DEV && this.isRunning) {
+        this.restartUnexpectedlyStoppedMesh('automatic relay migration');
+        return;
+      }
+    }
     // Older HMR cleanup destroyed window.__mesh while Vue retained this
     // component and its `isRunning` state. Repair that impossible half-state
     // automatically instead of leaving a dev tab stuck at Connected 0.
@@ -961,6 +987,27 @@ export default {
     }
   },
   methods: {
+    usesAutomaticSignalingServer(value) {
+      const raw = String(value || '').trim();
+      if (!raw) return true;
+      const mode = raw.toLowerCase();
+      if (mode === 'auto' || mode === 'automatic') return true;
+      try {
+        const candidate = new URL(raw);
+        if (candidate.protocol === 'https:') candidate.protocol = 'wss:';
+        if (candidate.protocol === 'http:') candidate.protocol = 'ws:';
+        if (!candidate.pathname || candidate.pathname === '/') candidate.pathname = '/ws';
+        candidate.search = '';
+        candidate.hash = '';
+        return this.signalingServerOptions.some((relayUrl) => {
+          const known = new URL(relayUrl);
+          return candidate.toString() === known.toString();
+        });
+      } catch {
+        return false;
+      }
+    },
+
     shouldDeferStorageInit() {
       return false;
     },
@@ -2397,6 +2444,9 @@ export default {
     },
 
     async startMesh() {
+      if (this.isRunning || this.isConnecting) return;
+      this.isConnecting = true;
+      this.showStatus('Connecting...', 'Preparing PeerPigeon...', 'connecting');
       try {
         const normalized = this.normalizePeerBounds(this.minPeers, this.maxPeers, this.tolerantPeers);
         this.minPeers = normalized.minPeers;
@@ -2408,9 +2458,12 @@ export default {
         if (!this.roomSessionId) {
           this.roomSessionId = this.generateRandomRoomSessionId();
         }
-        this.signalingServer = String(this.signalingServer || '').trim() || 'wss://peer.ooo/ws';
-        try {
-          const signalingUrl = new URL(this.signalingServer);
+        const requestedSignalingServer = String(this.signalingServer || '').trim();
+        const automaticSignalingServer = this.usesAutomaticSignalingServer(requestedSignalingServer);
+        this.signalingServer = automaticSignalingServer ? 'auto' : requestedSignalingServer;
+        let bootstrapSignalingServer = DEFAULT_SIGNALING_SERVERS[0];
+        if (!automaticSignalingServer) try {
+          const signalingUrl = new URL(requestedSignalingServer);
           const hostname = signalingUrl.hostname.toLowerCase();
           const isLocalDevelopmentHost = hostname === 'localhost'
             || hostname === '::1'
@@ -2424,9 +2477,11 @@ export default {
           if (signalingUrl.protocol === 'http:') signalingUrl.protocol = isLocalDevelopmentHost ? 'ws:' : 'wss:';
           if (signalingUrl.protocol === 'ws:' && !isLocalDevelopmentHost) signalingUrl.protocol = 'wss:';
           this.signalingServer = signalingUrl.toString();
+          bootstrapSignalingServer = this.signalingServer;
         } catch {
           throw new Error(`Invalid signaling server URL: ${this.signalingServer}`);
         }
+        this.activeSignalingServer = '';
         this.updateUrlState();
         await this.ensureCryptoKeys();
         if (this.runtimeMode === 'go-wasm') {
@@ -2435,11 +2490,12 @@ export default {
 
         this.updateUrlState();
 
-        this.isConnecting = true;
         this.showStatus('Connecting...', 'Initializing PartialMesh with PeerPigeon...', 'connecting');
 
         this.mesh = new PartialMesh({
-          signalingServer: this.signalingServer,
+          signalingServer: bootstrapSignalingServer,
+          signalingServers: automaticSignalingServer ? this.signalingServerOptions : undefined,
+          automaticSignalingServer,
           networkId: this.activeNetworkName,
           sessionId: this.activeRoomSessionId,
           minPeers: this.minPeers,
@@ -2502,8 +2558,16 @@ export default {
         window.__gossip = this.gossip;
 
         // Mesh events
+        this.mesh.on('identity:ready', ({ clientId }) => {
+          this.clientId = String(clientId || '').trim();
+          this.updateStats();
+        });
+
         this.mesh.on('signaling:connected', (data) => {
           this.signalingConnected = true;
+          clearTimeout(this.meshConnectWarnTimer);
+          this.meshConnectWarnTimer = null;
+          this.activeSignalingServer = String(data?.signalingServer || bootstrapSignalingServer);
           this.clientId = (data.clientId || '').trim();
           if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
             this.callGoWasm('peerpigeonSetClientID', this.goWasmNodeId, this.clientId);
@@ -2648,13 +2712,7 @@ export default {
         this.announceCryptoPublicInfo();
         this.startDebugMonitor();
 
-        // Best-effort warning only; do not hard-fail startup on transient signaling slowness.
-        clearTimeout(this.meshConnectWarnTimer);
-        this.meshConnectWarnTimer = setTimeout(() => {
-          if (this.isRunning && !this.clientId) {
-            this.showStatus('Connecting...', `Still waiting on signaling server (${this.signalingServer})`, 'connecting');
-          }
-        }, 12_000);
+        this.startSignalingWatchdog();
       } catch (error) {
         console.error('Failed to start mesh:', error);
         this.showStatus('Error', error.message || String(error), 'error');
@@ -4436,11 +4494,43 @@ export default {
       });
     },
 
+    startSignalingWatchdog() {
+      clearTimeout(this.meshConnectWarnTimer);
+      const check = () => {
+        this.meshConnectWarnTimer = null;
+        if (!this.isRunning || this.signalingConnected) return;
+
+        const adapter = this.mesh?.signalingClient;
+        if (!adapter) {
+          this.restartUnexpectedlyStoppedMesh('signaling watchdog');
+          return;
+        }
+
+        this.showStatus(
+          'Connecting...',
+          `Still waiting on signaling server (${this.activeSignalingServer || this.signalingServer})`,
+          'connecting'
+        );
+        this.addLog('info', '[signal] watchdog: reconnecting and re-announcing', 'freertc');
+        try { adapter.connect?.(); } catch { /* FreeRTC will be retried below */ }
+        try { adapter.nudgeSignaling?.(); } catch { /* wait for registration */ }
+        try { this.mesh?.recoverAfterInactivity?.('signaling-watchdog'); } catch { /* retry later */ }
+
+        this.meshConnectWarnTimer = setTimeout(check, 12_000);
+      };
+      this.meshConnectWarnTimer = setTimeout(check, 4_000);
+    },
+
     updateUrlState() {
       try {
         const url = new URL(window.location.href);
         // Preserve original query params to avoid disturbing tests or manual URL state
         const originalParams = new URLSearchParams(window.location.search);
+        if (!originalParams.has('autostart')) {
+          url.searchParams.set('autostart', '1');
+        } else {
+          url.searchParams.set('autostart', originalParams.get('autostart'));
+        }
         
         // Update only the configuration params; preserve any explicitly provided sessionId
         url.searchParams.set('topology', this.topology);
@@ -4448,7 +4538,7 @@ export default {
         url.searchParams.set('maxPeers', String(this.maxPeers));
         url.searchParams.set('tolerantPeers', String(this.tolerantPeers));
         const signalingServer = String(this.signalingServer || '').trim();
-        if (signalingServer) {
+        if (signalingServer && signalingServer.toLowerCase() !== 'auto') {
           url.searchParams.set('signalingServer', signalingServer);
         } else {
           url.searchParams.delete('signalingServer');

@@ -6,9 +6,21 @@ import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const workspaceRoot = path.resolve(__dirname, '../..')
+const peerPigeonSourceRoot = path.resolve(workspaceRoot, 'src')
 
 export default defineConfig({
   plugins: [
+    {
+      name: 'peerpigeon-core-full-reload',
+      configureServer(server) {
+        server.watcher.add(peerPigeonSourceRoot)
+        server.watcher.on('change', (file) => {
+          if (path.resolve(file).startsWith(`${peerPigeonSourceRoot}${path.sep}`)) {
+            server.ws.send({ type: 'full-reload', path: '*' })
+          }
+        })
+      }
+    },
     vue(),
     inject({
       Buffer: ['buffer', 'Buffer'],
