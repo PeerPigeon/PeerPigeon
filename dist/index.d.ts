@@ -1,22 +1,80 @@
 type GossipProtocolOptions = {
     /** Maximum number of re-propagation hops for a message. */
     maxHops?: number;
-    /** Maximum hops for a direct/routed message before it is dropped. Default 20. */
+    /** Maximum hops for a direct/routed message before it is dropped. Default 256. */
     maxDirectHops?: number;
     /** Relative weight of coordinate-space distance in CECR hybrid routing (0..1). */
     cecrCoordinateWeight?: number;
     /** Maximum age of extrema snapshot before coordinate weight is reduced. */
     cecrExtremaMaxAgeMs?: number;
-    /** If coordinate drift exceeds this, coordinate routing is strongly de-weighted. */
+    /** @deprecated CECR v1 uses readiness gating instead of a claimed drift threshold. */
     cecrMaxAcceptedDrift?: number;
     /** Require canonical global-set/extrema agreement across connected peers before coordinate routing. */
     cecrRequireConsensus?: boolean;
+    /** Consecutive state rounds required before coordinate routing. Default 3. */
+    cecrConvergenceRounds?: number;
     /** Default deadline for opt-in tracked gossip delivery. Default 30 seconds. */
     deliveryTimeoutMs?: number;
     /** Delay before a tracked message is eligible for targeted repair. Default 4 seconds. */
     deliveryRepairDelayMs?: number;
     /** Minimum delay between repair attempts for the same target. Default 5 seconds. */
     deliveryRepairIntervalMs?: number;
+    /** Maximum recent broadcast IDs advertised per epidemic anti-entropy summary. Default 256. */
+    antiEntropySummarySize?: number;
+    /** Maximum missing broadcasts requested or served per anti-entropy exchange. Default 64. */
+    antiEntropyRequestSize?: number;
+};
+type CecrConfigSnapshot = {
+    protocol: 'cecr/1';
+    configId: string;
+    idWidthBits: 256;
+    hashProfile: 'fnv1a64-compat';
+    signatureProfile: 'unsigned-partial';
+    coordinateWeightNumerator: number;
+    coordinateWeightDenominator: number;
+    extremaMaxAgeMs: number;
+    requireConsensus: boolean;
+    maxDirectHops: number;
+    membershipLeaseMs: number;
+    membershipGossipIntervalMs: number;
+    membershipTombstoneRetentionMs: number;
+    membershipClockSkewMs: number;
+    convergenceRounds: number;
+    xorBucketRedundancy: 1;
+};
+type CecrOverlaySnapshot = {
+    xorBucketCoverage: boolean;
+    coordinateAdjacency: boolean;
+    missingXorBuckets: number[];
+    missingCoordinatePeerIds: string[];
+    degraded: boolean;
+};
+type CecrStateSnapshot = {
+    protocol: 'cecr/1';
+    conformance: 'partial';
+    configId: string;
+    peerId: string | null;
+    livePeerIds: string[];
+    viewId: string;
+    viewStableForMs: number;
+    requiredStableForMs: number;
+    size: number;
+    minHex: string | null;
+    maxHex: string | null;
+    coordinateReady: boolean;
+    connectedDegree: number;
+    fanout: number;
+    membershipRecords: Array<{
+        peerId: string;
+        incarnation: number;
+        sequence: number;
+        state: 'alive' | 'left';
+        issuedAt: number;
+        validUntil: number | null;
+    }>;
+    membershipEquivocations: string[];
+    overlay: CecrOverlaySnapshot;
+    limitations: string[];
 };
 type GossipBroadcastOptions = {
     /** Track delivery to the canonical known-peer snapshot captured at send time. */
@@ -65,6 +123,8 @@ type DirectMessage = {
     hops: number;
     maxHops: number;
     timestamp: number;
+    originConfigId?: string;
+    originViewId?: string;
 };
 type GossipStats = {
     totalMessagesTracked: number;
@@ -88,6 +148,21 @@ interface MeshLike {
     getConnectedPeers(): string[];
     getDiscoveredPeers(): string[];
     getGlobalPeers(): string[];
+    getCecrMembershipConfig?(): {
+        leaseMs: number;
+        gossipIntervalMs: number;
+        tombstoneRetentionMs: number;
+        clockSkewMs: number;
+    };
+    getCecrMembershipRecords?(): Array<{
+        peerId: string;
+        incarnation: number;
+        sequence: number;
+        state: 'alive' | 'left';
+        issuedAt: number;
+        validUntil: number | null;
+    }>;
+    getCecrMembershipEquivocations?(): string[];
     send(peerId: string, data: string | ArrayBuffer | ArrayBufferView): void;
 }
 type GossipEvents = {
@@ -116,6 +191,7 @@ type GossipEvents = {
  *
  * - De-duplicates messages by `id`
  * - Re-broadcasts unseen messages to connected peers until `maxHops`
+ * - Repairs missed recent broadcasts with bounded summary/request anti-entropy
  */
 declare class GossipProtocol {
     private mesh;
@@ -123,23 +199,29 @@ declare class GossipProtocol {
     private readonly maxTrackedMessages;
     private readonly maxTrackedDirectIds;
     private readonly trackingRetentionMs;
+    private antiEntropySummarySize;
+    private antiEntropyRequestSize;
     private maxHops;
     private maxDirectHops;
     private cecrCoordinateWeight;
     private cecrExtremaMaxAgeMs;
-    private cecrMaxAcceptedDrift;
     private cecrRequireConsensus;
+    private cecrConvergenceRounds;
+    private cecrViewChangedAtMs;
     private deliveryTimeoutMs;
     private deliveryRepairDelayMs;
     private deliveryRepairIntervalMs;
     private cecrCurrentExtrema;
-    private cecrPreviousExtrema;
     private cecrRemoteStates;
     private cecrSyncTimer;
     private trackingCleanupTimer;
     private seenDirectIds;
     private deliveryStates;
+    private retainedMessages;
     private dirtyDeliveryReceiptIds;
+    private gossipFanoutCursor;
+    private cecrFanoutCursor;
+    private antiEntropyFanoutCursor;
     private callbacks;
     private peers;
     constructor(mesh: MeshLike, options?: GossipProtocolOptions);
@@ -159,13 +241,18 @@ declare class GossipProtocol {
      */
     getDeliveryStatus(messageId: string): GossipDeliveryStatus | null;
     /**
-     * Propagate a message to all currently-connected peers.
+     * Propagate to the CECR v1 fan-out budget. Selection rotates over the
+     * sorted neighbor set so every eligible connection is chosen fairly.
      */
     propagate(message: GossipMessage, exceptPeerId?: string): void;
     /**
      * Handle an incoming message from the mesh.
      */
     handleIncomingMessage(message: GossipMessage, fromPeerId: string): void;
+    private retainGossipMessage;
+    private recentRetainedMessageIds;
+    private publishGossipAntiEntropy;
+    private handleGossipAntiEntropy;
     private createDeliveryBits;
     private setDeliveryBit;
     private hasDeliveryBit;
@@ -183,27 +270,23 @@ declare class GossipProtocol {
     private selectRepairOwner;
     private maintainTrackedDeliveries;
     private reliableRepairMessage;
-    /**
-     * XOR distance between two hex-encoded peer IDs.
-     * Returns a BigInt (lower = closer).
-     */
-    private xorDistance;
-    /**
-     * Pick the connected peer closest (by XOR distance) to target.
-     * Falls back to any connected peer if IDs can't be compared.
-     */
-    private closestPeerTo;
     private peerIdToNumeric;
     private canonicalPeerSet;
     private canonicalSetHash;
+    private cecrConfigId;
+    private cecrFanout;
+    private selectFanoutPeers;
     private updateCecrExtremaSnapshot;
-    private coordinateFor;
     private effectiveCecrCoordinateWeight;
     private hasCecrConsensus;
     private publishCecrState;
+    private publishCecrDeliveryState;
     private handleIncomingCecrState;
-    private normalizedBigIntRatio;
-    private closestPeerHybrid;
+    private handleIncomingCecrDeliveryState;
+    private bucketRank;
+    private hybridScore;
+    private orderedRouteCandidates;
+    private getCecrOverlaySnapshot;
     /**
      * Send a direct message to a specific peer, routed through the mesh via XOR distance.
      * Delivers even if there is no direct connection to the target.
@@ -211,6 +294,8 @@ declare class GossipProtocol {
     sendDirect(targetPeerId: string, data: unknown): string | null;
     private routeDirect;
     private handleIncomingDirect;
+    getCecrConfig(): Readonly<CecrConfigSnapshot>;
+    getCecrState(): CecrStateSnapshot;
     getStats(): GossipStats;
     cleanup(maxAgeMs?: number): void;
     private markDirectSeen;
@@ -638,6 +723,14 @@ interface PartialMeshConfig {
      * Disable to emit full offer/answer payloads after ICE gathering finishes.
      */
     trickleIce?: boolean;
+    /** Lifetime of an alive CECR membership record. Default 30 seconds. */
+    membershipLeaseMs?: number;
+    /** Interval for renewing and disseminating membership records. Default 5 seconds. */
+    membershipGossipIntervalMs?: number;
+    /** Retention period for explicit-left tombstones. Default 2 minutes. */
+    membershipTombstoneRetentionMs?: number;
+    /** Maximum accepted clock skew for CECR membership timestamps. Default 5 seconds. */
+    membershipClockSkewMs?: number;
 }
 interface PeerConnection {
     id: string;
@@ -655,12 +748,28 @@ type PeerCapacitySnapshot = PeerCapacityAdvertisement & {
     fresh: boolean;
     local: boolean;
 };
+type CecrMembershipRecordSnapshot = {
+    peerId: string;
+    incarnation: number;
+    sequence: number;
+    state: 'alive' | 'left';
+    issuedAt: number;
+    validUntil: number | null;
+};
 type PeerGraphNode = {
     peerId: string;
     local: boolean;
     directlyConnected: boolean;
     discovered: boolean;
     capacity: PeerCapacitySnapshot | null;
+    /** Shortest known topology path from the local peer: local=0, direct=1. */
+    hopDistance: number | null;
+    /** XOR-space distance from the local peer, encoded as an exact hex string. */
+    xorDistance: string | null;
+    /** Zero-based nearest-first rank, excluding the local peer. */
+    xorDistanceRank: number | null;
+    /** Relative distance in the known set: nearest=0, farthest=1. */
+    xorDistanceRatio: number | null;
 };
 type PeerGraphEdge = {
     source: string;
@@ -722,9 +831,12 @@ declare class PartialMesh {
     private connecting;
     private connectionTimers;
     private connectionStartedAtMs;
+    /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
+    private orphanRtcFirstSeenAtMs;
     private peerConnectedAtMs;
     private discoveredAtMs;
     private maintenanceTimer;
+    private membershipTimer;
     private underConnectedSinceMs;
     private lastHardResetAtMs;
     private lastDiscoveryRefreshAtMs;
@@ -737,6 +849,11 @@ declare class PartialMesh {
     private pendingRebalanceDropByTarget;
     /** Converged global peer membership — populated via in-band membership gossip. */
     private globalPeers;
+    /** Versioned, expiring CECR membership records keyed by subject peer. */
+    private membershipRecordsById;
+    private membershipEquivocationAtById;
+    private membershipIncarnation;
+    private membershipSequence;
     /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
     private peerCapacityById;
     /** Relayed adjacency snapshots used to reconstruct the known network graph. */
@@ -768,12 +885,18 @@ declare class PartialMesh {
     private isHexId;
     private fastIdHash;
     private peerDistance;
+    private cecrNumericPeerId;
+    private cecrBucketRank;
+    private cecrCoordinateNeighbors;
+    private cecrOverlayDialPriority;
+    private cecrProtectedConnectedPeerIds;
     private maybeRebalanceForCloserPeer;
     /**
      * Initialize and connect to the signaling server
      */
     init(): Promise<void>;
     private startMaintenanceLoop;
+    private startMembershipLoop;
     private maybeRefreshDiscovery;
     /**
      * Revalidate transports after browser suspension, network changes, or focus
@@ -781,7 +904,14 @@ declare class PartialMesh {
      * maintenance loop also calls the same stale-channel check.
      */
     recoverAfterInactivity(reason?: string): void;
+    private recoverMeshAfterInactivity;
     private recoverStaleConnectedPeers;
+    /**
+     * FreeRTC can retain a half-open connection that never became a PartialMesh
+     * peer. Without local peer/pending state, the normal negotiation watchdog
+     * cannot see it, while connectToPeerInternal treats it as active forever.
+     */
+    private recoverOrphanedRtcNegotiations;
     private maybeRecoverStalledNegotiations;
     private maybeHardResetUnderConnected;
     private isPeerBackedOff;
@@ -801,6 +931,7 @@ declare class PartialMesh {
     /**
      * Maintain the target number of peer connections
      */
+    private dialCandidatePeerIds;
     private maintainPeerConnections;
     /**
      * Connect to a specific peer
@@ -835,6 +966,14 @@ declare class PartialMesh {
      * Get the converged global peer set (all peers known via membership gossip).
      */
     getGlobalPeers(): string[];
+    getCecrMembershipRecords(): CecrMembershipRecordSnapshot[];
+    getCecrMembershipEquivocations(): string[];
+    getCecrMembershipConfig(): Readonly<{
+        leaseMs: number;
+        gossipIntervalMs: number;
+        tombstoneRetentionMs: number;
+        clockSkewMs: number;
+    }>;
     /** Return the effective configuration, including constructor defaults. */
     getConfig(): Readonly<Required<PartialMeshConfig>>;
     /**
@@ -847,6 +986,10 @@ declare class PartialMesh {
     getPeerCapacity(peerId: string): PeerCapacitySnapshot | null;
     /** Return advertised capacity for every known peer, including this node. */
     getPeerCapacities(): PeerCapacitySnapshot[];
+    /** Return the exact XOR-space distance used by partial-mesh rebalancing. */
+    getXorDistance(peerId: string, fromPeerId?: string | null): string | null;
+    /** Return the shortest currently-known topology path from this peer. */
+    getHopDistance(peerId: string): number | null;
     /** Reconstruct the complete currently-known node and undirected edge snapshot. */
     getGraphSnapshot(): PeerGraphSnapshot;
     /**
@@ -869,6 +1012,12 @@ declare class PartialMesh {
      * Emit an event
      */
     private emit;
+    private renewLocalMembership;
+    private isMembershipRecordNewer;
+    private mergeMembershipRecord;
+    private rebuildGlobalMembership;
+    private pruneMembershipRecords;
+    private membershipRecordsForWire;
     private sendMembership;
     private broadcastMembership;
     private tryParseMembership;
@@ -935,6 +1084,10 @@ declare class PeerPigeonNode {
     getGraphSnapshot(): PeerGraphSnapshot;
     getPeerCapacity(peerId: string): PeerCapacitySnapshot | null;
     getPeerCapacities(): PeerCapacitySnapshot[];
+    getXorDistance(peerId: string, fromPeerId?: string): string | null;
+    getHopDistance(peerId: string): number | null;
+    getCecrConfig(): Readonly<CecrConfigSnapshot>;
+    getCecrState(): CecrStateSnapshot;
     getClientId(): string | null;
     getConnectedPeers(): string[];
     getDiscoveredPeers(): string[];
@@ -961,4 +1114,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };

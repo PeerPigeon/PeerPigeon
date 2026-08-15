@@ -21,8 +21,13 @@ const INSTANCE_PID_FILE = '/tmp/peerpigeon-dev-with-mdns.pid'
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..')
 const TLS_CERT_DIR = process.env.PEERPIGEON_TLS_DIR || path.join(REPO_ROOT, '.peerpigeon-dev-tls')
+const TLS_CA_KEY_PATH = `${TLS_CERT_DIR}/peerpigeon-dev-ca.key.pem`
+const TLS_CA_CERT_PATH = `${TLS_CERT_DIR}/peerpigeon-dev-ca.cert.pem`
 const TLS_KEY_PATH = `${TLS_CERT_DIR}/peerpigeon-dev.key.pem`
 const TLS_CERT_PATH = `${TLS_CERT_DIR}/peerpigeon-dev.cert.pem`
+const TLS_CSR_PATH = `${TLS_CERT_DIR}/peerpigeon-dev.csr.pem`
+const TLS_CA_CONFIG_PATH = `${TLS_CERT_DIR}/openssl-ca.cnf`
+const TLS_CERT_CONFIG_PATH = `${TLS_CERT_DIR}/openssl-san.cnf`
 const GENERATE_TLS_ONLY = process.argv.includes('--generate-tls')
 
 function isRfc1918IPv4(ip) {
@@ -494,6 +499,194 @@ async function ensureDevTlsCertificate(hostnames, ipAddress) {
   }
 }
 
+async function ensureTrustedDevTlsCertificate(hostnames, ipAddress) {
+  fs.mkdirSync(TLS_CERT_DIR, { recursive: true })
+
+  const safeUnlink = (filePath) => {
+    try {
+      fs.unlinkSync(filePath)
+    } catch {
+      // best-effort only
+    }
+  }
+
+  const runOpenSsl = (args, fallbackMessage) => {
+    const result = spawnSync('openssl', args, { encoding: 'utf8' })
+    if (result.status !== 0) {
+      const stderr = String(result.stderr || '').trim()
+      throw new Error(stderr || fallbackMessage)
+    }
+    return String(result.stdout || '')
+  }
+
+  const isExistingKeyValid = (keyPath) => {
+    try {
+      if (!fs.existsSync(keyPath)) return false
+      createPrivateKey(fs.readFileSync(keyPath))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const certificatePasses = (certPath, args) => {
+    if (!fs.existsSync(certPath)) return false
+    return spawnSync('openssl', [
+      'x509',
+      '-in', certPath,
+      ...args
+    ], { encoding: 'utf8' }).status === 0
+  }
+
+  const caIsValid = isExistingKeyValid(TLS_CA_KEY_PATH)
+    && certificatePasses(TLS_CA_CERT_PATH, ['-checkend', '86400', '-noout'])
+    && spawnSync('openssl', [
+      'verify',
+      '-CAfile', TLS_CA_CERT_PATH,
+      TLS_CA_CERT_PATH
+    ], { encoding: 'utf8' }).status === 0
+
+  if (!caIsValid) {
+    safeUnlink(TLS_CA_KEY_PATH)
+    safeUnlink(TLS_CA_CERT_PATH)
+    safeUnlink(TLS_CERT_PATH)
+    safeUnlink(`${TLS_CERT_DIR}/peerpigeon-dev-ca.cert.srl`)
+
+    const caConf = [
+      '[req]',
+      'distinguished_name = req_distinguished_name',
+      'x509_extensions = v3_ca',
+      'prompt = no',
+      '',
+      '[req_distinguished_name]',
+      'CN = PeerPigeon Local Development CA',
+      '',
+      '[v3_ca]',
+      'subjectKeyIdentifier = hash',
+      'authorityKeyIdentifier = keyid:always,issuer',
+      'basicConstraints = critical, CA:TRUE',
+      'keyUsage = critical, keyCertSign, cRLSign'
+    ].join('\n')
+    fs.writeFileSync(TLS_CA_CONFIG_PATH, caConf, 'utf8')
+
+    runOpenSsl([
+      'genrsa',
+      '-out', TLS_CA_KEY_PATH,
+      '2048'
+    ], 'openssl local CA key generation failed')
+    fs.chmodSync(TLS_CA_KEY_PATH, 0o600)
+
+    runOpenSsl([
+      'req',
+      '-x509',
+      '-new',
+      '-sha256',
+      '-days', '3650',
+      '-key', TLS_CA_KEY_PATH,
+      '-out', TLS_CA_CERT_PATH,
+      '-config', TLS_CA_CONFIG_PATH,
+      '-extensions', 'v3_ca'
+    ], 'openssl local CA certificate generation failed')
+  }
+
+  if (!isExistingKeyValid(TLS_KEY_PATH)) {
+    safeUnlink(TLS_KEY_PATH)
+    safeUnlink(TLS_CERT_PATH)
+
+    const keys = await generateRandomPair()
+    const [x, y] = String(keys.pub || '').split('.')
+    if (!x || !y || !keys.priv) {
+      throw new Error('UNSEA key material shape is invalid for TLS key generation')
+    }
+
+    const privateJwk = {
+      kty: 'EC',
+      crv: 'P-256',
+      d: keys.priv,
+      x,
+      y
+    }
+    const privateKey = createPrivateKey({ key: privateJwk, format: 'jwk' })
+    const pemPrivateKey = privateKey.export({ format: 'pem', type: 'pkcs8' })
+    fs.writeFileSync(TLS_KEY_PATH, pemPrivateKey, { mode: 0o600 })
+  }
+
+  const uniqueHosts = Array.from(new Set((hostnames || []).filter(Boolean)))
+  const sanEntries = [
+    ...uniqueHosts.map((host) => `DNS:${host}`),
+    'DNS:localhost',
+    'IP:127.0.0.1'
+  ]
+  if (ipAddress) sanEntries.push(`IP:${ipAddress}`)
+
+  const certVerification = fs.existsSync(TLS_CERT_PATH)
+    ? spawnSync('openssl', [
+      'verify',
+      '-CAfile', TLS_CA_CERT_PATH,
+      TLS_CERT_PATH
+    ], { encoding: 'utf8' })
+    : null
+  const certText = certificatePasses(TLS_CERT_PATH, ['-checkend', '86400', '-noout'])
+    ? runOpenSsl([
+      'x509',
+      '-in', TLS_CERT_PATH,
+      '-noout',
+      '-text'
+    ], 'openssl certificate inspection failed')
+    : ''
+  const hasEverySan = sanEntries.every((entry) => {
+    if (entry.startsWith('IP:')) return certText.includes(`IP Address:${entry.slice(3)}`)
+    return certText.includes(entry)
+  })
+
+  if (certVerification?.status !== 0 || !certText || !hasEverySan) {
+    safeUnlink(TLS_CERT_PATH)
+    safeUnlink(TLS_CSR_PATH)
+
+    const subjectHost = uniqueHosts[0] || 'localhost'
+    const certConf = [
+      '[v3_req]',
+      `subjectAltName = ${sanEntries.join(',')}`,
+      'subjectKeyIdentifier = hash',
+      'authorityKeyIdentifier = keyid,issuer',
+      'basicConstraints = critical, CA:FALSE',
+      'keyUsage = critical, digitalSignature, keyEncipherment',
+      'extendedKeyUsage = serverAuth'
+    ].join('\n')
+    fs.writeFileSync(TLS_CERT_CONFIG_PATH, certConf, 'utf8')
+
+    runOpenSsl([
+      'req',
+      '-new',
+      '-sha256',
+      '-key', TLS_KEY_PATH,
+      '-out', TLS_CSR_PATH,
+      '-subj', `/CN=${subjectHost}`
+    ], 'openssl server certificate request generation failed')
+
+    runOpenSsl([
+      'x509',
+      '-req',
+      '-sha256',
+      '-days', '825',
+      '-in', TLS_CSR_PATH,
+      '-CA', TLS_CA_CERT_PATH,
+      '-CAkey', TLS_CA_KEY_PATH,
+      '-CAcreateserial',
+      '-out', TLS_CERT_PATH,
+      '-extfile', TLS_CERT_CONFIG_PATH,
+      '-extensions', 'v3_req'
+    ], 'openssl server certificate signing failed')
+    safeUnlink(TLS_CSR_PATH)
+  }
+
+  const certChain = `${fs.readFileSync(TLS_CERT_PATH, 'utf8').trim()}\n${fs.readFileSync(TLS_CA_CERT_PATH, 'utf8').trim()}\n`
+  return {
+    key: fs.readFileSync(TLS_KEY_PATH),
+    cert: certChain
+  }
+}
+
 function startMdnsHostResponder(hostname, ip) {
   const fqdn = hostname.endsWith('.') ? hostname : `${hostname}.`
   const mdns = multicastDns()
@@ -552,7 +745,8 @@ function startMdnsHostResponders(hostnames, ip) {
 async function main() {
   if (GENERATE_TLS_ONLY) {
     const preferredNetwork = process.platform === 'darwin' ? getPreferredIPv4() : null
-    await ensureDevTlsCertificate(DEV_HOSTNAME_ALIASES, preferredNetwork?.ip)
+    await ensureTrustedDevTlsCertificate(DEV_HOSTNAME_ALIASES, preferredNetwork?.ip)
+    console.log(`[tls] Generated dev TLS CA: ${TLS_CA_CERT_PATH}`)
     console.log(`[tls] Generated dev TLS key: ${TLS_KEY_PATH}`)
     console.log(`[tls] Generated dev TLS cert: ${TLS_CERT_PATH}`)
     return
@@ -574,7 +768,7 @@ async function main() {
   let publicPort = vitePort
 
   try {
-    const tlsMaterial = await ensureDevTlsCertificate(DEV_HOSTNAME_ALIASES, preferredNetwork?.ip)
+    const tlsMaterial = await ensureTrustedDevTlsCertificate(DEV_HOSTNAME_ALIASES, preferredNetwork?.ip)
     httpsBridgeServer = createHttpsBridge(vitePort, tlsMaterial)
     await new Promise((resolve, reject) => {
       httpsBridgeServer.on('error', reject)

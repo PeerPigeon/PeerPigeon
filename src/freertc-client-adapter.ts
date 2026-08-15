@@ -219,12 +219,16 @@ export class FreeRTCClientAdapter {
    * Revalidate signaling and RTC transports after a tab resumes, regains focus,
    * or the browser reports that the network is online again.
    */
-  recoverAfterInactivity(reason = 'resume'): void {
-    if (this.intentionallyDisconnected) return;
+  recoverAfterInactivity(reason = 'resume'): boolean {
+    if (this.intentionallyDisconnected) return false;
 
     const now = Date.now();
-    if (now - this.lastRecoveryProbeAtMs < RECOVERY_PROBE_THROTTLE_MS) return;
+    if (now - this.lastRecoveryProbeAtMs < RECOVERY_PROBE_THROTTLE_MS) return false;
     this.lastRecoveryProbeAtMs = now;
+    // PartialMesh owns connection targets and retry state. Notify it on every
+    // accepted lifecycle recovery so it can immediately repair isolation
+    // instead of waiting for a later maintenance interval.
+    this.emitter.emit('lifecycle:resume', { reason });
 
     for (const peerId of Array.from(this.connectedPeers)) {
       const entry = this.client?.mesh?.connections?.get?.(peerId);
@@ -244,7 +248,7 @@ export class FreeRTCClientAdapter {
     if (!this.client?.isRegistered) {
       this.emitter.emit('signaling:log', { message: `[signal] ${reason} recovery: reconnecting signaling` });
       this.client?.connect?.();
-      return;
+      return true;
     }
 
     this.emitter.emit('signaling:log', { message: `[signal] ${reason} recovery: refreshing discovery` });
@@ -256,6 +260,7 @@ export class FreeRTCClientAdapter {
       this.restartClientAfterStaleSignaling(reason);
     }, RECOVERY_PROBE_TIMEOUT_MS);
     this.nudgeSignaling();
+    return true;
   }
 
   closeConnection(peerId: string): void {

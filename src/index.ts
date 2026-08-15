@@ -1,6 +1,8 @@
 import FreeRTCClientAdapter from './freertc-client-adapter.js';
 import { GossipProtocol } from './gossip.js';
 import type {
+  CecrConfigSnapshot,
+  CecrStateSnapshot,
   DirectMessage,
   GossipBroadcastOptions,
   GossipDeliveryStatus,
@@ -105,6 +107,18 @@ export interface PartialMeshConfig {
    * Disable to emit full offer/answer payloads after ICE gathering finishes.
    */
   trickleIce?: boolean;
+
+  /** Lifetime of an alive CECR membership record. Default 30 seconds. */
+  membershipLeaseMs?: number;
+
+  /** Interval for renewing and disseminating membership records. Default 5 seconds. */
+  membershipGossipIntervalMs?: number;
+
+  /** Retention period for explicit-left tombstones. Default 2 minutes. */
+  membershipTombstoneRetentionMs?: number;
+
+  /** Maximum accepted clock skew for CECR membership timestamps. Default 5 seconds. */
+  membershipClockSkewMs?: number;
 }
 
 export interface PeerConnection {
@@ -131,12 +145,32 @@ type PeerTopologyAdvertisement = {
   updatedAt: number;
 };
 
+export type CecrMembershipRecordSnapshot = {
+  peerId: string;
+  incarnation: number;
+  sequence: number;
+  state: 'alive' | 'left';
+  issuedAt: number;
+  validUntil: number | null;
+};
+
+type CecrMembershipRecord = CecrMembershipRecordSnapshot;
+type CecrWireMembershipRecord = [number, number, 'alive' | 'left', number, number | null];
+
 export type PeerGraphNode = {
   peerId: string;
   local: boolean;
   directlyConnected: boolean;
   discovered: boolean;
   capacity: PeerCapacitySnapshot | null;
+  /** Shortest known topology path from the local peer: local=0, direct=1. */
+  hopDistance: number | null;
+  /** XOR-space distance from the local peer, encoded as an exact hex string. */
+  xorDistance: string | null;
+  /** Zero-based nearest-first rank, excluding the local peer. */
+  xorDistanceRank: number | null;
+  /** Relative distance in the known set: nearest=0, farthest=1. */
+  xorDistanceRatio: number | null;
 };
 
 export type PeerGraphEdge = {
@@ -203,9 +237,12 @@ export class PartialMesh {
   private connecting: Set<string> = new Set();
   private connectionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private connectionStartedAtMs: Map<string, number> = new Map();
+  /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
+  private orphanRtcFirstSeenAtMs: Map<string, number> = new Map();
   private peerConnectedAtMs: Map<string, number> = new Map();
   private discoveredAtMs: Map<string, number> = new Map();
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
+  private membershipTimer: ReturnType<typeof setInterval> | null = null;
   private underConnectedSinceMs: number | null = null;
   private lastHardResetAtMs: number = 0;
   private lastDiscoveryRefreshAtMs: number = 0;
@@ -218,6 +255,11 @@ export class PartialMesh {
   private pendingRebalanceDropByTarget: Map<string, string> = new Map();
   /** Converged global peer membership — populated via in-band membership gossip. */
   private globalPeers: Set<string> = new Set();
+  /** Versioned, expiring CECR membership records keyed by subject peer. */
+  private membershipRecordsById: Map<string, CecrMembershipRecord> = new Map();
+  private membershipEquivocationAtById: Map<string, number> = new Map();
+  private membershipIncarnation: number = Date.now();
+  private membershipSequence = 0;
   /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
   private peerCapacityById: Map<string, PeerCapacityAdvertisement> = new Map();
   /** Relayed adjacency snapshots used to reconstruct the known network graph. */
@@ -244,10 +286,34 @@ export class PartialMesh {
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
       nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 2_500,
       peerStateMaxAgeMs: config.peerStateMaxAgeMs ?? 60_000,
-      trickleIce: config.trickleIce ?? true
+      trickleIce: config.trickleIce ?? true,
+      membershipLeaseMs: config.membershipLeaseMs ?? 30_000,
+      membershipGossipIntervalMs: config.membershipGossipIntervalMs ?? 5_000,
+      membershipTombstoneRetentionMs: config.membershipTombstoneRetentionMs ?? 120_000,
+      membershipClockSkewMs: config.membershipClockSkewMs ?? 5_000,
     };
 
     this.validatePeerLimits(this.config.minPeers, this.config.maxPeers, this.config.tolerantPeers);
+    if (!Number.isSafeInteger(this.config.membershipLeaseMs) || this.config.membershipLeaseMs < 3_000) {
+      throw new RangeError('membershipLeaseMs must be a safe integer of at least 3000');
+    }
+    if (
+      !Number.isSafeInteger(this.config.membershipGossipIntervalMs) ||
+      this.config.membershipGossipIntervalMs < 500 ||
+      this.config.membershipGossipIntervalMs > Math.floor(this.config.membershipLeaseMs / 3)
+    ) {
+      throw new RangeError('membershipGossipIntervalMs must be at least 500 and no more than one third of membershipLeaseMs');
+    }
+    if (!Number.isSafeInteger(this.config.membershipClockSkewMs) || this.config.membershipClockSkewMs < 0) {
+      throw new RangeError('membershipClockSkewMs must be a non-negative safe integer');
+    }
+    if (
+      !Number.isSafeInteger(this.config.membershipTombstoneRetentionMs) ||
+      this.config.membershipTombstoneRetentionMs <
+        this.config.membershipLeaseMs + (2 * this.config.membershipClockSkewMs) + this.config.membershipGossipIntervalMs
+    ) {
+      throw new RangeError('membershipTombstoneRetentionMs must be at least lease + 2*clockSkew + gossipInterval');
+    }
 
     // Initialize event handler maps
     const events: (keyof PartialMeshEvents)[] = [
@@ -314,6 +380,8 @@ export class PartialMesh {
     this.selfAliases.add(id);
     this.discoveredPeers.delete(id);
     this.globalPeers.delete(id);
+    this.membershipRecordsById.delete(id);
+    this.membershipEquivocationAtById.delete(id);
   }
 
   private isSelfAlias(peerId: string | null | undefined): boolean {
@@ -374,9 +442,11 @@ export class PartialMesh {
     this.selfAliases.add(id);
     const removedDiscovered = this.discoveredPeers.delete(id);
     const removedGlobal = this.globalPeers.delete(id);
+    const removedMembership = this.membershipRecordsById.delete(id);
+    this.membershipEquivocationAtById.delete(id);
     const removedCapacity = this.peerCapacityById.delete(id);
     const removedTopology = this.peerTopologyById.delete(id);
-    const changed = removedDiscovered || removedGlobal || removedCapacity || removedTopology;
+    const changed = removedDiscovered || removedGlobal || removedMembership || removedCapacity || removedTopology;
     this.discoveredAtMs.delete(id);
     this.dialFailureCount.delete(id);
     this.dialBackoffUntilMs.delete(id);
@@ -460,6 +530,8 @@ export class PartialMesh {
   }
 
   private compareDialCandidates(a: string, b: string): number {
+    const cecrOrder = this.cecrOverlayDialPriority(a) - this.cecrOverlayDialPriority(b);
+    if (cecrOrder !== 0) return cecrOrder;
     const capacityOrder = this.compareCapacityPriority(a, b);
     if (capacityOrder !== 0) return capacityOrder;
     const failA = this.dialFailureCount.get(a) ?? 0;
@@ -486,12 +558,15 @@ export class PartialMesh {
     this.rebalanceCooldownUntilMs = Math.max(this.rebalanceCooldownUntilMs, Date.now() + 2_000);
 
     // Drop newest connections first to keep longer-lived links stable.
+    const protectedPeerIds = this.cecrProtectedConnectedPeerIds();
     const dropOrder = connectedPeers
       .map((peerId) => ({
         peerId,
-        connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0
+        connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0,
+        cecrProtected: protectedPeerIds.has(peerId),
       }))
       .sort((a, b) => {
+        if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? 1 : -1;
         if (a.connectedAt !== b.connectedAt) return b.connectedAt - a.connectedAt;
         return a.peerId.localeCompare(b.peerId);
       });
@@ -553,6 +628,59 @@ export class PartialMesh {
     return BigInt((leftHash ^ rightHash) >>> 0);
   }
 
+  private cecrNumericPeerId(peerId: string): bigint | null {
+    const hex = this.normalizePeerId(peerId).replace(/-/g, '').toLowerCase();
+    if (hex.length !== 64 || !this.isHexId(hex)) return null;
+    try { return BigInt(`0x${hex}`); } catch { return null; }
+  }
+
+  private cecrBucketRank(distance: bigint): number {
+    return distance === 0n ? -1 : distance.toString(2).length - 1;
+  }
+
+  private cecrCoordinateNeighbors(): Set<string> {
+    const selfId = this.normalizePeerId(this.clientId);
+    const liveIds = Array.from(new Set([selfId, ...this.globalPeers])).filter(Boolean);
+    const numeric = liveIds
+      .map((peerId) => ({ peerId, value: this.cecrNumericPeerId(peerId) }))
+      .filter((peer): peer is { peerId: string; value: bigint } => peer.value != null)
+      .sort((left, right) => left.value < right.value ? -1 : left.value > right.value ? 1 : left.peerId.localeCompare(right.peerId));
+    const selfIndex = numeric.findIndex((peer) => peer.peerId === selfId);
+    const required = new Set<string>();
+    if (selfIndex > 0) required.add(numeric[selfIndex - 1].peerId);
+    if (selfIndex >= 0 && selfIndex + 1 < numeric.length) required.add(numeric[selfIndex + 1].peerId);
+    return required;
+  }
+
+  private cecrOverlayDialPriority(peerId: string): number {
+    const selfId = this.normalizePeerId(this.clientId);
+    const self = this.cecrNumericPeerId(selfId);
+    const candidate = this.cecrNumericPeerId(peerId);
+    if (self == null || candidate == null || !this.globalPeers.has(peerId)) return 1;
+    if (this.cecrCoordinateNeighbors().has(peerId)) return 0;
+    const candidateRank = this.cecrBucketRank(self ^ candidate);
+    const bucketCovered = this.getConnectedPeers().some((connectedPeerId) => {
+      const connected = this.cecrNumericPeerId(connectedPeerId);
+      return connected != null && this.cecrBucketRank(self ^ connected) === candidateRank;
+    });
+    return bucketCovered ? 1 : 0;
+  }
+
+  private cecrProtectedConnectedPeerIds(): Set<string> {
+    const protectedIds = this.cecrCoordinateNeighbors();
+    const self = this.cecrNumericPeerId(this.clientId ?? '');
+    if (self == null) return protectedIds;
+    const representativeByBucket = new Map<number, string>();
+    for (const peerId of this.getConnectedPeers().slice().sort()) {
+      const peer = this.cecrNumericPeerId(peerId);
+      if (peer == null) continue;
+      const rank = this.cecrBucketRank(self ^ peer);
+      if (!representativeByBucket.has(rank)) representativeByBucket.set(rank, peerId);
+    }
+    for (const peerId of representativeByBucket.values()) protectedIds.add(peerId);
+    return protectedIds;
+  }
+
   private maybeRebalanceForCloserPeer(candidates: string[]): boolean {
     const selfId = this.normalizePeerId(this.clientId);
     if (!selfId || this.config.tolerantPeers <= 0) return false;
@@ -573,14 +701,19 @@ export class PartialMesh {
     }
 
     const reservedDropPeerIds = new Set(this.pendingRebalanceDropByTarget.values());
+    const cecrProtectedPeerIds = this.cecrProtectedConnectedPeerIds();
     const connectedByDistance = connectedPeers
       .filter((peerId) => !reservedDropPeerIds.has(peerId))
       .map((peerId) => ({
         peerId,
         distance: this.peerDistance(selfId, peerId),
-        connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0
+        connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0,
+        cecrProtected: cecrProtectedPeerIds.has(peerId),
       }))
-      .sort((a, b) => (a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId)));
+      .sort((a, b) => {
+        if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? -1 : 1;
+        return a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId);
+      });
 
     const candidateByDistance = candidates
       .map((peerId) => ({
@@ -590,6 +723,8 @@ export class PartialMesh {
         lastAttemptAt: this.rebalanceAttemptAtMs.get(peerId) ?? 0
       }))
       .sort((a, b) => {
+        const cecrOrder = this.cecrOverlayDialPriority(a.peerId) - this.cecrOverlayDialPriority(b.peerId);
+        if (cecrOrder !== 0) return cecrOrder;
         const capacityOrder = this.compareCapacityPriority(a.peerId, b.peerId);
         if (capacityOrder !== 0) return capacityOrder;
         return a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId);
@@ -616,7 +751,8 @@ export class PartialMesh {
     // Prefer genuinely closer candidates, but do not exclude late joiners forever
     // when random peer IDs produce a stable yet closed cluster.
     const candidateDiscoveredAgeMs = now - closestCandidate.discoveredAt;
-    const materiallyCloser = closestCandidate.distance * 4n < farthestConnected.distance * 3n;
+    const repairsCecrOverlay = this.cecrOverlayDialPriority(closestCandidate.peerId) === 0;
+    const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 4n < farthestConnected.distance * 3n;
     const staleExcludedCandidate = candidateDiscoveredAgeMs >= 3_000;
     if (!materiallyCloser && !staleExcludedCandidate) {
       return false;
@@ -686,6 +822,8 @@ export class PartialMesh {
       this.addSelfAlias(nextClientId);
       this.addSelfAlias(data?.requestedClientId);
       this.addSelfAlias(data?.previousClientId);
+      this.renewLocalMembership(true);
+      this.startMembershipLoop();
       this.emit('signaling:connected', { clientId: this.clientId, rawClientId });
       
       if (this.config.autoDiscover) {
@@ -699,6 +837,10 @@ export class PartialMesh {
 
     this.signalingClient.on('disconnected', () => {
       this.emit('signaling:disconnected');
+    });
+
+    this.signalingClient.on('lifecycle:resume', (data: { reason?: string }) => {
+      this.recoverMeshAfterInactivity(String(data?.reason || 'resume'));
     });
 
     this.signalingClient.on('joined', (data: { sessionId: string; clients: string[] }) => {
@@ -735,6 +877,9 @@ export class PartialMesh {
 
     this.signalingClient.on('peers-updated', (data: { peers: string[] }) => {
       this.reconcileSignalingPeers(Array.isArray(data?.peers) ? data.peers : []);
+      if (this.config.autoConnect) {
+        this.maintainPeerConnections();
+      }
     });
 
     this.signalingClient.on('rtc:connected', (data: { peerId: string }) => {
@@ -743,6 +888,7 @@ export class PartialMesh {
         try { this.signalingClient?.closeConnection?.(peerId); } catch { /* ignore */ }
         return;
       }
+      this.orphanRtcFirstSeenAtMs.delete(peerId);
       let peerConnection = this.peers.get(peerId);
       if (!peerConnection) {
         // Inbound connection — FreeRTC accepted and fully established without us initiating.
@@ -834,7 +980,7 @@ export class PartialMesh {
     this.signalingClient.on('rtc:data', (data: { peerId: string; data: any }) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
-        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, msg.topology, data.peerId);
+        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, msg.topology, data.peerId, msg.records);
       } else {
         this.emit('peer:data', data);
       }
@@ -869,6 +1015,19 @@ export class PartialMesh {
     }, this.config.maintenanceIntervalMs);
   }
 
+  private startMembershipLoop(): void {
+    if (this.membershipTimer) return;
+    this.membershipTimer = setInterval(() => {
+      try {
+        this.renewLocalMembership(true);
+        this.pruneMembershipRecords();
+        this.broadcastMembership();
+      } catch {
+        // best-effort membership maintenance
+      }
+    }, this.config.membershipGossipIntervalMs);
+  }
+
   private maybeRefreshDiscovery(): void {
     if (!this.config.autoDiscover) return;
 
@@ -898,19 +1057,40 @@ export class PartialMesh {
    * maintenance loop also calls the same stale-channel check.
    */
   public recoverAfterInactivity(reason: string = 'resume'): void {
+    let adapterTriggeredMeshRecovery = false;
     try {
-      this.signalingClient?.recoverAfterInactivity?.(reason);
+      adapterTriggeredMeshRecovery = this.signalingClient?.recoverAfterInactivity?.(reason) === true;
     } catch {
       // Continue with local transport validation even if signaling recovery fails.
     }
 
+    if (!adapterTriggeredMeshRecovery) {
+      this.recoverMeshAfterInactivity(reason);
+    }
+  }
+
+  private recoverMeshAfterInactivity(reason: string): void {
     this.recoverStaleConnectedPeers(reason);
+    this.recoverOrphanedRtcNegotiations();
     this.lastDiscoveryRefreshAtMs = 0;
     this.underConnectedSinceMs = null;
 
     try {
       this.maybeRefreshDiscovery();
-      if (this.config.autoConnect) this.maintainPeerConnections();
+      if (!this.config.autoConnect) return;
+
+      const isolated = this.getConnectedPeerCount() === 0;
+      const candidates = this.dialCandidatePeerIds(true);
+      if (isolated && candidates.length > 0) {
+        // Resume is authoritative evidence that timer/ICE state may have been
+        // frozen. Do not let old attempts or exponential backoff strand the
+        // peer: close every non-live transport and redial immediately.
+        this.dialBackoffUntilMs.clear();
+        this.hardReset(`${reason}-isolated`);
+        return;
+      }
+
+      this.maintainPeerConnections();
     } catch {
       // The regular maintenance loop will retry.
     }
@@ -937,10 +1117,78 @@ export class PartialMesh {
     }
   }
 
+  /**
+   * FreeRTC can retain a half-open connection that never became a PartialMesh
+   * peer. Without local peer/pending state, the normal negotiation watchdog
+   * cannot see it, while connectToPeerInternal treats it as active forever.
+   */
+  private recoverOrphanedRtcNegotiations(now: number = Date.now()): void {
+    const connections = (this.signalingClient as any)?.client?.mesh?.connections;
+    if (!connections || typeof connections.entries !== 'function') return;
+
+    const isolated = this.getConnectedPeerCount() === 0;
+    const staleAfterMs = isolated
+      ? Math.max(3_500, Math.min(this.config.connectionTimeoutMs, 8_000))
+      : Math.max(8_000, Math.min(this.config.connectionTimeoutMs, 15_000));
+
+    for (const [rawPeerId, entry] of Array.from(connections.entries()) as Array<[string, any]>) {
+      const peerId = this.normalizePeerId(rawPeerId);
+      if (!peerId) continue;
+      if (this.peers.has(peerId) || this.connecting.has(peerId)) {
+        this.orphanRtcFirstSeenAtMs.delete(peerId);
+        continue;
+      }
+
+      const connectionState = String(entry?.connection?.connectionState ?? entry?.state ?? '').toLowerCase();
+      const channelState = String(entry?.channel?.readyState ?? '').toLowerCase();
+      // A connected RTCPeerConnection without an open data channel is not a
+      // usable mesh edge and must remain subject to the orphan timeout.
+      if (channelState === 'open') {
+        this.orphanRtcFirstSeenAtMs.delete(peerId);
+        continue;
+      }
+
+      const lastSeen = Number(entry?.lastSeen);
+      const initialObservation = Number.isFinite(lastSeen) && lastSeen > 0
+        ? Math.min(now, lastSeen)
+        : now;
+      const firstSeenAt = this.orphanRtcFirstSeenAtMs.get(peerId) ?? initialObservation;
+      this.orphanRtcFirstSeenAtMs.set(peerId, firstSeenAt);
+      // FreeRTC refreshes lastSeen for every repeated offer/ICE packet. That is
+      // signaling activity, not proof that the data channel is progressing.
+      // Age the orphan from our first observation so relayed retries cannot
+      // keep a permanently non-open negotiation alive forever.
+      const orphanAgeMs = Math.max(0, now - firstSeenAt);
+      const definitelyDead = connectionState === 'failed'
+        || connectionState === 'closed'
+        || connectionState === 'dead';
+      if (!definitelyDead && orphanAgeMs < staleAfterMs) continue;
+
+      this.orphanRtcFirstSeenAtMs.delete(peerId);
+      this.noteDialFailure(peerId);
+      this.emit('peer:error', {
+        peerId,
+        error: new Error(`Untracked negotiation stalled (${connectionState || 'unknown'}/${channelState || 'closed'})`),
+      });
+      this.emit('signaling:log', {
+        message: `[webrtc] purging stale untracked negotiation to ${peerId}; retrying`,
+      });
+      try {
+        this.signalingClient?.closeConnection?.(peerId);
+      } catch {
+        try { connections.delete?.(peerId); } catch { /* best-effort */ }
+      }
+    }
+
+    for (const peerId of Array.from(this.orphanRtcFirstSeenAtMs.keys())) {
+      if (!connections.has?.(peerId)) this.orphanRtcFirstSeenAtMs.delete(peerId);
+    }
+  }
+
   private maybeRecoverStalledNegotiations(): void {
     const now = Date.now();
     const connectedCount = this.getConnectedPeerCount();
-    const isolated = connectedCount === 0 && this.discoveredPeers.size > 0;
+    const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
     const baseStallMs = Math.max(10_000, Math.min(this.config.connectionTimeoutMs, 15_000));
     const stallMs = isolated ? Math.max(8_000, Math.min(this.config.connectionTimeoutMs, 12_000)) : baseStallMs;
 
@@ -1003,13 +1251,14 @@ export class PartialMesh {
     const connected = this.getConnectedPeers().length;
     const pending = this.getPendingPeerCount();
     const oldestPendingAge = this.getOldestPendingAgeMs();
-    const hasEnoughCandidates = this.discoveredPeers.size >= this.config.minPeers;
-    const hasAnyCandidate = this.discoveredPeers.size > 0;
+    const candidatePeerIds = this.dialCandidatePeerIds(connected === 0);
+    const hasEnoughCandidates = candidatePeerIds.length >= this.config.minPeers;
+    const hasAnyCandidate = candidatePeerIds.length > 0;
     const underConnected = connected < this.config.minPeers && hasEnoughCandidates;
     const isolated = connected === 0 && hasAnyCandidate;
     const isolatedThresholdMs = Math.max(3_500, Math.min(thresholdMs, 8_000));
     const hasStalePending = pending > 0 && oldestPendingAge >= isolatedThresholdMs;
-    const hasRepeatedFailures = Array.from(this.discoveredPeers)
+    const hasRepeatedFailures = candidatePeerIds
       .some((peerId) => (this.dialFailureCount.get(peerId) ?? 0) >= 3);
 
     const now = Date.now();
@@ -1091,7 +1340,15 @@ export class PartialMesh {
     this.peerConnectedAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
 
-    for (const peerId of this.peers.keys()) {
+    const rtcConnections = (this.signalingClient as any)?.client?.mesh?.connections;
+    const resetPeerIds = new Set<string>(this.peers.keys());
+    if (rtcConnections && typeof rtcConnections.keys === 'function') {
+      for (const rawPeerId of Array.from(rtcConnections.keys()) as string[]) {
+        const peerId = this.normalizePeerId(rawPeerId);
+        if (peerId) resetPeerIds.add(peerId);
+      }
+    }
+    for (const peerId of resetPeerIds) {
       try {
         this.signalingClient?.closeConnection(peerId);
       } catch {
@@ -1102,6 +1359,7 @@ export class PartialMesh {
     const hadConnectedPeers = this.getConnectedPeerCount() > 0;
     this.peers.clear();
     this.connecting.clear();
+    this.orphanRtcFirstSeenAtMs.clear();
     if (hadConnectedPeers) {
       this.noteLocalCapacityChanged();
       this.broadcastMembership();
@@ -1189,13 +1447,25 @@ export class PartialMesh {
   /**
    * Maintain the target number of peer connections
    */
+  private dialCandidatePeerIds(includeLiveMembership: boolean): string[] {
+    const candidates = new Set<string>(this.discoveredPeers);
+    if (includeLiveMembership) {
+      for (const peerId of this.getGlobalPeers()) candidates.add(peerId);
+    }
+    return Array.from(candidates).filter(
+      (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId),
+    );
+  }
+
   private maintainPeerConnections(): void {
     const now = Date.now();
+    this.recoverOrphanedRtcNegotiations(now);
     const connectedCount = this.getConnectedPeerCount();
     const pendingCount = this.getPendingPeerCount();
-    const emergencyIsolated = connectedCount === 0 && this.discoveredPeers.size > 0;
+    const candidatePeerIds = this.dialCandidatePeerIds(connectedCount === 0);
+    const emergencyIsolated = connectedCount === 0 && candidatePeerIds.length > 0;
     const totalInProgress = connectedCount + pendingCount;
-    const allCandidates = Array.from(this.discoveredPeers).filter(
+    const allCandidates = candidatePeerIds.filter(
       peerId => !this.isSelfAlias(peerId) && !this.peers.has(peerId) && !this.connecting.has(peerId)
     );
     const available = emergencyIsolated
@@ -1264,7 +1534,8 @@ export class PartialMesh {
     const selfId = this.normalizePeerId(this.clientId);
     const normalizedPeerId = this.normalizePeerId(peerId);
     const signalingConnected = this.signalingClient?.isConnected?.() ?? true;
-    const emergencyIsolated = this.getConnectedPeerCount() === 0 && this.discoveredPeers.size > 0;
+    const emergencyIsolated = this.getConnectedPeerCount() === 0
+      && this.dialCandidatePeerIds(true).length > 0;
 
     if (!signalingConnected) {
       try {
@@ -1336,7 +1607,7 @@ export class PartialMesh {
         return;
       }
 
-      const candidatePeers = Array.from(this.discoveredPeers)
+      const candidatePeers = this.dialCandidatePeerIds(emergencyIsolated)
         .map((id) => this.normalizePeerId(id))
         .filter((id) => {
           if (!id || id === selfId || this.isSelfAlias(id)) return false;
@@ -1373,7 +1644,7 @@ export class PartialMesh {
             return;
           }
 
-          const refreshedCandidates = Array.from(this.discoveredPeers)
+          const refreshedCandidates = this.dialCandidatePeerIds(emergencyIsolated)
             .map((id) => this.normalizePeerId(id))
             .filter((id) => {
               if (!id || id === selfId || this.isSelfAlias(id)) return false;
@@ -1473,6 +1744,7 @@ export class PartialMesh {
         this.connectionTimers.delete(peerId);
       }
       this.connectionStartedAtMs.delete(peerId);
+      this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.peers.delete(peerId);
       this.peerConnectedAtMs.delete(peerId);
       this.connecting.delete(peerId);
@@ -1539,7 +1811,34 @@ export class PartialMesh {
    * Get the converged global peer set (all peers known via membership gossip).
    */
   public getGlobalPeers(): string[] {
+    this.pruneMembershipRecords(Date.now(), false);
     return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
+  }
+
+  public getCecrMembershipRecords(): CecrMembershipRecordSnapshot[] {
+    this.pruneMembershipRecords();
+    return Array.from(this.membershipRecordsById.values())
+      .map((record) => ({ ...record }))
+      .sort((left, right) => left.peerId.localeCompare(right.peerId));
+  }
+
+  public getCecrMembershipEquivocations(): string[] {
+    this.pruneMembershipRecords();
+    return Array.from(this.membershipEquivocationAtById.keys()).sort();
+  }
+
+  public getCecrMembershipConfig(): Readonly<{
+    leaseMs: number;
+    gossipIntervalMs: number;
+    tombstoneRetentionMs: number;
+    clockSkewMs: number;
+  }> {
+    return Object.freeze({
+      leaseMs: this.config.membershipLeaseMs,
+      gossipIntervalMs: this.config.membershipGossipIntervalMs,
+      tombstoneRetentionMs: this.config.membershipTombstoneRetentionMs,
+      clockSkewMs: this.config.membershipClockSkewMs,
+    });
   }
 
   /** Return the effective configuration, including constructor defaults. */
@@ -1623,24 +1922,44 @@ export class PartialMesh {
       .sort((a, b) => a.peerId.localeCompare(b.peerId));
   }
 
+  /** Return the exact XOR-space distance used by partial-mesh rebalancing. */
+  public getXorDistance(peerId: string, fromPeerId: string | null = this.clientId): string | null {
+    const from = this.normalizePeerId(fromPeerId);
+    const target = this.normalizePeerId(peerId);
+    if (!from || !target) return null;
+    return `0x${this.peerDistance(from, target).toString(16)}`;
+  }
+
+  /** Return the shortest currently-known topology path from this peer. */
+  public getHopDistance(peerId: string): number | null {
+    const target = this.normalizePeerId(peerId);
+    if (!target) return null;
+    return this.getGraphSnapshot().nodes.find((node) => node.peerId === target)?.hopDistance ?? null;
+  }
+
   /** Reconstruct the complete currently-known node and undirected edge snapshot. */
   public getGraphSnapshot(): PeerGraphSnapshot {
+    const now = Date.now();
+    this.pruneMembershipRecords(now, false);
     const self = this.normalizePeerId(this.clientId) || null;
+    const connected = new Set(this.getConnectedPeers());
     const knownIds = new Set<string>();
     if (self) knownIds.add(self);
     for (const peerId of this.globalPeers) knownIds.add(peerId);
     for (const peerId of this.discoveredPeers) knownIds.add(peerId);
-    for (const peerId of this.getConnectedPeers()) knownIds.add(peerId);
-    for (const peerId of this.peerCapacityById.keys()) knownIds.add(peerId);
-    for (const [peerId, state] of this.peerTopologyById.entries()) {
-      knownIds.add(peerId);
-      for (const connectedPeerId of state.connectedPeerIds) knownIds.add(connectedPeerId);
-    }
+    for (const peerId of connected) knownIds.add(peerId);
     for (const peerId of Array.from(knownIds)) {
       if (!peerId || this.isSelfAlias(peerId) && peerId !== self || this.retiredPeerIds.has(peerId)) knownIds.delete(peerId);
     }
 
-    const connected = new Set(this.getConnectedPeers());
+    // Capacity and topology are attributes of authoritative peers, never
+    // membership evidence. Otherwise a stale relayed edge can resurrect a
+    // departed identity indefinitely after its membership lease expires.
+    const freshTopologyEntries = Array.from(this.peerTopologyById.entries()).filter(([peerId, state]) => (
+      knownIds.has(peerId)
+      && state.updatedAt <= now + this.config.membershipClockSkewMs
+      && now - state.updatedAt <= this.config.peerStateMaxAgeMs
+    ));
     const edgeMap = new Map<string, PeerGraphEdge>();
     const addEdge = (observer: string, left: string, right: string, updatedAt: number): void => {
       if (!knownIds.has(left) || !knownIds.has(right) || left === right) return;
@@ -1660,14 +1979,60 @@ export class PartialMesh {
     if (self) {
       for (const peerId of connected) addEdge(self, self, peerId, this.localTopologyUpdatedAtMs);
     }
-    for (const [peerId, state] of this.peerTopologyById.entries()) {
+    for (const [peerId, state] of freshTopologyEntries) {
       for (const connectedPeerId of state.connectedPeerIds) {
         addEdge(peerId, peerId, connectedPeerId, state.updatedAt);
       }
     }
 
+    const distanceByPeerId = new Map<string, bigint>();
+    if (self) {
+      for (const peerId of knownIds) {
+        if (peerId !== self) distanceByPeerId.set(peerId, this.peerDistance(self, peerId));
+      }
+    }
+    const rankedDistances = Array.from(distanceByPeerId.entries())
+      .sort((a, b) => a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : a[0].localeCompare(b[0]));
+    const rankByPeerId = new Map(rankedDistances.map(([peerId], rank) => [peerId, rank]));
+    const minimumDistance = rankedDistances[0]?.[1] ?? 0n;
+    const maximumDistance = rankedDistances[rankedDistances.length - 1]?.[1] ?? minimumDistance;
+    const distanceSpan = maximumDistance - minimumDistance;
+    const relativeDistance = (peerId: string): number | null => {
+      if (peerId === self) return 0;
+      const distance = distanceByPeerId.get(peerId);
+      if (distance == null) return null;
+      if (distanceSpan <= 0n) return 0;
+      const precision = 1_000_000n;
+      return Number(((distance - minimumDistance) * precision) / distanceSpan) / Number(precision);
+    };
+
+    const edges = Array.from(edgeMap.values())
+      .map((edge) => ({ ...edge, observedBy: edge.observedBy.sort() }))
+      .sort((a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target));
+    const hopDistanceByPeerId = new Map<string, number>();
+    if (self) {
+      const adjacentByPeerId = new Map<string, string[]>();
+      for (const peerId of knownIds) adjacentByPeerId.set(peerId, []);
+      for (const edge of edges) {
+        adjacentByPeerId.get(edge.source)?.push(edge.target);
+        adjacentByPeerId.get(edge.target)?.push(edge.source);
+      }
+      hopDistanceByPeerId.set(self, 0);
+      const queue = [self];
+      for (let index = 0; index < queue.length; index += 1) {
+        const peerId = queue[index];
+        const nextDistance = (hopDistanceByPeerId.get(peerId) ?? 0) + 1;
+        for (const adjacentPeerId of adjacentByPeerId.get(peerId) ?? []) {
+          if (hopDistanceByPeerId.has(adjacentPeerId)) continue;
+          hopDistanceByPeerId.set(adjacentPeerId, nextDistance);
+          queue.push(adjacentPeerId);
+        }
+      }
+    }
+
+    const freshTopologyPeerIds = new Set(freshTopologyEntries.map(([peerId]) => peerId));
     const missingTopologyPeerIds = Array.from(knownIds)
-      .filter((peerId) => peerId !== self && !this.peerTopologyById.has(peerId))
+      .filter((peerId) => peerId !== self && !freshTopologyPeerIds.has(peerId))
       .sort();
     const nodes = Array.from(knownIds).sort().map((peerId): PeerGraphNode => ({
       peerId,
@@ -1675,17 +2040,20 @@ export class PartialMesh {
       directlyConnected: connected.has(peerId),
       discovered: this.discoveredPeers.has(peerId),
       capacity: this.getPeerCapacity(peerId),
+      hopDistance: hopDistanceByPeerId.get(peerId) ?? null,
+      xorDistance: peerId === self
+        ? '0x0'
+        : (distanceByPeerId.has(peerId) ? `0x${distanceByPeerId.get(peerId)!.toString(16)}` : null),
+      xorDistanceRank: peerId === self ? null : (rankByPeerId.get(peerId) ?? null),
+      xorDistanceRatio: relativeDistance(peerId),
     }));
-    const edges = Array.from(edgeMap.values())
-      .map((edge) => ({ ...edge, observedBy: edge.observedBy.sort() }))
-      .sort((a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target));
     return {
       localPeerId: self,
       nodes,
       edges,
       complete: missingTopologyPeerIds.length === 0,
       missingTopologyPeerIds,
-      generatedAt: Date.now(),
+      generatedAt: now,
     };
   }
 
@@ -1741,12 +2109,139 @@ export class PartialMesh {
   }
     // ─── Membership gossip ────────────────────────────────────────────────────
 
+    private renewLocalMembership(force: boolean = false): boolean {
+      const self = this.normalizePeerId(this.clientId);
+      if (!self) return false;
+      const now = Date.now();
+      const existing = this.membershipRecordsById.get(self);
+      if (
+        !force && existing?.state === 'alive' && existing.validUntil != null &&
+        existing.validUntil - now > this.config.membershipGossipIntervalMs * 2
+      ) return false;
+      this.membershipSequence += 1;
+      this.membershipRecordsById.set(self, {
+        peerId: self,
+        incarnation: this.membershipIncarnation,
+        sequence: this.membershipSequence,
+        state: 'alive',
+        issuedAt: now,
+        validUntil: now + this.config.membershipLeaseMs,
+      });
+      return true;
+    }
+
+    private isMembershipRecordNewer(incoming: CecrMembershipRecord, existing?: CecrMembershipRecord): boolean {
+      if (!existing) return true;
+      if (incoming.incarnation !== existing.incarnation) return incoming.incarnation > existing.incarnation;
+      return incoming.sequence > existing.sequence;
+    }
+
+    private mergeMembershipRecord(record: CecrMembershipRecord, now: number = Date.now()): boolean {
+      const peerId = this.normalizePeerId(record.peerId);
+      if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) return false;
+      const canonicalId = peerId.replace(/-/g, '').toLowerCase();
+      if (canonicalId.length !== 64 || !this.isHexId(canonicalId)) return false;
+      if (!Number.isSafeInteger(record.incarnation) || record.incarnation < 0) return false;
+      if (!Number.isSafeInteger(record.sequence) || record.sequence < 0) return false;
+      if (!Number.isSafeInteger(record.issuedAt) || record.issuedAt <= 0) return false;
+      if (record.issuedAt > now + this.config.membershipClockSkewMs) return false;
+      if (record.state !== 'alive' && record.state !== 'left') return false;
+      if (record.state === 'alive') {
+        if (!Number.isSafeInteger(record.validUntil)) return false;
+        if ((record.validUntil ?? 0) <= record.issuedAt) return false;
+        if ((record.validUntil ?? 0) - record.issuedAt > this.config.membershipLeaseMs) return false;
+        if ((record.validUntil ?? 0) + this.config.membershipTombstoneRetentionMs <= now) return false;
+      } else if (record.validUntil !== null) {
+        return false;
+      }
+      const normalized = { ...record, peerId };
+      const existing = this.membershipRecordsById.get(peerId);
+      if (
+        existing && existing.incarnation === normalized.incarnation &&
+        existing.sequence === normalized.sequence
+      ) {
+        const identical = existing.state === normalized.state &&
+          existing.issuedAt === normalized.issuedAt && existing.validUntil === normalized.validUntil;
+        if (!identical) {
+          this.membershipEquivocationAtById.set(peerId, now);
+          return true;
+        }
+        return false;
+      }
+      if (!this.isMembershipRecordNewer(normalized, existing)) return false;
+      this.membershipRecordsById.set(peerId, normalized);
+      return true;
+    }
+
+    private rebuildGlobalMembership(emitChanges: boolean = true): boolean {
+      const now = Date.now();
+      const next = new Set<string>();
+      for (const record of this.membershipRecordsById.values()) {
+        if (
+          record.state === 'alive' && record.validUntil != null && record.validUntil > now &&
+          !this.isSelfAlias(record.peerId) && !this.retiredPeerIds.has(record.peerId) &&
+          !this.membershipEquivocationAtById.has(record.peerId)
+        ) next.add(record.peerId);
+      }
+      const changed = next.size !== this.globalPeers.size || Array.from(next).some((peerId) => !this.globalPeers.has(peerId));
+      if (!changed) return false;
+      for (const peerId of this.globalPeers) {
+        if (next.has(peerId)) continue;
+        this.peerCapacityById.delete(peerId);
+        this.peerTopologyById.delete(peerId);
+      }
+      this.globalPeers = next;
+      if (emitChanges) {
+        this.emit('mesh:membership', Array.from(this.globalPeers));
+        this.emit('mesh:capacity', this.getPeerCapacities());
+        this.emit('mesh:graph', this.getGraphSnapshot());
+      }
+      return true;
+    }
+
+    private pruneMembershipRecords(now: number = Date.now(), emitChanges: boolean = true): boolean {
+      let pruned = false;
+      for (const [peerId, record] of this.membershipRecordsById.entries()) {
+        const expiredAlive = record.state === 'alive' && (
+          record.validUntil == null ||
+          record.validUntil + this.config.membershipTombstoneRetentionMs <= now
+        );
+        const expiredTombstone = record.state === 'left' && now - record.issuedAt > this.config.membershipTombstoneRetentionMs;
+        if (!expiredAlive && !expiredTombstone) continue;
+        this.membershipRecordsById.delete(peerId);
+        pruned = true;
+      }
+      for (const [peerId, quarantinedAt] of this.membershipEquivocationAtById.entries()) {
+        if (now - quarantinedAt <= this.config.membershipTombstoneRetentionMs) continue;
+        this.membershipEquivocationAtById.delete(peerId);
+        pruned = true;
+      }
+      return this.rebuildGlobalMembership(emitChanges) || pruned;
+    }
+
+    private membershipRecordsForWire(): Record<string, CecrWireMembershipRecord> {
+      const records: Record<string, CecrWireMembershipRecord> = {};
+      const now = Date.now();
+      for (const record of this.membershipRecordsById.values()) {
+        if (record.state === 'alive' && (record.validUntil == null || record.validUntil <= now)) continue;
+        if (record.state === 'left' && now - record.issuedAt > this.config.membershipTombstoneRetentionMs) continue;
+        records[record.peerId] = [
+          record.incarnation,
+          record.sequence,
+          record.state,
+          record.issuedAt,
+          record.validUntil,
+        ];
+      }
+      return records;
+    }
+
     private sendMembership(toPeerId: string): void {
       const self = this.normalizePeerId(this.clientId);
+      this.renewLocalMembership(false);
+      this.pruneMembershipRecords();
       const all = new Set<string>(this.globalPeers);
       if (self) all.add(self);
-      for (const p of this.discoveredPeers) all.add(p);
-      for (const p of this.getConnectedPeers()) all.add(p);
       for (const retiredPeerId of this.retiredPeerIds) all.delete(retiredPeerId);
       const capacities: Record<string, [number, number, number]> = {};
       const topology: Record<string, [string[], number]> = {};
@@ -1766,6 +2261,7 @@ export class PartialMesh {
         __membership: true,
         peers: Array.from(all),
         retiredPeers: Array.from(this.retiredPeerIds),
+        records: this.membershipRecordsForWire(),
         capacities,
         topology,
       });
@@ -1787,6 +2283,7 @@ export class PartialMesh {
       retiredPeers: string[];
       capacities: Record<string, unknown>;
       topology: Record<string, unknown>;
+      records: Record<string, unknown>;
     } | null {
       try {
         const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -1799,6 +2296,9 @@ export class PartialMesh {
               : {},
             topology: obj.topology && typeof obj.topology === 'object' && !Array.isArray(obj.topology)
               ? obj.topology
+              : {},
+            records: obj.records && typeof obj.records === 'object' && !Array.isArray(obj.records)
+              ? obj.records
               : {},
           };
         }
@@ -1813,24 +2313,60 @@ export class PartialMesh {
       retired: string[],
       capacities: Record<string, unknown>,
       topologyInput: Record<string, unknown> | string = {},
-      fromPeerId: string = ''
+      fromPeerId: string = '',
+      records: Record<string, unknown> = {}
     ): void {
       const topology = typeof topologyInput === 'string' ? {} : topologyInput;
       if (typeof topologyInput === 'string') fromPeerId = topologyInput;
       let membershipChanged = false;
       let capacityChanged = false;
       let topologyChanged = false;
-      for (const raw of retired) {
-        if (this.retirePeerId(raw)) membershipChanged = true;
+      const now = Date.now();
+      for (const [rawPeerId, rawRecord] of Object.entries(records || {})) {
+        const peerId = this.normalizePeerId(rawPeerId);
+        if (!peerId || !Array.isArray(rawRecord) || rawRecord.length < 5) continue;
+        const record: CecrMembershipRecord = {
+          peerId,
+          incarnation: Math.floor(Number(rawRecord[0])),
+          sequence: Math.floor(Number(rawRecord[1])),
+          state: rawRecord[2] === 'left' ? 'left' : 'alive',
+          issuedAt: Math.floor(Number(rawRecord[3])),
+          validUntil: rawRecord[4] === null ? null : Math.floor(Number(rawRecord[4])),
+        };
+        if (this.mergeMembershipRecord(record, now)) membershipChanged = true;
+      }
+      // A transport-authenticated peer may retire itself. Third-party legacy
+      // retirement claims are ignored; CECR v1 left records carry versions.
+      const normalizedFromPeerId = this.normalizePeerId(fromPeerId);
+      if (retired.some((raw) => this.normalizePeerId(raw) === normalizedFromPeerId) && normalizedFromPeerId) {
+        const existing = this.membershipRecordsById.get(normalizedFromPeerId);
+        const left: CecrMembershipRecord = {
+          peerId: normalizedFromPeerId,
+          incarnation: existing?.incarnation ?? 0,
+          sequence: (existing?.sequence ?? 0) + 1,
+          state: 'left',
+          issuedAt: now,
+          validUntil: null,
+        };
+        if (this.mergeMembershipRecord(left, now)) membershipChanged = true;
       }
       for (const raw of incoming) {
         const id = this.normalizePeerId(raw);
         if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) continue;
-        if (!this.globalPeers.has(id)) {
-          this.globalPeers.add(id);
-          membershipChanged = true;
-        }
+        const existing = this.membershipRecordsById.get(id);
+        if (existing && (existing.incarnation > 0 || existing.state === 'left')) continue;
+        // Compatibility lease for pre-v1 peers. It expires unless an old peer
+        // continues to advertise it; versioned records always supersede it.
+        if (this.mergeMembershipRecord({
+          peerId: id,
+          incarnation: 0,
+          sequence: now,
+          state: 'alive',
+          issuedAt: now,
+          validUntil: now + this.config.membershipLeaseMs,
+        }, now)) membershipChanged = true;
       }
+      if (this.rebuildGlobalMembership(false)) membershipChanged = true;
       for (const [rawPeerId, rawState] of Object.entries(capacities || {})) {
         const peerId = this.normalizePeerId(rawPeerId);
         if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
@@ -1876,7 +2412,19 @@ export class PartialMesh {
     }
 
     private removeFromGlobalMembership(peerId: string): void {
-      const removed = this.globalPeers.delete(peerId);
+      const now = Date.now();
+      const existing = this.membershipRecordsById.get(peerId);
+      if (existing) {
+        this.membershipRecordsById.set(peerId, {
+          peerId,
+          incarnation: existing.incarnation,
+          sequence: existing.sequence + 1,
+          state: 'left',
+          issuedAt: now,
+          validUntil: null,
+        });
+      }
+      const removed = this.rebuildGlobalMembership(false) || this.globalPeers.delete(peerId);
       const removedCapacity = this.peerCapacityById.delete(peerId);
       const removedTopology = this.peerTopologyById.delete(peerId);
       if (!removed && !removedCapacity && !removedTopology) return;
@@ -1897,6 +2445,10 @@ export class PartialMesh {
     if (this.maintenanceTimer) {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;
+    }
+    if (this.membershipTimer) {
+      clearInterval(this.membershipTimer);
+      this.membershipTimer = null;
     }
 
     for (const t of this.connectionTimers.values()) {
@@ -1921,10 +2473,13 @@ export class PartialMesh {
     this.discoveredPeers.clear();
     this.discoveredAtMs.clear();
     this.connectionStartedAtMs.clear();
+    this.orphanRtcFirstSeenAtMs.clear();
     this.peerConnectedAtMs.clear();
     this.rebalanceAttemptAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
     this.globalPeers.clear();
+    this.membershipRecordsById.clear();
+    this.membershipEquivocationAtById.clear();
     this.peerCapacityById.clear();
     this.peerTopologyById.clear();
     this.selfAliases.clear();
@@ -2073,6 +2628,22 @@ export class PeerPigeonNode {
 
   getPeerCapacities(): PeerCapacitySnapshot[] {
     return this.mesh.getPeerCapacities();
+  }
+
+  getXorDistance(peerId: string, fromPeerId?: string): string | null {
+    return this.mesh.getXorDistance(peerId, fromPeerId ?? this.mesh.getClientId());
+  }
+
+  getHopDistance(peerId: string): number | null {
+    return this.mesh.getHopDistance(peerId);
+  }
+
+  getCecrConfig(): Readonly<CecrConfigSnapshot> {
+    return this.gossip.getCecrConfig();
+  }
+
+  getCecrState(): CecrStateSnapshot {
+    return this.gossip.getCecrState();
   }
 
   getClientId(): string | null { return this.mesh.getClientId(); }
@@ -2264,6 +2835,9 @@ export default PartialMesh;
 
 export { GossipProtocol };
 export type {
+  CecrConfigSnapshot,
+  CecrOverlaySnapshot,
+  CecrStateSnapshot,
   GossipBroadcastOptions,
   GossipDeliveryStatus,
   GossipMessage,

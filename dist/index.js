@@ -177,10 +177,11 @@ var FreeRTCClientAdapter = class {
    * or the browser reports that the network is online again.
    */
   recoverAfterInactivity(reason = "resume") {
-    if (this.intentionallyDisconnected) return;
+    if (this.intentionallyDisconnected) return false;
     const now = Date.now();
-    if (now - this.lastRecoveryProbeAtMs < RECOVERY_PROBE_THROTTLE_MS) return;
+    if (now - this.lastRecoveryProbeAtMs < RECOVERY_PROBE_THROTTLE_MS) return false;
     this.lastRecoveryProbeAtMs = now;
+    this.emitter.emit("lifecycle:resume", { reason });
     for (const peerId of Array.from(this.connectedPeers)) {
       const entry = this.client?.mesh?.connections?.get?.(peerId);
       const connectionState = String(entry?.connection?.connectionState ?? entry?.state ?? "").toLowerCase();
@@ -196,7 +197,7 @@ var FreeRTCClientAdapter = class {
     if (!this.client?.isRegistered) {
       this.emitter.emit("signaling:log", { message: `[signal] ${reason} recovery: reconnecting signaling` });
       this.client?.connect?.();
-      return;
+      return true;
     }
     this.emitter.emit("signaling:log", { message: `[signal] ${reason} recovery: refreshing discovery` });
     this.clearRecoveryProbeTimer();
@@ -207,6 +208,7 @@ var FreeRTCClientAdapter = class {
       this.restartClientAfterStaleSignaling(reason);
     }, RECOVERY_PROBE_TIMEOUT_MS);
     this.nudgeSignaling();
+    return true;
   }
   closeConnection(peerId) {
     const id = this.normalizePeerId(peerId);
@@ -444,35 +446,53 @@ var freertc_client_adapter_default = FreeRTCClientAdapter;
 
 // src/gossip.ts
 var RELIABLE_REPAIR_TYPE = "pp-gossip-repair-v1";
+var CECR_ID_WIDTH_BITS = 256;
+var CECR_ID_HEX_LENGTH = CECR_ID_WIDTH_BITS / 4;
+var CECR_ID_MAX = (1n << BigInt(CECR_ID_WIDTH_BITS)) - 1n;
+var CECR_WEIGHT_DENOMINATOR = 1e6;
 var MAX_RECEIPT_DELTAS_PER_SYNC = 32;
 var MAX_DELIVERY_PEERS = 4096;
 var MAX_REPAIR_ATTEMPTS_PER_TARGET = 3;
+var DEFAULT_ANTI_ENTROPY_SUMMARY_SIZE = 256;
+var DEFAULT_ANTI_ENTROPY_REQUEST_SIZE = 64;
 var GossipProtocol = class {
   constructor(mesh, options = {}) {
     this.messageLog = /* @__PURE__ */ new Map();
     this.maxTrackedMessages = 12e3;
     this.maxTrackedDirectIds = 12e3;
     this.trackingRetentionMs = 10 * 6e4;
+    this.cecrViewChangedAtMs = Date.now();
     this.cecrCurrentExtrema = null;
-    this.cecrPreviousExtrema = null;
     this.cecrRemoteStates = /* @__PURE__ */ new Map();
     this.cecrSyncTimer = null;
     this.trackingCleanupTimer = null;
     this.seenDirectIds = /* @__PURE__ */ new Map();
     this.deliveryStates = /* @__PURE__ */ new Map();
+    this.retainedMessages = /* @__PURE__ */ new Map();
     this.dirtyDeliveryReceiptIds = /* @__PURE__ */ new Set();
+    this.gossipFanoutCursor = 0;
+    this.cecrFanoutCursor = 0;
+    this.antiEntropyFanoutCursor = 0;
     this.callbacks = {};
     this.peers = /* @__PURE__ */ new Map();
     this.mesh = mesh;
     this.maxHops = options.maxHops ?? 5;
-    this.maxDirectHops = options.maxDirectHops ?? 20;
+    this.maxDirectHops = options.maxDirectHops ?? CECR_ID_WIDTH_BITS;
     this.cecrCoordinateWeight = Math.max(0, Math.min(1, options.cecrCoordinateWeight ?? 0.35));
     this.cecrExtremaMaxAgeMs = Math.max(1e3, options.cecrExtremaMaxAgeMs ?? 2e4);
-    this.cecrMaxAcceptedDrift = Math.max(0.01, Math.min(1, options.cecrMaxAcceptedDrift ?? 0.18));
     this.cecrRequireConsensus = options.cecrRequireConsensus ?? true;
+    this.cecrConvergenceRounds = Math.max(1, Math.floor(options.cecrConvergenceRounds ?? 3));
     this.deliveryTimeoutMs = Math.max(2e3, options.deliveryTimeoutMs ?? 3e4);
     this.deliveryRepairDelayMs = Math.max(1e3, options.deliveryRepairDelayMs ?? 4e3);
     this.deliveryRepairIntervalMs = Math.max(1e3, options.deliveryRepairIntervalMs ?? 5e3);
+    this.antiEntropySummarySize = Math.max(
+      1,
+      Math.min(this.maxTrackedMessages, Math.floor(options.antiEntropySummarySize ?? DEFAULT_ANTI_ENTROPY_SUMMARY_SIZE))
+    );
+    this.antiEntropyRequestSize = Math.max(
+      1,
+      Math.min(this.antiEntropySummarySize, Math.floor(options.antiEntropyRequestSize ?? DEFAULT_ANTI_ENTROPY_REQUEST_SIZE))
+    );
     this.setupMeshListeners();
     this.startCecrSyncLoop();
     this.startTrackingCleanupLoop();
@@ -485,6 +505,10 @@ var GossipProtocol = class {
         this.handleIncomingDirect(parsed, peerId);
       } else if (parsed.type === "cecr-state") {
         this.handleIncomingCecrState(parsed, peerId);
+      } else if (parsed.type === "cecr-dr") {
+        this.handleIncomingCecrDeliveryState(parsed, peerId);
+      } else if (parsed.type === "gossip-ae") {
+        this.handleGossipAntiEntropy(parsed, peerId);
       } else {
         this.handleIncomingMessage(parsed, peerId);
       }
@@ -494,7 +518,8 @@ var GossipProtocol = class {
       for (const messageId of this.deliveryStates.keys()) {
         this.dirtyDeliveryReceiptIds.add(messageId);
       }
-      this.publishCecrState();
+      this.publishCecrState(peerId);
+      this.publishGossipAntiEntropy(peerId);
       this.emit("peerConnected", { peerId });
     });
     this.mesh.on("peer:disconnected", (peerId) => {
@@ -509,6 +534,7 @@ var GossipProtocol = class {
     this.cecrSyncTimer = setInterval(() => {
       this.maintainTrackedDeliveries();
       this.publishCecrState();
+      this.publishGossipAntiEntropy();
     }, 2e3);
   }
   startTrackingCleanupLoop() {
@@ -558,6 +584,7 @@ var GossipProtocol = class {
       sender: message.sender,
       hops: 0
     });
+    this.retainGossipMessage(message);
     if (this.messageLog.size > this.maxTrackedMessages) {
       this.pruneTracking(message.timestamp);
     }
@@ -583,14 +610,16 @@ var GossipProtocol = class {
     return this.deliveryStatusForState(state);
   }
   /**
-   * Propagate a message to all currently-connected peers.
+   * Propagate to the CECR v1 fan-out budget. Selection rotates over the
+   * sorted neighbor set so every eligible connection is chosen fairly.
    */
   propagate(message, exceptPeerId) {
-    const connectedPeers = this.mesh.getConnectedPeers();
+    const excluded = /* @__PURE__ */ new Set();
+    if (message.sender) excluded.add(message.sender);
+    if (exceptPeerId) excluded.add(exceptPeerId);
+    const connectedPeers = this.selectFanoutPeers(excluded, "gossip");
     const deliveryState = this.deliveryStates.get(message.id);
     for (const peerId of connectedPeers) {
-      if (peerId === message.sender) continue;
-      if (exceptPeerId && peerId === exceptPeerId) continue;
       const forwarded = {
         ...message,
         hops: message.hops + 1,
@@ -607,6 +636,7 @@ var GossipProtocol = class {
    */
   handleIncomingMessage(message, fromPeerId) {
     const alreadySeen = this.messageLog.has(message.id);
+    this.retainGossipMessage(message);
     if (message.delivery) {
       this.registerTrackedDelivery(message, null, true);
     }
@@ -622,6 +652,87 @@ var GossipProtocol = class {
     this.emit("messageReceived", { message, local: false, fromPeer: fromPeerId });
     if (message.hops < message.maxHops) {
       this.propagate(message, fromPeerId);
+    }
+  }
+  // ─── Epidemic anti-entropy ────────────────────────────────────────
+  retainGossipMessage(message, retainedAt = Date.now()) {
+    if (this.retainedMessages.has(message.id)) return;
+    try {
+      const snapshot = JSON.parse(JSON.stringify(message));
+      this.retainedMessages.set(message.id, { message: snapshot, retainedAt });
+    } catch {
+      return;
+    }
+    while (this.retainedMessages.size > this.maxTrackedMessages) {
+      const oldest = this.retainedMessages.keys().next().value;
+      if (!oldest) break;
+      this.retainedMessages.delete(oldest);
+    }
+  }
+  recentRetainedMessageIds(now = Date.now()) {
+    const minRetainedAt = now - this.trackingRetentionMs;
+    return Array.from(this.retainedMessages.entries()).filter(([, retained]) => retained.retainedAt >= minRetainedAt).slice(-this.antiEntropySummarySize).map(([messageId]) => messageId);
+  }
+  publishGossipAntiEntropy(targetPeerId) {
+    const self = this.mesh.getClientId();
+    if (!self) return;
+    const connected = new Set(this.mesh.getConnectedPeers());
+    const targets = targetPeerId && connected.has(targetPeerId) ? [targetPeerId] : this.selectFanoutPeers(/* @__PURE__ */ new Set(), "anti-entropy");
+    if (targets.length === 0) return;
+    const message = {
+      id: this.generateMessageId(self),
+      type: "gossip-ae",
+      protocol: "gossip-ae/1",
+      from: self,
+      timestamp: Date.now(),
+      mode: "summary",
+      messageIds: this.recentRetainedMessageIds()
+    };
+    const encoded = JSON.stringify(message);
+    for (const peerId of targets) {
+      try {
+        this.mesh.send(peerId, encoded);
+      } catch {
+      }
+    }
+  }
+  handleGossipAntiEntropy(message, fromPeerId) {
+    if (message.from !== fromPeerId || message.protocol !== "gossip-ae/1" || message.mode !== "summary" && message.mode !== "request" || !Array.isArray(message.messageIds)) return;
+    const limit = message.mode === "summary" ? this.antiEntropySummarySize : this.antiEntropyRequestSize;
+    const messageIds = Array.from(new Set(
+      message.messageIds.filter((messageId) => typeof messageId === "string" && messageId.length <= 512).slice(0, limit)
+    ));
+    if (message.mode === "summary") {
+      const missing = messageIds.filter((messageId) => !this.retainedMessages.has(messageId)).slice(0, this.antiEntropyRequestSize);
+      if (missing.length === 0) return;
+      const request = {
+        id: this.generateMessageId(this.mesh.getClientId()),
+        type: "gossip-ae",
+        protocol: "gossip-ae/1",
+        from: this.mesh.getClientId() ?? "",
+        timestamp: Date.now(),
+        mode: "request",
+        messageIds: missing
+      };
+      if (!request.from) return;
+      try {
+        this.mesh.send(fromPeerId, JSON.stringify(request));
+      } catch {
+      }
+      return;
+    }
+    for (const messageId of messageIds) {
+      const retained = this.retainedMessages.get(messageId);
+      if (!retained) continue;
+      const deliveryState = this.deliveryStates.get(messageId);
+      const repaired = {
+        ...retained.message,
+        ...deliveryState ? { delivery: this.deliveryEnvelopeForState(deliveryState) } : {}
+      };
+      try {
+        this.mesh.send(fromPeerId, JSON.stringify(repaired));
+      } catch {
+      }
     }
   }
   // ─── Tracked delivery receipts ──────────────────────────────────────────
@@ -894,44 +1005,10 @@ var GossipProtocol = class {
     return message;
   }
   // ─── Direct / XOR-routed messaging ───────────────────────────────────────
-  /**
-   * XOR distance between two hex-encoded peer IDs.
-   * Returns a BigInt (lower = closer).
-   */
-  xorDistance(a, b) {
-    const left = this.peerIdToNumeric(a);
-    const right = this.peerIdToNumeric(b);
-    if (left == null || right == null) {
-      throw new Error("Peer IDs are not comparable in XOR space");
-    }
-    return left ^ right;
-  }
-  /**
-   * Pick the connected peer closest (by XOR distance) to target.
-   * Falls back to any connected peer if IDs can't be compared.
-   */
-  closestPeerTo(target, exclude) {
-    const connected = this.mesh.getConnectedPeers().filter((p) => p !== exclude);
-    if (connected.length === 0) return null;
-    let best = null;
-    let bestDist = null;
-    for (const p of connected) {
-      try {
-        const d = this.xorDistance(p, target);
-        if (bestDist == null || d < bestDist) {
-          bestDist = d;
-          best = p;
-        }
-      } catch {
-        if (!best) best = p;
-      }
-    }
-    return best;
-  }
   peerIdToNumeric(peerId) {
     try {
       const hex = peerId.replace(/-/g, "").toLowerCase();
-      if (!hex || !/^[0-9a-f]+$/.test(hex)) return null;
+      if (hex.length !== CECR_ID_HEX_LENGTH || !/^[0-9a-f]+$/.test(hex)) return null;
       return BigInt("0x" + hex);
     } catch {
       return null;
@@ -955,6 +1032,51 @@ var GossipProtocol = class {
     }
     return hash.toString(16).padStart(16, "0");
   }
+  cecrConfigId() {
+    const membership = this.mesh.getCecrMembershipConfig?.() ?? {
+      leaseMs: 0,
+      gossipIntervalMs: 0,
+      tombstoneRetentionMs: 0,
+      clockSkewMs: 0
+    };
+    return this.canonicalSetHash([JSON.stringify({
+      protocol: "cecr/1",
+      idWidthBits: CECR_ID_WIDTH_BITS,
+      hashProfile: "fnv1a64-compat",
+      signatureProfile: "unsigned-partial",
+      coordinateWeightNumerator: Math.round(this.cecrCoordinateWeight * CECR_WEIGHT_DENOMINATOR),
+      coordinateWeightDenominator: CECR_WEIGHT_DENOMINATOR,
+      maxDirectHops: this.maxDirectHops,
+      convergenceRounds: this.cecrConvergenceRounds,
+      xorBucketRedundancy: 1,
+      membership
+    })]);
+  }
+  cecrFanout(connectedDegree = this.mesh.getConnectedPeers().length) {
+    const liveN = Math.max(1, this.canonicalPeerSet().length);
+    return Math.min(Math.max(0, connectedDegree), Math.ceil(Math.log2(liveN)));
+  }
+  selectFanoutPeers(excluded, channel) {
+    const connected = Array.from(new Set(this.mesh.getConnectedPeers())).sort();
+    const budget = this.cecrFanout(connected.length);
+    const eligible = connected.filter((peerId) => !excluded.has(peerId));
+    const count = Math.min(budget, eligible.length);
+    if (count <= 0) return [];
+    const cursor = channel === "gossip" ? this.gossipFanoutCursor : channel === "cecr" ? this.cecrFanoutCursor : this.antiEntropyFanoutCursor;
+    const start = cursor % eligible.length;
+    const selected = [];
+    for (let offset = 0; offset < count; offset += 1) {
+      selected.push(eligible[(start + offset) % eligible.length]);
+    }
+    if (channel === "gossip") {
+      this.gossipFanoutCursor = (start + count) % eligible.length;
+    } else if (channel === "cecr") {
+      this.cecrFanoutCursor = (start + count) % eligible.length;
+    } else {
+      this.antiEntropyFanoutCursor = (start + count) % eligible.length;
+    }
+    return selected;
+  }
   updateCecrExtremaSnapshot() {
     const canonicalPeers = this.canonicalPeerSet();
     const setHash = this.canonicalSetHash(canonicalPeers);
@@ -969,6 +1091,10 @@ var GossipProtocol = class {
       count++;
     }
     if (min == null || max == null || count < 2 || min === max) {
+      if (this.cecrCurrentExtrema) {
+        this.cecrCurrentExtrema = null;
+        this.cecrViewChangedAtMs = Date.now();
+      }
       return null;
     }
     const next = {
@@ -979,78 +1105,95 @@ var GossipProtocol = class {
       setHash
     };
     if (!this.cecrCurrentExtrema || this.cecrCurrentExtrema.min !== next.min || this.cecrCurrentExtrema.max !== next.max || this.cecrCurrentExtrema.size !== next.size || this.cecrCurrentExtrema.setHash !== next.setHash) {
-      this.cecrPreviousExtrema = this.cecrCurrentExtrema;
       this.cecrCurrentExtrema = next;
+      this.cecrViewChangedAtMs = next.updatedAtMs;
     } else {
       this.cecrCurrentExtrema.updatedAtMs = next.updatedAtMs;
     }
     return this.cecrCurrentExtrema;
   }
-  coordinateFor(peerId, extrema) {
-    const value = this.peerIdToNumeric(peerId);
-    if (value == null) return null;
-    const span = extrema.max - extrema.min;
-    if (span <= 0n) return null;
-    return Number(value - extrema.min) / Number(span);
-  }
-  effectiveCecrCoordinateWeight(targetPeerId) {
-    let weight = this.cecrCoordinateWeight;
-    const current = this.cecrCurrentExtrema ?? this.updateCecrExtremaSnapshot();
+  effectiveCecrCoordinateWeight() {
+    const current = this.updateCecrExtremaSnapshot();
     if (!current) return 0;
     if (!this.hasCecrConsensus(current)) return 0;
-    const ageMs = Date.now() - current.updatedAtMs;
-    if (ageMs > this.cecrExtremaMaxAgeMs) {
-      weight *= 0.2;
-    }
-    if (this.cecrPreviousExtrema) {
-      const prevCoord = this.coordinateFor(targetPeerId, this.cecrPreviousExtrema);
-      const nextCoord = this.coordinateFor(targetPeerId, current);
-      if (prevCoord != null && nextCoord != null) {
-        const drift = Math.abs(prevCoord - nextCoord);
-        if (drift > this.cecrMaxAcceptedDrift) {
-          weight *= 0.15;
-        }
-      }
-    }
-    return Math.max(0, Math.min(1, weight));
+    if (this.getCecrOverlaySnapshot().degraded) return 0;
+    return this.cecrCoordinateWeight;
   }
   hasCecrConsensus(local) {
     if (!this.cecrRequireConsensus) return true;
     const now = Date.now();
     if (now - local.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
+    const gossipIntervalMs = this.mesh.getCecrMembershipConfig?.().gossipIntervalMs ?? 2e3;
+    if (now - this.cecrViewChangedAtMs < this.cecrConvergenceRounds * gossipIntervalMs) return false;
+    if ((this.mesh.getCecrMembershipEquivocations?.().length ?? 0) > 0) return false;
+    const configId = this.cecrConfigId();
     const connectedPeers = this.mesh.getConnectedPeers();
     for (const peerId of connectedPeers) {
       const remote = this.cecrRemoteStates.get(peerId);
       if (!remote) return false;
       if (now - remote.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
+      if (remote.configId !== configId || remote.viewId !== local.setHash) return false;
+      if (remote.matchingRounds < this.cecrConvergenceRounds) return false;
       if (remote.setHash !== local.setHash) return false;
       if (remote.size !== local.size) return false;
       if (remote.min !== local.min || remote.max !== local.max) return false;
     }
     return true;
   }
-  publishCecrState() {
+  publishCecrState(targetPeerId) {
     const self = this.mesh.getClientId();
     if (!self) return;
+    const connected = new Set(this.mesh.getConnectedPeers());
+    const targets = targetPeerId && connected.has(targetPeerId) ? [targetPeerId] : this.selectFanoutPeers(/* @__PURE__ */ new Set(), "cecr");
     const extrema = this.updateCecrExtremaSnapshot();
-    const receiptIds = Array.from(this.dirtyDeliveryReceiptIds).slice(0, MAX_RECEIPT_DELTAS_PER_SYNC);
-    if (!extrema && receiptIds.length === 0) return;
-    const canonicalPeers = extrema ? null : this.canonicalPeerSet();
+    const canonicalPeers = this.canonicalPeerSet();
+    const numericPeers = canonicalPeers.map((peerId) => this.peerIdToNumeric(peerId)).filter((value) => value != null);
+    if (numericPeers.length !== canonicalPeers.length || numericPeers.length === 0) {
+      this.publishCecrDeliveryState(targets, self);
+      return;
+    }
+    let min = numericPeers[0];
+    let max = numericPeers[0];
+    for (const value of numericPeers.slice(1)) {
+      if (value < min) min = value;
+      if (value > max) max = value;
+    }
     const message = {
       id: this.generateMessageId(self),
       type: "cecr-state",
+      protocol: "cecr/1",
+      configId: this.cecrConfigId(),
+      viewId: extrema?.setHash ?? this.canonicalSetHash(canonicalPeers),
       from: self,
       timestamp: Date.now(),
-      setHash: extrema?.setHash ?? this.canonicalSetHash(canonicalPeers ?? []),
-      minHex: extrema?.min.toString(16) ?? "0",
-      maxHex: extrema?.max.toString(16) ?? "0",
-      size: extrema?.size ?? canonicalPeers?.length ?? 0
+      setHash: extrema?.setHash ?? this.canonicalSetHash(canonicalPeers),
+      minHex: (extrema?.min ?? min).toString(16).padStart(CECR_ID_HEX_LENGTH, "0"),
+      maxHex: (extrema?.max ?? max).toString(16).padStart(CECR_ID_HEX_LENGTH, "0"),
+      size: extrema?.size ?? canonicalPeers.length
     };
-    if (receiptIds.length) {
-      message.receipts = receiptIds.map((messageId) => this.deliveryStates.get(messageId)).filter((state) => !!state).map((state) => this.deliveryReceiptForState(state));
-    }
     let sent = false;
-    for (const peerId of this.mesh.getConnectedPeers()) {
+    for (const peerId of targets) {
+      try {
+        this.mesh.send(peerId, JSON.stringify(message));
+        sent = true;
+      } catch {
+      }
+    }
+    if (sent || targets.length > 0) this.publishCecrDeliveryState(targets, self);
+  }
+  publishCecrDeliveryState(targets, self) {
+    const receiptIds = Array.from(this.dirtyDeliveryReceiptIds).slice(0, MAX_RECEIPT_DELTAS_PER_SYNC);
+    if (receiptIds.length === 0 || targets.length === 0) return;
+    const message = {
+      id: this.generateMessageId(self),
+      type: "cecr-dr",
+      protocol: "cecr-dr/1",
+      from: self,
+      timestamp: Date.now(),
+      receipts: receiptIds.map((messageId) => this.deliveryStates.get(messageId)).filter((state) => !!state).map((state) => this.deliveryReceiptForState(state))
+    };
+    let sent = false;
+    for (const peerId of targets) {
       try {
         this.mesh.send(peerId, JSON.stringify(message));
         sent = true;
@@ -1069,65 +1212,120 @@ var GossipProtocol = class {
       const min = BigInt("0x" + message.minHex);
       const max = BigInt("0x" + message.maxHex);
       if (min > max) return;
+      const configId = message.configId ?? "";
+      const viewId = message.viewId ?? message.setHash;
+      const previous = this.cecrRemoteStates.get(fromPeerId);
+      const matchingRounds = previous && previous.configId === configId && previous.viewId === viewId ? previous.matchingRounds + 1 : 1;
       this.cecrRemoteStates.set(fromPeerId, {
+        configId,
+        viewId,
         setHash: message.setHash,
         min,
         max,
         size: Math.floor(message.size),
-        updatedAtMs: Date.now()
+        updatedAtMs: Date.now(),
+        matchingRounds
       });
-      if (Array.isArray(message.receipts)) {
-        for (const receipt of message.receipts.slice(0, MAX_RECEIPT_DELTAS_PER_SYNC)) {
-          this.mergeDeliveryReceipt(receipt);
-        }
-      }
     } catch {
     }
   }
-  normalizedBigIntRatio(numerator, denominator) {
-    if (denominator <= 0n) return 1;
-    if (numerator <= 0n) return 0;
-    const scale = 1000000n;
-    const scaled = numerator * scale / denominator;
-    return Number(scaled) / Number(scale);
+  handleIncomingCecrDeliveryState(message, fromPeerId) {
+    if (message.from !== fromPeerId || message.protocol !== "cecr-dr/1" || !Array.isArray(message.receipts)) return;
+    for (const receipt of message.receipts.slice(0, MAX_RECEIPT_DELTAS_PER_SYNC)) {
+      this.mergeDeliveryReceipt(receipt);
+    }
   }
-  closestPeerHybrid(target, exclude) {
-    const connected = this.mesh.getConnectedPeers().filter((p) => p !== exclude);
-    if (connected.length === 0) return null;
-    const coordWeight = this.effectiveCecrCoordinateWeight(target);
-    if (coordWeight <= 1e-3) {
-      return this.closestPeerTo(target, exclude);
+  bucketRank(distance) {
+    return distance === 0n ? -1 : distance.toString(2).length - 1;
+  }
+  hybridScore(peerId, target, extrema) {
+    const peer = this.peerIdToNumeric(peerId);
+    if (peer == null) return null;
+    const span = extrema.max - extrema.min;
+    if (span <= 0n) return null;
+    const weight = BigInt(Math.round(this.cecrCoordinateWeight * CECR_WEIGHT_DENOMINATOR));
+    const inverse = BigInt(CECR_WEIGHT_DENOMINATOR) - weight;
+    const coordinateDistance = peer >= target ? peer - target : target - peer;
+    const xor = peer ^ target;
+    return weight * coordinateDistance * CECR_ID_MAX + inverse * xor * span;
+  }
+  orderedRouteCandidates(targetPeerId, exclude, originConfigId) {
+    const selfId = this.mesh.getClientId();
+    if (!selfId) return [];
+    const self = this.peerIdToNumeric(selfId);
+    const target = this.peerIdToNumeric(targetPeerId);
+    if (self == null || target == null) return [];
+    const candidates = Array.from(new Set(this.mesh.getConnectedPeers())).filter((peerId) => peerId !== exclude).map((peerId) => ({ peerId, numeric: this.peerIdToNumeric(peerId) })).filter((candidate) => candidate.numeric != null);
+    const selfXor = self ^ target;
+    const selfRank = this.bucketRank(selfXor);
+    const progress = candidates.filter(({ numeric }) => this.bucketRank(numeric ^ target) < selfRank);
+    const coordinateReady = originConfigId === this.cecrConfigId() && this.effectiveCecrCoordinateWeight() > 0;
+    const extrema = coordinateReady ? this.cecrCurrentExtrema ?? this.updateCecrExtremaSnapshot() : null;
+    if (progress.length > 0) {
+      return progress.sort((left, right) => {
+        if (extrema) {
+          const leftScore = this.hybridScore(left.peerId, target, extrema);
+          const rightScore = this.hybridScore(right.peerId, target, extrema);
+          if (leftScore != null && rightScore != null && leftScore !== rightScore) {
+            return leftScore < rightScore ? -1 : 1;
+          }
+        }
+        const leftXor = left.numeric ^ target;
+        const rightXor = right.numeric ^ target;
+        if (leftXor !== rightXor) return leftXor < rightXor ? -1 : 1;
+        if (left.numeric !== right.numeric) return left.numeric < right.numeric ? -1 : 1;
+        return left.peerId.localeCompare(right.peerId);
+      }).map(({ peerId }) => peerId);
     }
-    const extrema = this.cecrCurrentExtrema ?? this.updateCecrExtremaSnapshot();
-    const targetCoord = extrema ? this.coordinateFor(target, extrema) : null;
-    if (!extrema || targetCoord == null) {
-      return this.closestPeerTo(target, exclude);
+    return candidates.filter(({ numeric }) => (numeric ^ target) < selfXor).sort((left, right) => {
+      const leftXor = left.numeric ^ target;
+      const rightXor = right.numeric ^ target;
+      if (leftXor !== rightXor) return leftXor < rightXor ? -1 : 1;
+      if (left.numeric !== right.numeric) return left.numeric < right.numeric ? -1 : 1;
+      return left.peerId.localeCompare(right.peerId);
+    }).map(({ peerId }) => peerId);
+  }
+  getCecrOverlaySnapshot() {
+    const selfId = this.mesh.getClientId();
+    const livePeerIds = this.canonicalPeerSet();
+    const self = selfId ? this.peerIdToNumeric(selfId) : null;
+    const live = livePeerIds.map((peerId) => ({ peerId, numeric: this.peerIdToNumeric(peerId) })).filter((peer) => peer.numeric != null);
+    const connected = new Set(this.mesh.getConnectedPeers());
+    if (!selfId || self == null || live.length !== livePeerIds.length) {
+      return {
+        xorBucketCoverage: false,
+        coordinateAdjacency: false,
+        missingXorBuckets: [],
+        missingCoordinatePeerIds: [],
+        degraded: true
+      };
     }
-    let maxXor = 1n;
-    const xorDistances = /* @__PURE__ */ new Map();
-    for (const peerId of connected) {
-      try {
-        const d = this.xorDistance(peerId, target);
-        xorDistances.set(peerId, d);
-        if (d > maxXor) maxXor = d;
-      } catch {
-        xorDistances.set(peerId, maxXor);
-      }
+    const requiredBuckets = /* @__PURE__ */ new Set();
+    const connectedBuckets = /* @__PURE__ */ new Set();
+    for (const peer of live) {
+      if (peer.peerId === selfId) continue;
+      requiredBuckets.add(this.bucketRank(self ^ peer.numeric));
+      if (connected.has(peer.peerId)) connectedBuckets.add(this.bucketRank(self ^ peer.numeric));
     }
-    let bestPeer = null;
-    let bestScore = Number.POSITIVE_INFINITY;
-    for (const peerId of connected) {
-      const dXor = xorDistances.get(peerId) ?? maxXor;
-      const xorScore = this.normalizedBigIntRatio(dXor, maxXor || 1n);
-      const peerCoord = this.coordinateFor(peerId, extrema);
-      const ratioScore = peerCoord == null ? 1 : Math.abs(peerCoord - targetCoord);
-      const score = (1 - coordWeight) * xorScore + coordWeight * ratioScore;
-      if (score < bestScore) {
-        bestScore = score;
-        bestPeer = peerId;
-      }
-    }
-    return bestPeer ?? this.closestPeerTo(target, exclude);
+    const missingXorBuckets = Array.from(requiredBuckets).filter((rank) => !connectedBuckets.has(rank)).sort((left, right) => left - right);
+    const sorted = live.slice().sort((left, right) => {
+      if (left.numeric !== right.numeric) return left.numeric < right.numeric ? -1 : 1;
+      return left.peerId.localeCompare(right.peerId);
+    });
+    const selfIndex = sorted.findIndex((peer) => peer.peerId === selfId);
+    const requiredCoordinatePeers = /* @__PURE__ */ new Set();
+    if (selfIndex > 0) requiredCoordinatePeers.add(sorted[selfIndex - 1].peerId);
+    if (selfIndex >= 0 && selfIndex + 1 < sorted.length) requiredCoordinatePeers.add(sorted[selfIndex + 1].peerId);
+    const missingCoordinatePeerIds = Array.from(requiredCoordinatePeers).filter((peerId) => !connected.has(peerId)).sort();
+    const xorBucketCoverage = missingXorBuckets.length === 0;
+    const coordinateAdjacency = selfIndex >= 0 && missingCoordinatePeerIds.length === 0;
+    return {
+      xorBucketCoverage,
+      coordinateAdjacency,
+      missingXorBuckets,
+      missingCoordinatePeerIds,
+      degraded: !xorBucketCoverage || !coordinateAdjacency
+    };
   }
   /**
    * Send a direct message to a specific peer, routed through the mesh via XOR distance.
@@ -1144,7 +1342,9 @@ var GossipProtocol = class {
       data,
       hops: 0,
       maxHops: this.maxDirectHops,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      originConfigId: this.cecrConfigId(),
+      originViewId: this.canonicalSetHash(this.canonicalPeerSet())
     };
     this.markDirectSeen(message.id, message.timestamp);
     this.routeDirect(message, null);
@@ -1161,6 +1361,8 @@ var GossipProtocol = class {
       this.emit("directMessageReceived", { message });
       return;
     }
+    if (!this.canonicalPeerSet().includes(message.to)) return;
+    if (message.hops >= message.maxHops) return;
     const connected = this.mesh.getConnectedPeers();
     if (connected.includes(message.to)) {
       try {
@@ -1169,18 +1371,79 @@ var GossipProtocol = class {
       }
       return;
     }
-    if (message.hops >= message.maxHops) return;
-    const next = this.closestPeerHybrid(message.to, fromPeerId ?? void 0);
-    if (!next) return;
-    try {
-      this.mesh.send(next, JSON.stringify({ ...message, hops: message.hops + 1 }));
-    } catch {
+    for (const next of this.orderedRouteCandidates(
+      message.to,
+      fromPeerId ?? void 0,
+      message.originConfigId
+    )) {
+      try {
+        this.mesh.send(next, JSON.stringify({ ...message, hops: message.hops + 1 }));
+        return;
+      } catch {
+      }
     }
   }
   handleIncomingDirect(message, fromPeerId) {
     if (this.seenDirectIds.has(message.id)) return;
     this.markDirectSeen(message.id, message.timestamp);
     this.routeDirect(message, fromPeerId);
+  }
+  getCecrConfig() {
+    const membership = this.mesh.getCecrMembershipConfig?.() ?? {
+      leaseMs: 0,
+      gossipIntervalMs: 0,
+      tombstoneRetentionMs: 0,
+      clockSkewMs: 0
+    };
+    return Object.freeze({
+      protocol: "cecr/1",
+      configId: this.cecrConfigId(),
+      idWidthBits: CECR_ID_WIDTH_BITS,
+      hashProfile: "fnv1a64-compat",
+      signatureProfile: "unsigned-partial",
+      coordinateWeightNumerator: Math.round(this.cecrCoordinateWeight * CECR_WEIGHT_DENOMINATOR),
+      coordinateWeightDenominator: CECR_WEIGHT_DENOMINATOR,
+      extremaMaxAgeMs: this.cecrExtremaMaxAgeMs,
+      requireConsensus: this.cecrRequireConsensus,
+      maxDirectHops: this.maxDirectHops,
+      membershipLeaseMs: membership.leaseMs,
+      membershipGossipIntervalMs: membership.gossipIntervalMs,
+      membershipTombstoneRetentionMs: membership.tombstoneRetentionMs,
+      membershipClockSkewMs: membership.clockSkewMs,
+      convergenceRounds: this.cecrConvergenceRounds,
+      xorBucketRedundancy: 1
+    });
+  }
+  getCecrState() {
+    const livePeerIds = this.canonicalPeerSet();
+    const extrema = this.updateCecrExtremaSnapshot();
+    const overlay = this.getCecrOverlaySnapshot();
+    const connectedDegree = this.mesh.getConnectedPeers().length;
+    const gossipIntervalMs = this.mesh.getCecrMembershipConfig?.().gossipIntervalMs ?? 2e3;
+    return {
+      protocol: "cecr/1",
+      conformance: "partial",
+      configId: this.cecrConfigId(),
+      peerId: this.mesh.getClientId(),
+      livePeerIds,
+      viewId: this.canonicalSetHash(livePeerIds),
+      viewStableForMs: Math.max(0, Date.now() - this.cecrViewChangedAtMs),
+      requiredStableForMs: this.cecrConvergenceRounds * gossipIntervalMs,
+      size: livePeerIds.length,
+      minHex: extrema?.min.toString(16).padStart(CECR_ID_HEX_LENGTH, "0") ?? null,
+      maxHex: extrema?.max.toString(16).padStart(CECR_ID_HEX_LENGTH, "0") ?? null,
+      coordinateReady: !!extrema && this.hasCecrConsensus(extrema) && !overlay.degraded,
+      connectedDegree,
+      fanout: this.cecrFanout(connectedDegree),
+      membershipRecords: this.mesh.getCecrMembershipRecords?.() ?? [],
+      membershipEquivocations: this.mesh.getCecrMembershipEquivocations?.() ?? [],
+      overlay,
+      limitations: [
+        "membership, state, and routed frames are not cryptographically signed",
+        "viewId uses the legacy 64-bit membership digest",
+        "incarnation persistence is not available for applications that reuse a peer identity across processes"
+      ]
+    };
   }
   getStats() {
     const now = Date.now();
@@ -1203,6 +1466,7 @@ var GossipProtocol = class {
     for (const [id, info] of this.messageLog.entries()) {
       if (now - info.timestamp > maxAgeMs) {
         this.messageLog.delete(id);
+        this.retainedMessages.delete(id);
       }
     }
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
@@ -1224,11 +1488,22 @@ var GossipProtocol = class {
         break;
       }
       this.messageLog.delete(id);
+      this.retainedMessages.delete(id);
     }
     while (this.messageLog.size > this.maxTrackedMessages) {
       const oldest = this.messageLog.keys().next().value;
       if (!oldest) break;
       this.messageLog.delete(oldest);
+      this.retainedMessages.delete(oldest);
+    }
+    for (const [id, retained] of this.retainedMessages.entries()) {
+      if (retained.retainedAt >= minTimestamp) break;
+      this.retainedMessages.delete(id);
+    }
+    while (this.retainedMessages.size > this.maxTrackedMessages) {
+      const oldest = this.retainedMessages.keys().next().value;
+      if (!oldest) break;
+      this.retainedMessages.delete(oldest);
     }
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
       if (timestamp >= minTimestamp) {
@@ -1267,6 +1542,7 @@ var GossipProtocol = class {
     this.peers.clear();
     this.seenDirectIds.clear();
     this.deliveryStates.clear();
+    this.retainedMessages.clear();
     this.dirtyDeliveryReceiptIds.clear();
     this.cecrRemoteStates.clear();
     if (this.cecrSyncTimer) {
@@ -1324,11 +1600,24 @@ var GossipProtocol = class {
     if (parsed.type === "cecr-state" && typeof parsed.from === "string" && typeof parsed.setHash === "string" && typeof parsed.minHex === "string" && typeof parsed.maxHex === "string" && typeof parsed.size === "number") {
       return parsed;
     }
+    if (parsed.type === "cecr-dr" && parsed.protocol === "cecr-dr/1" && typeof parsed.from === "string" && Array.isArray(parsed.receipts)) {
+      return parsed;
+    }
+    if (parsed.type === "gossip-ae" && parsed.protocol === "gossip-ae/1" && typeof parsed.from === "string" && (parsed.mode === "summary" || parsed.mode === "request") && Array.isArray(parsed.messageIds)) {
+      return parsed;
+    }
     return null;
   }
   generateMessageId(sender) {
     const safeSender = (sender ?? "unknown").toString();
-    return `${safeSender}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    try {
+      const bytes = new Uint8Array(16);
+      globalThis.crypto.getRandomValues(bytes);
+      const nonce = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+      return `${safeSender}-${nonce}`;
+    } catch {
+      return `${safeSender}-${Date.now()}-${Math.random().toString(36).slice(2, 15)}`;
+    }
   }
 };
 
@@ -2676,9 +2965,12 @@ var PartialMesh = class {
     this.connecting = /* @__PURE__ */ new Set();
     this.connectionTimers = /* @__PURE__ */ new Map();
     this.connectionStartedAtMs = /* @__PURE__ */ new Map();
+    /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
+    this.orphanRtcFirstSeenAtMs = /* @__PURE__ */ new Map();
     this.peerConnectedAtMs = /* @__PURE__ */ new Map();
     this.discoveredAtMs = /* @__PURE__ */ new Map();
     this.maintenanceTimer = null;
+    this.membershipTimer = null;
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;
     this.lastDiscoveryRefreshAtMs = 0;
@@ -2691,6 +2983,11 @@ var PartialMesh = class {
     this.pendingRebalanceDropByTarget = /* @__PURE__ */ new Map();
     /** Converged global peer membership — populated via in-band membership gossip. */
     this.globalPeers = /* @__PURE__ */ new Set();
+    /** Versioned, expiring CECR membership records keyed by subject peer. */
+    this.membershipRecordsById = /* @__PURE__ */ new Map();
+    this.membershipEquivocationAtById = /* @__PURE__ */ new Map();
+    this.membershipIncarnation = Date.now();
+    this.membershipSequence = 0;
     /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
     this.peerCapacityById = /* @__PURE__ */ new Map();
     /** Relayed adjacency snapshots used to reconstruct the known network graph. */
@@ -2715,9 +3012,25 @@ var PartialMesh = class {
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
       nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 2500,
       peerStateMaxAgeMs: config.peerStateMaxAgeMs ?? 6e4,
-      trickleIce: config.trickleIce ?? true
+      trickleIce: config.trickleIce ?? true,
+      membershipLeaseMs: config.membershipLeaseMs ?? 3e4,
+      membershipGossipIntervalMs: config.membershipGossipIntervalMs ?? 5e3,
+      membershipTombstoneRetentionMs: config.membershipTombstoneRetentionMs ?? 12e4,
+      membershipClockSkewMs: config.membershipClockSkewMs ?? 5e3
     };
     this.validatePeerLimits(this.config.minPeers, this.config.maxPeers, this.config.tolerantPeers);
+    if (!Number.isSafeInteger(this.config.membershipLeaseMs) || this.config.membershipLeaseMs < 3e3) {
+      throw new RangeError("membershipLeaseMs must be a safe integer of at least 3000");
+    }
+    if (!Number.isSafeInteger(this.config.membershipGossipIntervalMs) || this.config.membershipGossipIntervalMs < 500 || this.config.membershipGossipIntervalMs > Math.floor(this.config.membershipLeaseMs / 3)) {
+      throw new RangeError("membershipGossipIntervalMs must be at least 500 and no more than one third of membershipLeaseMs");
+    }
+    if (!Number.isSafeInteger(this.config.membershipClockSkewMs) || this.config.membershipClockSkewMs < 0) {
+      throw new RangeError("membershipClockSkewMs must be a non-negative safe integer");
+    }
+    if (!Number.isSafeInteger(this.config.membershipTombstoneRetentionMs) || this.config.membershipTombstoneRetentionMs < this.config.membershipLeaseMs + 2 * this.config.membershipClockSkewMs + this.config.membershipGossipIntervalMs) {
+      throw new RangeError("membershipTombstoneRetentionMs must be at least lease + 2*clockSkew + gossipInterval");
+    }
     const events = [
       "signaling:connected",
       "signaling:disconnected",
@@ -2770,6 +3083,8 @@ var PartialMesh = class {
     this.selfAliases.add(id);
     this.discoveredPeers.delete(id);
     this.globalPeers.delete(id);
+    this.membershipRecordsById.delete(id);
+    this.membershipEquivocationAtById.delete(id);
   }
   isSelfAlias(peerId) {
     const id = this.normalizePeerId(peerId);
@@ -2823,9 +3138,11 @@ var PartialMesh = class {
     this.selfAliases.add(id);
     const removedDiscovered = this.discoveredPeers.delete(id);
     const removedGlobal = this.globalPeers.delete(id);
+    const removedMembership = this.membershipRecordsById.delete(id);
+    this.membershipEquivocationAtById.delete(id);
     const removedCapacity = this.peerCapacityById.delete(id);
     const removedTopology = this.peerTopologyById.delete(id);
-    const changed = removedDiscovered || removedGlobal || removedCapacity || removedTopology;
+    const changed = removedDiscovered || removedGlobal || removedMembership || removedCapacity || removedTopology;
     this.discoveredAtMs.delete(id);
     this.dialFailureCount.delete(id);
     this.dialBackoffUntilMs.delete(id);
@@ -2902,6 +3219,8 @@ var PartialMesh = class {
     return 0;
   }
   compareDialCandidates(a, b) {
+    const cecrOrder = this.cecrOverlayDialPriority(a) - this.cecrOverlayDialPriority(b);
+    if (cecrOrder !== 0) return cecrOrder;
     const capacityOrder = this.compareCapacityPriority(a, b);
     if (capacityOrder !== 0) return capacityOrder;
     const failA = this.dialFailureCount.get(a) ?? 0;
@@ -2921,10 +3240,13 @@ var PartialMesh = class {
     const overflow = connectedPeers.length - this.config.maxPeers;
     if (overflow <= 0) return;
     this.rebalanceCooldownUntilMs = Math.max(this.rebalanceCooldownUntilMs, Date.now() + 2e3);
+    const protectedPeerIds = this.cecrProtectedConnectedPeerIds();
     const dropOrder = connectedPeers.map((peerId) => ({
       peerId,
-      connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0
+      connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0,
+      cecrProtected: protectedPeerIds.has(peerId)
     })).sort((a, b) => {
+      if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? 1 : -1;
       if (a.connectedAt !== b.connectedAt) return b.connectedAt - a.connectedAt;
       return a.peerId.localeCompare(b.peerId);
     });
@@ -2975,6 +3297,55 @@ var PartialMesh = class {
     const rightHash = this.fastIdHash(right);
     return BigInt((leftHash ^ rightHash) >>> 0);
   }
+  cecrNumericPeerId(peerId) {
+    const hex = this.normalizePeerId(peerId).replace(/-/g, "").toLowerCase();
+    if (hex.length !== 64 || !this.isHexId(hex)) return null;
+    try {
+      return BigInt(`0x${hex}`);
+    } catch {
+      return null;
+    }
+  }
+  cecrBucketRank(distance) {
+    return distance === 0n ? -1 : distance.toString(2).length - 1;
+  }
+  cecrCoordinateNeighbors() {
+    const selfId = this.normalizePeerId(this.clientId);
+    const liveIds = Array.from(/* @__PURE__ */ new Set([selfId, ...this.globalPeers])).filter(Boolean);
+    const numeric = liveIds.map((peerId) => ({ peerId, value: this.cecrNumericPeerId(peerId) })).filter((peer) => peer.value != null).sort((left, right) => left.value < right.value ? -1 : left.value > right.value ? 1 : left.peerId.localeCompare(right.peerId));
+    const selfIndex = numeric.findIndex((peer) => peer.peerId === selfId);
+    const required = /* @__PURE__ */ new Set();
+    if (selfIndex > 0) required.add(numeric[selfIndex - 1].peerId);
+    if (selfIndex >= 0 && selfIndex + 1 < numeric.length) required.add(numeric[selfIndex + 1].peerId);
+    return required;
+  }
+  cecrOverlayDialPriority(peerId) {
+    const selfId = this.normalizePeerId(this.clientId);
+    const self = this.cecrNumericPeerId(selfId);
+    const candidate = this.cecrNumericPeerId(peerId);
+    if (self == null || candidate == null || !this.globalPeers.has(peerId)) return 1;
+    if (this.cecrCoordinateNeighbors().has(peerId)) return 0;
+    const candidateRank = this.cecrBucketRank(self ^ candidate);
+    const bucketCovered = this.getConnectedPeers().some((connectedPeerId) => {
+      const connected = this.cecrNumericPeerId(connectedPeerId);
+      return connected != null && this.cecrBucketRank(self ^ connected) === candidateRank;
+    });
+    return bucketCovered ? 1 : 0;
+  }
+  cecrProtectedConnectedPeerIds() {
+    const protectedIds = this.cecrCoordinateNeighbors();
+    const self = this.cecrNumericPeerId(this.clientId ?? "");
+    if (self == null) return protectedIds;
+    const representativeByBucket = /* @__PURE__ */ new Map();
+    for (const peerId of this.getConnectedPeers().slice().sort()) {
+      const peer = this.cecrNumericPeerId(peerId);
+      if (peer == null) continue;
+      const rank = this.cecrBucketRank(self ^ peer);
+      if (!representativeByBucket.has(rank)) representativeByBucket.set(rank, peerId);
+    }
+    for (const peerId of representativeByBucket.values()) protectedIds.add(peerId);
+    return protectedIds;
+  }
   maybeRebalanceForCloserPeer(candidates) {
     const selfId = this.normalizePeerId(this.clientId);
     if (!selfId || this.config.tolerantPeers <= 0) return false;
@@ -2990,17 +3361,24 @@ var PartialMesh = class {
       return false;
     }
     const reservedDropPeerIds = new Set(this.pendingRebalanceDropByTarget.values());
+    const cecrProtectedPeerIds = this.cecrProtectedConnectedPeerIds();
     const connectedByDistance = connectedPeers.filter((peerId) => !reservedDropPeerIds.has(peerId)).map((peerId) => ({
       peerId,
       distance: this.peerDistance(selfId, peerId),
-      connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0
-    })).sort((a, b) => a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId));
+      connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0,
+      cecrProtected: cecrProtectedPeerIds.has(peerId)
+    })).sort((a, b) => {
+      if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? -1 : 1;
+      return a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId);
+    });
     const candidateByDistance = candidates.map((peerId) => ({
       peerId,
       distance: this.peerDistance(selfId, peerId),
       discoveredAt: this.discoveredAtMs.get(peerId) ?? 0,
       lastAttemptAt: this.rebalanceAttemptAtMs.get(peerId) ?? 0
     })).sort((a, b) => {
+      const cecrOrder = this.cecrOverlayDialPriority(a.peerId) - this.cecrOverlayDialPriority(b.peerId);
+      if (cecrOrder !== 0) return cecrOrder;
       const capacityOrder = this.compareCapacityPriority(a.peerId, b.peerId);
       if (capacityOrder !== 0) return capacityOrder;
       return a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.peerId.localeCompare(b.peerId);
@@ -3019,7 +3397,8 @@ var PartialMesh = class {
       return false;
     }
     const candidateDiscoveredAgeMs = now - closestCandidate.discoveredAt;
-    const materiallyCloser = closestCandidate.distance * 4n < farthestConnected.distance * 3n;
+    const repairsCecrOverlay = this.cecrOverlayDialPriority(closestCandidate.peerId) === 0;
+    const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 4n < farthestConnected.distance * 3n;
     const staleExcludedCandidate = candidateDiscoveredAgeMs >= 3e3;
     if (!materiallyCloser && !staleExcludedCandidate) {
       return false;
@@ -3073,6 +3452,8 @@ var PartialMesh = class {
       this.addSelfAlias(nextClientId);
       this.addSelfAlias(data?.requestedClientId);
       this.addSelfAlias(data?.previousClientId);
+      this.renewLocalMembership(true);
+      this.startMembershipLoop();
       this.emit("signaling:connected", { clientId: this.clientId, rawClientId });
       if (this.config.autoDiscover) {
         this.signalingClient.joinSession(this.config.sessionId);
@@ -3083,6 +3464,9 @@ var PartialMesh = class {
     });
     this.signalingClient.on("disconnected", () => {
       this.emit("signaling:disconnected");
+    });
+    this.signalingClient.on("lifecycle:resume", (data) => {
+      this.recoverMeshAfterInactivity(String(data?.reason || "resume"));
     });
     this.signalingClient.on("joined", (data) => {
       data.clients.forEach((rawPeerId) => {
@@ -3113,6 +3497,9 @@ var PartialMesh = class {
     });
     this.signalingClient.on("peers-updated", (data) => {
       this.reconcileSignalingPeers(Array.isArray(data?.peers) ? data.peers : []);
+      if (this.config.autoConnect) {
+        this.maintainPeerConnections();
+      }
     });
     this.signalingClient.on("rtc:connected", (data) => {
       const peerId = this.normalizePeerId(data.peerId);
@@ -3123,6 +3510,7 @@ var PartialMesh = class {
         }
         return;
       }
+      this.orphanRtcFirstSeenAtMs.delete(peerId);
       let peerConnection = this.peers.get(peerId);
       if (!peerConnection) {
         peerConnection = { id: peerId, connected: false, initiator: false };
@@ -3200,7 +3588,7 @@ var PartialMesh = class {
     this.signalingClient.on("rtc:data", (data) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
-        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, msg.topology, data.peerId);
+        this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, msg.topology, data.peerId, msg.records);
       } else {
         this.emit("peer:data", data);
       }
@@ -3227,6 +3615,17 @@ var PartialMesh = class {
       }
     }, this.config.maintenanceIntervalMs);
   }
+  startMembershipLoop() {
+    if (this.membershipTimer) return;
+    this.membershipTimer = setInterval(() => {
+      try {
+        this.renewLocalMembership(true);
+        this.pruneMembershipRecords();
+        this.broadcastMembership();
+      } catch {
+      }
+    }, this.config.membershipGossipIntervalMs);
+  }
   maybeRefreshDiscovery() {
     if (!this.config.autoDiscover) return;
     const connected = this.getConnectedPeers().length;
@@ -3248,16 +3647,31 @@ var PartialMesh = class {
    * maintenance loop also calls the same stale-channel check.
    */
   recoverAfterInactivity(reason = "resume") {
+    let adapterTriggeredMeshRecovery = false;
     try {
-      this.signalingClient?.recoverAfterInactivity?.(reason);
+      adapterTriggeredMeshRecovery = this.signalingClient?.recoverAfterInactivity?.(reason) === true;
     } catch {
     }
+    if (!adapterTriggeredMeshRecovery) {
+      this.recoverMeshAfterInactivity(reason);
+    }
+  }
+  recoverMeshAfterInactivity(reason) {
     this.recoverStaleConnectedPeers(reason);
+    this.recoverOrphanedRtcNegotiations();
     this.lastDiscoveryRefreshAtMs = 0;
     this.underConnectedSinceMs = null;
     try {
       this.maybeRefreshDiscovery();
-      if (this.config.autoConnect) this.maintainPeerConnections();
+      if (!this.config.autoConnect) return;
+      const isolated = this.getConnectedPeerCount() === 0;
+      const candidates = this.dialCandidatePeerIds(true);
+      if (isolated && candidates.length > 0) {
+        this.dialBackoffUntilMs.clear();
+        this.hardReset(`${reason}-isolated`);
+        return;
+      }
+      this.maintainPeerConnections();
     } catch {
     }
   }
@@ -3276,10 +3690,62 @@ var PartialMesh = class {
       this.removePeer(peer.id, false);
     }
   }
+  /**
+   * FreeRTC can retain a half-open connection that never became a PartialMesh
+   * peer. Without local peer/pending state, the normal negotiation watchdog
+   * cannot see it, while connectToPeerInternal treats it as active forever.
+   */
+  recoverOrphanedRtcNegotiations(now = Date.now()) {
+    const connections = this.signalingClient?.client?.mesh?.connections;
+    if (!connections || typeof connections.entries !== "function") return;
+    const isolated = this.getConnectedPeerCount() === 0;
+    const staleAfterMs = isolated ? Math.max(3500, Math.min(this.config.connectionTimeoutMs, 8e3)) : Math.max(8e3, Math.min(this.config.connectionTimeoutMs, 15e3));
+    for (const [rawPeerId, entry] of Array.from(connections.entries())) {
+      const peerId = this.normalizePeerId(rawPeerId);
+      if (!peerId) continue;
+      if (this.peers.has(peerId) || this.connecting.has(peerId)) {
+        this.orphanRtcFirstSeenAtMs.delete(peerId);
+        continue;
+      }
+      const connectionState = String(entry?.connection?.connectionState ?? entry?.state ?? "").toLowerCase();
+      const channelState = String(entry?.channel?.readyState ?? "").toLowerCase();
+      if (channelState === "open") {
+        this.orphanRtcFirstSeenAtMs.delete(peerId);
+        continue;
+      }
+      const lastSeen = Number(entry?.lastSeen);
+      const initialObservation = Number.isFinite(lastSeen) && lastSeen > 0 ? Math.min(now, lastSeen) : now;
+      const firstSeenAt = this.orphanRtcFirstSeenAtMs.get(peerId) ?? initialObservation;
+      this.orphanRtcFirstSeenAtMs.set(peerId, firstSeenAt);
+      const orphanAgeMs = Math.max(0, now - firstSeenAt);
+      const definitelyDead = connectionState === "failed" || connectionState === "closed" || connectionState === "dead";
+      if (!definitelyDead && orphanAgeMs < staleAfterMs) continue;
+      this.orphanRtcFirstSeenAtMs.delete(peerId);
+      this.noteDialFailure(peerId);
+      this.emit("peer:error", {
+        peerId,
+        error: new Error(`Untracked negotiation stalled (${connectionState || "unknown"}/${channelState || "closed"})`)
+      });
+      this.emit("signaling:log", {
+        message: `[webrtc] purging stale untracked negotiation to ${peerId}; retrying`
+      });
+      try {
+        this.signalingClient?.closeConnection?.(peerId);
+      } catch {
+        try {
+          connections.delete?.(peerId);
+        } catch {
+        }
+      }
+    }
+    for (const peerId of Array.from(this.orphanRtcFirstSeenAtMs.keys())) {
+      if (!connections.has?.(peerId)) this.orphanRtcFirstSeenAtMs.delete(peerId);
+    }
+  }
   maybeRecoverStalledNegotiations() {
     const now = Date.now();
     const connectedCount = this.getConnectedPeerCount();
-    const isolated = connectedCount === 0 && this.discoveredPeers.size > 0;
+    const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
     const baseStallMs = Math.max(1e4, Math.min(this.config.connectionTimeoutMs, 15e3));
     const stallMs = isolated ? Math.max(8e3, Math.min(this.config.connectionTimeoutMs, 12e3)) : baseStallMs;
     for (const peer of this.peers.values()) {
@@ -3329,13 +3795,14 @@ var PartialMesh = class {
     const connected = this.getConnectedPeers().length;
     const pending = this.getPendingPeerCount();
     const oldestPendingAge = this.getOldestPendingAgeMs();
-    const hasEnoughCandidates = this.discoveredPeers.size >= this.config.minPeers;
-    const hasAnyCandidate = this.discoveredPeers.size > 0;
+    const candidatePeerIds = this.dialCandidatePeerIds(connected === 0);
+    const hasEnoughCandidates = candidatePeerIds.length >= this.config.minPeers;
+    const hasAnyCandidate = candidatePeerIds.length > 0;
     const underConnected = connected < this.config.minPeers && hasEnoughCandidates;
     const isolated = connected === 0 && hasAnyCandidate;
     const isolatedThresholdMs = Math.max(3500, Math.min(thresholdMs, 8e3));
     const hasStalePending = pending > 0 && oldestPendingAge >= isolatedThresholdMs;
-    const hasRepeatedFailures = Array.from(this.discoveredPeers).some((peerId) => (this.dialFailureCount.get(peerId) ?? 0) >= 3);
+    const hasRepeatedFailures = candidatePeerIds.some((peerId) => (this.dialFailureCount.get(peerId) ?? 0) >= 3);
     const now = Date.now();
     if (!underConnected && !isolated) {
       this.underConnectedSinceMs = null;
@@ -3396,7 +3863,15 @@ var PartialMesh = class {
     this.connectionStartedAtMs.clear();
     this.peerConnectedAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
-    for (const peerId of this.peers.keys()) {
+    const rtcConnections = this.signalingClient?.client?.mesh?.connections;
+    const resetPeerIds = new Set(this.peers.keys());
+    if (rtcConnections && typeof rtcConnections.keys === "function") {
+      for (const rawPeerId of Array.from(rtcConnections.keys())) {
+        const peerId = this.normalizePeerId(rawPeerId);
+        if (peerId) resetPeerIds.add(peerId);
+      }
+    }
+    for (const peerId of resetPeerIds) {
       try {
         this.signalingClient?.closeConnection(peerId);
       } catch {
@@ -3405,6 +3880,7 @@ var PartialMesh = class {
     const hadConnectedPeers = this.getConnectedPeerCount() > 0;
     this.peers.clear();
     this.connecting.clear();
+    this.orphanRtcFirstSeenAtMs.clear();
     if (hadConnectedPeers) {
       this.noteLocalCapacityChanged();
       this.broadcastMembership();
@@ -3469,13 +3945,24 @@ var PartialMesh = class {
   /**
    * Maintain the target number of peer connections
    */
+  dialCandidatePeerIds(includeLiveMembership) {
+    const candidates = new Set(this.discoveredPeers);
+    if (includeLiveMembership) {
+      for (const peerId of this.getGlobalPeers()) candidates.add(peerId);
+    }
+    return Array.from(candidates).filter(
+      (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId)
+    );
+  }
   maintainPeerConnections() {
     const now = Date.now();
+    this.recoverOrphanedRtcNegotiations(now);
     const connectedCount = this.getConnectedPeerCount();
     const pendingCount = this.getPendingPeerCount();
-    const emergencyIsolated = connectedCount === 0 && this.discoveredPeers.size > 0;
+    const candidatePeerIds = this.dialCandidatePeerIds(connectedCount === 0);
+    const emergencyIsolated = connectedCount === 0 && candidatePeerIds.length > 0;
     const totalInProgress = connectedCount + pendingCount;
-    const allCandidates = Array.from(this.discoveredPeers).filter(
+    const allCandidates = candidatePeerIds.filter(
       (peerId) => !this.isSelfAlias(peerId) && !this.peers.has(peerId) && !this.connecting.has(peerId)
     );
     const available = emergencyIsolated ? allCandidates : allCandidates.filter((peerId) => !this.isPeerBackedOff(peerId));
@@ -3518,7 +4005,7 @@ var PartialMesh = class {
     const selfId = this.normalizePeerId(this.clientId);
     const normalizedPeerId = this.normalizePeerId(peerId);
     const signalingConnected = this.signalingClient?.isConnected?.() ?? true;
-    const emergencyIsolated = this.getConnectedPeerCount() === 0 && this.discoveredPeers.size > 0;
+    const emergencyIsolated = this.getConnectedPeerCount() === 0 && this.dialCandidatePeerIds(true).length > 0;
     if (!signalingConnected) {
       try {
         this.signalingClient?.connect?.();
@@ -3562,7 +4049,7 @@ var PartialMesh = class {
       if (!fallbackMs || fallbackMs <= 0) {
         return;
       }
-      const candidatePeers = Array.from(this.discoveredPeers).map((id) => this.normalizePeerId(id)).filter((id) => {
+      const candidatePeers = this.dialCandidatePeerIds(emergencyIsolated).map((id) => this.normalizePeerId(id)).filter((id) => {
         if (!id || id === selfId || this.isSelfAlias(id)) return false;
         if (this.peers.has(id) || this.connecting.has(id)) return false;
         if (!emergencyIsolated && this.isPeerBackedOff(id)) return false;
@@ -3585,7 +4072,7 @@ var PartialMesh = class {
           if (this.peers.has(normalizedPeerId) || this.connecting.has(normalizedPeerId)) {
             return;
           }
-          const refreshedCandidates = Array.from(this.discoveredPeers).map((id) => this.normalizePeerId(id)).filter((id) => {
+          const refreshedCandidates = this.dialCandidatePeerIds(emergencyIsolated).map((id) => this.normalizePeerId(id)).filter((id) => {
             if (!id || id === selfId || this.isSelfAlias(id)) return false;
             if (this.peers.has(id) || this.connecting.has(id)) return false;
             if (!emergencyIsolated && this.isPeerBackedOff(id)) return false;
@@ -3663,6 +4150,7 @@ var PartialMesh = class {
         this.connectionTimers.delete(peerId);
       }
       this.connectionStartedAtMs.delete(peerId);
+      this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.peers.delete(peerId);
       this.peerConnectedAtMs.delete(peerId);
       this.connecting.delete(peerId);
@@ -3716,7 +4204,24 @@ var PartialMesh = class {
    * Get the converged global peer set (all peers known via membership gossip).
    */
   getGlobalPeers() {
+    this.pruneMembershipRecords(Date.now(), false);
     return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
+  }
+  getCecrMembershipRecords() {
+    this.pruneMembershipRecords();
+    return Array.from(this.membershipRecordsById.values()).map((record) => ({ ...record })).sort((left, right) => left.peerId.localeCompare(right.peerId));
+  }
+  getCecrMembershipEquivocations() {
+    this.pruneMembershipRecords();
+    return Array.from(this.membershipEquivocationAtById.keys()).sort();
+  }
+  getCecrMembershipConfig() {
+    return Object.freeze({
+      leaseMs: this.config.membershipLeaseMs,
+      gossipIntervalMs: this.config.membershipGossipIntervalMs,
+      tombstoneRetentionMs: this.config.membershipTombstoneRetentionMs,
+      clockSkewMs: this.config.membershipClockSkewMs
+    });
   }
   /** Return the effective configuration, including constructor defaults. */
   getConfig() {
@@ -3787,23 +4292,34 @@ var PartialMesh = class {
     if (this.clientId) ids.add(this.clientId);
     return Array.from(ids).map((peerId) => this.getPeerCapacity(peerId)).filter((value) => value != null).sort((a, b) => a.peerId.localeCompare(b.peerId));
   }
+  /** Return the exact XOR-space distance used by partial-mesh rebalancing. */
+  getXorDistance(peerId, fromPeerId = this.clientId) {
+    const from = this.normalizePeerId(fromPeerId);
+    const target = this.normalizePeerId(peerId);
+    if (!from || !target) return null;
+    return `0x${this.peerDistance(from, target).toString(16)}`;
+  }
+  /** Return the shortest currently-known topology path from this peer. */
+  getHopDistance(peerId) {
+    const target = this.normalizePeerId(peerId);
+    if (!target) return null;
+    return this.getGraphSnapshot().nodes.find((node) => node.peerId === target)?.hopDistance ?? null;
+  }
   /** Reconstruct the complete currently-known node and undirected edge snapshot. */
   getGraphSnapshot() {
+    const now = Date.now();
+    this.pruneMembershipRecords(now, false);
     const self = this.normalizePeerId(this.clientId) || null;
+    const connected = new Set(this.getConnectedPeers());
     const knownIds = /* @__PURE__ */ new Set();
     if (self) knownIds.add(self);
     for (const peerId of this.globalPeers) knownIds.add(peerId);
     for (const peerId of this.discoveredPeers) knownIds.add(peerId);
-    for (const peerId of this.getConnectedPeers()) knownIds.add(peerId);
-    for (const peerId of this.peerCapacityById.keys()) knownIds.add(peerId);
-    for (const [peerId, state] of this.peerTopologyById.entries()) {
-      knownIds.add(peerId);
-      for (const connectedPeerId of state.connectedPeerIds) knownIds.add(connectedPeerId);
-    }
+    for (const peerId of connected) knownIds.add(peerId);
     for (const peerId of Array.from(knownIds)) {
       if (!peerId || this.isSelfAlias(peerId) && peerId !== self || this.retiredPeerIds.has(peerId)) knownIds.delete(peerId);
     }
-    const connected = new Set(this.getConnectedPeers());
+    const freshTopologyEntries = Array.from(this.peerTopologyById.entries()).filter(([peerId, state]) => knownIds.has(peerId) && state.updatedAt <= now + this.config.membershipClockSkewMs && now - state.updatedAt <= this.config.peerStateMaxAgeMs);
     const edgeMap = /* @__PURE__ */ new Map();
     const addEdge = (observer, left, right, updatedAt) => {
       if (!knownIds.has(left) || !knownIds.has(right) || left === right) return;
@@ -3822,27 +4338,71 @@ var PartialMesh = class {
     if (self) {
       for (const peerId of connected) addEdge(self, self, peerId, this.localTopologyUpdatedAtMs);
     }
-    for (const [peerId, state] of this.peerTopologyById.entries()) {
+    for (const [peerId, state] of freshTopologyEntries) {
       for (const connectedPeerId of state.connectedPeerIds) {
         addEdge(peerId, peerId, connectedPeerId, state.updatedAt);
       }
     }
-    const missingTopologyPeerIds = Array.from(knownIds).filter((peerId) => peerId !== self && !this.peerTopologyById.has(peerId)).sort();
+    const distanceByPeerId = /* @__PURE__ */ new Map();
+    if (self) {
+      for (const peerId of knownIds) {
+        if (peerId !== self) distanceByPeerId.set(peerId, this.peerDistance(self, peerId));
+      }
+    }
+    const rankedDistances = Array.from(distanceByPeerId.entries()).sort((a, b) => a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : a[0].localeCompare(b[0]));
+    const rankByPeerId = new Map(rankedDistances.map(([peerId], rank) => [peerId, rank]));
+    const minimumDistance = rankedDistances[0]?.[1] ?? 0n;
+    const maximumDistance = rankedDistances[rankedDistances.length - 1]?.[1] ?? minimumDistance;
+    const distanceSpan = maximumDistance - minimumDistance;
+    const relativeDistance = (peerId) => {
+      if (peerId === self) return 0;
+      const distance = distanceByPeerId.get(peerId);
+      if (distance == null) return null;
+      if (distanceSpan <= 0n) return 0;
+      const precision = 1000000n;
+      return Number((distance - minimumDistance) * precision / distanceSpan) / Number(precision);
+    };
+    const edges = Array.from(edgeMap.values()).map((edge) => ({ ...edge, observedBy: edge.observedBy.sort() })).sort((a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target));
+    const hopDistanceByPeerId = /* @__PURE__ */ new Map();
+    if (self) {
+      const adjacentByPeerId = /* @__PURE__ */ new Map();
+      for (const peerId of knownIds) adjacentByPeerId.set(peerId, []);
+      for (const edge of edges) {
+        adjacentByPeerId.get(edge.source)?.push(edge.target);
+        adjacentByPeerId.get(edge.target)?.push(edge.source);
+      }
+      hopDistanceByPeerId.set(self, 0);
+      const queue = [self];
+      for (let index = 0; index < queue.length; index += 1) {
+        const peerId = queue[index];
+        const nextDistance = (hopDistanceByPeerId.get(peerId) ?? 0) + 1;
+        for (const adjacentPeerId of adjacentByPeerId.get(peerId) ?? []) {
+          if (hopDistanceByPeerId.has(adjacentPeerId)) continue;
+          hopDistanceByPeerId.set(adjacentPeerId, nextDistance);
+          queue.push(adjacentPeerId);
+        }
+      }
+    }
+    const freshTopologyPeerIds = new Set(freshTopologyEntries.map(([peerId]) => peerId));
+    const missingTopologyPeerIds = Array.from(knownIds).filter((peerId) => peerId !== self && !freshTopologyPeerIds.has(peerId)).sort();
     const nodes = Array.from(knownIds).sort().map((peerId) => ({
       peerId,
       local: peerId === self,
       directlyConnected: connected.has(peerId),
       discovered: this.discoveredPeers.has(peerId),
-      capacity: this.getPeerCapacity(peerId)
+      capacity: this.getPeerCapacity(peerId),
+      hopDistance: hopDistanceByPeerId.get(peerId) ?? null,
+      xorDistance: peerId === self ? "0x0" : distanceByPeerId.has(peerId) ? `0x${distanceByPeerId.get(peerId).toString(16)}` : null,
+      xorDistanceRank: peerId === self ? null : rankByPeerId.get(peerId) ?? null,
+      xorDistanceRatio: relativeDistance(peerId)
     }));
-    const edges = Array.from(edgeMap.values()).map((edge) => ({ ...edge, observedBy: edge.observedBy.sort() })).sort((a, b) => a.source.localeCompare(b.source) || a.target.localeCompare(b.target));
     return {
       localPeerId: self,
       nodes,
       edges,
       complete: missingTopologyPeerIds.length === 0,
       missingTopologyPeerIds,
-      generatedAt: Date.now()
+      generatedAt: now
     };
   }
   /**
@@ -3891,12 +4451,119 @@ var PartialMesh = class {
     }
   }
   // ─── Membership gossip ────────────────────────────────────────────────────
+  renewLocalMembership(force = false) {
+    const self = this.normalizePeerId(this.clientId);
+    if (!self) return false;
+    const now = Date.now();
+    const existing = this.membershipRecordsById.get(self);
+    if (!force && existing?.state === "alive" && existing.validUntil != null && existing.validUntil - now > this.config.membershipGossipIntervalMs * 2) return false;
+    this.membershipSequence += 1;
+    this.membershipRecordsById.set(self, {
+      peerId: self,
+      incarnation: this.membershipIncarnation,
+      sequence: this.membershipSequence,
+      state: "alive",
+      issuedAt: now,
+      validUntil: now + this.config.membershipLeaseMs
+    });
+    return true;
+  }
+  isMembershipRecordNewer(incoming, existing) {
+    if (!existing) return true;
+    if (incoming.incarnation !== existing.incarnation) return incoming.incarnation > existing.incarnation;
+    return incoming.sequence > existing.sequence;
+  }
+  mergeMembershipRecord(record, now = Date.now()) {
+    const peerId = this.normalizePeerId(record.peerId);
+    if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) return false;
+    const canonicalId = peerId.replace(/-/g, "").toLowerCase();
+    if (canonicalId.length !== 64 || !this.isHexId(canonicalId)) return false;
+    if (!Number.isSafeInteger(record.incarnation) || record.incarnation < 0) return false;
+    if (!Number.isSafeInteger(record.sequence) || record.sequence < 0) return false;
+    if (!Number.isSafeInteger(record.issuedAt) || record.issuedAt <= 0) return false;
+    if (record.issuedAt > now + this.config.membershipClockSkewMs) return false;
+    if (record.state !== "alive" && record.state !== "left") return false;
+    if (record.state === "alive") {
+      if (!Number.isSafeInteger(record.validUntil)) return false;
+      if ((record.validUntil ?? 0) <= record.issuedAt) return false;
+      if ((record.validUntil ?? 0) - record.issuedAt > this.config.membershipLeaseMs) return false;
+      if ((record.validUntil ?? 0) + this.config.membershipTombstoneRetentionMs <= now) return false;
+    } else if (record.validUntil !== null) {
+      return false;
+    }
+    const normalized = { ...record, peerId };
+    const existing = this.membershipRecordsById.get(peerId);
+    if (existing && existing.incarnation === normalized.incarnation && existing.sequence === normalized.sequence) {
+      const identical = existing.state === normalized.state && existing.issuedAt === normalized.issuedAt && existing.validUntil === normalized.validUntil;
+      if (!identical) {
+        this.membershipEquivocationAtById.set(peerId, now);
+        return true;
+      }
+      return false;
+    }
+    if (!this.isMembershipRecordNewer(normalized, existing)) return false;
+    this.membershipRecordsById.set(peerId, normalized);
+    return true;
+  }
+  rebuildGlobalMembership(emitChanges = true) {
+    const now = Date.now();
+    const next = /* @__PURE__ */ new Set();
+    for (const record of this.membershipRecordsById.values()) {
+      if (record.state === "alive" && record.validUntil != null && record.validUntil > now && !this.isSelfAlias(record.peerId) && !this.retiredPeerIds.has(record.peerId) && !this.membershipEquivocationAtById.has(record.peerId)) next.add(record.peerId);
+    }
+    const changed = next.size !== this.globalPeers.size || Array.from(next).some((peerId) => !this.globalPeers.has(peerId));
+    if (!changed) return false;
+    for (const peerId of this.globalPeers) {
+      if (next.has(peerId)) continue;
+      this.peerCapacityById.delete(peerId);
+      this.peerTopologyById.delete(peerId);
+    }
+    this.globalPeers = next;
+    if (emitChanges) {
+      this.emit("mesh:membership", Array.from(this.globalPeers));
+      this.emit("mesh:capacity", this.getPeerCapacities());
+      this.emit("mesh:graph", this.getGraphSnapshot());
+    }
+    return true;
+  }
+  pruneMembershipRecords(now = Date.now(), emitChanges = true) {
+    let pruned = false;
+    for (const [peerId, record] of this.membershipRecordsById.entries()) {
+      const expiredAlive = record.state === "alive" && (record.validUntil == null || record.validUntil + this.config.membershipTombstoneRetentionMs <= now);
+      const expiredTombstone = record.state === "left" && now - record.issuedAt > this.config.membershipTombstoneRetentionMs;
+      if (!expiredAlive && !expiredTombstone) continue;
+      this.membershipRecordsById.delete(peerId);
+      pruned = true;
+    }
+    for (const [peerId, quarantinedAt] of this.membershipEquivocationAtById.entries()) {
+      if (now - quarantinedAt <= this.config.membershipTombstoneRetentionMs) continue;
+      this.membershipEquivocationAtById.delete(peerId);
+      pruned = true;
+    }
+    return this.rebuildGlobalMembership(emitChanges) || pruned;
+  }
+  membershipRecordsForWire() {
+    const records = {};
+    const now = Date.now();
+    for (const record of this.membershipRecordsById.values()) {
+      if (record.state === "alive" && (record.validUntil == null || record.validUntil <= now)) continue;
+      if (record.state === "left" && now - record.issuedAt > this.config.membershipTombstoneRetentionMs) continue;
+      records[record.peerId] = [
+        record.incarnation,
+        record.sequence,
+        record.state,
+        record.issuedAt,
+        record.validUntil
+      ];
+    }
+    return records;
+  }
   sendMembership(toPeerId) {
     const self = this.normalizePeerId(this.clientId);
+    this.renewLocalMembership(false);
+    this.pruneMembershipRecords();
     const all = new Set(this.globalPeers);
     if (self) all.add(self);
-    for (const p of this.discoveredPeers) all.add(p);
-    for (const p of this.getConnectedPeers()) all.add(p);
     for (const retiredPeerId of this.retiredPeerIds) all.delete(retiredPeerId);
     const capacities = {};
     const topology = {};
@@ -3916,6 +4583,7 @@ var PartialMesh = class {
       __membership: true,
       peers: Array.from(all),
       retiredPeers: Array.from(this.retiredPeerIds),
+      records: this.membershipRecordsForWire(),
       capacities,
       topology
     });
@@ -3937,30 +4605,62 @@ var PartialMesh = class {
           peers: obj.peers,
           retiredPeers: Array.isArray(obj.retiredPeers) ? obj.retiredPeers : [],
           capacities: obj.capacities && typeof obj.capacities === "object" && !Array.isArray(obj.capacities) ? obj.capacities : {},
-          topology: obj.topology && typeof obj.topology === "object" && !Array.isArray(obj.topology) ? obj.topology : {}
+          topology: obj.topology && typeof obj.topology === "object" && !Array.isArray(obj.topology) ? obj.topology : {},
+          records: obj.records && typeof obj.records === "object" && !Array.isArray(obj.records) ? obj.records : {}
         };
       }
     } catch {
     }
     return null;
   }
-  mergeMembership(incoming, retired, capacities, topologyInput = {}, fromPeerId = "") {
+  mergeMembership(incoming, retired, capacities, topologyInput = {}, fromPeerId = "", records = {}) {
     const topology = typeof topologyInput === "string" ? {} : topologyInput;
     if (typeof topologyInput === "string") fromPeerId = topologyInput;
     let membershipChanged = false;
     let capacityChanged = false;
     let topologyChanged = false;
-    for (const raw of retired) {
-      if (this.retirePeerId(raw)) membershipChanged = true;
+    const now = Date.now();
+    for (const [rawPeerId, rawRecord] of Object.entries(records || {})) {
+      const peerId = this.normalizePeerId(rawPeerId);
+      if (!peerId || !Array.isArray(rawRecord) || rawRecord.length < 5) continue;
+      const record = {
+        peerId,
+        incarnation: Math.floor(Number(rawRecord[0])),
+        sequence: Math.floor(Number(rawRecord[1])),
+        state: rawRecord[2] === "left" ? "left" : "alive",
+        issuedAt: Math.floor(Number(rawRecord[3])),
+        validUntil: rawRecord[4] === null ? null : Math.floor(Number(rawRecord[4]))
+      };
+      if (this.mergeMembershipRecord(record, now)) membershipChanged = true;
+    }
+    const normalizedFromPeerId = this.normalizePeerId(fromPeerId);
+    if (retired.some((raw) => this.normalizePeerId(raw) === normalizedFromPeerId) && normalizedFromPeerId) {
+      const existing = this.membershipRecordsById.get(normalizedFromPeerId);
+      const left = {
+        peerId: normalizedFromPeerId,
+        incarnation: existing?.incarnation ?? 0,
+        sequence: (existing?.sequence ?? 0) + 1,
+        state: "left",
+        issuedAt: now,
+        validUntil: null
+      };
+      if (this.mergeMembershipRecord(left, now)) membershipChanged = true;
     }
     for (const raw of incoming) {
       const id = this.normalizePeerId(raw);
       if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) continue;
-      if (!this.globalPeers.has(id)) {
-        this.globalPeers.add(id);
-        membershipChanged = true;
-      }
+      const existing = this.membershipRecordsById.get(id);
+      if (existing && (existing.incarnation > 0 || existing.state === "left")) continue;
+      if (this.mergeMembershipRecord({
+        peerId: id,
+        incarnation: 0,
+        sequence: now,
+        state: "alive",
+        issuedAt: now,
+        validUntil: now + this.config.membershipLeaseMs
+      }, now)) membershipChanged = true;
     }
+    if (this.rebuildGlobalMembership(false)) membershipChanged = true;
     for (const [rawPeerId, rawState] of Object.entries(capacities || {})) {
       const peerId = this.normalizePeerId(rawPeerId);
       if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
@@ -3999,7 +4699,19 @@ var PartialMesh = class {
     }
   }
   removeFromGlobalMembership(peerId) {
-    const removed = this.globalPeers.delete(peerId);
+    const now = Date.now();
+    const existing = this.membershipRecordsById.get(peerId);
+    if (existing) {
+      this.membershipRecordsById.set(peerId, {
+        peerId,
+        incarnation: existing.incarnation,
+        sequence: existing.sequence + 1,
+        state: "left",
+        issuedAt: now,
+        validUntil: null
+      });
+    }
+    const removed = this.rebuildGlobalMembership(false) || this.globalPeers.delete(peerId);
     const removedCapacity = this.peerCapacityById.delete(peerId);
     const removedTopology = this.peerTopologyById.delete(peerId);
     if (!removed && !removedCapacity && !removedTopology) return;
@@ -4020,6 +4732,10 @@ var PartialMesh = class {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;
     }
+    if (this.membershipTimer) {
+      clearInterval(this.membershipTimer);
+      this.membershipTimer = null;
+    }
     for (const t of this.connectionTimers.values()) {
       clearTimeout(t);
     }
@@ -4039,10 +4755,13 @@ var PartialMesh = class {
     this.discoveredPeers.clear();
     this.discoveredAtMs.clear();
     this.connectionStartedAtMs.clear();
+    this.orphanRtcFirstSeenAtMs.clear();
     this.peerConnectedAtMs.clear();
     this.rebalanceAttemptAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
     this.globalPeers.clear();
+    this.membershipRecordsById.clear();
+    this.membershipEquivocationAtById.clear();
     this.peerCapacityById.clear();
     this.peerTopologyById.clear();
     this.selfAliases.clear();
@@ -4129,6 +4848,18 @@ var PeerPigeonNode = class {
   }
   getPeerCapacities() {
     return this.mesh.getPeerCapacities();
+  }
+  getXorDistance(peerId, fromPeerId) {
+    return this.mesh.getXorDistance(peerId, fromPeerId ?? this.mesh.getClientId());
+  }
+  getHopDistance(peerId) {
+    return this.mesh.getHopDistance(peerId);
+  }
+  getCecrConfig() {
+    return this.gossip.getCecrConfig();
+  }
+  getCecrState() {
+    return this.gossip.getCecrState();
   }
   getClientId() {
     return this.mesh.getClientId();
