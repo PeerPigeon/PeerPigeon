@@ -650,6 +650,31 @@ declare class PeerPigeonCryptoProtocol {
     private emit;
 }
 
+declare const DEFAULT_SIGNALING_SERVERS: readonly string[];
+declare const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
+/** Order relays by SHA-256(hostname) XOR distance to the peer ID. */
+declare function rankSignalingServersByDistance(peerId: string, relayUrls: readonly string[]): Promise<string[]>;
+/** Choose exactly one relay by SHA-256(hostname) XOR distance to the peer ID. */
+declare function selectClosestSignalingServer(peerId: string, relayUrls: readonly string[]): Promise<string>;
+/**
+ * Read the public relay registry from one bootstrap, then select one relay.
+ * The bootstrap request is HTTP-only; only the selected relay gets a WebSocket.
+ */
+declare function discoverClosestSignalingServers(options: {
+    bootstrapServer: string;
+    peerId: string;
+    fallbackServers?: readonly string[];
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+    limit?: number;
+}): Promise<string[]>;
+declare function discoverClosestSignalingServer(options: {
+    bootstrapServer: string;
+    peerId: string;
+    fallbackServers?: readonly string[];
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+}): Promise<string>;
 interface PartialMeshConfig {
     /**
      * Minimum number of peers to maintain connections with
@@ -667,6 +692,10 @@ interface PartialMeshConfig {
       * FreeRTC signaling server URL
      */
     signalingServer?: string;
+    /** Known relays used if the bootstrap registry is empty or unavailable. */
+    signalingServers?: readonly string[];
+    /** Resolve one relay closest to the peer ID before opening signaling. */
+    automaticSignalingServer?: boolean;
     /**
      * FreeRTC network/application namespace. Peers must match both networkId and
      * sessionId (room) even when they use different federated relay domains.
@@ -700,11 +729,8 @@ interface PartialMeshConfig {
      */
     maintenanceIntervalMs?: number;
     /**
-     * If set (>0), perform a hard reset of all peer connections when the mesh remains
-     * under-connected (connectedPeers < minPeers) for this long while there are enough
-     * discovered peers available to connect to.
-     *
-     * This helps recover from rare stuck negotiation/ICE states in some browsers.
+     * If set (>0), refresh discovery when the mesh remains under-connected for
+     * this long. Existing FreeRTC negotiations are preserved.
      */
     underConnectedResetMs?: number;
     /**
@@ -789,9 +815,13 @@ type PeerGraphSnapshot = {
 };
 type PartialMeshRuntimeConfig = Pick<Required<PartialMeshConfig>, 'minPeers' | 'maxPeers' | 'tolerantPeers' | 'autoDiscover' | 'autoConnect' | 'connectionTimeoutMs' | 'maintenanceIntervalMs' | 'underConnectedResetMs' | 'nonInitiatorFallbackDialMs' | 'peerStateMaxAgeMs'>;
 type PartialMeshEvents = {
+    'identity:ready': (data: {
+        clientId: string;
+    }) => void;
     'signaling:connected': (data: {
         clientId: string;
         rawClientId?: string;
+        signalingServer?: string;
     }) => void;
     'signaling:disconnected': () => void;
     'signaling:error': (error: any) => void;
@@ -839,8 +869,10 @@ declare class PartialMesh {
     private membershipTimer;
     private underConnectedSinceMs;
     private lastHardResetAtMs;
+    private lastUnderConnectedRecoveryAtMs;
     private lastDiscoveryRefreshAtMs;
     private lastSignalingReconnectAtMs;
+    private restoreGraceUntilMs;
     private dialFailureCount;
     private dialBackoffUntilMs;
     private nonInitiatorFallbackTimers;
@@ -928,6 +960,7 @@ declare class PartialMesh {
      * Create a new peer connection
      */
     private createPeerConnection;
+    private scheduleConnectionTimeout;
     /**
      * Maintain the target number of peer connections
      */
@@ -1114,4 +1147,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, rankSignalingServersByDistance, selectClosestSignalingServer };

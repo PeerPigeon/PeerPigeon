@@ -31,6 +31,23 @@ function hueOf(color) {
   return ((hue * 60) + 360) % 360;
 }
 
+function saturationAndLightnessOf(color) {
+  const value = Number.parseInt(color.slice(1), 16);
+  const channels = [
+    (value >>> 16) & 0xff,
+    (value >>> 8) & 0xff,
+    value & 0xff,
+  ].map((channel) => channel / 255);
+  const maximum = Math.max(...channels);
+  const minimum = Math.min(...channels);
+  const lightness = (maximum + minimum) / 2;
+  const chroma = maximum - minimum;
+  const saturation = chroma === 0
+    ? 0
+    : chroma / (1 - Math.abs(2 * lightness - 1));
+  return { saturation, lightness };
+}
+
 function circularHueDistance(first, second) {
   const direct = Math.abs(first - second);
   return Math.min(direct, 360 - direct);
@@ -73,6 +90,15 @@ test('every prefix color remains visibly separated from the neutral graph backgr
       visibility.minimumDistance >= 0.14,
       `${prefix.toUpperCase()} color ${color} is too close to the graph background`,
     );
+  }
+});
+
+test('every prefix family renders as a visible pastel', () => {
+  for (const prefix of '0123456789abcdef') {
+    const color = assignPeerColor(`${prefix}${'0123456789abcdef'.repeat(4).slice(1)}`);
+    const { saturation, lightness } = saturationAndLightnessOf(color);
+    assert.ok(saturation >= 0.64 && saturation <= 0.78, `${color} is not pastel saturation`);
+    assert.ok(lightness >= 0.67 && lightness <= 0.77, `${color} is not pastel lightness`);
   }
 });
 

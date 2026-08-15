@@ -18,6 +18,146 @@ import type {
   PeerPublicKey,
 } from './crypto.js';
 
+export const DEFAULT_SIGNALING_SERVERS = Object.freeze([
+  'wss://peer.ooo/ws',
+  'wss://decentralize.ooo/ws',
+  'wss://freertc-worker-dev.draeder.workers.dev/ws',
+  'wss://oooooooooooooooooooooooooooo.ooo/ws',
+]);
+
+export const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
+const FREERTC_RESTORE_GRACE_MS = 11_000;
+
+function canonicalSignalingUrl(value: string): string | null {
+  try {
+    const url = new URL(String(value || '').trim());
+    if (url.protocol === 'https:') url.protocol = 'wss:';
+    if (url.protocol === 'http:') url.protocol = 'ws:';
+    if (url.protocol !== 'wss:' && url.protocol !== 'ws:') return null;
+    if (!url.pathname || url.pathname === '/') url.pathname = '/ws';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function hexIdBytes(peerId: string): Uint8Array {
+  const normalized = String(peerId || '').trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(normalized)) {
+    throw new TypeError('Automatic relay selection requires a 256-bit hexadecimal peer ID');
+  }
+  return Uint8Array.from(
+    { length: 32 },
+    (_, index) => Number.parseInt(normalized.slice(index * 2, index * 2 + 2), 16)
+  );
+}
+
+function compareXorDistance(left: Uint8Array, right: Uint8Array, target: Uint8Array): number {
+  for (let index = 0; index < target.length; index += 1) {
+    const leftDistanceByte = left[index] ^ target[index];
+    const rightDistanceByte = right[index] ^ target[index];
+    if (leftDistanceByte !== rightDistanceByte) return leftDistanceByte - rightDistanceByte;
+  }
+  return 0;
+}
+
+/** Order relays by SHA-256(hostname) XOR distance to the peer ID. */
+export async function rankSignalingServersByDistance(
+  peerId: string,
+  relayUrls: readonly string[]
+): Promise<string[]> {
+  const candidates = Array.from(new Set(
+    relayUrls.map((url) => canonicalSignalingUrl(url)).filter((url): url is string => Boolean(url))
+  ));
+  if (candidates.length === 0) return [];
+  const target = hexIdBytes(peerId);
+  const encoder = new TextEncoder();
+  const scored = await Promise.all(candidates.map(async (url) => {
+    const hostname = new URL(url).hostname.toLowerCase();
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', encoder.encode(hostname));
+    return { url, nodeId: new Uint8Array(digest) };
+  }));
+  scored.sort((left, right) => (
+    compareXorDistance(left.nodeId, right.nodeId, target)
+    || left.url.localeCompare(right.url)
+  ));
+  return scored.map(({ url }) => url);
+}
+
+/** Choose exactly one relay by SHA-256(hostname) XOR distance to the peer ID. */
+export async function selectClosestSignalingServer(
+  peerId: string,
+  relayUrls: readonly string[]
+): Promise<string> {
+  const ranked = await rankSignalingServersByDistance(peerId, relayUrls);
+  if (ranked.length === 0) throw new Error('No valid FreeRTC relays are available');
+  return ranked[0];
+}
+
+/**
+ * Read the public relay registry from one bootstrap, then select one relay.
+ * The bootstrap request is HTTP-only; only the selected relay gets a WebSocket.
+ */
+export async function discoverClosestSignalingServers(options: {
+  bootstrapServer: string;
+  peerId: string;
+  fallbackServers?: readonly string[];
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+  limit?: number;
+}): Promise<string[]> {
+  const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
+  if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);
+  const candidates = new Set<string>([bootstrap]);
+  for (const fallback of options.fallbackServers ?? []) {
+    const normalized = canonicalSignalingUrl(fallback);
+    if (normalized) candidates.add(normalized);
+  }
+
+  const registryUrl = new URL(bootstrap);
+  registryUrl.protocol = registryUrl.protocol === 'wss:' ? 'https:' : 'http:';
+  registryUrl.pathname = '/api/v1/relays';
+  registryUrl.search = '';
+  registryUrl.hash = '';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(250, options.timeoutMs ?? 4_000));
+  try {
+    const response = await (options.fetchImpl ?? globalThis.fetch)(registryUrl.toString(), {
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (response.ok) {
+      const body = await response.json() as { relays?: Array<{ url?: string } | string> };
+      for (const record of Array.isArray(body?.relays) ? body.relays : []) {
+        const normalized = canonicalSignalingUrl(typeof record === 'string' ? record : String(record?.url || ''));
+        if (normalized) candidates.add(normalized);
+      }
+    }
+  } catch {
+    // The known bootstrap/fallback set remains usable when registry discovery
+    // is temporarily unavailable.
+  } finally {
+    clearTimeout(timer);
+  }
+  const ranked = await rankSignalingServersByDistance(options.peerId, Array.from(candidates));
+  const limit = Math.max(1, Math.trunc(options.limit ?? DEFAULT_CLOSE_SIGNALING_RELAY_COUNT));
+  return ranked.slice(0, limit);
+}
+
+export async function discoverClosestSignalingServer(options: {
+  bootstrapServer: string;
+  peerId: string;
+  fallbackServers?: readonly string[];
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<string> {
+  const ranked = await discoverClosestSignalingServers({ ...options, limit: 1 });
+  if (ranked.length === 0) throw new Error('No valid FreeRTC relays are available');
+  return ranked[0];
+}
+
 export interface PartialMeshConfig {
   /**
    * Minimum number of peers to maintain connections with
@@ -38,6 +178,12 @@ export interface PartialMeshConfig {
     * FreeRTC signaling server URL
    */
   signalingServer?: string;
+
+  /** Known relays used if the bootstrap registry is empty or unavailable. */
+  signalingServers?: readonly string[];
+
+  /** Resolve one relay closest to the peer ID before opening signaling. */
+  automaticSignalingServer?: boolean;
 
   /**
    * FreeRTC network/application namespace. Peers must match both networkId and
@@ -81,11 +227,8 @@ export interface PartialMeshConfig {
   maintenanceIntervalMs?: number;
 
   /**
-   * If set (>0), perform a hard reset of all peer connections when the mesh remains
-   * under-connected (connectedPeers < minPeers) for this long while there are enough
-   * discovered peers available to connect to.
-   *
-   * This helps recover from rare stuck negotiation/ICE states in some browsers.
+   * If set (>0), refresh discovery when the mesh remains under-connected for
+   * this long. Existing FreeRTC negotiations are preserved.
    */
   underConnectedResetMs?: number;
 
@@ -205,7 +348,8 @@ export type PartialMeshRuntimeConfig = Pick<Required<PartialMeshConfig>,
 >;
 
 export type PartialMeshEvents = {
-  'signaling:connected': (data: { clientId: string; rawClientId?: string }) => void;
+  'identity:ready': (data: { clientId: string }) => void;
+  'signaling:connected': (data: { clientId: string; rawClientId?: string; signalingServer?: string }) => void;
   'signaling:disconnected': () => void;
   'signaling:error': (error: any) => void;
   'signaling:log': (data: { message: string }) => void;
@@ -245,8 +389,10 @@ export class PartialMesh {
   private membershipTimer: ReturnType<typeof setInterval> | null = null;
   private underConnectedSinceMs: number | null = null;
   private lastHardResetAtMs: number = 0;
+  private lastUnderConnectedRecoveryAtMs: number = 0;
   private lastDiscoveryRefreshAtMs: number = 0;
   private lastSignalingReconnectAtMs: number = 0;
+  private restoreGraceUntilMs: number = 0;
   private dialFailureCount: Map<string, number> = new Map();
   private dialBackoffUntilMs: Map<string, number> = new Map();
   private nonInitiatorFallbackTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -268,11 +414,23 @@ export class PartialMesh {
   private localTopologyUpdatedAtMs: number = Date.now();
 
   constructor(config: PartialMeshConfig = {}) {
+    const automaticSignalingServer = config.automaticSignalingServer ?? !config.signalingServer;
+    const bootstrapServer = String(config.signalingServer || DEFAULT_SIGNALING_SERVERS[0]).trim();
+    const configuredSignalingServers = Array.from(new Set((
+      config.signalingServers != null
+        ? [bootstrapServer, ...config.signalingServers]
+        : (automaticSignalingServer ? DEFAULT_SIGNALING_SERVERS : [bootstrapServer])
+    ).map((url) => String(url || '').trim()).filter(Boolean)));
+    const signalingServers = configuredSignalingServers.length > 0
+      ? configuredSignalingServers
+      : [...DEFAULT_SIGNALING_SERVERS];
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
       tolerantPeers: config.tolerantPeers ?? Math.max(1, Math.min(2, Math.floor((config.maxPeers ?? 10) * 0.25))),
-      signalingServer: config.signalingServer ?? 'wss://peer.ooo/ws',
+      signalingServer: bootstrapServer,
+      signalingServers,
+      automaticSignalingServer,
       networkId: config.networkId ?? config.sessionId ?? 'peerpigeon',
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
@@ -317,6 +475,7 @@ export class PartialMesh {
 
     // Initialize event handler maps
     const events: (keyof PartialMeshEvents)[] = [
+      'identity:ready',
       'signaling:connected',
       'signaling:disconnected',
       'signaling:error',
@@ -400,7 +559,7 @@ export class PartialMesh {
     this.emit('mesh:graph', this.getGraphSnapshot());
   }
 
-  private rotateBrowserPeerId(signalingUrl: string): { requestedPeerId: string; previousPeerId: string | null; retiredPeerIds: string[] } {
+  private rotateBrowserPeerId(signalingUrls: string[]): { requestedPeerId: string; previousPeerId: string | null; retiredPeerIds: string[] } {
     const requestedPeerId = Array.from(
       (globalThis.window?.crypto ?? globalThis.crypto).getRandomValues(new Uint8Array(32)),
       (value) => value.toString(16).padStart(2, '0')
@@ -411,8 +570,10 @@ export class PartialMesh {
     try {
       const storage = globalThis.window?.sessionStorage;
       if (storage) {
-        const relayScope = new URL(signalingUrl).origin;
-        const key = `peerpigeon:previous-peer-id:${relayScope}:${this.config.networkId}:${this.config.sessionId}`;
+        // Federated relays are transport alternatives for the same logical
+        // scope. Keep one identity history across the pool so failover cannot
+        // manufacture a new peer merely because the relay origin changed.
+        const key = `peerpigeon:previous-peer-id:federated:${this.config.networkId}:${this.config.sessionId}`;
         const retiredKey = `${key}:retired`;
         previousPeerId = this.normalizePeerId(storage.getItem(key)) || null;
         try {
@@ -422,6 +583,20 @@ export class PartialMesh {
           }
         } catch {
           retiredPeerIds = [];
+        }
+        // Import old relay-scoped identities once so deployments upgraded from
+        // single-server mode withdraw every identity they may have announced.
+        for (const signalingUrl of signalingUrls) {
+          const relayScope = new URL(signalingUrl).origin;
+          const legacyKey = `peerpigeon:previous-peer-id:${relayScope}:${this.config.networkId}:${this.config.sessionId}`;
+          const legacyPeerId = this.normalizePeerId(storage.getItem(legacyKey));
+          if (legacyPeerId) retiredPeerIds.push(legacyPeerId);
+          try {
+            const legacyRetired = JSON.parse(storage.getItem(`${legacyKey}:retired`) || '[]');
+            if (Array.isArray(legacyRetired)) retiredPeerIds.push(...legacyRetired);
+          } catch {
+            // Ignore malformed legacy state.
+          }
         }
         if (previousPeerId) retiredPeerIds.push(previousPeerId);
         retiredPeerIds = Array.from(new Set(retiredPeerIds)).filter((peerId) => peerId !== requestedPeerId).slice(-64);
@@ -793,17 +968,33 @@ export class PartialMesh {
    * Initialize and connect to the signaling server
    */
   async init(): Promise<void> {
-    // Let FreeRTC client manage query params such as networkId.
-    const signalingUrl = this.normalizeSignalingUrl(this.config.signalingServer);
-
-    const { requestedPeerId, previousPeerId, retiredPeerIds } = this.rotateBrowserPeerId(signalingUrl);
+    const signalingCandidates = Array.from(new Set(
+      this.config.signalingServers.map((url) => this.normalizeSignalingUrl(url))
+    ));
+    const { requestedPeerId, previousPeerId, retiredPeerIds } = this.rotateBrowserPeerId(signalingCandidates);
+    // Identity is local and authoritative. Do not make it wait for relay
+    // discovery or registration; the same ID is used for relay ranking.
+    this.clientId = requestedPeerId;
     this.addSelfAlias(requestedPeerId);
+    this.emit('identity:ready', { clientId: requestedPeerId });
+    // Query one bootstrap, then try only the closest relays, one at a time.
+    const signalingUrls = this.config.automaticSignalingServer
+      ? await discoverClosestSignalingServers({
+        bootstrapServer: this.config.signalingServer,
+        peerId: requestedPeerId,
+        fallbackServers: signalingCandidates,
+        limit: DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
+      })
+      : [this.normalizeSignalingUrl(this.config.signalingServer)];
+    this.emit('signaling:log', {
+      message: `[signal] close federated relays ${signalingUrls.join(' -> ')}`,
+    });
     for (const peerId of retiredPeerIds) {
       this.retiredPeerIds.add(peerId);
       this.addSelfAlias(peerId);
     }
 
-    this.signalingClient = new FreeRTCClientAdapter(signalingUrl, {
+    this.signalingClient = new FreeRTCClientAdapter(signalingUrls, {
       networkId: this.config.networkId,
       roomId: this.config.sessionId,
       peerId: requestedPeerId,
@@ -814,7 +1005,7 @@ export class PartialMesh {
     });
 
     // Set up signaling event handlers
-    this.signalingClient.on('connected', (data: { clientId: string; requestedClientId?: string; previousClientId?: string }) => {
+    this.signalingClient.on('connected', (data: { clientId: string; requestedClientId?: string; previousClientId?: string; signalUrl?: string }) => {
       const rawClientId = data?.clientId;
       const nextClientId = this.normalizePeerId(rawClientId);
       this.clientId = nextClientId;
@@ -824,7 +1015,11 @@ export class PartialMesh {
       this.addSelfAlias(data?.previousClientId);
       this.renewLocalMembership(true);
       this.startMembershipLoop();
-      this.emit('signaling:connected', { clientId: this.clientId, rawClientId });
+      this.emit('signaling:connected', {
+        clientId: this.clientId,
+        rawClientId,
+        signalingServer: data?.signalUrl || signalingUrls[0],
+      });
       
       if (this.config.autoDiscover) {
         this.signalingClient.joinSession(this.config.sessionId);
@@ -1070,8 +1265,15 @@ export class PartialMesh {
   }
 
   private recoverMeshAfterInactivity(reason: string): void {
-    this.recoverStaleConnectedPeers(reason);
-    this.recoverOrphanedRtcNegotiations();
+    const now = Date.now();
+    // FreeRTC owns restoration. Reset stale-age baselines and wait for its
+    // success/failure signal instead of destroying transports on visibility.
+    this.restoreGraceUntilMs = Math.max(this.restoreGraceUntilMs, now + FREERTC_RESTORE_GRACE_MS);
+    this.orphanRtcFirstSeenAtMs.clear();
+    for (const peerId of this.connecting) {
+      this.connectionStartedAtMs.set(peerId, now);
+      this.scheduleConnectionTimeout(peerId);
+    }
     this.lastDiscoveryRefreshAtMs = 0;
     this.underConnectedSinceMs = null;
 
@@ -1079,42 +1281,20 @@ export class PartialMesh {
       this.maybeRefreshDiscovery();
       if (!this.config.autoConnect) return;
 
-      const isolated = this.getConnectedPeerCount() === 0;
-      const candidates = this.dialCandidatePeerIds(true);
-      if (isolated && candidates.length > 0) {
-        // Resume is authoritative evidence that timer/ICE state may have been
-        // frozen. Do not let old attempts or exponential backoff strand the
-        // peer: close every non-live transport and redial immediately.
-        this.dialBackoffUntilMs.clear();
-        this.hardReset(`${reason}-isolated`);
-        return;
-      }
-
+      this.emit('signaling:log', {
+        message: `[webrtc] ${reason} recovery: waiting for FreeRTC transport restoration`,
+      });
       this.maintainPeerConnections();
     } catch {
       // The regular maintenance loop will retry.
     }
   }
 
-  private recoverStaleConnectedPeers(reason: string): void {
-    for (const peer of Array.from(this.peers.values())) {
-      if (!peer.connected) continue;
-
-      const rtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(peer.id);
-      const connectionState = String(rtcEntry?.connection?.connectionState ?? rtcEntry?.state ?? '').toLowerCase();
-      const channelState = String(rtcEntry?.channel?.readyState ?? '').toLowerCase();
-      const transportIsDead = connectionState === 'failed'
-        || connectionState === 'closed'
-        || connectionState === 'dead';
-      const channelIsGone = !rtcEntry || !rtcEntry.channel || channelState === 'closing' || channelState === 'closed';
-
-      if (!transportIsDead && !channelIsGone) continue;
-
-      this.emit('signaling:log', {
-        message: `[webrtc] ${reason} recovery: removing stale connection to ${peer.id}`
-      });
-      this.removePeer(peer.id, false);
-    }
+  private recoverStaleConnectedPeers(_reason: string): void {
+    // FreeRTC and its adapter own transport restoration and emit rtc:disconnected
+    // only after the restore/reannounce window has genuinely failed. Removing a
+    // connection here used to race that window once per maintenance tick and
+    // discarded FreeRTC's cached answer while its duplicate-offer record lived on.
   }
 
   /**
@@ -1123,13 +1303,14 @@ export class PartialMesh {
    * cannot see it, while connectToPeerInternal treats it as active forever.
    */
   private recoverOrphanedRtcNegotiations(now: number = Date.now()): void {
+    if (now < this.restoreGraceUntilMs) return;
     const connections = (this.signalingClient as any)?.client?.mesh?.connections;
     if (!connections || typeof connections.entries !== 'function') return;
 
-    const isolated = this.getConnectedPeerCount() === 0;
-    const staleAfterMs = isolated
-      ? Math.max(3_500, Math.min(this.config.connectionTimeoutMs, 8_000))
-      : Math.max(8_000, Math.min(this.config.connectionTimeoutMs, 15_000));
+    // FreeRTC owns an outgoing offer for up to 30 seconds. Deleting its entry
+    // earlier discards the cached answer while its SDP dedup record remains,
+    // causing valid retransmitted offers to be ignored without a response.
+    const staleAfterMs = Math.max(32_000, this.config.connectionTimeoutMs);
 
     for (const [rawPeerId, entry] of Array.from(connections.entries()) as Array<[string, any]>) {
       const peerId = this.normalizePeerId(rawPeerId);
@@ -1159,10 +1340,7 @@ export class PartialMesh {
       // Age the orphan from our first observation so relayed retries cannot
       // keep a permanently non-open negotiation alive forever.
       const orphanAgeMs = Math.max(0, now - firstSeenAt);
-      const definitelyDead = connectionState === 'failed'
-        || connectionState === 'closed'
-        || connectionState === 'dead';
-      if (!definitelyDead && orphanAgeMs < staleAfterMs) continue;
+      if (orphanAgeMs < staleAfterMs) continue;
 
       this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.noteDialFailure(peerId);
@@ -1187,10 +1365,11 @@ export class PartialMesh {
 
   private maybeRecoverStalledNegotiations(): void {
     const now = Date.now();
+    if (now < this.restoreGraceUntilMs) return;
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
-    const baseStallMs = Math.max(10_000, Math.min(this.config.connectionTimeoutMs, 15_000));
-    const stallMs = isolated ? Math.max(8_000, Math.min(this.config.connectionTimeoutMs, 12_000)) : baseStallMs;
+    // Never race FreeRTC's 30-second offer retry loop or its SDP dedup window.
+    const stallMs = Math.max(32_000, this.config.connectionTimeoutMs);
 
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
@@ -1230,15 +1409,14 @@ export class PartialMesh {
           this.connectToPeerInternal(peer.id, true);
         }
 
-        if (answeredButNoChannel || repeatedlyFailing) {
-          this.maybeHardResetUnderConnected();
-        }
+        if (answeredButNoChannel || repeatedlyFailing) this.maybeHardResetUnderConnected();
       }
       return;
     }
   }
 
   private maybeHardResetUnderConnected(): void {
+    if (Date.now() < this.restoreGraceUntilMs) return;
     const signalingConnected = this.signalingClient?.isConnected?.() ?? true;
     if (!signalingConnected) {
       this.underConnectedSinceMs = null;
@@ -1269,16 +1447,24 @@ export class PartialMesh {
     }
 
     if (isolated && (hasStalePending || hasRepeatedFailures)) {
-      if (now - this.lastHardResetAtMs < isolatedThresholdMs) {
+      if (now - this.lastUnderConnectedRecoveryAtMs < isolatedThresholdMs) {
         return;
       }
-      this.hardReset('isolated-stalled');
+      this.lastUnderConnectedRecoveryAtMs = now;
+      this.emit('signaling:log', {
+        message: '[webrtc] isolated recovery: preserving FreeRTC negotiation and refreshing discovery',
+      });
+      this.signalingClient?.nudgeSignaling?.();
+      try {
+        this.signalingClient?.joinSession?.(this.config.sessionId);
+      } catch {
+        // FreeRTC will also refresh discovery on its regular heartbeat.
+      }
+      this.maintainPeerConnections();
       return;
     }
 
-    // Do not hard-reset while fresh negotiations are in progress.
-    // But if pending attempts are stale beyond threshold, allow reset to break
-    // out of stuck have-local-offer loops.
+    // Preserve fresh negotiations while FreeRTC owns their retry window.
     if (pending > 0) {
       if (oldestPendingAge < thresholdMs) {
         this.underConnectedSinceMs = null;
@@ -1293,9 +1479,22 @@ export class PartialMesh {
 
     // Avoid repeated rapid resets if the environment is genuinely unable to connect.
     if (now - this.underConnectedSinceMs < thresholdMs) return;
-    if (now - this.lastHardResetAtMs < thresholdMs) return;
+    if (now - this.lastUnderConnectedRecoveryAtMs < thresholdMs) return;
 
-    this.hardReset('under-connected');
+    // Automatic recovery must not destroy healthy or in-flight FreeRTC state.
+    // Refresh discovery and let the existing client own retries/backoff.
+    this.lastUnderConnectedRecoveryAtMs = now;
+    this.underConnectedSinceMs = now;
+    this.emit('signaling:log', {
+      message: '[webrtc] under-connected recovery: refreshing discovery without resetting FreeRTC',
+    });
+    this.signalingClient?.nudgeSignaling?.();
+    try {
+      this.signalingClient?.joinSession?.(this.config.sessionId);
+    } catch {
+      // FreeRTC will also refresh discovery on its regular heartbeat.
+    }
+    this.maintainPeerConnections();
   }
 
   private isPeerBackedOff(peerId: string): boolean {
@@ -1401,22 +1600,7 @@ export class PartialMesh {
       initiator
     };
 
-    // If a connection stalls, tear it down and retry.
-    const existingTimer = this.connectionTimers.get(peerId);
-    if (existingTimer) clearTimeout(existingTimer);
-
-    const timer = setTimeout(() => {
-      const current = this.peers.get(peerId);
-      if (!current || current.connected) return;
-
-      this.connecting.delete(peerId);
-      this.connectionStartedAtMs.delete(peerId);
-      this.noteDialFailure(peerId);
-      this.emit('peer:error', { peerId, error: new Error('Connection timeout') });
-      this.removePeer(peerId);
-    }, this.config.connectionTimeoutMs);
-
-    this.connectionTimers.set(peerId, timer);
+    this.scheduleConnectionTimeout(peerId);
     this.connectionStartedAtMs.set(peerId, Date.now());
     this.peers.set(peerId, peerConnection);
 
@@ -1442,6 +1626,22 @@ export class PartialMesh {
     // We'll receive an rtc:connected event when the data channel opens.
 
     return peerConnection;
+  }
+
+  private scheduleConnectionTimeout(peerId: string): void {
+    const existingTimer = this.connectionTimers.get(peerId);
+    if (existingTimer) clearTimeout(existingTimer);
+    const timer = setTimeout(() => {
+      const current = this.peers.get(peerId);
+      if (!current || current.connected) return;
+
+      this.connecting.delete(peerId);
+      this.connectionStartedAtMs.delete(peerId);
+      this.noteDialFailure(peerId);
+      this.emit('peer:error', { peerId, error: new Error('Connection timeout') });
+      this.removePeer(peerId);
+    }, this.config.connectionTimeoutMs);
+    this.connectionTimers.set(peerId, timer);
   }
 
   /**
@@ -1845,6 +2045,7 @@ export class PartialMesh {
   public getConfig(): Readonly<Required<PartialMeshConfig>> {
     return {
       ...this.config,
+      signalingServers: [...this.config.signalingServers],
       iceServers: this.config.iceServers ? this.config.iceServers.map((server) => ({ ...server })) : null,
     };
   }

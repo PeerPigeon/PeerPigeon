@@ -1,4 +1,4 @@
-export const PEER_COLOR_ALGORITHM_VERSION = 6;
+export const PEER_COLOR_ALGORITHM_VERSION = 7;
 export const PEER_NODE_IDLE_ALPHA = 0.72;
 export const SELF_NODE_IDLE_ALPHA = 0.64;
 export const MIN_PEER_NODE_IDLE_ALPHA = 0.54;
@@ -166,8 +166,11 @@ export function assignPeerColor(peerId) {
     : avalancheHash(hashText(canonicalId)) % PEER_ID_PREFIX_HUE_COUNT;
   const variation = avalancheHash(hashText(`${canonicalId}\u0000peer-color-variation`));
   const hue = PEER_ID_PREFIX_HUE[prefixIndex];
-  const saturation = 0.92 + ((variation >>> 16) & 0xff) / 3187.5;
-  const lightness = 0.62 + ((variation >>> 24) & 0xff) / 3187.5;
+  // The neutral graph canvas supports the complete pastel wheel. Keep enough
+  // saturation to distinguish neighboring prefix families, with high stable
+  // lightness so low-opacity distant circles remain visible.
+  const saturation = 0.66 + ((variation >>> 16) & 0xff) / 2550;
+  const lightness = 0.68 + ((variation >>> 24) & 0xff) / 3187.5;
   return rgbToHex(hslToRgb(hue, saturation, lightness));
 }
 

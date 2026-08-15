@@ -465,7 +465,7 @@ test('tolerantPeers is a real temporary connected-plus-pending overflow budget',
   }
 });
 
-test('an isolated mesh purges a stale untracked RTC negotiation and immediately redials', () => {
+test('an isolated mesh redials an orphan only after FreeRTC exhausts offer recovery', () => {
   const self = '0'.repeat(63) + '1';
   const target = '0'.repeat(63) + '2';
   const mesh = new PartialMesh({
@@ -477,7 +477,7 @@ test('an isolated mesh purges a stale untracked RTC negotiation and immediately 
   });
   const connections = new Map([[target, {
     state: 'connected',
-    lastSeen: Date.now() - 9_000,
+    lastSeen: Date.now() - 46_000,
     connection: { connectionState: 'connected', signalingState: 'stable' },
     channel: { readyState: 'connecting' },
   }]]);
@@ -548,8 +548,8 @@ test('repeated signaling cannot keep an isolated orphan negotiation alive foreve
     mesh.recoverOrphanedRtcNegotiations(now);
     // A retry packet refreshes FreeRTC's activity timestamp, but it does not
     // reset the independent deadline for opening a usable data channel.
-    entry.lastSeen = now + 9_000;
-    mesh.recoverOrphanedRtcNegotiations(now + 9_000);
+    entry.lastSeen = now + 46_000;
+    mesh.recoverOrphanedRtcNegotiations(now + 46_000);
 
     assert.deepEqual(closed, [target]);
   } finally {
@@ -557,7 +557,7 @@ test('repeated signaling cannot keep an isolated orphan negotiation alive foreve
   }
 });
 
-test('resume immediately clears a fresh orphan negotiation and redials', () => {
+test('resume gives FreeRTC a restore grace instead of immediately redialing', () => {
   const self = '0'.repeat(63) + '1';
   const target = '0'.repeat(63) + '2';
   const connections = new Map([[target, {
@@ -598,8 +598,87 @@ test('resume immediately clears a fresh orphan negotiation and redials', () => {
 
     mesh.recoverAfterInactivity('visible');
 
-    assert.deepEqual(closed, [target]);
-    assert.deepEqual(dials, [target]);
+    assert.deepEqual(closed, []);
+    assert.deepEqual(dials, []);
+    assert.equal(mesh.connecting.has(target), false);
+    assert.ok(mesh.restoreGraceUntilMs > Date.now());
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('maintenance never destroys a failed transport before FreeRTC restore fails', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const connections = new Map([[target, {
+    state: 'failed',
+    connection: { connectionState: 'failed', signalingState: 'closed' },
+    channel: { readyState: 'closed' },
+  }]]);
+  const closed = [];
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.peers.set(target, { id: target, connected: true, initiator: true });
+    mesh.signalingClient = {
+      closeConnection(peerId) {
+        closed.push(peerId);
+        connections.delete(peerId);
+      },
+      disconnect() {},
+      client: { mesh: { connections } },
+    };
+
+    mesh.recoverStaleConnectedPeers('maintenance');
+
+    assert.deepEqual(closed, []);
+    assert.equal(mesh.getConnectedPeerCount(), 1);
+    assert.equal(connections.has(target), true);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('isolated recovery refreshes discovery without hard-resetting an active offer', () => {
+  const self = 'f'.repeat(64);
+  const target = '1'.repeat(64);
+  const closed = [];
+  let refreshes = 0;
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+    underConnectedResetMs: 20_000,
+  });
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.discoveredPeers.add(target);
+    mesh.peers.set(target, { id: target, connected: false, initiator: true });
+    mesh.connecting.add(target);
+    mesh.connectionStartedAtMs.set(target, Date.now() - 9_000);
+    mesh.dialFailureCount.set(target, 3);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() { refreshes += 1; },
+      joinSession() { refreshes += 1; },
+      closeConnection(peerId) { closed.push(peerId); },
+      disconnect() {},
+      client: { mesh: { connections: new Map() } },
+    };
+
+    mesh.maybeHardResetUnderConnected();
+
+    assert.deepEqual(closed, []);
+    assert.equal(refreshes, 2);
+    assert.equal(mesh.peers.has(target), true);
     assert.equal(mesh.connecting.has(target), true);
   } finally {
     mesh.destroy();
