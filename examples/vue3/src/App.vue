@@ -748,30 +748,12 @@ export default {
       debugLastByPeer: {},
       debugLastLogAtByPeer: {},
       unexpectedMeshRestartInFlight: false,
-      runtimeMode: 'typescript',
-      goWasmNodeId: null,
-      goWasmHandlers: {
-        messageReceived: new Set(),
-        directMessageReceived: new Set(),
-        deliveryProgress: new Set(),
-        deliveryComplete: new Set(),
-        deliveryTimeout: new Set(),
-      },
       deliveryReceipts: {},
-      goWasmStorageNotify: null,
-      goWasmLoadPromise: null,
-      goWasmStarted: false,
     };
   },
   mounted() {
     window.__app = this;
     const params = new URLSearchParams(window.location.search);
-    const runtimeParam = String(params.get('runtime') || params.get('engine') || '').trim().toLowerCase();
-    if (runtimeParam === 'js' || runtimeParam === 'javascript') {
-      this.runtimeMode = 'js';
-    } else if (runtimeParam === 'go' || runtimeParam === 'go-wasm' || runtimeParam === 'wasm') {
-      this.runtimeMode = 'go-wasm';
-    }
 
     // ==== IMPORTANT: URL params take ABSOLUTE priority for test isolation ====
     // Check for explicit sessionId param FIRST (before any session-state fallback)
@@ -841,7 +823,6 @@ export default {
     this.loadUiState();
 
     // Local-first storage should be available even before mesh/gossip is connected.
-    // In go-wasm mode, wait for node creation to avoid a transient js-storage -> wasm-storage swap.
     if (this.activeTab === 'storage') {
       this.ensureStorageReady({ fastPath: true }).catch((error) => {
         this.storageError = String(error?.message || error || 'Failed to initialize storage');
@@ -1211,7 +1192,6 @@ export default {
       const space = this.storageActiveSpace;
       const key = String(this.storageFormKey || '').trim();
       if (!key) return;
-      const isGoWasm = this.runtimeMode === 'go-wasm';
 
       const ownerId = this.storageActiveSpace === 'user'
         ? this.storageLookupUserId()
@@ -1245,13 +1225,6 @@ export default {
             : JSON.stringify(current.value);
         }
         await showCurrentValue();
-
-        // Go/WASM retrieval is intentionally backgrounded to avoid blocking
-        // the browser main thread. Re-read after its response can arrive.
-        if (isGoWasm) {
-          setTimeout(() => showCurrentValue().catch(() => {}), 300);
-          setTimeout(() => showCurrentValue().catch(() => {}), 1000);
-        }
       } catch (error) {
         this.storageError = String(error?.message || error || 'Failed to get storage key');
       } finally {
@@ -2220,272 +2193,6 @@ export default {
       this.updateUrlState();
     },
 
-    noteGoWasmRuntimeExited(errorLike) {
-      const message = String(errorLike?.message || errorLike || 'Go program has already exited');
-      if (!message.includes('Go program has already exited')) {
-        return false;
-      }
-
-      this.goWasmNodeId = null;
-      this.goWasmStarted = false;
-      this.goWasmLoadPromise = null;
-      this.goWasmStorageNotify = null;
-      this.storageReady = false;
-      this.storage = null;
-      this.storageError = 'Go runtime exited. Reload page to restart wasm runtime.';
-      this.addLog('info', 'Go runtime exited; blocked further wasm calls until reload.', 'wasm');
-      this.showStatus('Runtime exited', 'Go runtime exited. Reload page to continue.', 'error');
-      return true;
-    },
-
-    callGoWasm(fnName, ...args) {
-      if (this.runtimeMode !== 'go-wasm') return null;
-      const fn = window[fnName];
-      if (typeof fn !== 'function') {
-        return null;
-      }
-
-      try {
-        return fn(...args);
-      } catch (error) {
-        if (!this.noteGoWasmRuntimeExited(error)) {
-          this.addLog('info', `WASM bridge error (${fnName}): ${String(error?.message || error || 'unknown')}`, 'wasm');
-        }
-        return null;
-      }
-    },
-
-    async ensureGoWasmRuntimeLoaded() {
-      if (this.runtimeMode !== 'go-wasm') return;
-      if (typeof window.peerpigeonCreateNode === 'function') return;
-      if (this.goWasmLoadPromise) {
-        await this.goWasmLoadPromise;
-        return;
-      }
-
-      this.goWasmLoadPromise = (async () => {
-        if (!window.Go) {
-          await new Promise((resolve, reject) => {
-            const script = document.createElement('script');
-            script.src = '/wasm_exec.js';
-            script.async = true;
-            script.onload = () => resolve();
-            script.onerror = () => reject(new Error('Failed to load wasm_exec.js'));
-            document.head.appendChild(script);
-          });
-        }
-
-        const go = new window.Go();
-        let result;
-        try {
-          result = await WebAssembly.instantiateStreaming(fetch('/peerpigeon.wasm'), go.importObject);
-        } catch {
-          const resp = await fetch('/peerpigeon.wasm');
-          if (!resp.ok) {
-            throw new Error('Failed to fetch /peerpigeon.wasm');
-          }
-          const bytes = await resp.arrayBuffer();
-          result = await WebAssembly.instantiate(bytes, go.importObject);
-        }
-
-        this.goWasmStarted = true;
-        go.run(result.instance);
-
-        const timeoutAt = Date.now() + 10_000;
-        while (typeof window.peerpigeonCreateNode !== 'function') {
-          if (Date.now() > timeoutAt) {
-            throw new Error('peerpigeon wasm runtime did not initialize');
-          }
-          await new Promise((resolve) => setTimeout(resolve, 50));
-        }
-      })();
-
-      await this.goWasmLoadPromise;
-    },
-
-    toPeerDataUint8Array(data) {
-      if (data instanceof Uint8Array) return data;
-      if (data instanceof ArrayBuffer) return new Uint8Array(data);
-      if (ArrayBuffer.isView(data)) {
-        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-      }
-      if (typeof data === 'string') {
-        return new TextEncoder().encode(data);
-      }
-      try {
-        return new TextEncoder().encode(JSON.stringify(data));
-      } catch {
-        return new Uint8Array();
-      }
-    },
-
-    createGoWasmGossipAdapter() {
-      const invokeHandlers = (name, payload) => {
-        for (const fn of this.goWasmHandlers[name]) {
-          try {
-            fn(payload);
-          } catch {
-            // keep bridge robust against handler errors
-          }
-        }
-      };
-
-      const bridge = {
-        send: (peerId, payload) => {
-          if (!this.mesh || typeof this.mesh.send !== 'function') return;
-          try {
-            this.mesh.send(peerId, payload);
-          } catch {
-            // Never throw into Go runtime from JS bridge callbacks.
-          }
-        },
-        onMessageReceived: (event) => {
-          invokeHandlers('messageReceived', {
-            message: {
-              id: String(event?.id || ''),
-              data: event?.data,
-              hops: Number(event?.hops || 0),
-              sender: String(event?.sender || ''),
-              delivery: event?.delivery || null,
-              metadata: event?.metadata || {},
-            },
-            local: Boolean(event?.local),
-            fromPeer: String(event?.fromPeer || ''),
-          });
-        },
-        onDirectMessageReceived: (event) => {
-          invokeHandlers('directMessageReceived', {
-            message: event?.message || null,
-          });
-        },
-        onDeliveryProgress: (status) => invokeHandlers('deliveryProgress', status || {}),
-        onDeliveryComplete: (status) => invokeHandlers('deliveryComplete', status || {}),
-        onDeliveryTimeout: (status) => invokeHandlers('deliveryTimeout', status || {}),
-        onStorageChange: (event) => {
-          if (typeof this.goWasmStorageNotify === 'function') {
-            this.goWasmStorageNotify(event || {});
-          }
-        },
-      };
-
-      const nextNodeId = this.callGoWasm('peerpigeonCreateNode', {
-        clientId: this.clientId,
-        sessionId: this.effectiveSessionId,
-        userId: String(this.cryptoKeys?.epub || 'wasm-user').trim() || 'wasm-user',
-        maxHops: 6,
-      }, bridge);
-      if (nextNodeId instanceof Error) {
-        throw nextNodeId;
-      }
-      if (nextNodeId && typeof nextNodeId === 'object' && String(nextNodeId.name || '') === 'Error' && typeof nextNodeId.message === 'string') {
-        throw new Error(nextNodeId.message);
-      }
-      if (nextNodeId == null) {
-        throw new Error('failed to create go-wasm node');
-      }
-      this.goWasmNodeId = nextNodeId;
-
-      return {
-        on: (name, fn) => {
-          if (!this.goWasmHandlers[name]) return;
-          this.goWasmHandlers[name].add(fn);
-        },
-        off: (name, fn) => {
-          if (!this.goWasmHandlers[name]) return;
-          this.goWasmHandlers[name].delete(fn);
-        },
-        broadcast: (data, metadata, options) => {
-          return this.callGoWasm('peerpigeonBroadcast', this.goWasmNodeId, data, metadata || null, options || null);
-        },
-        broadcastReliable: (data, metadata, options) => {
-          return this.callGoWasm('peerpigeonBroadcast', this.goWasmNodeId, data, metadata || null, {
-            ...(options || {}),
-            trackDelivery: true,
-          });
-        },
-        getDeliveryStatus: (messageId) => {
-          return this.callGoWasm('peerpigeonGetDeliveryStatus', this.goWasmNodeId, messageId);
-        },
-        sendDirect: (peerId, data) => {
-          return this.callGoWasm('peerpigeonSendDirect', this.goWasmNodeId, peerId, data);
-        },
-        destroy: () => {
-          if (this.goWasmNodeId != null) {
-            this.callGoWasm('peerpigeonDestroyNode', this.goWasmNodeId);
-          }
-          this.goWasmNodeId = null;
-          this.goWasmHandlers.messageReceived.clear();
-          this.goWasmHandlers.directMessageReceived.clear();
-          this.goWasmHandlers.deliveryProgress.clear();
-          this.goWasmHandlers.deliveryComplete.clear();
-          this.goWasmHandlers.deliveryTimeout.clear();
-        }
-      };
-    },
-
-    createGoWasmStorageAdapter() {
-      const subscribers = new Set();
-      const invoke = (fnName, ...args) => {
-        const result = this.callGoWasm(fnName, ...args);
-        if (result instanceof Error) {
-          throw result;
-        }
-        if (result && typeof result === 'object' && String(result.name || '') === 'Error' && typeof result.message === 'string') {
-          throw new Error(result.message);
-        }
-        return result;
-      };
-      this.goWasmStorageNotify = (event) => {
-        for (const fn of subscribers) {
-          try {
-            fn(event || {});
-          } catch {
-            // ignore storage subscriber errors
-          }
-        }
-      };
-
-      return {
-        init: async () => {},
-        close: async () => {
-          subscribers.clear();
-          this.goWasmStorageNotify = null;
-        },
-        subscribe: (fn) => {
-          subscribers.add(fn);
-          return () => subscribers.delete(fn);
-        },
-        list: async (space) => {
-          return invoke('peerpigeonStorageList', this.goWasmNodeId, space) || [];
-        },
-        get: async (space, key) => {
-          return invoke('peerpigeonStorageGet', this.goWasmNodeId, space, key);
-        },
-        retrieve: async (space, key, options = {}) => {
-          return invoke('peerpigeonStorageRetrieve', this.goWasmNodeId, space, key, options || {});
-        },
-        subscribeKey: (space, key) => {
-          invoke('peerpigeonStorageSubscribe', this.goWasmNodeId, space, key);
-          return () => invoke('peerpigeonStorageUnsubscribe', this.goWasmNodeId, space, key);
-        },
-        unsubscribeKey: (space, key) => {
-          invoke('peerpigeonStorageUnsubscribe', this.goWasmNodeId, space, key);
-        },
-        put: async (space, key, value, _options = {}) => {
-          return invoke('peerpigeonStoragePut', this.goWasmNodeId, space, key, value);
-        },
-        putSystem: async (space, key, value, _options = {}) => {
-          return invoke('peerpigeonStoragePut', this.goWasmNodeId, space, key, value);
-        },
-        delete: async (space, key) => {
-          return invoke('peerpigeonStorageDelete', this.goWasmNodeId, space, key);
-        },
-        deleteSystem: async (space, key) => {
-          return invoke('peerpigeonStorageDelete', this.goWasmNodeId, space, key);
-        },
-      };
-    },
-
     async startMesh() {
       if (this.isRunning || this.isConnecting) return;
       this.isConnecting = true;
@@ -2527,9 +2234,6 @@ export default {
         this.activeSignalingServer = '';
         this.updateUrlState();
         await this.ensureCryptoKeys();
-        if (this.runtimeMode === 'go-wasm') {
-          await this.ensureGoWasmRuntimeLoaded();
-        }
 
         this.updateUrlState();
 
@@ -2552,11 +2256,7 @@ export default {
           underConnectedResetMs: 20_000
         });
 
-        if (this.runtimeMode === 'go-wasm') {
-          this.gossip = this.createGoWasmGossipAdapter();
-        } else {
-          this.gossip = new GossipProtocol(this.mesh);
-        }
+        this.gossip = new GossipProtocol(this.mesh);
 
         this.cryptoProtocol = new PeerPigeonCryptoProtocol(this.mesh, this.gossip, {
           roomId: this.effectiveSessionId,
@@ -2612,9 +2312,6 @@ export default {
           this.meshConnectWarnTimer = null;
           this.activeSignalingServer = String(data?.signalingServer || bootstrapSignalingServer);
           this.clientId = (data.clientId || '').trim();
-          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
-            this.callGoWasm('peerpigeonSetClientID', this.goWasmNodeId, this.clientId);
-          }
           this.addLog('signaling', `Connected to signaling server`, this.clientId);
           this.registerLocalPublicCryptoInfo();
           this.announceCryptoPublicInfo();
@@ -2645,12 +2342,6 @@ export default {
         });
 
         this.mesh.on('peer:connected', (peerId) => {
-          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
-            this.callGoWasm('peerpigeonHandlePeerConnected', this.goWasmNodeId, peerId);
-            this.callGoWasm('peerpigeonSetConnectedPeers', this.goWasmNodeId, this.mesh.getConnectedPeers());
-            this.callGoWasm('peerpigeonSetDiscoveredPeers', this.goWasmNodeId, this.mesh.getDiscoveredPeers());
-            this.callGoWasm('peerpigeonSetGlobalPeers', this.goWasmNodeId, this.mesh.getGlobalPeers());
-          }
           this.addLog('connected', `Connected to peer`, peerId);
           this.markNetworkGraphPeerActivity(peerId);
           this.markNetworkGraphPeerActivity(this.mesh?.getClientId?.() || this.clientId);
@@ -2661,21 +2352,9 @@ export default {
         });
 
         this.mesh.on('peer:disconnected', (peerId) => {
-          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
-            this.callGoWasm('peerpigeonHandlePeerDisconnected', this.goWasmNodeId, peerId);
-            this.callGoWasm('peerpigeonSetConnectedPeers', this.goWasmNodeId, this.mesh.getConnectedPeers());
-            this.callGoWasm('peerpigeonSetDiscoveredPeers', this.goWasmNodeId, this.mesh.getDiscoveredPeers());
-            this.callGoWasm('peerpigeonSetGlobalPeers', this.goWasmNodeId, this.mesh.getGlobalPeers());
-          }
           this.addLog('disconnected', `Disconnected from peer`, peerId);
           this.updateStats();
           this.onMeshConnectionsChanged('peer:disconnected');
-        });
-
-        this.mesh.on('peer:data', ({ peerId, data }) => {
-          if (this.runtimeMode !== 'go-wasm' || this.goWasmNodeId == null) return;
-          const payload = this.toPeerDataUint8Array(data);
-          this.callGoWasm('peerpigeonHandlePeerData', this.goWasmNodeId, peerId, payload);
         });
 
         this.mesh.on('peer:error', ({ peerId, error }) => {
@@ -2685,19 +2364,12 @@ export default {
         });
 
         this.mesh.on('peer:discovered', (peerId) => {
-          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
-            this.callGoWasm('peerpigeonSetDiscoveredPeers', this.goWasmNodeId, this.mesh.getDiscoveredPeers());
-            this.callGoWasm('peerpigeonSetGlobalPeers', this.goWasmNodeId, this.mesh.getGlobalPeers());
-          }
           const self = String(this.mesh?.getClientId?.() || '').trim();
           const initiator = self && peerId ? self < peerId : false;
           this.addLog('info', `Dial role -> ${initiator ? 'initiator' : 'non-initiator(wait)'}`, peerId || 'debug');
         });
 
         this.mesh.on('mesh:membership', () => {
-          if (this.runtimeMode === 'go-wasm' && this.goWasmNodeId != null) {
-            this.callGoWasm('peerpigeonSetGlobalPeers', this.goWasmNodeId, this.mesh.getGlobalPeers());
-          }
           this.updateStats();
         });
 

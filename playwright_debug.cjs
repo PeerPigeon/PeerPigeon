@@ -22,8 +22,8 @@ const { chromium } = require('playwright');
     });
 
     try {
-        console.log('Navigating to http://localhost:5173/?autostart=1&runtime=go-wasm ...');
-        await page.goto('http://localhost:5173/?autostart=1&runtime=go-wasm', { timeout: 30000 });
+        console.log('Navigating to https://localhost:5173/?autostart=1 ...');
+        await page.goto('https://localhost:5173/?autostart=1', { timeout: 30000 });
         console.log('Page loaded, waiting 15 seconds for logs...');
         await new Promise(resolve => setTimeout(resolve, 15000));
     } catch (e) {

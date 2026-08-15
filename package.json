@@ -19,7 +19,6 @@
     "README.md"
   ],
   "scripts": {
-    "wasm:build": "node scripts/build-wasm.mjs",
     "freertc:sync": "node scripts/sync-freertc-head.mjs",
     "prebuild": "npm run freertc:sync",
     "predev": "npm run freertc:sync",
