@@ -95,10 +95,37 @@ var FreeRTCClientAdapter = class {
   get activeSignalUrl() {
     return this.signalUrls[0];
   }
+  emitConnectedIfNeeded(signalUrl = this.activeSignalUrl) {
+    const wasConnected = this.signalingConnected;
+    this.signalingConnected = true;
+    if (!wasConnected) {
+      this.emitter.emit("connected", {
+        clientId: this.requestedPeerId,
+        requestedClientId: this.requestedPeerId,
+        previousClientId: this.previousPeerId,
+        signalUrl
+      });
+    }
+    this.startSignalingHealthLoop();
+  }
+  ensureRegistrationRecoveryProbe(reason) {
+    if (this.recoveryProbeTimer || this.intentionallyDisconnected) return;
+    this.emitter.emit("signaling:log", {
+      message: `[signal] ${reason}: waiting for registration acknowledgement`
+    });
+    this.startRecoveryProbe(`${reason} registration`, true);
+  }
   connect() {
     this.intentionallyDisconnected = false;
     this.attachLifecycleListeners();
+    this.startSignalingHealthLoop();
     if (this.client) {
+      if (this.client.isRegistered) {
+        this.emitConnectedIfNeeded();
+        this.nudgeSignaling();
+        return;
+      }
+      this.ensureRegistrationRecoveryProbe("connect");
       this.client.connect?.();
       return;
     }
@@ -119,14 +146,7 @@ var FreeRTCClientAdapter = class {
       },
       onRegistered: () => {
         if (!isCurrentClient()) return;
-        this.signalingConnected = true;
-        this.emitter.emit("connected", {
-          clientId: this.requestedPeerId,
-          requestedClientId: this.requestedPeerId,
-          previousClientId: this.previousPeerId,
-          signalUrl
-        });
-        this.startSignalingHealthLoop();
+        this.emitConnectedIfNeeded(signalUrl);
         this.startRecoveryProbe("registration", false);
         nextClient?.requestBootstrap?.(Array.from(this.selfAliases));
       },
@@ -175,6 +195,7 @@ var FreeRTCClientAdapter = class {
     });
     this.client = nextClient;
     this.emitter.emit("signaling:log", { message: `[signal] trying relay ${signalUrl}` });
+    this.ensureRegistrationRecoveryProbe("initial connect");
     nextClient.connect();
   }
   disconnect() {
@@ -194,6 +215,8 @@ var FreeRTCClientAdapter = class {
     this.client = null;
     this.connectedPeers.clear();
     this.pendingTransportRestorePeerIds.clear();
+    this.recyclingSignalingTransport = false;
+    this.waitingForTransportClose = false;
     this.knownPeers.clear();
     this.knownPeerLastSeenAtMs.clear();
     this.joinedOnce = false;
@@ -246,6 +269,7 @@ var FreeRTCClientAdapter = class {
     }
     if (!this.client?.isRegistered) {
       this.emitter.emit("signaling:log", { message: `[signal] ${reason} recovery: reconnecting signaling` });
+      this.ensureRegistrationRecoveryProbe(reason);
       this.client?.connect?.();
       return true;
     }
@@ -326,7 +350,7 @@ var FreeRTCClientAdapter = class {
     this.emitter.emit("peers-updated", { peers: peerList });
   }
   handleConnectionState(data) {
-    if (this.recyclingSignalingTransport) return;
+    if (this.recyclingSignalingTransport || this.pendingTransportRestorePeerIds.size > 0) return;
     const peerId = this.normalizePeerId(data?.peerId);
     const state = String(data?.state ?? "").toLowerCase();
     if (!peerId || this.isSelfAlias(peerId)) {
@@ -451,6 +475,7 @@ var FreeRTCClientAdapter = class {
       if (this.intentionallyDisconnected || this.recyclingSignalingTransport || this.recoveryProbeTimer) return;
       if (typeof document !== "undefined" && document.hidden) return;
       if (!this.client?.isRegistered) {
+        this.ensureRegistrationRecoveryProbe("health check");
         this.client?.connect?.();
         return;
       }
@@ -497,19 +522,21 @@ var FreeRTCClientAdapter = class {
   resumeSameClientTransport() {
     if (!this.recyclingSignalingTransport || !this.waitingForTransportClose || this.intentionallyDisconnected) return;
     this.waitingForTransportClose = false;
+    this.recyclingSignalingTransport = false;
     this.clearSignalingReconnectTimer();
     this.emitter.emit("signaling:log", {
       message: "[signal] reconnecting stale transport with existing FreeRTC client"
     });
     try {
+      this.ensureRegistrationRecoveryProbe("transport reconnect");
       this.client?.connect?.();
     } catch (error) {
-      this.recyclingSignalingTransport = false;
+      this.clearRecoveryProbeTimer();
       this.emitter.emit("error", error);
     }
   }
   flushPendingTransportRestoreFailures() {
-    if (!this.recyclingSignalingTransport) return;
+    if (!this.recyclingSignalingTransport && this.pendingTransportRestorePeerIds.size === 0) return;
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
     this.clearSignalingReconnectTimer();
