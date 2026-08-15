@@ -3978,21 +3978,7 @@ export default {
 
       const knownRemotePeers = Math.max(0, knownPeers.size - 1);
       const reachableRemotePeers = Math.max(0, visited.size - 1);
-      let reachableEdges = 0;
-      for (const peerId of visited) {
-        for (const neighbor of adjacency.get(peerId) || []) {
-          if (visited.has(neighbor)) reachableEdges++;
-        }
-      }
-      reachableEdges /= 2;
-
-      const reachability = knownRemotePeers > 0 ? reachableRemotePeers / knownRemotePeers : 0;
-      // A fully connected tree (including Star) is exactly 100%: every peer is
-      // reachable, but there is no redundant gossip route. Extra live edges can
-      // raise the score above 100% only when the entire known graph is reachable.
-      const coverage = reachability >= 1
-        ? Math.max(1, reachableEdges / Math.max(1, knownRemotePeers))
-        : reachability;
+      const coverage = knownRemotePeers > 0 ? reachableRemotePeers / knownRemotePeers : 0;
       return {
         reachablePeers: reachableRemotePeers,
         knownPeers: knownRemotePeers,
@@ -4021,10 +4007,7 @@ export default {
       let quality = 'Poor';
       let statusType = 'connecting';
 
-      if (coverage >= 2) {
-        quality = 'Excellent';
-        statusType = 'success';
-      } else if (coverage >= 1) {
+      if (coverage >= 1) {
         quality = 'Good';
         statusType = 'success';
       } else if (coverage >= 0.5) {
