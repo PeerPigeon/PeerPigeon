@@ -65,7 +65,12 @@
             </button>
           </div>
 
-          <div class="status-field" :class="`status-${status.type}`" data-testid="status-message">
+          <div
+            v-if="!isRunning"
+            class="status-field"
+            :class="`status-${status.type}`"
+            data-testid="status-message"
+          >
             {{ status.message || 'Idle' }}
           </div>
         </div>
@@ -190,6 +195,16 @@
             :links="networkGraphModel.links"
             :activity-by-peer="networkGraphActivityByPeer"
           />
+          <div
+            class="network-graph-gossip-status"
+            :class="`gossip-state-${networkGossipState}`"
+            data-testid="status-message"
+            role="status"
+            aria-live="polite"
+          >
+            <FontAwesomeIcon :icon="icons.state" class="network-graph-gossip-icon" aria-hidden="true" />
+            <span>{{ status.message || 'Idle' }}</span>
+          </div>
         </div>
 
         <div class="workspace-tabs" v-if="isRunning">
@@ -553,6 +568,7 @@ import {
 import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome';
 import {
   faCommentDots,
+  faCircle,
   faDatabase,
   faEnvelope,
   faEye,
@@ -570,6 +586,7 @@ import PeerNetworkGraph from './components/PeerNetworkGraph.vue';
 import { canonicalPeerId } from './peer-id.js';
 
 const APP_ICONS = Object.freeze({
+  state: faCircle,
   message: faCommentDots,
   media: faFilm,
   storage: faDatabase,
@@ -870,6 +887,32 @@ export default {
     }
   },
   computed: {
+    networkGossipState() {
+      if (!this.isRunning) return 'grey';
+
+      const message = String(this.status?.message || '').toLowerCase();
+      const type = String(this.status?.type || '').toLowerCase();
+
+      if (
+        type === 'error'
+        || message.includes('offline')
+        || message.includes('poor')
+      ) {
+        return 'red';
+      }
+      if (
+        !this.signalingConnected
+        || type === 'connecting'
+        || type === 'info'
+        || message.includes('fair')
+        || message.includes('degraded')
+      ) {
+        return 'yellow';
+      }
+      if (type === 'success') return 'green';
+      return 'grey';
+    },
+
     networkGraphModel() {
       // Direct line state must use the same reactive peer IDs as the Connected
       // counter. Track the IDs, not only length, so same-count peer swaps repaint.
@@ -5621,6 +5664,53 @@ section {
   background:
     radial-gradient(circle at 18% 20%, rgba(255, 255, 255, 0.055), transparent 32%),
     radial-gradient(circle at 84% 78%, rgba(255, 255, 255, 0.035), transparent 35%);
+}
+
+.network-graph-gossip-status {
+  position: absolute;
+  right: 0.8rem;
+  bottom: 0.72rem;
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  width: max-content;
+  max-width: calc(100% - 1.6rem);
+  padding: 0.38rem 0.62rem;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  background: rgba(9, 9, 9, 0.76);
+  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.3);
+  color: #f8fafc;
+  font-size: 0.76rem;
+  font-weight: 700;
+  line-height: 1.2;
+  pointer-events: none;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.network-graph-gossip-icon {
+  width: 0.58rem;
+  height: 0.58rem;
+  flex: 0 0 auto;
+  filter: drop-shadow(0 0 4px currentColor);
+}
+
+.gossip-state-green .network-graph-gossip-icon {
+  color: #4ade80;
+}
+
+.gossip-state-yellow .network-graph-gossip-icon {
+  color: #facc15;
+}
+
+.gossip-state-red .network-graph-gossip-icon {
+  color: #f87171;
+}
+
+.gossip-state-grey .network-graph-gossip-icon {
+  color: #9ca3af;
 }
 
 .network-graph-svg {
