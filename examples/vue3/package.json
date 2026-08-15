@@ -8,9 +8,9 @@
     "predev:raw": "npm --prefix ../.. run freertc:sync",
     "prebuild": "npm --prefix ../.. run freertc:sync",
     "prepreview": "npm --prefix ../.. run freertc:sync && npm run build",
-    "dev": "npm --prefix ../.. run wasm:build && vite --host 0.0.0.0 --port 5173 --strictPort",
-    "dev:raw": "npm --prefix ../.. run wasm:build && vite --host 0.0.0.0 --strictPort",
-    "build": "npm --prefix ../.. run wasm:build && vite build",
+    "dev": "vite --host 0.0.0.0 --port 5173 --strictPort",
+    "dev:raw": "vite --host 0.0.0.0 --strictPort",
+    "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
