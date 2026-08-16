@@ -3,6 +3,7 @@ import { createSignalingClient, withdrawSignalingIdentity } from 'freertc/client
 type Handler = (...args: any[]) => void;
 
 const RECOVERY_PROBE_TIMEOUT_MS = 5_000;
+const ISOLATED_RELAY_PROBE_TIMEOUT_MS = 1_000;
 const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
 const DISCOVERY_ABSENCE_GRACE_MS = 30_000;
 const DISCOVERY_ACTIVE_MAX_AGE_MS = 18_000;
@@ -630,10 +631,20 @@ export class FreeRTCClientAdapter {
 
   private startRecoveryProbe(reason: string, recycleOnTimeout: boolean): void {
     this.clearRecoveryProbeTimer();
+    const timeoutMs = this.connectedPeers.size === 0 && this.recoveryRelayAttemptsRemaining > 0
+      ? ISOLATED_RELAY_PROBE_TIMEOUT_MS
+      : RECOVERY_PROBE_TIMEOUT_MS;
     this.recoveryProbeTimer = setTimeout(() => {
       this.recoveryProbeTimer = null;
       if (this.intentionallyDisconnected) return;
       if (typeof document !== 'undefined' && document.hidden) return;
+      if (
+        this.connectedPeers.size === 0
+        && this.recoveryRelayAttemptsRemaining > 0
+        && this.advanceToNextSignalingRelay(`${reason}: relay discovery timed out`)
+      ) {
+        return;
+      }
       if (recycleOnTimeout) {
         this.recycleStaleSignalingTransport(reason);
         return;
@@ -642,7 +653,7 @@ export class FreeRTCClientAdapter {
         message: `[signal] ${reason}: discovery stale; re-announcing without replacing FreeRTC`,
       });
       this.nudgeSignaling();
-    }, RECOVERY_PROBE_TIMEOUT_MS);
+    }, timeoutMs);
   }
 
   private startSignalingHealthLoop(): void {
