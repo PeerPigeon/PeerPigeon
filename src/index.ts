@@ -434,9 +434,10 @@ export class PartialMesh {
       autoConnect: config.autoConnect ?? true,
       // Prefer FreeRTC's richer built-in ICE profile by default.
       iceServers: config.iceServers ?? null,
-      // FreeRTC retries relayed offers for up to ~30s; keep this above that window
-      // so we do not abort otherwise-recoverable negotiations.
-      connectionTimeoutMs: config.connectionTimeoutMs ?? 45_000,
+      // FreeRTC exhausts an unanswered offer in 2.85s. A negotiation that has
+      // not opened its data channel after four seconds must release the slot so
+      // an isolated peer can immediately try another discovered candidate.
+      connectionTimeoutMs: config.connectionTimeoutMs ?? 4_000,
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 1_000,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
       nonInitiatorFallbackDialMs: 0,
@@ -1478,10 +1479,9 @@ export class PartialMesh {
     const connections = (this.signalingClient as any)?.client?.mesh?.connections;
     if (!connections || typeof connections.entries !== 'function') return;
 
-    // FreeRTC owns an outgoing offer for up to 30 seconds. Deleting its entry
-    // earlier discards the cached answer while its SDP dedup record remains,
-    // causing valid retransmitted offers to be ignored without a response.
-    const staleAfterMs = Math.max(32_000, this.config.connectionTimeoutMs);
+    // FreeRTC owns an outgoing offer for 2.85 seconds. Keep the orphan guard
+    // just beyond that bound, then release a half-open data channel promptly.
+    const staleAfterMs = Math.max(4_000, this.config.connectionTimeoutMs);
 
     for (const [rawPeerId, entry] of Array.from(connections.entries()) as Array<[string, any]>) {
       const peerId = this.normalizePeerId(rawPeerId);
@@ -1538,8 +1538,8 @@ export class PartialMesh {
     const now = Date.now();
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
-    // Never race FreeRTC's 30-second offer retry loop or its SDP dedup window.
-    const stallMs = Math.max(32_000, this.config.connectionTimeoutMs);
+    // Never race FreeRTC's 2.85-second offer retry loop.
+    const stallMs = Math.max(4_000, this.config.connectionTimeoutMs);
 
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
