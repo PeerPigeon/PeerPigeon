@@ -39,6 +39,7 @@ module.exports = __toCommonJS(index_exports);
 // src/freertc-client-adapter.ts
 var import_client = require("freertc/client");
 var RECOVERY_PROBE_TIMEOUT_MS = 5e3;
+var ISOLATED_RELAY_PROBE_TIMEOUT_MS = 1e3;
 var SIGNALING_HEALTH_INTERVAL_MS = 15e3;
 var DISCOVERY_ABSENCE_GRACE_MS = 3e4;
 var DISCOVERY_ACTIVE_MAX_AGE_MS = 18e3;
@@ -566,10 +567,14 @@ var FreeRTCClientAdapter = class {
   }
   startRecoveryProbe(reason, recycleOnTimeout) {
     this.clearRecoveryProbeTimer();
+    const timeoutMs = this.connectedPeers.size === 0 && this.recoveryRelayAttemptsRemaining > 0 ? ISOLATED_RELAY_PROBE_TIMEOUT_MS : RECOVERY_PROBE_TIMEOUT_MS;
     this.recoveryProbeTimer = setTimeout(() => {
       this.recoveryProbeTimer = null;
       if (this.intentionallyDisconnected) return;
       if (typeof document !== "undefined" && document.hidden) return;
+      if (this.connectedPeers.size === 0 && this.recoveryRelayAttemptsRemaining > 0 && this.advanceToNextSignalingRelay(`${reason}: relay discovery timed out`)) {
+        return;
+      }
       if (recycleOnTimeout) {
         this.recycleStaleSignalingTransport(reason);
         return;
@@ -578,7 +583,7 @@ var FreeRTCClientAdapter = class {
         message: `[signal] ${reason}: discovery stale; re-announcing without replacing FreeRTC`
       });
       this.nudgeSignaling();
-    }, RECOVERY_PROBE_TIMEOUT_MS);
+    }, timeoutMs);
   }
   startSignalingHealthLoop() {
     if (this.signalingHealthTimer) return;

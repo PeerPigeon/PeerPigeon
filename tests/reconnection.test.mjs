@@ -132,7 +132,7 @@ test('Vue-style proxying does not suppress FreeRTC registration callbacks', () =
   }
 });
 
-test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) => {
+test('adapter keeps socket retries in FreeRTC but abandons a silent relay', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const originalWebSocket = globalThis.WebSocket;
   const attempts = [];
@@ -184,7 +184,9 @@ test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) =
       socket.onclose?.({ code: 1006 });
     };
 
-    // FreeRTC owns every retry and its backoff on the original client.
+    // FreeRTC owns socket retries on the active relay. If registration remains
+    // silent for the isolated-relay deadline, the adapter advances instead of
+    // applying that retry sequence forever to one dead discovery endpoint.
     failLatestSocket();
     t.mock.timers.tick(0);
     assert.equal(attempts.length, 2);
@@ -196,9 +198,8 @@ test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) =
     assert.equal(attempts.length, 4);
     assert.match(attempts[0], /^wss:\/\/nearest\.example\/ws/);
     assert.match(attempts[1], /^wss:\/\/nearest\.example\/ws/);
-    assert.match(attempts[2], /^wss:\/\/nearest\.example\/ws/);
-    assert.match(attempts[3], /^wss:\/\/nearest\.example\/ws/);
-    assert.equal(attempts.some((url) => /^wss:\/\/next-nearest\.example\/ws/.test(url)), false);
+    assert.match(attempts[2], /^wss:\/\/next-nearest\.example\/ws/);
+    assert.match(attempts[3], /^wss:\/\/next-nearest\.example\/ws/);
   } finally {
     adapter.disconnect();
     globalThis.WebSocket = originalWebSocket;
@@ -282,6 +283,16 @@ test('an isolated restored tab immediately advances past an empty relay', (t) =>
     });
     assert.equal(sockets.length, 2);
     assert.deepEqual(activeSnapshots.at(-1), [remotePeerId]);
+
+    // A relay that acknowledges registration but never answers discovery is
+    // also abandoned promptly; it cannot consume the old five-second probe on
+    // every relay and strand a restored tab at Discovered 0.
+    adapter.recoverAfterInactivity('focus');
+    t.mock.timers.tick(999);
+    assert.equal(sockets.length, 2);
+    t.mock.timers.tick(1);
+    assert.equal(sockets.length, 3);
+    assert.match(sockets[2].url, /^wss:\/\/third-nearest\.example\/ws/);
   } finally {
     adapter.disconnect();
     globalThis.WebSocket = originalWebSocket;
