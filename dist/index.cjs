@@ -39,7 +39,6 @@ module.exports = __toCommonJS(index_exports);
 // src/freertc-client-adapter.ts
 var import_client = require("freertc/client");
 var RECOVERY_PROBE_TIMEOUT_MS = 5e3;
-var ISOLATED_RELAY_PROBE_TIMEOUT_MS = 1e3;
 var SIGNALING_HEALTH_INTERVAL_MS = 15e3;
 var DISCOVERY_ABSENCE_GRACE_MS = 3e4;
 var DISCOVERY_ACTIVE_MAX_AGE_MS = 18e3;
@@ -83,8 +82,6 @@ var FreeRTCClientAdapter = class {
     this.joinedOnce = false;
     this.intentionallyDisconnected = false;
     this.signalingConnected = false;
-    this.activeSignalUrlIndex = 0;
-    this.recoveryRelayAttemptsRemaining = 0;
     this.recoveryProbeTimer = null;
     this.signalingHealthTimer = null;
     this.lastBootstrapAtMs = 0;
@@ -114,7 +111,6 @@ var FreeRTCClientAdapter = class {
       throw new Error("At least one FreeRTC signaling relay is required");
     }
     this.signalUrls = normalizedSignalUrls;
-    this.recoveryRelayAttemptsRemaining = Math.max(0, normalizedSignalUrls.length - 1);
     this.networkId = options?.networkId ?? "default-session";
     this.roomId = options?.roomId ?? this.networkId;
     this.requestedPeerId = options?.peerId ?? generateMessageId(32);
@@ -135,7 +131,7 @@ var FreeRTCClientAdapter = class {
     this.emitter.on(event, handler);
   }
   get activeSignalUrl() {
-    return this.signalUrls[this.activeSignalUrlIndex] ?? this.signalUrls[0];
+    return this.signalUrls[0];
   }
   emitConnectedIfNeeded(signalUrl = this.activeSignalUrl) {
     const wasConnected = this.signalingConnected;
@@ -325,7 +321,6 @@ var FreeRTCClientAdapter = class {
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
     this.lastBootstrapAtMs = 0;
-    this.recoveryRelayAttemptsRemaining = Math.max(0, this.signalUrls.length - 1);
     this.client?.resetRecoveryBackoffs?.();
     this.emitter.emit("lifecycle:resume", { reason });
     for (const peerId of Array.from(this.connectedPeers)) {
@@ -408,8 +403,6 @@ var FreeRTCClientAdapter = class {
     const activeSnapshotPeers = new Set(
       normalizedCandidates.filter(({ advertisedAt }) => !Number.isFinite(advertisedAt) || now - advertisedAt <= DISCOVERY_ACTIVE_MAX_AGE_MS).map(({ peerId }) => peerId)
     );
-    const shouldTryNextRelay = activeSnapshotPeers.size === 0 && this.connectedPeers.size === 0 && this.recoveryRelayAttemptsRemaining > 0;
-    if (activeSnapshotPeers.size > 0) this.recoveryRelayAttemptsRemaining = 0;
     for (const peerId of snapshotPeers) this.knownPeerLastSeenAtMs.set(peerId, now);
     const nextPeers = new Set(snapshotPeers);
     for (const peerId of this.knownPeers) {
@@ -436,38 +429,6 @@ var FreeRTCClientAdapter = class {
       peers: peerList,
       activePeers: Array.from(activeSnapshotPeers)
     });
-    if (shouldTryNextRelay) {
-      this.advanceToNextSignalingRelay("empty discovery while isolated");
-    }
-  }
-  advanceToNextSignalingRelay(reason) {
-    if (this.intentionallyDisconnected || this.signalUrls.length < 2 || this.recoveryRelayAttemptsRemaining <= 0) {
-      return false;
-    }
-    const previousSignalUrl = this.activeSignalUrl;
-    this.recoveryRelayAttemptsRemaining -= 1;
-    this.activeSignalUrlIndex = (this.activeSignalUrlIndex + 1) % this.signalUrls.length;
-    const nextSignalUrl = this.activeSignalUrl;
-    const staleClient = this.client;
-    const wasConnected = this.signalingConnected;
-    this.clearRecoveryProbeTimer();
-    this.signalingConnected = false;
-    this.recyclingSignalingTransport = false;
-    this.waitingForTransportClose = false;
-    this.lastBootstrapAtMs = 0;
-    for (const peerId of this.connectedPeers) this.pendingTransportRestorePeerIds.add(peerId);
-    this.clientGeneration += 1;
-    this.client = null;
-    this.emitter.emit("signaling:log", {
-      message: `[signal] ${reason}: ${previousSignalUrl} returned no peers; trying ${nextSignalUrl} immediately`
-    });
-    try {
-      staleClient?.disconnect?.();
-    } catch {
-    }
-    if (wasConnected) this.emitter.emit("disconnected");
-    this.connect();
-    return true;
   }
   handleConnectionState(data) {
     if (this.recyclingSignalingTransport || this.pendingTransportRestorePeerIds.size > 0) return;
@@ -567,14 +528,10 @@ var FreeRTCClientAdapter = class {
   }
   startRecoveryProbe(reason, recycleOnTimeout) {
     this.clearRecoveryProbeTimer();
-    const timeoutMs = this.connectedPeers.size === 0 && this.recoveryRelayAttemptsRemaining > 0 ? ISOLATED_RELAY_PROBE_TIMEOUT_MS : RECOVERY_PROBE_TIMEOUT_MS;
     this.recoveryProbeTimer = setTimeout(() => {
       this.recoveryProbeTimer = null;
       if (this.intentionallyDisconnected) return;
       if (typeof document !== "undefined" && document.hidden) return;
-      if (this.connectedPeers.size === 0 && this.recoveryRelayAttemptsRemaining > 0 && this.advanceToNextSignalingRelay(`${reason}: relay discovery timed out`)) {
-        return;
-      }
       if (recycleOnTimeout) {
         this.recycleStaleSignalingTransport(reason);
         return;
@@ -583,7 +540,7 @@ var FreeRTCClientAdapter = class {
         message: `[signal] ${reason}: discovery stale; re-announcing without replacing FreeRTC`
       });
       this.nudgeSignaling();
-    }, timeoutMs);
+    }, RECOVERY_PROBE_TIMEOUT_MS);
   }
   startSignalingHealthLoop() {
     if (this.signalingHealthTimer) return;
@@ -4352,7 +4309,7 @@ var PartialMesh = class {
       fallbackServers: signalingCandidates,
       limit: DEFAULT_CLOSE_SIGNALING_RELAY_COUNT
     }) : [this.normalizeSignalingUrl(this.config.signalingServer)];
-    this.rememberBrowserPeerSignalUrls(signalingUrls);
+    this.rememberBrowserPeerSignalUrls(signalingUrls.slice(0, 1));
     this.emit("signaling:log", {
       message: `[signal] close federated relays ${signalingUrls.join(" -> ")}`
     });

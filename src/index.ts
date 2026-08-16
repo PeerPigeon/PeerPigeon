@@ -1148,7 +1148,8 @@ export class PartialMesh {
     this.clientId = requestedPeerId;
     this.addSelfAlias(requestedPeerId);
     this.emit('identity:ready', { clientId: requestedPeerId });
-    // Query one bootstrap, then try only the closest relays, one at a time.
+    // Query one bootstrap and select the closest relay. That relay owns the
+    // client connection; FreeRTC's Kademlia overlay federates discovery.
     const signalingUrls = this.config.automaticSignalingServer
       ? await discoverClosestSignalingServers({
         bootstrapServer: this.config.signalingServer,
@@ -1157,10 +1158,8 @@ export class PartialMesh {
         limit: DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
       })
       : [this.normalizeSignalingUrl(this.config.signalingServer)];
-    // Recovery can move the same identity through this bounded relay set.
-    // Remember every possible relay so a same-tab reload withdraws any prior
-    // announcement instead of leaving a ghost on the relay used before sleep.
-    this.rememberBrowserPeerSignalUrls(signalingUrls);
+    // Only the selected relay receives this identity announcement.
+    this.rememberBrowserPeerSignalUrls(signalingUrls.slice(0, 1));
     this.emit('signaling:log', {
       message: `[signal] close federated relays ${signalingUrls.join(' -> ')}`,
     });

@@ -132,7 +132,7 @@ test('Vue-style proxying does not suppress FreeRTC registration callbacks', () =
   }
 });
 
-test('adapter keeps socket retries in FreeRTC but abandons a silent relay', (t) => {
+test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const originalWebSocket = globalThis.WebSocket;
   const attempts = [];
@@ -184,9 +184,7 @@ test('adapter keeps socket retries in FreeRTC but abandons a silent relay', (t) 
       socket.onclose?.({ code: 1006 });
     };
 
-    // FreeRTC owns socket retries on the active relay. If registration remains
-    // silent for the isolated-relay deadline, the adapter advances instead of
-    // applying that retry sequence forever to one dead discovery endpoint.
+    // FreeRTC owns every retry and its backoff on the selected federated relay.
     failLatestSocket();
     t.mock.timers.tick(0);
     assert.equal(attempts.length, 2);
@@ -198,101 +196,9 @@ test('adapter keeps socket retries in FreeRTC but abandons a silent relay', (t) 
     assert.equal(attempts.length, 4);
     assert.match(attempts[0], /^wss:\/\/nearest\.example\/ws/);
     assert.match(attempts[1], /^wss:\/\/nearest\.example\/ws/);
-    assert.match(attempts[2], /^wss:\/\/next-nearest\.example\/ws/);
-    assert.match(attempts[3], /^wss:\/\/next-nearest\.example\/ws/);
-  } finally {
-    adapter.disconnect();
-    globalThis.WebSocket = originalWebSocket;
-  }
-});
-
-test('an isolated restored tab immediately advances past an empty relay', (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
-  const originalWebSocket = globalThis.WebSocket;
-  const sockets = [];
-
-  class DiscoveryWebSocket {
-    static CONNECTING = 0;
-    static OPEN = 1;
-    static CLOSING = 2;
-    static CLOSED = 3;
-
-    constructor(url) {
-      this.url = String(url);
-      this.readyState = DiscoveryWebSocket.CONNECTING;
-      this.sent = [];
-      sockets.push(this);
-    }
-
-    send(value) {
-      this.sent.push(JSON.parse(value));
-    }
-
-    open() {
-      this.readyState = DiscoveryWebSocket.OPEN;
-      this.onopen?.();
-    }
-
-    receive(message) {
-      this.onmessage?.({ data: JSON.stringify(message) });
-    }
-
-    close(code = 1000) {
-      this.readyState = DiscoveryWebSocket.CLOSED;
-      this.onclose?.({ code });
-    }
-  }
-
-  globalThis.WebSocket = DiscoveryWebSocket;
-  const selfPeerId = '1'.repeat(64);
-  const remotePeerId = '2'.repeat(64);
-  const adapter = new FreeRTCClientAdapter([
-    'wss://nearest.example/ws',
-    'wss://next-nearest.example/ws',
-    'wss://third-nearest.example/ws',
-  ], { peerId: selfPeerId });
-  const activeSnapshots = [];
-  adapter.on('peers-updated', ({ activePeers }) => activeSnapshots.push(activePeers));
-
-  try {
-    adapter.connect();
-    const firstSocket = sockets[0];
-    firstSocket.open();
-    firstSocket.receive({ type: 'ack', body: { status: 'ok' } });
-    firstSocket.receive({
-      type: 'peer_list',
-      body: { peers: [{ peer_id: remotePeerId, timestamp: Date.now() }] },
-    });
-    assert.equal(sockets.length, 1);
-
-    adapter.recoverAfterInactivity('pageshow');
-    firstSocket.receive({ type: 'peer_list', body: { peers: [] } });
-
-    // No backoff or timer tick: the empty active snapshot replaces the stale
-    // signaling client with the next closest relay in the same task.
-    assert.equal(sockets.length, 2);
-    assert.match(sockets[1].url, /^wss:\/\/next-nearest\.example\/ws/);
-    assert.deepEqual(activeSnapshots.at(-1), []);
-
-    const secondSocket = sockets[1];
-    secondSocket.open();
-    secondSocket.receive({ type: 'ack', body: { status: 'ok' } });
-    secondSocket.receive({
-      type: 'peer_list',
-      body: { peers: [{ peer_id: remotePeerId, timestamp: Date.now() }] },
-    });
-    assert.equal(sockets.length, 2);
-    assert.deepEqual(activeSnapshots.at(-1), [remotePeerId]);
-
-    // A relay that acknowledges registration but never answers discovery is
-    // also abandoned promptly; it cannot consume the old five-second probe on
-    // every relay and strand a restored tab at Discovered 0.
-    adapter.recoverAfterInactivity('focus');
-    t.mock.timers.tick(999);
-    assert.equal(sockets.length, 2);
-    t.mock.timers.tick(1);
-    assert.equal(sockets.length, 3);
-    assert.match(sockets[2].url, /^wss:\/\/third-nearest\.example\/ws/);
+    assert.match(attempts[2], /^wss:\/\/nearest\.example\/ws/);
+    assert.match(attempts[3], /^wss:\/\/nearest\.example\/ws/);
+    assert.equal(attempts.some((url) => /^wss:\/\/next-nearest\.example\/ws/.test(url)), false);
   } finally {
     adapter.disconnect();
     globalThis.WebSocket = originalWebSocket;
