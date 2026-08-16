@@ -3,7 +3,6 @@ import { createSignalingClient, withdrawSignalingIdentity } from 'freertc/client
 type Handler = (...args: any[]) => void;
 
 const RECOVERY_PROBE_TIMEOUT_MS = 5_000;
-const RECOVERY_PROBE_THROTTLE_MS = 1_500;
 const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
 const DISCOVERY_ABSENCE_GRACE_MS = 30_000;
 const DISCOVERY_ACTIVE_MAX_AGE_MS = 18_000;
@@ -66,7 +65,6 @@ export class FreeRTCClientAdapter {
   private signalingConnected = false;
   private recoveryProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private signalingHealthTimer: ReturnType<typeof setInterval> | null = null;
-  private lastRecoveryProbeAtMs = 0;
   private lastBootstrapAtMs = 0;
   private recyclingSignalingTransport = false;
   private waitingForTransportClose = false;
@@ -333,9 +331,15 @@ export class FreeRTCClientAdapter {
   recoverAfterInactivity(reason = 'resume'): boolean {
     if (this.intentionallyDisconnected) return false;
 
-    const now = Date.now();
-    if (now - this.lastRecoveryProbeAtMs < RECOVERY_PROBE_THROTTLE_MS) return false;
-    this.lastRecoveryProbeAtMs = now;
+    // A suspended browser can wake after every prior deadline has expired.
+    // Clear all recovery guards and retry delays before inspecting transports.
+    this.clearRecoveryProbeTimer();
+    this.recoveringPeerIds.clear();
+    this.pendingTransportRestorePeerIds.clear();
+    this.recyclingSignalingTransport = false;
+    this.waitingForTransportClose = false;
+    this.lastBootstrapAtMs = 0;
+    this.client?.resetRecoveryBackoffs?.();
     // Notify PartialMesh so it can reset stale-age baselines. FreeRTC retains
     // ownership of restoration; this event must not trigger immediate redials.
     this.emitter.emit('lifecycle:resume', { reason });

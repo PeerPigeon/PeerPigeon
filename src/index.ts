@@ -1435,9 +1435,15 @@ export class PartialMesh {
 
   private recoverMeshAfterInactivity(reason: string): void {
     const now = Date.now();
-    // Lifecycle recovery must not restart connection-age clocks or introduce a
-    // grace period. Revalidate immediately while preserving FreeRTC's existing
-    // negotiation failure deadline.
+    // A thaw is a new recovery opportunity. No failure, dial, discovery, or
+    // rebalance backoff from before suspension may delay it. Active negotiation
+    // age remains intact so a permanently stuck transport still reaches its
+    // safety deadline.
+    this.dialFailureCount.clear();
+    this.dialBackoffUntilMs.clear();
+    this.rebalanceAttemptAtMs.clear();
+    this.rebalanceCooldownUntilMs = 0;
+    this.lastUnderConnectedRecoveryAtMs = 0;
     this.lastDiscoveryRefreshAtMs = 0;
     this.underConnectedSinceMs = null;
 
