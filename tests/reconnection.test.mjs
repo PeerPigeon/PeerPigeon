@@ -205,6 +205,46 @@ test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) =
   }
 });
 
+test('resume clears every adapter and FreeRTC recovery backoff immediately', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  let resets = 0;
+  let discoveryRequests = 0;
+  adapter.client = {
+    isRegistered: true,
+    mesh: { connections: new Map() },
+    resetRecoveryBackoffs() { resets += 1; },
+    advertise() {},
+    requestBootstrap() { discoveryRequests += 1; },
+    disconnect() {},
+  };
+  adapter.recoveringPeerIds.add('2'.repeat(64));
+  adapter.pendingTransportRestorePeerIds.add('3'.repeat(64));
+  adapter.recyclingSignalingTransport = true;
+  adapter.waitingForTransportClose = true;
+  adapter.lastBootstrapAtMs = Date.now();
+
+  try {
+    assert.equal(adapter.recoverAfterInactivity('resume'), true);
+    assert.equal(resets, 1);
+    assert.equal(discoveryRequests, 1);
+    assert.equal(adapter.recoveringPeerIds.size, 0);
+    assert.equal(adapter.pendingTransportRestorePeerIds.size, 0);
+    assert.equal(adapter.recyclingSignalingTransport, false);
+    assert.equal(adapter.waitingForTransportClose, false);
+    assert.equal(adapter.lastBootstrapAtMs, 0);
+
+    // Focus/pageshow events in the same thaw are not blocked by an old throttle.
+    assert.equal(adapter.recoverAfterInactivity('focus'), true);
+    assert.equal(resets, 2);
+    assert.equal(discoveryRequests, 2);
+  } finally {
+    adapter.disconnect();
+  }
+});
+
 test('a failed transport is released and redialed immediately even with another healthy edge', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const peerId = '2'.repeat(64);

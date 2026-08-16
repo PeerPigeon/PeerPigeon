@@ -1,7 +1,6 @@
 // src/freertc-client-adapter.ts
 import { createSignalingClient, withdrawSignalingIdentity } from "freertc/client";
 var RECOVERY_PROBE_TIMEOUT_MS = 5e3;
-var RECOVERY_PROBE_THROTTLE_MS = 1500;
 var SIGNALING_HEALTH_INTERVAL_MS = 15e3;
 var DISCOVERY_ABSENCE_GRACE_MS = 3e4;
 var DISCOVERY_ACTIVE_MAX_AGE_MS = 18e3;
@@ -47,7 +46,6 @@ var FreeRTCClientAdapter = class {
     this.signalingConnected = false;
     this.recoveryProbeTimer = null;
     this.signalingHealthTimer = null;
-    this.lastRecoveryProbeAtMs = 0;
     this.lastBootstrapAtMs = 0;
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
@@ -279,9 +277,13 @@ var FreeRTCClientAdapter = class {
    */
   recoverAfterInactivity(reason = "resume") {
     if (this.intentionallyDisconnected) return false;
-    const now = Date.now();
-    if (now - this.lastRecoveryProbeAtMs < RECOVERY_PROBE_THROTTLE_MS) return false;
-    this.lastRecoveryProbeAtMs = now;
+    this.clearRecoveryProbeTimer();
+    this.recoveringPeerIds.clear();
+    this.pendingTransportRestorePeerIds.clear();
+    this.recyclingSignalingTransport = false;
+    this.waitingForTransportClose = false;
+    this.lastBootstrapAtMs = 0;
+    this.client?.resetRecoveryBackoffs?.();
     this.emitter.emit("lifecycle:resume", { reason });
     for (const peerId of Array.from(this.connectedPeers)) {
       const entry = this.client?.mesh?.connections?.get?.(peerId);
@@ -4499,6 +4501,11 @@ var PartialMesh = class {
   }
   recoverMeshAfterInactivity(reason) {
     const now = Date.now();
+    this.dialFailureCount.clear();
+    this.dialBackoffUntilMs.clear();
+    this.rebalanceAttemptAtMs.clear();
+    this.rebalanceCooldownUntilMs = 0;
+    this.lastUnderConnectedRecoveryAtMs = 0;
     this.lastDiscoveryRefreshAtMs = 0;
     this.underConnectedSinceMs = null;
     try {

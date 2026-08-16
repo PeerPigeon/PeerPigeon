@@ -883,7 +883,7 @@ test('repeated signaling cannot keep an isolated orphan negotiation alive foreve
   }
 });
 
-test('resume revalidates immediately without resetting an active negotiation deadline', () => {
+test('resume clears every recovery backoff without resetting an active negotiation deadline', () => {
   const self = '0'.repeat(63) + '1';
   const target = '0'.repeat(63) + '2';
   const connections = new Map([[target, {
@@ -906,7 +906,12 @@ test('resume revalidates immediately without resetting an active negotiation dea
     mesh.selfAliases.add(self);
     mesh.discoveredPeers.add(target);
     mesh.connectionStartedAtMs.set(target, originalStartedAt);
+    mesh.dialFailureCount.set(target, 4);
     mesh.dialBackoffUntilMs.set(target, Date.now() + 30_000);
+    mesh.rebalanceAttemptAtMs.set(target, Date.now());
+    mesh.rebalanceCooldownUntilMs = Date.now() + 30_000;
+    mesh.lastUnderConnectedRecoveryAtMs = Date.now();
+    mesh.lastDiscoveryRefreshAtMs = Date.now();
     mesh.signalingClient = {
       isConnected: () => true,
       recoverAfterInactivity: () => false,
@@ -930,6 +935,11 @@ test('resume revalidates immediately without resetting an active negotiation dea
     assert.deepEqual(dials, []);
     assert.equal(mesh.connecting.has(target), false);
     assert.equal(mesh.connectionStartedAtMs.get(target), originalStartedAt);
+    assert.equal(mesh.dialFailureCount.size, 0);
+    assert.equal(mesh.dialBackoffUntilMs.size, 0);
+    assert.equal(mesh.rebalanceAttemptAtMs.size, 0);
+    assert.equal(mesh.rebalanceCooldownUntilMs, 0);
+    assert.equal(mesh.lastUnderConnectedRecoveryAtMs, 0);
   } finally {
     mesh.destroy();
   }
