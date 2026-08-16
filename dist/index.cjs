@@ -3749,9 +3749,10 @@ var PartialMesh = class {
       autoConnect: config.autoConnect ?? true,
       // Prefer FreeRTC's richer built-in ICE profile by default.
       iceServers: config.iceServers ?? null,
-      // FreeRTC retries relayed offers for up to ~30s; keep this above that window
-      // so we do not abort otherwise-recoverable negotiations.
-      connectionTimeoutMs: config.connectionTimeoutMs ?? 45e3,
+      // FreeRTC exhausts an unanswered offer in 2.85s. A negotiation that has
+      // not opened its data channel after four seconds must release the slot so
+      // an isolated peer can immediately try another discovered candidate.
+      connectionTimeoutMs: config.connectionTimeoutMs ?? 4e3,
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 1e3,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
       nonInitiatorFallbackDialMs: 0,
@@ -4575,7 +4576,7 @@ var PartialMesh = class {
   recoverOrphanedRtcNegotiations(now = Date.now()) {
     const connections = this.signalingClient?.client?.mesh?.connections;
     if (!connections || typeof connections.entries !== "function") return;
-    const staleAfterMs = Math.max(32e3, this.config.connectionTimeoutMs);
+    const staleAfterMs = Math.max(4e3, this.config.connectionTimeoutMs);
     for (const [rawPeerId, entry] of Array.from(connections.entries())) {
       const peerId = this.normalizePeerId(rawPeerId);
       if (!peerId) continue;
@@ -4621,7 +4622,7 @@ var PartialMesh = class {
     const now = Date.now();
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
-    const stallMs = Math.max(32e3, this.config.connectionTimeoutMs);
+    const stallMs = Math.max(4e3, this.config.connectionTimeoutMs);
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
       const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;

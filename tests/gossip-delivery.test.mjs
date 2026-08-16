@@ -791,6 +791,45 @@ test('tolerantPeers is a real temporary connected-plus-pending overflow budget',
   }
 });
 
+test('the default negotiation timeout releases an isolated slot after four seconds', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  const errors = [];
+  const closed = [];
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.discoveredPeers.add(target);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      initiateConnection: () => new Promise(() => {}),
+      closeConnection(peerId) { closed.push(peerId); },
+      disconnect() {},
+      client: { mesh: { connections: new Map() } },
+    };
+    mesh.on('peer:error', ({ peerId, error }) => errors.push({ peerId, message: error.message }));
+
+    mesh.connectToPeer(target);
+    t.mock.timers.tick(3_999);
+    assert.equal(errors.length, 0);
+    t.mock.timers.tick(1);
+
+    assert.deepEqual(errors, [{ peerId: target, message: 'Connection timeout' }]);
+    assert.deepEqual(closed, [target]);
+    assert.equal(mesh.connecting.has(target), false);
+  } finally {
+    mesh.destroy();
+  }
+});
+
 test('an isolated mesh redials an orphan only after FreeRTC exhausts offer recovery', () => {
   const self = '0'.repeat(63) + '1';
   const target = '0'.repeat(63) + '2';
