@@ -92,6 +92,60 @@ test('PartialMesh defaults to automatic discovery but preserves explicit manual 
   assert.deepEqual(manualConfig.signalingServers, [manualUrl]);
 });
 
+test('a same-tab reload rotates and retires its previous peer identity', () => {
+  const originalWindow = globalThis.window;
+  const values = new Map();
+  let navigationType = 'navigate';
+  const sessionStorage = {
+    getItem(key) { return values.get(key) ?? null; },
+    setItem(key, value) { values.set(key, String(value)); },
+  };
+  globalThis.window = {
+    crypto: globalThis.crypto,
+    sessionStorage,
+    performance: {
+      getEntriesByType(type) {
+        return type === 'navigation' ? [{ type: navigationType }] : [];
+      },
+    },
+  };
+
+  try {
+    const options = { networkId: 'identity-test', sessionId: 'identity-test' };
+    const firstMesh = new PartialMesh(options);
+    const first = firstMesh.loadOrCreateBrowserPeerId(['wss://relay.example/ws']);
+    firstMesh.rememberBrowserPeerSignalUrls(['wss://first-relay.example/ws']);
+
+    navigationType = 'reload';
+    const reloadedMesh = new PartialMesh(options);
+    const reloaded = reloadedMesh.loadOrCreateBrowserPeerId(['wss://relay.example/ws']);
+    assert.notEqual(reloaded.requestedPeerId, first.requestedPeerId);
+    assert.equal(reloaded.previousPeerId, first.requestedPeerId);
+    assert.equal(reloaded.retiredPeerIds.includes(first.requestedPeerId), true);
+    assert.deepEqual(reloaded.previousPeerSignalUrls, ['wss://first-relay.example/ws']);
+    reloadedMesh.rememberBrowserPeerSignalUrls(['wss://second-relay.example/ws']);
+
+    const reloadedAgainMesh = new PartialMesh(options);
+    const reloadedAgain = reloadedAgainMesh.loadOrCreateBrowserPeerId(['wss://relay.example/ws']);
+    assert.notEqual(reloadedAgain.requestedPeerId, reloaded.requestedPeerId);
+    assert.equal(reloadedAgain.previousPeerId, reloaded.requestedPeerId);
+    assert.deepEqual(reloadedAgain.previousPeerSignalUrls, ['wss://second-relay.example/ws']);
+    assert.equal(reloadedAgain.retiredPeerIds.includes(first.requestedPeerId), true);
+    assert.equal(reloadedAgain.retiredPeerIds.includes(reloaded.requestedPeerId), true);
+
+    navigationType = 'navigate';
+    const separatelyOpenedMesh = new PartialMesh(options);
+    const separatelyOpened = separatelyOpenedMesh.loadOrCreateBrowserPeerId(['wss://relay.example/ws']);
+    assert.notEqual(separatelyOpened.requestedPeerId, reloadedAgain.requestedPeerId);
+    assert.equal(separatelyOpened.previousPeerId, null);
+    assert.equal(separatelyOpened.retiredPeerIds.includes(first.requestedPeerId), true);
+    assert.equal(separatelyOpened.retiredPeerIds.includes(reloadedAgain.requestedPeerId), false);
+  } finally {
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  }
+});
+
 test('local peer identity is ready before automatic relay discovery completes', async () => {
   const originalFetch = globalThis.fetch;
   const originalWebSocket = globalThis.WebSocket;

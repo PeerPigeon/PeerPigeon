@@ -4,6 +4,7 @@ import type {
   CecrConfigSnapshot,
   CecrStateSnapshot,
   DirectMessage,
+  GossipAggregateDeliveryStatus,
   GossipBroadcastOptions,
   GossipDeliveryStatus,
   GossipMessage,
@@ -12,6 +13,7 @@ import type {
 import { PeerPigeonStorage } from './storage.js';
 import type { StorageOptions } from './storage.js';
 import { PeerPigeonCryptoProtocol } from './crypto.js';
+export { sha1Hex } from './sha1.js';
 import type {
   PeerPigeonCryptoOptions,
   PeerPigeonKeyPair,
@@ -26,7 +28,6 @@ export const DEFAULT_SIGNALING_SERVERS = Object.freeze([
 ]);
 
 export const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
-const FREERTC_RESTORE_GRACE_MS = 11_000;
 
 function canonicalSignalingUrl(value: string): string | null {
   try {
@@ -232,11 +233,7 @@ export interface PartialMeshConfig {
    */
   underConnectedResetMs?: number;
 
-  /**
-   * Optional fallback for environments where asymmetric discovery can stall.
-   * When set (>0), non-initiators may place a delayed assist dial if no inbound
-   * negotiation appears within this window.
-   */
+  /** @deprecated Offers are immediate from either side; retained for API compatibility. */
   nonInitiatorFallbackDialMs?: number;
 
   /**
@@ -385,6 +382,8 @@ export class PartialMesh {
   private orphanRtcFirstSeenAtMs: Map<string, number> = new Map();
   private peerConnectedAtMs: Map<string, number> = new Map();
   private discoveredAtMs: Map<string, number> = new Map();
+  /** Peers present in the relay's latest un-graced discovery snapshot. */
+  private activeSignalingPeers: Set<string> = new Set();
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
   private membershipTimer: ReturnType<typeof setInterval> | null = null;
   private underConnectedSinceMs: number | null = null;
@@ -392,10 +391,8 @@ export class PartialMesh {
   private lastUnderConnectedRecoveryAtMs: number = 0;
   private lastDiscoveryRefreshAtMs: number = 0;
   private lastSignalingReconnectAtMs: number = 0;
-  private restoreGraceUntilMs: number = 0;
   private dialFailureCount: Map<string, number> = new Map();
   private dialBackoffUntilMs: Map<string, number> = new Map();
-  private nonInitiatorFallbackTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private rebalanceCooldownUntilMs: number = 0;
   private rebalanceAttemptAtMs: Map<string, number> = new Map();
   private pendingRebalanceDropByTarget: Map<string, string> = new Map();
@@ -442,7 +439,7 @@ export class PartialMesh {
       connectionTimeoutMs: config.connectionTimeoutMs ?? 45_000,
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 1_000,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
-      nonInitiatorFallbackDialMs: config.nonInitiatorFallbackDialMs ?? 2_500,
+      nonInitiatorFallbackDialMs: 0,
       peerStateMaxAgeMs: config.peerStateMaxAgeMs ?? 60_000,
       trickleIce: config.trickleIce ?? true,
       membershipLeaseMs: config.membershipLeaseMs ?? 30_000,
@@ -538,6 +535,7 @@ export class PartialMesh {
     if (!id) return;
     this.selfAliases.add(id);
     this.discoveredPeers.delete(id);
+    this.activeSignalingPeers.delete(id);
     this.globalPeers.delete(id);
     this.membershipRecordsById.delete(id);
     this.membershipEquivocationAtById.delete(id);
@@ -559,12 +557,18 @@ export class PartialMesh {
     this.emit('mesh:graph', this.getGraphSnapshot());
   }
 
-  private rotateBrowserPeerId(signalingUrls: string[]): { requestedPeerId: string; previousPeerId: string | null; retiredPeerIds: string[] } {
-    const requestedPeerId = Array.from(
+  private loadOrCreateBrowserPeerId(signalingUrls: string[]): {
+    requestedPeerId: string;
+    previousPeerId: string | null;
+    previousPeerSignalUrls: string[];
+    retiredPeerIds: string[];
+  } {
+    let requestedPeerId = Array.from(
       (globalThis.window?.crypto ?? globalThis.crypto).getRandomValues(new Uint8Array(32)),
       (value) => value.toString(16).padStart(2, '0')
     ).join('');
     let previousPeerId: string | null = null;
+    let previousPeerSignalUrls: string[] = [];
     let retiredPeerIds: string[] = [];
 
     try {
@@ -575,7 +579,39 @@ export class PartialMesh {
         // manufacture a new peer merely because the relay origin changed.
         const key = `peerpigeon:previous-peer-id:federated:${this.config.networkId}:${this.config.sessionId}`;
         const retiredKey = `${key}:retired`;
-        previousPeerId = this.normalizePeerId(storage.getItem(key)) || null;
+        const storedPeerId = this.normalizePeerId(storage.getItem(key)) || null;
+        const navigationEntry = globalThis.window?.performance
+          ?.getEntriesByType?.('navigation')?.[0] as PerformanceNavigationTiming | undefined;
+        const navigationType = navigationEntry?.type;
+        const isSameTabReturn = navigationType === 'reload' || navigationType === 'back_forward';
+
+        // Every document gets a fresh identity. On a same-tab reload/return,
+        // the stored identity is ours to withdraw again in case the departing
+        // document's unload handler was interrupted. A duplicated tab also
+        // clones sessionStorage, so ordinary navigations must not withdraw the
+        // still-live source tab's identity.
+        if (storedPeerId && isSameTabReturn) {
+          previousPeerId = storedPeerId;
+          try {
+            const storedSignalUrls = JSON.parse(storage.getItem(`${key}:relays`) || '[]');
+            if (Array.isArray(storedSignalUrls)) {
+              previousPeerSignalUrls = Array.from(new Set(
+                storedSignalUrls
+                  .map((url) => canonicalSignalingUrl(String(url || '')))
+                  .filter((url): url is string => Boolean(url))
+              ));
+            }
+          } catch {
+            previousPeerSignalUrls = [];
+          }
+          if (previousPeerSignalUrls.length === 0) {
+            previousPeerSignalUrls = Array.from(new Set(
+              signalingUrls
+                .map((url) => canonicalSignalingUrl(url))
+                .filter((url): url is string => Boolean(url))
+            ));
+          }
+        }
         try {
           const storedRetired = JSON.parse(storage.getItem(retiredKey) || '[]');
           if (Array.isArray(storedRetired)) {
@@ -584,8 +620,8 @@ export class PartialMesh {
         } catch {
           retiredPeerIds = [];
         }
-        // Import old relay-scoped identities once so deployments upgraded from
-        // single-server mode withdraw every identity they may have announced.
+        // Import old relay-scoped identities once so upgraded deployments keep
+        // excluding identities that may still be visible during lease expiry.
         for (const signalingUrl of signalingUrls) {
           const relayScope = new URL(signalingUrl).origin;
           const legacyKey = `peerpigeon:previous-peer-id:${relayScope}:${this.config.networkId}:${this.config.sessionId}`;
@@ -607,7 +643,23 @@ export class PartialMesh {
       // sessionStorage can be unavailable in privacy-restricted contexts.
     }
 
-    return { requestedPeerId, previousPeerId, retiredPeerIds };
+    return { requestedPeerId, previousPeerId, previousPeerSignalUrls, retiredPeerIds };
+  }
+
+  private rememberBrowserPeerSignalUrls(signalingUrls: string[]): void {
+    try {
+      const storage = globalThis.window?.sessionStorage;
+      if (!storage) return;
+      const key = `peerpigeon:previous-peer-id:federated:${this.config.networkId}:${this.config.sessionId}:relays`;
+      const normalized = Array.from(new Set(
+        signalingUrls
+          .map((url) => canonicalSignalingUrl(url))
+          .filter((url): url is string => Boolean(url))
+      ));
+      storage.setItem(key, JSON.stringify(normalized));
+    } catch {
+      // sessionStorage can be unavailable in privacy-restricted contexts.
+    }
   }
 
   private retirePeerId(peerId: string): boolean {
@@ -616,6 +668,7 @@ export class PartialMesh {
     this.retiredPeerIds.add(id);
     this.selfAliases.add(id);
     const removedDiscovered = this.discoveredPeers.delete(id);
+    this.activeSignalingPeers.delete(id);
     const removedGlobal = this.globalPeers.delete(id);
     const removedMembership = this.membershipRecordsById.delete(id);
     this.membershipEquivocationAtById.delete(id);
@@ -633,12 +686,35 @@ export class PartialMesh {
     return changed;
   }
 
-  private reconcileSignalingPeers(rawPeerIds: string[]): void {
+  private reconcileSignalingPeers(rawPeerIds: string[], rawActivePeerIds?: string[]): void {
+    const previousActiveSignalingPeers = new Set(this.activeSignalingPeers);
     const nextPeers = new Set(
       rawPeerIds
         .map((peerId) => this.normalizePeerId(peerId))
         .filter((peerId) => peerId && !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId))
     );
+
+    if (Array.isArray(rawActivePeerIds)) {
+      const nextActiveSignalingPeers = new Set(
+        rawActivePeerIds
+          .map((peerId) => this.normalizePeerId(peerId))
+          .filter((peerId) => nextPeers.has(peerId))
+      );
+      // Empty snapshots can occur briefly while federation converges after a
+      // re-announcement. Retain the last non-empty current set until the grace
+      // list itself expires, but accept any non-empty snapshot immediately.
+      if (nextActiveSignalingPeers.size > 0 || nextPeers.size === 0) {
+        this.activeSignalingPeers = nextActiveSignalingPeers;
+      } else {
+        this.activeSignalingPeers = new Set(
+          Array.from(this.activeSignalingPeers).filter((peerId) => nextPeers.has(peerId))
+        );
+      }
+    } else {
+      this.activeSignalingPeers = new Set(
+        Array.from(this.activeSignalingPeers).filter((peerId) => nextPeers.has(peerId))
+      );
+    }
 
     for (const peerId of Array.from(this.discoveredPeers)) {
       if (!nextPeers.has(peerId)) {
@@ -647,6 +723,48 @@ export class PartialMesh {
       }
     }
     for (const peerId of nextPeers) this.addDiscoveredPeer(peerId);
+
+    const activeViewChanged = previousActiveSignalingPeers.size !== this.activeSignalingPeers.size
+      || Array.from(this.activeSignalingPeers).some((peerId) => !previousActiveSignalingPeers.has(peerId));
+    if (activeViewChanged) {
+      this.emit('mesh:membership', Array.from(this.globalPeers));
+      this.emit('mesh:graph', this.getGraphSnapshot());
+    }
+
+    // A non-empty current snapshot is positive evidence that the relay is
+    // healthy. Pending dials to peers missing from that snapshot should not
+    // consume every bounded connection slot while announced alternatives wait.
+    if (this.activeSignalingPeers.size > 0) {
+      const inactivePendingPeers = Array.from(this.peers.values()).filter((peer) => (
+        !peer.connected
+        && !this.activeSignalingPeers.has(peer.id)
+        && Array.from(this.activeSignalingPeers).some((peerId) => peerId !== peer.id)
+      ));
+      for (const peer of inactivePendingPeers) {
+        this.emit('signaling:log', {
+          message: `[webrtc] replacing pending dial to ${peer.id}; peer is absent from the current relay snapshot`,
+        });
+        this.noteDialFailure(peer.id);
+        this.removePeer(peer.id);
+      }
+    }
+  }
+
+  private handleSignalingPeerLeft(rawPeerId: string): void {
+    const peerId = this.normalizePeerId(rawPeerId);
+    if (!peerId) return;
+
+    // Signaling discovery is only a dial hint. Relay absence can mean browser
+    // suspension, federation delay, or an expired announcement; it is not an
+    // authoritative CECR leave and must never tear down a healthy RTC edge.
+    const discoveryChanged = this.discoveredPeers.delete(peerId);
+    const activeChanged = this.activeSignalingPeers.delete(peerId);
+    this.discoveredAtMs.delete(peerId);
+    this.dialFailureCount.delete(peerId);
+    this.dialBackoffUntilMs.delete(peerId);
+    if (discoveryChanged || activeChanged) {
+      this.emit('mesh:graph', this.getGraphSnapshot());
+    }
   }
 
   private getConnectedPeerCount(): number {
@@ -722,6 +840,45 @@ export class PartialMesh {
     return a.localeCompare(b);
   }
 
+  /** Direct neighbors whose local edge is the only known path to part of the mesh. */
+  private localBridgeConnectedPeerIds(): Set<string> {
+    const graph = this.getGraphSnapshot();
+    const self = this.normalizePeerId(graph.localPeerId);
+    const bridgePeerIds = new Set<string>();
+    if (!self) return bridgePeerIds;
+
+    const adjacency = new Map<string, Set<string>>();
+    for (const node of graph.nodes) adjacency.set(node.peerId, new Set());
+    for (const edge of graph.edges) {
+      adjacency.get(edge.source)?.add(edge.target);
+      adjacency.get(edge.target)?.add(edge.source);
+    }
+
+    const reachable = (excludedNeighbor: string | null): Set<string> => {
+      const visited = new Set<string>([self]);
+      const queue = [self];
+      for (let index = 0; index < queue.length; index += 1) {
+        const current = queue[index];
+        for (const next of adjacency.get(current) ?? []) {
+          if (
+            excludedNeighbor
+            && (current === self && next === excludedNeighbor || current === excludedNeighbor && next === self)
+          ) continue;
+          if (visited.has(next)) continue;
+          visited.add(next);
+          queue.push(next);
+        }
+      }
+      return visited;
+    };
+
+    const baselineReachableCount = reachable(null).size;
+    for (const peerId of this.getConnectedPeers()) {
+      if (reachable(peerId).size < baselineReachableCount) bridgePeerIds.add(peerId);
+    }
+    return bridgePeerIds;
+  }
+
   private trimExcessPeers(): void {
     const connectedPeers = this.getConnectedPeers();
     // maxPeers is the steady-state target. tolerantPeers must never increase
@@ -732,17 +889,26 @@ export class PartialMesh {
     // Pause proactive expansion briefly so we do not oscillate around maxPeers.
     this.rebalanceCooldownUntilMs = Math.max(this.rebalanceCooldownUntilMs, Date.now() + 2_000);
 
-    // Drop newest connections first to keep longer-lived links stable.
+    // A saturated component can only merge with another component by briefly
+    // accepting a degree-overflow edge. Preserve any edge that expands the
+    // currently reachable graph, then shed an older redundant intra-component
+    // edge. Dropping the newest edge here permanently trapped 2/2 cycles and
+    // isolated peers in separate CECR components.
     const protectedPeerIds = this.cecrProtectedConnectedPeerIds();
+    const bridgePeerIds = this.localBridgeConnectedPeerIds();
     const dropOrder = connectedPeers
       .map((peerId) => ({
         peerId,
         connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0,
         cecrProtected: protectedPeerIds.has(peerId),
+        graphBridge: bridgePeerIds.has(peerId),
       }))
       .sort((a, b) => {
+        if (a.graphBridge !== b.graphBridge) return a.graphBridge ? 1 : -1;
         if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? 1 : -1;
-        if (a.connectedAt !== b.connectedAt) return b.connectedAt - a.connectedAt;
+        // When all other safety signals tie, replace an old edge and retain
+        // the newly admitted candidate that triggered the tolerant overflow.
+        if (a.connectedAt !== b.connectedAt) return a.connectedAt - b.connectedAt;
         return a.peerId.localeCompare(b.peerId);
       });
 
@@ -971,7 +1137,12 @@ export class PartialMesh {
     const signalingCandidates = Array.from(new Set(
       this.config.signalingServers.map((url) => this.normalizeSignalingUrl(url))
     ));
-    const { requestedPeerId, previousPeerId, retiredPeerIds } = this.rotateBrowserPeerId(signalingCandidates);
+    const {
+      requestedPeerId,
+      previousPeerId,
+      previousPeerSignalUrls,
+      retiredPeerIds,
+    } = this.loadOrCreateBrowserPeerId(signalingCandidates);
     // Identity is local and authoritative. Do not make it wait for relay
     // discovery or registration; the same ID is used for relay ranking.
     this.clientId = requestedPeerId;
@@ -986,6 +1157,9 @@ export class PartialMesh {
         limit: DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
       })
       : [this.normalizeSignalingUrl(this.config.signalingServer)];
+    // The adapter currently registers with the first (closest) relay. Remember
+    // that exact relay so the next same-tab reload can clean up this identity.
+    this.rememberBrowserPeerSignalUrls(signalingUrls.slice(0, 1));
     this.emit('signaling:log', {
       message: `[signal] close federated relays ${signalingUrls.join(' -> ')}`,
     });
@@ -999,6 +1173,7 @@ export class PartialMesh {
       roomId: this.config.sessionId,
       peerId: requestedPeerId,
       previousPeerId,
+      previousPeerSignalUrls,
       retiredPeerIds,
       iceServers: this.config.iceServers,
       trickleIce: this.config.trickleIce
@@ -1061,17 +1236,14 @@ export class PartialMesh {
     });
 
     this.signalingClient.on('peer-left', (data: { peerId: string }) => {
-      const peerId = this.normalizePeerId(data.peerId);
-      if (!peerId) return;
-      this.removeFromGlobalMembership(peerId);
-      this.discoveredPeers.delete(peerId);
-      this.dialFailureCount.delete(peerId);
-      this.dialBackoffUntilMs.delete(peerId);
-      this.removePeer(peerId, true);
+      this.handleSignalingPeerLeft(data.peerId);
     });
 
-    this.signalingClient.on('peers-updated', (data: { peers: string[] }) => {
-      this.reconcileSignalingPeers(Array.isArray(data?.peers) ? data.peers : []);
+    this.signalingClient.on('peers-updated', (data: { peers: string[]; activePeers?: string[] }) => {
+      this.reconcileSignalingPeers(
+        Array.isArray(data?.peers) ? data.peers : [],
+        Array.isArray(data?.activePeers) ? data.activePeers : undefined,
+      );
       if (this.config.autoConnect) {
         this.maintainPeerConnections();
       }
@@ -1102,11 +1274,6 @@ export class PartialMesh {
       this.connecting.delete(peerId);
       this.noteDialSuccess(peerId);
       this.noteLocalCapacityChanged();
-      const fallbackTimer = this.nonInitiatorFallbackTimers.get(peerId);
-      if (fallbackTimer) {
-        clearTimeout(fallbackTimer);
-        this.nonInitiatorFallbackTimers.delete(peerId);
-      }
       this.emit('peer:connected', peerId);
 
       const rebalanceDropPeerId = this.pendingRebalanceDropByTarget.get(peerId);
@@ -1227,12 +1394,14 @@ export class PartialMesh {
     if (!this.config.autoDiscover) return;
 
     const connected = this.getConnectedPeers().length;
+    const pending = this.getPendingPeerCount();
     const now = Date.now();
     const underConnected = connected < this.config.minPeers;
     const hasFewCandidates = this.discoveredPeers.size < this.config.minPeers;
     const saturatedWithoutSpareCandidates = connected >= this.config.maxPeers && this.discoveredPeers.size <= connected;
+    const negotiationNeedsFreshSnapshot = pending > 0;
 
-    if (!underConnected && !hasFewCandidates && !saturatedWithoutSpareCandidates) return;
+    if (!underConnected && !hasFewCandidates && !saturatedWithoutSpareCandidates && !negotiationNeedsFreshSnapshot) return;
     if (now - this.lastDiscoveryRefreshAtMs < 2_000) return;
 
     this.lastDiscoveryRefreshAtMs = now;
@@ -1266,14 +1435,9 @@ export class PartialMesh {
 
   private recoverMeshAfterInactivity(reason: string): void {
     const now = Date.now();
-    // FreeRTC owns restoration. Reset stale-age baselines and wait for its
-    // success/failure signal instead of destroying transports on visibility.
-    this.restoreGraceUntilMs = Math.max(this.restoreGraceUntilMs, now + FREERTC_RESTORE_GRACE_MS);
-    this.orphanRtcFirstSeenAtMs.clear();
-    for (const peerId of this.connecting) {
-      this.connectionStartedAtMs.set(peerId, now);
-      this.scheduleConnectionTimeout(peerId);
-    }
+    // Lifecycle recovery must not restart connection-age clocks or introduce a
+    // grace period. Revalidate immediately while preserving FreeRTC's existing
+    // negotiation failure deadline.
     this.lastDiscoveryRefreshAtMs = 0;
     this.underConnectedSinceMs = null;
 
@@ -1282,8 +1446,10 @@ export class PartialMesh {
       if (!this.config.autoConnect) return;
 
       this.emit('signaling:log', {
-        message: `[webrtc] ${reason} recovery: waiting for FreeRTC transport restoration`,
+        message: `[webrtc] ${reason} recovery: revalidating transports immediately`,
       });
+      this.recoverOrphanedRtcNegotiations(now);
+      this.maybeRecoverStalledNegotiations();
       this.maintainPeerConnections();
     } catch {
       // The regular maintenance loop will retry.
@@ -1303,7 +1469,6 @@ export class PartialMesh {
    * cannot see it, while connectToPeerInternal treats it as active forever.
    */
   private recoverOrphanedRtcNegotiations(now: number = Date.now()): void {
-    if (now < this.restoreGraceUntilMs) return;
     const connections = (this.signalingClient as any)?.client?.mesh?.connections;
     if (!connections || typeof connections.entries !== 'function') return;
 
@@ -1365,7 +1530,6 @@ export class PartialMesh {
 
   private maybeRecoverStalledNegotiations(): void {
     const now = Date.now();
-    if (now < this.restoreGraceUntilMs) return;
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
     // Never race FreeRTC's 30-second offer retry loop or its SDP dedup window.
@@ -1416,7 +1580,6 @@ export class PartialMesh {
   }
 
   private maybeHardResetUnderConnected(): void {
-    if (Date.now() < this.restoreGraceUntilMs) return;
     const signalingConnected = this.signalingClient?.isConnected?.() ?? true;
     if (!signalingConnected) {
       this.underConnectedSinceMs = null;
@@ -1505,7 +1668,14 @@ export class PartialMesh {
   private noteDialFailure(peerId: string): void {
     const failures = (this.dialFailureCount.get(peerId) ?? 0) + 1;
     this.dialFailureCount.set(peerId, failures);
-    const backoffMs = Math.min(30_000, 1_000 * Math.pow(2, Math.min(failures, 5)));
+    // FreeRTC has already exhausted its own negotiation deadline before this
+    // callback. Permit one immediate replacement attempt; only repeated hard
+    // failures receive backpressure to prevent a signaling storm.
+    if (failures === 1) {
+      this.dialBackoffUntilMs.delete(peerId);
+      return;
+    }
+    const backoffMs = Math.min(30_000, 500 * Math.pow(2, Math.min(failures - 2, 6)));
     this.dialBackoffUntilMs.set(peerId, Date.now() + backoffMs);
   }
 
@@ -1622,8 +1792,7 @@ export class PartialMesh {
         this.removePeer(peerId);
       });
     }
-    // Non-initiator: FreeRTC handles the incoming offer entirely on its own.
-    // We'll receive an rtc:connected event when the data channel opens.
+    // Inbound-only records still use initiator=false; FreeRTC owns their answer.
 
     return peerConnection;
   }
@@ -1648,8 +1817,15 @@ export class PartialMesh {
    * Maintain the target number of peer connections
    */
   private dialCandidatePeerIds(includeLiveMembership: boolean): string[] {
-    const candidates = new Set<string>(this.discoveredPeers);
-    if (includeLiveMembership) {
+    const activeDiscoveredPeers = Array.from(this.discoveredPeers)
+      .filter((peerId) => this.activeSignalingPeers.has(peerId));
+    // Prefer the relay's current snapshot whenever it is non-empty. The full
+    // discovered set intentionally carries a short absence grace, but using
+    // that grace list for dials can strand a ring behind suspended peers.
+    const candidates = new Set<string>(
+      activeDiscoveredPeers.length > 0 ? activeDiscoveredPeers : this.discoveredPeers
+    );
+    if (includeLiveMembership && activeDiscoveredPeers.length === 0) {
       for (const peerId of this.getGlobalPeers()) candidates.add(peerId);
     }
     return Array.from(candidates).filter(
@@ -1687,11 +1863,8 @@ export class PartialMesh {
       const needed = this.config.minPeers - totalInProgress;
       const emergencyBurst = emergencyIsolated ? Math.min(3, Math.max(2, available.length)) : 0;
       const dialCount = emergencyIsolated ? Math.max(needed, emergencyBurst) : needed;
-      // When under minPeers, try all available candidates (up to a small cap) so
-      // deterministic role selection doesn't leave the node with only non-initiator
-      // candidates selected. connectToPeer skips non-initiator candidates immediately
-      // (scheduling a fallback timer instead), so iterating all candidates is cheap
-      // and ensures at least one actual outgoing dial fires.
+      // Feed the best candidates through the live capacity gate. Isolation gets
+      // a small parallel burst so one unreachable candidate cannot block recovery.
       const tryCount = available.length <= this.config.maxPeers * 2
         ? available.length
         : Math.max(dialCount, this.config.minPeers + 1);
@@ -1747,8 +1920,7 @@ export class PartialMesh {
     }
 
     if (!selfId) {
-      // Wait until signaling has provided a stable local ID; dialing before this
-      // can make both sides choose initiator and deadlock in offer glare.
+      // Signaling needs a stable local identity before it can address an offer.
       return;
     }
     if (!normalizedPeerId ||
@@ -1789,119 +1961,15 @@ export class PartialMesh {
     const totalInProgress = this.getConnectedPeerCount() + this.getPendingPeerCount();
     // maxPeers is always the retained degree. tolerantPeers is only the bounded
     // dial-before-drop budget used by explicit rebalancing attempts.
-    const maxAllowed = this.config.maxPeers + (allowTemporaryOverflow ? this.config.tolerantPeers : 0);
+    const useToleranceBudget = allowTemporaryOverflow || emergencyIsolated;
+    const maxAllowed = this.config.maxPeers + (useToleranceBudget ? this.config.tolerantPeers : 0);
     if (totalInProgress >= maxAllowed) {
       return;
     }
 
-    // Discovery can be asymmetric (one side sees the other first).
-    // Use deterministic role selection to reduce glare, but keep a delayed
-    // assist dial so asymmetric discovery does not deadlock the edge forever.
-    const initiator = selfId < normalizedPeerId;
-
-    if (!initiator) {
-      this.signalingClient?.nudgeSignaling?.();
-
-      const fallbackMs = this.config.nonInitiatorFallbackDialMs;
-      if (!fallbackMs || fallbackMs <= 0) {
-        return;
-      }
-
-      const candidatePeers = this.dialCandidatePeerIds(emergencyIsolated)
-        .map((id) => this.normalizePeerId(id))
-        .filter((id) => {
-          if (!id || id === selfId || this.isSelfAlias(id)) return false;
-          if (this.peers.has(id) || this.connecting.has(id)) return false;
-          if (!emergencyIsolated && this.isPeerBackedOff(id)) return false;
-          return true;
-        });
-
-      // If we already have at least one natural initiator candidate, skip fallback.
-      // This prevents the largest-ID peer from scheduling extra assist dials.
-      if (candidatePeers.some((id) => selfId < id)) {
-        return;
-      }
-
-      const fallbackTargets = candidatePeers
-        .filter((id) => selfId > id)
-        .sort((a, b) => this.compareDialCandidates(a, b));
-      if (fallbackTargets.length === 0) {
-        return;
-      }
-
-      const selectedFallbackTarget = fallbackTargets
-        .slice()
-        .sort((a, b) => this.compareDialCandidates(a, b))[0];
-      if (selectedFallbackTarget !== normalizedPeerId) {
-        return;
-      }
-
-      if (!this.nonInitiatorFallbackTimers.has(normalizedPeerId)) {
-        const fallbackTimer = setTimeout(() => {
-          this.nonInitiatorFallbackTimers.delete(normalizedPeerId);
-
-          if (this.peers.has(normalizedPeerId) || this.connecting.has(normalizedPeerId)) {
-            return;
-          }
-
-          const refreshedCandidates = this.dialCandidatePeerIds(emergencyIsolated)
-            .map((id) => this.normalizePeerId(id))
-            .filter((id) => {
-              if (!id || id === selfId || this.isSelfAlias(id)) return false;
-              if (this.peers.has(id) || this.connecting.has(id)) return false;
-              if (!emergencyIsolated && this.isPeerBackedOff(id)) return false;
-              return true;
-            });
-
-          if (refreshedCandidates.some((id) => selfId < id)) {
-            return;
-          }
-
-          const refreshedTargets = refreshedCandidates
-            .filter((id) => selfId > id)
-            .sort((a, b) => this.compareDialCandidates(a, b));
-          if (refreshedTargets.length === 0) {
-            return;
-          }
-
-          const refreshedSelectedTarget = refreshedTargets
-            .slice()
-            .sort((a, b) => this.compareDialCandidates(a, b))[0];
-          if (refreshedSelectedTarget !== normalizedPeerId) {
-            return;
-          }
-
-          const fallbackRtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(normalizedPeerId);
-          if (fallbackRtcEntry) {
-            const fallbackRtcState = String(fallbackRtcEntry.state ?? fallbackRtcEntry.connection?.connectionState ?? '').toLowerCase();
-            const isFallbackDead = fallbackRtcState === 'failed' || fallbackRtcState === 'closed';
-            if (!isFallbackDead) {
-              return;
-            }
-            try {
-              this.signalingClient?.closeConnection?.(normalizedPeerId);
-            } catch {
-              // ignore
-            }
-          }
-
-          const currentInProgress = this.getConnectedPeerCount() + this.getPendingPeerCount();
-          const fallbackMaxAllowed = allowTemporaryOverflow
-            ? this.config.maxPeers + this.config.tolerantPeers
-            : this.config.maxPeers;
-          if (currentInProgress >= fallbackMaxAllowed) {
-            return;
-          }
-
-          this.connecting.add(normalizedPeerId);
-          this.createPeerConnection(normalizedPeerId, true);
-        }, fallbackMs);
-
-        this.nonInitiatorFallbackTimers.set(normalizedPeerId, fallbackTimer);
-      }
-      return;
-    }
-
+    // FreeRTC implements deterministic perfect-negotiation glare handling, so
+    // both sides may offer immediately. Waiting for a preferred initiator made
+    // asymmetric discovery add an avoidable multi-second connection delay.
     this.connecting.add(normalizedPeerId);
     this.createPeerConnection(normalizedPeerId, true);
   }
@@ -1927,12 +1995,6 @@ export class PartialMesh {
       if (dropPeerId === peerId) {
         this.pendingRebalanceDropByTarget.delete(targetPeerId);
       }
-    }
-
-    const fallbackTimer = this.nonInitiatorFallbackTimers.get(peerId);
-    if (fallbackTimer) {
-      clearTimeout(fallbackTimer);
-      this.nonInitiatorFallbackTimers.delete(peerId);
     }
 
     const peerConnection = this.peers.get(peerId);
@@ -2005,6 +2067,12 @@ export class PartialMesh {
    */
   public getDiscoveredPeers(): string[] {
     return Array.from(this.discoveredPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
+  }
+
+  /** Return peers in the relay's latest non-graced discovery snapshot. */
+  public getActiveSignalingPeers(): string[] {
+    return Array.from(this.activeSignalingPeers)
+      .filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
   }
 
   /**
@@ -2146,8 +2214,10 @@ export class PartialMesh {
     const connected = new Set(this.getConnectedPeers());
     const knownIds = new Set<string>();
     if (self) knownIds.add(self);
+    // Relay discovery is only a bootstrap/dial hint. Visible topology and
+    // membership come from CECR; a live local transport is included while its
+    // membership exchange is still arriving.
     for (const peerId of this.globalPeers) knownIds.add(peerId);
-    for (const peerId of this.discoveredPeers) knownIds.add(peerId);
     for (const peerId of connected) knownIds.add(peerId);
     for (const peerId of Array.from(knownIds)) {
       if (!peerId || this.isSelfAlias(peerId) && peerId !== self || this.retiredPeerIds.has(peerId)) knownIds.delete(peerId);
@@ -2156,10 +2226,14 @@ export class PartialMesh {
     // Capacity and topology are attributes of authoritative peers, never
     // membership evidence. Otherwise a stale relayed edge can resurrect a
     // departed identity indefinitely after its membership lease expires.
-    const freshTopologyEntries = Array.from(this.peerTopologyById.entries()).filter(([peerId, state]) => (
+    // Topology is versioned state owned by a live CECR member, not a cache
+    // entry with an independent TTL. Stable links legitimately keep the same
+    // version for longer than peerStateMaxAgeMs; expiring them made the graph
+    // claim a peer was unreachable while gossip still traversed that link.
+    // Membership leases own liveness and remove the topology when its subject
+    // leaves or expires.
+    const freshTopologyEntries = Array.from(this.peerTopologyById.entries()).filter(([peerId]) => (
       knownIds.has(peerId)
-      && state.updatedAt <= now + this.config.membershipClockSkewMs
-      && now - state.updatedAt <= this.config.peerStateMaxAgeMs
     ));
     const edgeMap = new Map<string, PeerGraphEdge>();
     const addEdge = (observer: string, left: string, right: string, updatedAt: number): void => {
@@ -2182,6 +2256,10 @@ export class PartialMesh {
     }
     for (const [peerId, state] of freshTopologyEntries) {
       for (const connectedPeerId of state.connectedPeerIds) {
+        // Only the local transport can authoritatively say that an edge to
+        // this peer exists. A delayed remote CECR record must not redraw a
+        // local line after that data channel has already closed.
+        if (self && (peerId === self || connectedPeerId === self)) continue;
         addEdge(peerId, peerId, connectedPeerId, state.updatedAt);
       }
     }
@@ -2590,7 +2668,11 @@ export class PartialMesh {
         if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
         if (!Array.isArray(rawState) || rawState.length < 2 || !Array.isArray(rawState[0])) continue;
         const updatedAt = Math.floor(Number(rawState[1]));
-        if (!Number.isSafeInteger(updatedAt) || updatedAt <= 0) continue;
+        if (
+          !Number.isSafeInteger(updatedAt)
+          || updatedAt <= 0
+          || updatedAt > now + this.config.membershipClockSkewMs
+        ) continue;
         const connectedPeerIds = Array.from(new Set(
           rawState[0]
             .map((value: unknown) => this.normalizePeerId(typeof value === 'string' ? value : ''))
@@ -2612,33 +2694,6 @@ export class PartialMesh {
       }
     }
 
-    private removeFromGlobalMembership(peerId: string): void {
-      const now = Date.now();
-      const existing = this.membershipRecordsById.get(peerId);
-      if (existing) {
-        this.membershipRecordsById.set(peerId, {
-          peerId,
-          incarnation: existing.incarnation,
-          sequence: existing.sequence + 1,
-          state: 'left',
-          issuedAt: now,
-          validUntil: null,
-        });
-      }
-      const removed = this.rebuildGlobalMembership(false) || this.globalPeers.delete(peerId);
-      const removedCapacity = this.peerCapacityById.delete(peerId);
-      const removedTopology = this.peerTopologyById.delete(peerId);
-      if (!removed && !removedCapacity && !removedTopology) return;
-      this.emit('mesh:membership', Array.from(this.globalPeers));
-      if (removedCapacity) this.emit('mesh:capacity', this.getPeerCapacities());
-      this.emit('mesh:graph', this.getGraphSnapshot());
-      for (const connectedPeerId of this.getConnectedPeers()) {
-        if (connectedPeerId !== peerId) {
-          this.sendMembership(connectedPeerId);
-        }
-      }
-    }
-
   /**
    * Disconnect from all peers and close signaling connection
    */
@@ -2656,10 +2711,6 @@ export class PartialMesh {
       clearTimeout(t);
     }
     this.connectionTimers.clear();
-    for (const t of this.nonInitiatorFallbackTimers.values()) {
-      clearTimeout(t);
-    }
-    this.nonInitiatorFallbackTimers.clear();
 
     // Close all peer connections
     for (const peerId of this.peers.keys()) {
@@ -2672,6 +2723,7 @@ export class PartialMesh {
     this.peers.clear();
     this.connecting.clear();
     this.discoveredPeers.clear();
+    this.activeSignalingPeers.clear();
     this.discoveredAtMs.clear();
     this.connectionStartedAtMs.clear();
     this.orphanRtcFirstSeenAtMs.clear();
@@ -2740,6 +2792,9 @@ export type PeerPigeonNodeEvents = {
   deliveryProgress: (status: GossipDeliveryStatus) => void;
   deliveryComplete: (status: GossipDeliveryStatus) => void;
   deliveryTimeout: (status: GossipDeliveryStatus) => void;
+  aggregateProgress: (status: GossipAggregateDeliveryStatus) => void;
+  aggregateSettled: (status: GossipAggregateDeliveryStatus) => void;
+  cecrStateChanged: (state: CecrStateSnapshot) => void;
   error: (error: Error) => void;
 };
 
@@ -2850,6 +2905,7 @@ export class PeerPigeonNode {
   getClientId(): string | null { return this.mesh.getClientId(); }
   getConnectedPeers(): string[] { return this.mesh.getConnectedPeers(); }
   getDiscoveredPeers(): string[] { return this.mesh.getDiscoveredPeers(); }
+  getActiveSignalingPeers(): string[] { return this.mesh.getActiveSignalingPeers(); }
   getGlobalPeers(): string[] { return this.mesh.getGlobalPeers(); }
 
   broadcast(data: unknown, metadata: Record<string, unknown> = {}, options: GossipBroadcastOptions = {}): string {
@@ -2870,6 +2926,10 @@ export class PeerPigeonNode {
 
   getDeliveryStatus(messageId: string): GossipDeliveryStatus | null {
     return this.gossip.getDeliveryStatus(messageId);
+  }
+
+  getAggregateDeliveryStatus(messageId: string): GossipAggregateDeliveryStatus | null {
+    return this.gossip.getAggregateDeliveryStatus(messageId);
   }
 
   async broadcastEncrypted(
@@ -2982,6 +3042,9 @@ export class PeerPigeonNode {
     this.gossip.on('deliveryProgress', (status) => this.emit('deliveryProgress', status));
     this.gossip.on('deliveryComplete', (status) => this.emit('deliveryComplete', status));
     this.gossip.on('deliveryTimeout', (status) => this.emit('deliveryTimeout', status));
+    this.gossip.on('aggregateProgress', (status) => this.emit('aggregateProgress', status));
+    this.gossip.on('aggregateSettled', (status) => this.emit('aggregateSettled', status));
+    this.gossip.on('cecrStateChanged', (state) => this.emit('cecrStateChanged', state));
 
     this.crypto?.on('keyDiscovered', (key) => this.emit('keyDiscovered', key));
     this.crypto?.on('encryptedBroadcastReceived', ({ plaintext, message, local, fromPeer }) => {
@@ -3040,6 +3103,7 @@ export type {
   CecrOverlaySnapshot,
   CecrStateSnapshot,
   GossipBroadcastOptions,
+  GossipAggregateDeliveryStatus,
   GossipDeliveryStatus,
   GossipMessage,
   GossipProtocolOptions,

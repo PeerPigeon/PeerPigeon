@@ -203,7 +203,7 @@
             aria-live="polite"
           >
             <FontAwesomeIcon :icon="icons.state" class="network-graph-gossip-icon" aria-hidden="true" />
-            <span>{{ status.message || 'Idle' }}</span>
+            <span>{{ networkGraphStatusLabel }}</span>
           </div>
         </div>
 
@@ -243,7 +243,10 @@
               >
                 <div class="bubble" :class="entryBubbleClass(entry)">
                   <div class="bubble-meta">
-                    <span class="sender">{{ entry.local ? 'You' : entry.sender.slice(0, 6) }}</span>
+                    <span
+                      class="sender"
+                      :title="entry.local ? '' : messagePeerSha1(entry.sender)"
+                    >{{ entry.local ? 'You' : formatMessagePeerId(entry.sender) }}</span>
                     <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
                   </div>
                   <div class="bubble-text">
@@ -256,13 +259,17 @@
                     <span>{{ entry.text }}</span>
                   </div>
                   <div
-                    v-if="entry.messageId && deliveryReceipts[entry.messageId]"
+                    v-if="entry.messageId && deliveryInferences[entry.messageId]"
                     class="bubble-delivery"
-                    :class="deliveryReceiptClass(entry.messageId)"
+                    :class="deliveryInferenceClass(entry.messageId)"
                   >
-                    {{ deliveryReceiptLabel(entry.messageId) }}
+                    {{ deliveryInferenceLabel(entry.messageId) }}
                   </div>
-                  <div v-if="entry.hops > 0" class="bubble-hops">{{ entry.hops === 1 ? '1 hop' : entry.hops + ' hops' }}</div>
+                  <div
+                    v-if="entry.type === 'received' && !entry.direct"
+                    class="bubble-hops"
+                    :title="formatHopTrace(entry.hopPath, entry.hops)"
+                  >{{ formatHopLatency(entry.hops, entry.latencyMs) }}</div>
                 </div>
               </div>
             </div>
@@ -565,6 +572,13 @@ import {
   isInternalMessagePayload,
   normalizeMessagePayload,
 } from './message-payloads.js';
+import {
+  calculateMessageLatency,
+  formatHopLatency,
+  formatHopTrace,
+  formatMessagePeerId,
+  messagePeerSha1,
+} from './message-latency.js';
 import { FontAwesomeIcon } from '@fortawesome/vue-fontawesome';
 import {
   faCommentDots,
@@ -584,6 +598,10 @@ import {
 } from '@fortawesome/free-solid-svg-icons';
 import PeerNetworkGraph from './components/PeerNetworkGraph.vue';
 import { canonicalPeerId } from './peer-id.js';
+import {
+  gossipQualityForCoverage,
+  graphCoverageSnapshot as calculateGraphCoverageSnapshot,
+} from './graph-coverage.js';
 
 const APP_ICONS = Object.freeze({
   state: faCircle,
@@ -609,10 +627,6 @@ const CRYPTO_PUBLIC_REQUEST_TYPE = 'pp-crypto-public-request-v1';
 const ENCRYPTED_BROADCAST_TYPE = 'pp-encrypted-broadcast-v1';
 const ENCRYPTED_DIRECT_TYPE = 'pp-encrypted-direct-v1';
 const STORAGE_SYNC_ENVELOPE_TYPE = 'pp-storage-sync-v1';
-const MESH_PEERS_STORAGE_KEY = 'mesh:peers';
-const MESH_PEERS_STORAGE_SPACE = 'epublic';
-const MESH_PEERS_HEARTBEAT_MS = 12_000;
-const MESH_PEERS_STALE_AFTER_MS = MESH_PEERS_HEARTBEAT_MS * 6;
 const DEBUG_MONITOR_INTERVAL_MS = 1000;
 const DEBUG_MONITOR_PEER_LOG_MIN_GAP_MS = 2500;
 const STORAGE_PEER_SCOPE_SESSION_KEY = 'peerpigeon:storage-peer-scope:v1';
@@ -717,15 +731,6 @@ export default {
       storageInterestSyncInFlight: false,
       storageInterestSyncQueued: false,
       storageInterestSyncPendingSpaces: new Set(),
-      meshPeersStorageSpace: MESH_PEERS_STORAGE_SPACE,
-      meshPeersStorageKey: MESH_PEERS_STORAGE_KEY,
-      sharedMeshPeerSnapshots: {},
-      meshPeersPublishTimer: null,
-      meshPeersRetrieveTimer: null,
-      meshPeersPublishInFlight: false,
-      meshPeersLastLocalSignature: '',
-      meshPeersLastPublishedAt: 0,
-      meshPeersLastSignature: '',
       uiStateKey: 'peerpigeon:ui-state',
       uiTabs: [
         { id: 'message', label: 'Message' },
@@ -744,11 +749,18 @@ export default {
       networkGraphResizeHandler: null,
       networkGraphResizeObserver: null,
       networkGraphResizeObservedElement: null,
+      browserSuspended: false,
+      pageLifecycleFreezeHandler: null,
+      pageLifecycleResumeHandler: null,
+      pageLifecycleVisibilityHandler: null,
+      pageLifecyclePageHideHandler: null,
       debugMonitorTimer: null,
       debugLastByPeer: {},
       debugLastLogAtByPeer: {},
       unexpectedMeshRestartInFlight: false,
-      deliveryReceipts: {},
+      // Constant-size topology estimates plus reverse subtree aggregates.
+      // No sender-side peer list or per-peer delivery bitset is retained.
+      deliveryInferences: {},
     };
   },
   mounted() {
@@ -843,6 +855,50 @@ export default {
       this.scheduleNetworkGraphRender({ immediate: true, reason: 'resize' });
     };
     window.addEventListener('resize', this.networkGraphResizeHandler);
+    this.pageLifecycleFreezeHandler = () => {
+      this.browserSuspended = true;
+      this.syncGossipStatus();
+    };
+    this.pageLifecycleResumeHandler = (event) => {
+      const wasSuspended = this.browserSuspended;
+      this.browserSuspended = false;
+      if (!this.isRunning) return;
+
+      // Safari can resume a page without first dispatching `freeze`, and it can
+      // discard a suspended requestAnimationFrame callback. Recovery therefore
+      // follows every foreground signal directly; it must never depend on a
+      // subsequent pointer move causing Vue or the canvas to repaint.
+      const lifecycleReason = String(event?.type || 'resume').trim() || 'resume';
+      if (wasSuspended) {
+        this.showStatus('Reconnecting', 'Browser resumed; restoring peer connections...', 'connecting');
+      }
+      try {
+        this.mesh?.recoverAfterInactivity?.(`app-${lifecycleReason}`);
+      } catch {
+        // Transport maintenance remains available as a fallback.
+      }
+      this.updateStats();
+      this.networkGraphRevision += 1;
+      this.$nextTick(() => this.$refs.peerNetworkGraph?.restartAnimationLoop?.());
+    };
+    this.pageLifecycleVisibilityHandler = (event) => {
+      if (document.hidden) {
+        this.pageLifecycleFreezeHandler?.();
+        return;
+      }
+      this.pageLifecycleResumeHandler?.(event);
+    };
+    this.pageLifecyclePageHideHandler = (event) => {
+      if (!event?.persisted) return;
+      this.pageLifecycleFreezeHandler?.();
+    };
+    document.addEventListener('freeze', this.pageLifecycleFreezeHandler);
+    document.addEventListener('resume', this.pageLifecycleResumeHandler);
+    document.addEventListener('visibilitychange', this.pageLifecycleVisibilityHandler);
+    window.addEventListener('pageshow', this.pageLifecycleResumeHandler);
+    window.addEventListener('focus', this.pageLifecycleResumeHandler);
+    window.addEventListener('online', this.pageLifecycleResumeHandler);
+    window.addEventListener('pagehide', this.pageLifecyclePageHideHandler);
   },
   updated() {
     // HMR preserves data from tabs opened with the former explicit peer.ooo
@@ -868,8 +924,15 @@ export default {
     }
   },
   computed: {
+    networkGraphStatusLabel() {
+      const coverage = this.gossipCoverageSnapshot();
+      const label = String(this.status?.title || 'Idle').replace(/^Gossip\s+/i, '');
+      return `Gossip ${label} (${coverage.reachablePeers}/${coverage.knownPeers})`;
+    },
+
     networkGossipState() {
       if (!this.isRunning) return 'grey';
+      if (this.browserSuspended) return 'grey';
 
       const message = String(this.status?.message || '').toLowerCase();
       const type = String(this.status?.type || '').toLowerCase();
@@ -1538,13 +1601,6 @@ export default {
       const peerId = this.storagePeerId();
       const nextIdentity = `js-storage::${this.effectiveSessionId}::${this.storagePeerScopeId}::${userId}::peer:${peerId}::gossip:${gossipAttached}`;
       if (this.storageReady && this.storage && this.storageIdentity === nextIdentity) {
-        if (!fastPath && this.gossip) {
-          this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
-            // background best-effort network sync
-          });
-        } else if (this.gossip) {
-          this.scheduleMeshPeersRetrieve('storage-tab');
-        }
         await this.refreshStorageList({ silent: true, syncInterested: false });
         this.requestInterestedKeySync('storage-ready-existing');
         return;
@@ -1585,10 +1641,7 @@ export default {
         }
       }
       this.storageIdentity = nextIdentity;
-      this.storageChangeUnsubscribe = this.storage.subscribe((event) => {
-        if (event?.space === this.meshPeersStorageSpace && event?.key === this.meshPeersStorageKey) {
-          this.refreshMeshPeersFromStorage();
-        }
+      this.storageChangeUnsubscribe = this.storage.subscribe(() => {
         if (this.activeTab === 'storage') {
           this.refreshStorageList({ silent: true });
         }
@@ -1599,14 +1652,6 @@ export default {
       // Local-first: render from IndexedDB immediately.
       await this.refreshStorageList({ silent: true, syncInterested: false });
 
-      if (!fastPath && this.gossip) {
-        this.syncMeshPeersFromNetwork('storage-ready').catch(() => {
-          // background best-effort network sync
-        });
-      } else if (this.gossip) {
-        this.scheduleMeshPeersRetrieve('storage-tab-init');
-      }
-      this.scheduleMeshPeersPublish('storage-ready');
       this.requestInterestedKeySync('storage-ready-init');
     },
 
@@ -1618,15 +1663,6 @@ export default {
       this.storageInterestSyncInFlight = false;
       this.storageInterestSyncQueued = false;
       this.storageInterestSyncPendingSpaces = new Set();
-      clearTimeout(this.meshPeersPublishTimer);
-      this.meshPeersPublishTimer = null;
-      clearTimeout(this.meshPeersRetrieveTimer);
-      this.meshPeersRetrieveTimer = null;
-      this.meshPeersPublishInFlight = false;
-      this.meshPeersLastLocalSignature = '';
-      this.meshPeersLastPublishedAt = 0;
-      this.sharedMeshPeerSnapshots = {};
-      this.meshPeersLastSignature = '';
       if (this.storageChangeUnsubscribe) {
         this.storageChangeUnsubscribe();
         this.storageChangeUnsubscribe = null;
@@ -1748,232 +1784,6 @@ export default {
         this.storageError = String(error?.message || error || 'Failed to load storage');
       } finally {
         if (!silent) this.storageBusy = false;
-      }
-    },
-
-    normalizeMeshPeersPayload(value) {
-      const out = {};
-      if (!value || typeof value !== 'object' || Array.isArray(value)) return out;
-
-      for (const [rawPeerId, rawSnapshot] of Object.entries(value)) {
-        const peerId = String(rawPeerId || rawSnapshot?.peerId || '').trim();
-        if (!peerId) continue;
-
-        const connectedPeers = [...new Set(
-          (Array.isArray(rawSnapshot?.connectedPeers) ? rawSnapshot.connectedPeers : [])
-            .map((peer) => String(peer || '').trim())
-            .filter((peer) => peer && peer !== peerId)
-        )].sort((a, b) => a.localeCompare(b));
-
-        const updatedAtRaw = Number(rawSnapshot?.updatedAt ?? rawSnapshot?.seenAt ?? 0);
-        const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0
-          ? Math.floor(updatedAtRaw)
-          : 0;
-
-        out[peerId] = {
-          peerId,
-          ownerId: String(rawSnapshot?.ownerId || '').trim() || null,
-          connectedPeers,
-          updatedAt,
-        };
-      }
-
-      return out;
-    },
-
-    pruneStaleMeshPeerSnapshots(snapshots) {
-      const now = Date.now();
-      const out = {};
-      for (const [peerId, snapshot] of Object.entries(snapshots || {})) {
-        const normalizedPeerId = String(peerId || snapshot?.peerId || '').trim();
-        const updatedAt = Number(snapshot?.updatedAt || 0);
-        if (!normalizedPeerId) continue;
-        if (!updatedAt) continue;
-        if (now - updatedAt > MESH_PEERS_STALE_AFTER_MS) continue;
-
-        out[normalizedPeerId] = {
-          peerId: normalizedPeerId,
-          ownerId: String(snapshot?.ownerId || '').trim() || null,
-          connectedPeers: [...new Set((snapshot?.connectedPeers || []).map((peer) => String(peer || '').trim()).filter(Boolean))],
-          updatedAt,
-        };
-      }
-
-      return out;
-    },
-
-    meshPeersSnapshotSignature(snapshots) {
-      const entries = Object.entries(snapshots || {});
-      if (!entries.length) return '';
-
-      return entries
-        .map(([peerId, snapshot]) => {
-          const connected = Array.isArray(snapshot?.connectedPeers)
-            ? snapshot.connectedPeers.map((peer) => String(peer || '').trim()).filter(Boolean).sort().join(',')
-            : '';
-          const updatedAt = Number(snapshot?.updatedAt || 0);
-          return `${String(peerId || '').trim()}|${updatedAt}|${connected}`;
-        })
-        .sort()
-        .join(';');
-    },
-
-    activeMeshPeerSnapshots() {
-      return this.pruneStaleMeshPeerSnapshots(this.sharedMeshPeerSnapshots || {});
-    },
-
-    localMeshPeerSnapshot() {
-      const peerId = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-      if (!peerId) return null;
-
-      const connectedPeers = [...new Set(
-        (Array.isArray(this.mesh?.getConnectedPeers?.()) ? this.mesh.getConnectedPeers() : [])
-          .map((peer) => String(peer || '').trim())
-          .filter((peer) => peer && peer !== peerId)
-      )].sort((a, b) => a.localeCompare(b));
-
-      return {
-        peerId,
-        ownerId: this.storageUserId() || null,
-        connectedPeers,
-        updatedAt: Date.now(),
-      };
-    },
-
-    meshPeerSnapshotSignature(snapshot) {
-      const peerId = String(snapshot?.peerId || '').trim();
-      if (!peerId) return '';
-      const connectedPeers = Array.isArray(snapshot?.connectedPeers) ? snapshot.connectedPeers : [];
-      return `${peerId}|${connectedPeers.join(',')}`;
-    },
-
-    scheduleMeshPeersPublish(reason = 'update') {
-      if (!this.isRunning) return;
-
-      clearTimeout(this.meshPeersPublishTimer);
-      this.meshPeersPublishTimer = setTimeout(() => {
-        this.meshPeersPublishTimer = null;
-        this.publishMeshPeersToStorage(reason);
-      }, 140);
-    },
-
-    scheduleMeshPeersRetrieve(reason = 'update') {
-      if (!this.isRunning || !this.storageReady || !this.storage) return;
-
-      clearTimeout(this.meshPeersRetrieveTimer);
-      this.meshPeersRetrieveTimer = setTimeout(() => {
-        this.meshPeersRetrieveTimer = null;
-        this.syncMeshPeersFromNetwork(reason).catch(() => {
-          // ignore mesh snapshot retrieval failures
-        });
-      }, 120);
-    },
-
-    onMeshConnectionsChanged(reason = 'connection-change') {
-      this.scheduleMeshPeersRetrieve(reason);
-      this.scheduleMeshPeersPublish(reason);
-    },
-
-    async syncMeshPeersFromNetwork(_reason = 'update') {
-      if (!this.storageReady || !this.storage) return;
-      try {
-        await this.storage.retrieve(this.meshPeersStorageSpace, this.meshPeersStorageKey, { timeoutMs: 1800 });
-      } catch {
-        // best-effort network retrieval; fall back to local state
-      }
-
-      await this.refreshMeshPeersFromStorage();
-    },
-
-    async refreshMeshPeersFromStorage() {
-      if (!this.storageReady || !this.storage) return;
-
-      try {
-        const record = await this.storage.get(this.meshPeersStorageSpace, this.meshPeersStorageKey);
-        const snapshots = this.pruneStaleMeshPeerSnapshots(this.normalizeMeshPeersPayload(record?.value));
-        const signature = this.meshPeersSnapshotSignature(snapshots);
-        if (signature === this.meshPeersLastSignature) {
-          return;
-        }
-        this.meshPeersLastSignature = signature;
-        this.sharedMeshPeerSnapshots = snapshots;
-        this.syncGossipStatus();
-        this.$nextTick(() => this.scheduleNetworkGraphRender({ reason: 'mesh-storage' }));
-      } catch {
-        // ignore mesh snapshot sync failures
-      }
-    },
-
-    async publishMeshPeersToStorage(reason = 'update') {
-      if (!this.storageReady || !this.storage || !this.isRunning) return;
-      if (this.meshPeersPublishInFlight) return;
-
-      const localSnapshot = this.localMeshPeerSnapshot();
-      if (!localSnapshot) return;
-
-      const localSignature = this.meshPeerSnapshotSignature(localSnapshot);
-      if (!localSignature) return;
-
-      const now = Date.now();
-      const publishAgeMs = now - Number(this.meshPeersLastPublishedAt || 0);
-      const shouldHeartbeat = publishAgeMs >= MESH_PEERS_HEARTBEAT_MS;
-      if (localSignature === this.meshPeersLastLocalSignature && reason !== 'storage-ready' && !shouldHeartbeat) {
-        return;
-      }
-
-      this.meshPeersPublishInFlight = true;
-      try {
-        // Pull latest mesh:peers from network before writing so concurrent
-        // publishers merge from a fresh base instead of clobbering snapshots.
-        try {
-          await this.storage.retrieve(this.meshPeersStorageSpace, this.meshPeersStorageKey, { timeoutMs: 1800 });
-        } catch {
-          // best-effort network retrieval; continue with local state
-        }
-
-        const existing = await this.storage.get(this.meshPeersStorageSpace, this.meshPeersStorageKey);
-        const mergedBase = {
-          ...this.activeMeshPeerSnapshots(),
-          ...this.normalizeMeshPeersPayload(existing?.value),
-        };
-        const snapshots = this.pruneStaleMeshPeerSnapshots(mergedBase);
-
-        // Peer ID can rotate on reload/reconnect; keep only newest entry per stable owner identity.
-        const localOwnerId = String(localSnapshot.ownerId || '').trim();
-        if (localOwnerId) {
-          for (const [peerId, snapshot] of Object.entries(snapshots)) {
-            if (peerId === localSnapshot.peerId) continue;
-            const ownerId = String(snapshot?.ownerId || '').trim();
-            if (ownerId && ownerId === localOwnerId) {
-              delete snapshots[peerId];
-            }
-          }
-        }
-
-        const prior = snapshots[localSnapshot.peerId];
-        const priorSignature = this.meshPeerSnapshotSignature(prior);
-        const priorUpdatedAt = Number(prior?.updatedAt || 0);
-
-        snapshots[localSnapshot.peerId] = localSnapshot;
-        this.meshPeersLastSignature = this.meshPeersSnapshotSignature(snapshots);
-        this.sharedMeshPeerSnapshots = snapshots;
-        this.meshPeersLastLocalSignature = localSignature;
-        this.syncGossipStatus();
-
-        const shouldRefreshTimestamp = now - priorUpdatedAt > MESH_PEERS_HEARTBEAT_MS;
-        const needsWrite = priorSignature !== localSignature || !priorUpdatedAt || shouldRefreshTimestamp;
-        if (!needsWrite) return;
-
-        if (typeof this.storage.putSystem === 'function') {
-          await this.storage.putSystem(this.meshPeersStorageSpace, this.meshPeersStorageKey, snapshots);
-        } else {
-          await this.storage.put(this.meshPeersStorageSpace, this.meshPeersStorageKey, snapshots);
-        }
-        this.meshPeersLastPublishedAt = now;
-      } catch {
-        // ignore mesh snapshot publish failures
-      } finally {
-        this.meshPeersPublishInFlight = false;
       }
     },
 
@@ -2250,9 +2060,8 @@ export default {
           tolerantPeers: this.tolerantPeers,
           autoDiscover: true,
           autoConnect: true,
-          // Helps highest-lexicographic peers (often Chrome in mixed-browser sessions)
-          // avoid indefinite non-initiator wait when all discovered peers are smaller IDs.
-          nonInitiatorFallbackDialMs: 2_500,
+          // Fallback watchdog for environments that never surface transport
+          // failure events; initial and replacement dials are still immediate.
           underConnectedResetMs: 20_000
         });
 
@@ -2269,13 +2078,18 @@ export default {
         this.cryptoProtocol.on('keyDiscovered', (key) => {
           this.upsertRemoteCryptoInfo(key.peerId, key);
         });
-        this.cryptoProtocol.on('encryptedBroadcastReceived', ({ plaintext, message, local, fromPeer }) => {
+        this.cryptoProtocol.on('encryptedBroadcastReceived', ({ plaintext, message, local, fromPeer, receivedAt: gossipReceivedAt }) => {
           if (local) return;
+          const receivedAt = Number.isFinite(gossipReceivedAt) && Number(gossipReceivedAt) > 0
+            ? Number(gossipReceivedAt)
+            : Date.now();
           const sourcePeer = String(fromPeer || message?.sender || 'peer');
           this.messagesSeen++;
-          const hopLabel = message.hops === 1 ? 'hop' : 'hops';
-          this.addLog('received', `[${message.hops} ${hopLabel}] ${plaintext}`, sourcePeer.slice(0, 6), message.hops, false, {
+          this.addLog('received', plaintext, sourcePeer, message.hops, false, {
             icon: 'received',
+            receivedAt,
+            latencyMs: calculateMessageLatency(message?.timestamp ?? message?.data?.timestamp, receivedAt),
+            hopPath: message?.path,
           });
           if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
         });
@@ -2348,13 +2162,11 @@ export default {
           this.announceCryptoPublicInfo();
           this.requestInterestedKeySync('peer-connected');
           this.updateStats();
-          this.onMeshConnectionsChanged('peer:connected');
         });
 
         this.mesh.on('peer:disconnected', (peerId) => {
           this.addLog('disconnected', `Disconnected from peer`, peerId);
           this.updateStats();
-          this.onMeshConnectionsChanged('peer:disconnected');
         });
 
         this.mesh.on('peer:error', ({ peerId, error }) => {
@@ -2364,18 +2176,19 @@ export default {
         });
 
         this.mesh.on('peer:discovered', (peerId) => {
-          const self = String(this.mesh?.getClientId?.() || '').trim();
-          const initiator = self && peerId ? self < peerId : false;
-          this.addLog('info', `Dial role -> ${initiator ? 'initiator' : 'non-initiator(wait)'}`, peerId || 'debug');
+          this.addLog('info', 'Dial eligible -> immediate offer', peerId || 'debug');
         });
 
         this.mesh.on('mesh:membership', () => {
+          this.refreshDeliveryInferences();
           this.updateStats();
         });
 
         this.mesh.on('mesh:graph', () => {
           this.syncSelfGlowForGraphConnections();
           this.networkGraphRevision += 1;
+          this.refreshDeliveryInferences();
+          this.syncGossipStatus();
           this.scheduleNetworkGraphRender({ reason: 'mesh:graph' });
         });
 
@@ -2385,18 +2198,20 @@ export default {
         });
 
         // Gossip events
-        this.gossip.on('messageReceived', ({ message, local, fromPeer }) => {
-          this.handleGossipPayload({ message, local, fromPeer }).catch((error) => {
+        this.gossip.on('messageReceived', ({ message, local, fromPeer, receivedAt }) => {
+          this.handleGossipPayload({ message, local, fromPeer, receivedAt }).catch((error) => {
             this.addLog('info', `Failed to process gossip payload: ${String(error?.message || error || '')}`, 'crypto');
           });
         });
-
-        const updateDeliveryReceipt = (deliveryStatus) => {
-          this.recordDeliveryReceipt(deliveryStatus);
+        const updateAggregateDelivery = (status) => {
+          this.recordAggregateDelivery(status);
         };
-        this.gossip.on('deliveryProgress', updateDeliveryReceipt);
-        this.gossip.on('deliveryComplete', updateDeliveryReceipt);
-        this.gossip.on('deliveryTimeout', updateDeliveryReceipt);
+        this.gossip.on('aggregateProgress', updateAggregateDelivery);
+        this.gossip.on('aggregateSettled', updateAggregateDelivery);
+        this.gossip.on('cecrStateChanged', () => {
+          this.refreshDeliveryInferences();
+          this.syncGossipStatus();
+        });
 
         this.mesh.on('signaling:error', (error) => {
           const message = `${error?.message || error || 'unknown signaling error'}`;
@@ -2440,14 +2255,6 @@ export default {
       this.stopCryptoAnnounceLoop();
       this.stopDebugMonitor();
       this.resetGraphStabilization();
-      clearTimeout(this.meshPeersPublishTimer);
-      this.meshPeersPublishTimer = null;
-      clearTimeout(this.meshPeersRetrieveTimer);
-      this.meshPeersRetrieveTimer = null;
-      this.meshPeersPublishInFlight = false;
-      this.meshPeersLastLocalSignature = '';
-      this.meshPeersLastPublishedAt = 0;
-      this.sharedMeshPeerSnapshots = {};
       this.networkGraphKnownEdgeKeys = [];
       clearTimeout(this.meshConnectWarnTimer);
       this.meshConnectWarnTimer = null;
@@ -2471,9 +2278,11 @@ export default {
       this.isRunning = false;
       this.signalingConnected = false;
       this.messageLog = [];
-      this.deliveryReceipts = {};
+      this.deliveryInferences = {};
       this.dmTarget = '';
       this.directMode = false;
+      this.connectedPeersList = [];
+      this.discoveredPeersList = [];
       this.globalPeersList = [];
       this.saveUiState();
       this.addLog('info', 'Mesh stopped', 'System');
@@ -2498,7 +2307,7 @@ export default {
           if (!this.cryptoPublicDirectory[target]?.epub) {
             this.queuePendingDirectMessage(target, message);
             this.requestCryptoPublicInfo(target);
-            this.addLog('info', `Queued DM for ${target.slice(0, 6)} until its direct key arrives`, 'crypto');
+            this.addLog('info', `Queued DM for ${formatMessagePeerId(target)} until its direct key arrives`, 'crypto');
             return;
           }
 
@@ -2510,23 +2319,25 @@ export default {
           }
 
           this.messagesSeen++;
-          this.addLog('sent', `[DM→${target.slice(0, 6)}] ${message}`, 'You', 0, true, {
+          this.addLog('sent', `[DM→${formatMessagePeerId(target)}] ${message}`, 'You', 0, true, {
             direct: true,
             icon: 'directSend'
           });
         } else {
           const encryptedBroadcastPayload = await this.buildEncryptedBroadcastPayload(message);
-          const messageId = this.gossip.broadcastReliable(encryptedBroadcastPayload, {
+          const messageId = this.gossip.broadcast(encryptedBroadcastPayload, {
             sender: this.clientId,
             timestamp: Date.now(),
             encrypted: true
           }, {
-            deliveryTimeoutMs: 30_000
+            aggregateDelivery: true,
+            deliveryTimeoutMs: 30_000,
           });
+          this.recordDeliveryInference(messageId);
 
           // Local history should not depend on decrypting our own echo envelope.
           this.messagesSeen++;
-          this.addLog('sent', `[0 hops] ${message}`, 'You', 0, true, {
+          this.addLog('sent', message, 'You', 0, true, {
             icon: 'sent',
             messageId
           });
@@ -2787,7 +2598,7 @@ export default {
         }
 
         this.messagesSeen++;
-        this.addLog('sent', `[DM→${target.slice(0, 6)}] ${message}`, 'You', 0, true, {
+        this.addLog('sent', `[DM→${formatMessagePeerId(target)}] ${message}`, 'You', 0, true, {
           direct: true,
           icon: 'directSend'
         });
@@ -2915,7 +2726,10 @@ export default {
       }
     },
 
-    async handleGossipPayload({ message, local, fromPeer }) {
+    async handleGossipPayload({ message, local, fromPeer, receivedAt: gossipReceivedAt }) {
+      const receivedAt = Number.isFinite(gossipReceivedAt) && Number(gossipReceivedAt) > 0
+        ? Number(gossipReceivedAt)
+        : Date.now();
       const sourcePeer = String(fromPeer || message?.sender || 'peer');
       const payload = normalizeMessagePayload(message?.data);
 
@@ -2973,15 +2787,19 @@ export default {
 
         this.messagesSeen++;
         const icon = local ? 'sent' : (sourcePeer ? 'received' : 'broadcast');
-        const source = local ? 'You' : sourcePeer.slice(0, 6);
-        const hopLabel = message.hops === 1 ? 'hop' : 'hops';
+        const source = local ? 'You' : sourcePeer;
         this.addLog(
           local ? 'sent' : 'received',
-          `[${message.hops} ${hopLabel}] ${decrypted}`,
+          decrypted,
           source,
           message.hops,
           local,
-          { icon }
+          {
+            icon,
+            receivedAt,
+            latencyMs: calculateMessageLatency(message?.timestamp ?? payload?.timestamp, receivedAt),
+            hopPath: message?.path,
+          }
         );
         if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
         return;
@@ -2990,15 +2808,19 @@ export default {
       // Backward-compatible path for plaintext messages.
       this.messagesSeen++;
       const icon = local ? 'sent' : (sourcePeer ? 'received' : 'broadcast');
-      const source = local ? 'You' : sourcePeer.slice(0, 6);
-      const hopLabel = message.hops === 1 ? 'hop' : 'hops';
+      const source = local ? 'You' : sourcePeer;
       this.addLog(
         local ? 'sent' : 'received',
-        `[${message.hops} ${hopLabel}] ${this.displayPayloadText(payload)}`,
+        this.displayPayloadText(payload),
         source,
         message.hops,
         local,
-        { icon }
+        {
+          icon,
+          receivedAt,
+          latencyMs: calculateMessageLatency(message?.timestamp ?? payload?.timestamp, receivedAt),
+          hopPath: message?.path,
+        }
       );
       if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
     },
@@ -3079,13 +2901,14 @@ export default {
         }
 
         this.connectedPeersList = this.mesh.getConnectedPeers();
-        this.discoveredPeersList = this.mesh.getDiscoveredPeers();
-        const global = this.mesh.getGlobalPeers ? this.mesh.getGlobalPeers() : [];
+        // Signaling discovery is only a dial hint. All visible membership,
+        // graph nodes, and user-facing peer totals use CECR membership.
+        const cecrPeers = this.mesh.getGlobalPeers ? this.mesh.getGlobalPeers() : [];
+        this.discoveredPeersList = [...new Set(cecrPeers)];
         const self = meshClientId;
         this.globalPeersList = [...new Set([
-          ...global,
+          ...cecrPeers,
           ...this.connectedPeersList,
-          ...this.discoveredPeersList,
         ])].filter(p => p && p !== self);
 
         // Keep DM target valid as the membership view converges.
@@ -3147,45 +2970,6 @@ export default {
       return new Set(sortedPeers.slice(-overflow));
     },
 
-    activeMeshPeerIds() {
-      const activePeerIds = new Set();
-      const addPeer = (peerId) => {
-        const id = String(peerId || '').trim();
-        if (id) activePeerIds.add(id);
-      };
-
-      addPeer(this.mesh?.getClientId?.() || this.clientId);
-      for (const peerId of this.connectedPeersList || []) addPeer(peerId);
-      for (const peerId of this.discoveredPeersList || []) addPeer(peerId);
-      for (const peerId of this.globalPeersList || []) addPeer(peerId);
-      return activePeerIds;
-    },
-
-    networkGraphHopDistances(localPeerId, peerIds, links) {
-      const distances = new Map();
-      if (!localPeerId) return distances;
-      const adjacency = new Map((peerIds || []).map((peerId) => [peerId, []]));
-      for (const link of links || []) {
-        const source = String(link?.source || '').trim();
-        const target = String(link?.target || '').trim();
-        if (!adjacency.has(source) || !adjacency.has(target)) continue;
-        adjacency.get(source).push(target);
-        adjacency.get(target).push(source);
-      }
-      distances.set(localPeerId, 0);
-      const queue = [localPeerId];
-      for (let index = 0; index < queue.length; index += 1) {
-        const peerId = queue[index];
-        const nextDistance = distances.get(peerId) + 1;
-        for (const adjacentPeerId of adjacency.get(peerId) || []) {
-          if (distances.has(adjacentPeerId)) continue;
-          distances.set(adjacentPeerId, nextDistance);
-          queue.push(adjacentPeerId);
-        }
-      }
-      return distances;
-    },
-
     networkGraphDistanceScale(hopDistance, isSelf = false) {
       if (isSelf) return 1;
       const distance = Number(hopDistance);
@@ -3232,89 +3016,7 @@ export default {
         return { nodes, links };
       }
 
-      const edgeMap = new Map();
-      const activePeerIds = this.activeMeshPeerIds();
-      const participants = new Set(activePeerIds);
-
-      const snapshots = this.activeMeshPeerSnapshots();
-      const localSnapshot = this.localMeshPeerSnapshot();
-      const localConnectedSet = new Set((this.connectedPeersList || []).map((peerId) => String(peerId || '').trim()).filter(Boolean));
-      const localDiscoveredSet = new Set((this.discoveredPeersList || []).map((peerId) => String(peerId || '').trim()).filter(Boolean));
-      if (localSnapshot) {
-        snapshots[localSnapshot.peerId] = localSnapshot;
-      }
-
-      const tolerantPeerIds = this.networkTolerantPeerIds(this.connectedPeersList || []);
-
-      for (const [sourcePeerId, snapshot] of Object.entries(snapshots)) {
-        const source = String(sourcePeerId || '').trim();
-        if (!source || !activePeerIds.has(source)) continue;
-
-        const connectedPeers = Array.isArray(snapshot?.connectedPeers) ? snapshot.connectedPeers : [];
-        for (const peerId of connectedPeers) {
-          const target = String(peerId || '').trim();
-          if (!target || target === source || !activePeerIds.has(target)) continue;
-
-          participants.add(source);
-          participants.add(target);
-
-          const edgeId = [source, target].sort().join('|');
-          const entry = edgeMap.get(edgeId) || {
-            source: [source, target].sort()[0],
-            target: [source, target].sort()[1],
-            direct: false,
-          };
-
-          // A solid edge means exactly what the Connected counter means: this
-          // browser currently has that peer in its direct WebRTC peer list.
-          const localDirectLink = Boolean(localSelf) && (
-            (source === localSelf && localConnectedSet.has(target)) ||
-            (target === localSelf && localConnectedSet.has(source))
-          );
-          entry.direct = entry.direct || localDirectLink;
-          edgeMap.set(edgeId, entry);
-        }
-      }
-
-      const links = Array.from(edgeMap.values()).map((entry) => ({
-        source: entry.source,
-        target: entry.target,
-        direct: Boolean(entry.direct),
-      }));
-
-      // Render the full merged topology from epublic mesh:peers, not only
-      // the local connected component.
-
-      // Always include local self so the graph never disappears when isolated.
-      if (localSelf) {
-        participants.add(localSelf);
-      }
-
-      const nodeIds = [...participants];
-      const hopDistances = this.networkGraphHopDistances(localSelf, nodeIds, links);
-
-      const nodes = nodeIds
-        .sort((a, b) => a.localeCompare(b))
-        .map((peerId) => {
-          const isSelf = Boolean(localSelf) && peerId === localSelf;
-          const hopDistance = hopDistances.get(peerId) ?? null;
-          return {
-            id: peerId,
-            isSelf,
-            isDirect: localConnectedSet.has(peerId),
-            isDiscovered: localDiscoveredSet.has(peerId),
-            isTolerant: tolerantPeerIds.has(peerId),
-            hue: this.networkNodeHue(peerId),
-            hopDistance,
-            distanceScale: this.networkGraphDistanceScale(hopDistance, isSelf),
-          };
-        });
-      const visiblePeerIds = new Set(nodes.map((node) => node.id));
-      const visibleLinks = links.filter(
-        (link) => visiblePeerIds.has(link.source) && visiblePeerIds.has(link.target),
-      );
-
-      return { nodes, links: visibleLinks };
+      return { nodes: [], links: [] };
     },
 
     networkGraphSignature(nodes, links) {
@@ -3918,76 +3620,22 @@ export default {
       this.destroyNetworkGraph();
     },
 
-    gossipCoverageSnapshot() {
+    gossipCoverageSnapshot(graph = this.networkGraphModel) {
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-      const localConnectedPeers = new Set(
-        (this.connectedPeersList || []).map((peerId) => String(peerId || '').trim()).filter(Boolean)
+      const totalNetworkPeers = Math.max(
+        1,
+        Number(this.gossip?.getCecrState?.()?.networkSizeEstimate || 0),
       );
-      const activePeerIds = this.activeMeshPeerIds();
-      const snapshots = this.activeMeshPeerSnapshots();
-      const localSnapshot = this.localMeshPeerSnapshot();
-      if (localSnapshot) snapshots[localSnapshot.peerId] = localSnapshot;
-
-      const knownPeers = new Set();
-      const adjacency = new Map();
-      const addPeer = (peerId) => {
-        const id = String(peerId || '').trim();
-        if (!id) return '';
-        knownPeers.add(id);
-        if (!adjacency.has(id)) adjacency.set(id, new Set());
-        return id;
-      };
-      const addConnection = (leftPeerId, rightPeerId) => {
-        const left = addPeer(leftPeerId);
-        const right = addPeer(rightPeerId);
-        if (!left || !right || left === right) return;
-        adjacency.get(left).add(right);
-        adjacency.get(right).add(left);
-      };
-
-      for (const peerId of activePeerIds) addPeer(peerId);
-      // The local transport is authoritative for every edge incident to self.
-      // A remote snapshot may still describe an edge this browser already lost.
-      for (const peerId of localConnectedPeers) addConnection(self, peerId);
-      for (const [peerId, snapshot] of Object.entries(snapshots)) {
-        const source = String(peerId || snapshot?.peerId || '').trim();
-        if (!source || !activePeerIds.has(source)) continue;
-        for (const target of snapshot?.connectedPeers || []) {
-          const normalizedTarget = String(target || '').trim();
-          if (!activePeerIds.has(normalizedTarget)) continue;
-          // Remote topology cannot resurrect a stale edge to this browser.
-          if (source === self || normalizedTarget === self) continue;
-          addConnection(source, normalizedTarget);
-        }
-      }
-
-      if (!self) {
-        return { reachablePeers: 0, knownPeers: Math.max(0, knownPeers.size), coverage: 0 };
-      }
-
-      const visited = new Set([self]);
-      const queue = [self];
-      while (queue.length > 0) {
-        const peerId = queue.shift();
-        for (const neighbor of adjacency.get(peerId) || []) {
-          if (visited.has(neighbor)) continue;
-          visited.add(neighbor);
-          queue.push(neighbor);
-        }
-      }
-
-      const knownRemotePeers = Math.max(0, knownPeers.size - 1);
-      const reachableRemotePeers = Math.max(0, visited.size - 1);
-      const coverage = knownRemotePeers > 0 ? reachableRemotePeers / knownRemotePeers : 0;
-      return {
-        reachablePeers: reachableRemotePeers,
-        knownPeers: knownRemotePeers,
-        coverage,
-      };
+      return calculateGraphCoverageSnapshot(graph, self, totalNetworkPeers - 1);
     },
 
     syncGossipStatus() {
       if (!this.isRunning) return;
+
+      if (this.browserSuspended) {
+        this.showStatus('Suspended', 'Suspended (browser paused this peer)', 'info');
+        return;
+      }
 
       if (!this.signalingConnected) {
         this.showStatus('Reconnecting', 'Signaling reconnect in progress...', 'connecting');
@@ -3998,27 +3646,13 @@ export default {
       if ((this.connectedPeersList || []).length === 0) {
         this.showStatus(
           'Gossip Offline',
-          `Gossip Offline (0/${coverageSnapshot.knownPeers} reachable; no live connections)`,
+          `Gossip Offline (${coverageSnapshot.reachablePeers}/${coverageSnapshot.knownPeers} reachable; no live remote connections)`,
           'connecting'
         );
         return;
       }
       const coverage = coverageSnapshot.coverage;
-      let quality = 'Poor';
-      let statusType = 'connecting';
-
-      if (coverage >= 1) {
-        quality = 'Good';
-        statusType = 'success';
-      } else if (coverage >= 0.5) {
-        quality = 'OK';
-        statusType = 'success';
-      } else if (coverage >= 0.25) {
-        quality = 'Fair';
-        statusType = 'info';
-      } else if (coverage >= 0.1) {
-        quality = 'Degraded';
-      }
+      const { label: quality, statusType } = gossipQualityForCoverage(coverage);
 
       this.showStatus(
         `Gossip ${quality}`,
@@ -4027,36 +3661,94 @@ export default {
       );
     },
 
-    recordDeliveryReceipt(status) {
-      const messageId = String(status?.messageId || '').trim();
+    recordDeliveryInference(rawMessageId) {
+      const messageId = String(rawMessageId || '').trim();
       if (!messageId) return;
-      this.deliveryReceipts = {
-        ...this.deliveryReceipts,
+      const coverage = this.gossipCoverageSnapshot();
+      const existing = this.deliveryInferences[messageId] || {};
+      this.deliveryInferences = {
+        ...this.deliveryInferences,
         [messageId]: {
-          ...status,
-          deliveredCount: Math.max(0, Number(status?.deliveredCount || 0)),
-          audienceCount: Math.max(0, Number(status?.audienceCount || 0)),
-          complete: Boolean(status?.complete),
-          timedOut: Boolean(status?.timedOut),
+          ...existing,
+          reachablePeers: coverage.reachablePeers,
+          knownPeers: Math.max(
+            coverage.knownPeers,
+            Number(existing.confirmedPeerCount || 0),
+            Number(existing.inferredAudienceCount || 0),
+          ),
+          coverage: coverage.coverage,
+          inferredAt: Date.now(),
         }
       };
     },
 
-    deliveryReceiptLabel(messageId) {
-      const status = this.deliveryReceipts[messageId];
-      if (!status) return '';
-      const count = `${status.deliveredCount}/${status.audienceCount}`;
-      if (status.complete) return `Delivered to all (${count})`;
-      if (status.timedOut) return `Delivery incomplete (${count})`;
-      return `Delivering (${count})`;
+    recordAggregateDelivery(status) {
+      const messageId = String(status?.messageId || '').trim();
+      if (!messageId) return;
+      const existing = this.deliveryInferences[messageId] || {};
+      const confirmedPeerCount = Math.max(0, Number(status?.confirmedPeerCount || 0));
+      const inferredAudienceCount = Math.max(
+        confirmedPeerCount,
+        Number(status?.inferredAudienceCount || 0),
+      );
+      this.deliveryInferences = {
+        ...this.deliveryInferences,
+        [messageId]: {
+          ...existing,
+          confirmedPeerCount,
+          inferredAudienceCount,
+          knownPeers: Math.max(Number(existing.knownPeers || 0), inferredAudienceCount),
+          maxConfirmedHops: Math.max(0, Number(status?.maxConfirmedHops || 0)),
+          settled: Boolean(status?.settled),
+          aggregateUpdatedAt: Number(status?.updatedAt || Date.now()),
+        },
+      };
+      this.syncGossipStatus();
     },
 
-    deliveryReceiptClass(messageId) {
-      const status = this.deliveryReceipts[messageId];
+    refreshDeliveryInferences() {
+      const messageIds = Object.keys(this.deliveryInferences || {});
+      if (messageIds.length === 0) return;
+      const coverage = this.gossipCoverageSnapshot();
+      const inferredAt = Date.now();
+      this.deliveryInferences = Object.fromEntries(messageIds.map((messageId) => {
+        const existing = this.deliveryInferences[messageId] || {};
+        const confirmedPeerCount = Math.max(0, Number(existing.confirmedPeerCount || 0));
+        const knownPeers = Math.max(
+          coverage.knownPeers,
+          confirmedPeerCount,
+          Number(existing.inferredAudienceCount || 0),
+        );
+        return [messageId, {
+          ...existing,
+          reachablePeers: coverage.reachablePeers,
+          knownPeers,
+          coverage: knownPeers > 0 ? Math.max(coverage.reachablePeers, confirmedPeerCount) / knownPeers : 0,
+          inferredAt,
+        }];
+      }));
+    },
+
+    deliveryInferenceLabel(messageId) {
+      const status = this.deliveryInferences[messageId];
       if (!status) return '';
-      if (status.complete) return 'complete';
-      if (status.timedOut) return 'timed-out';
-      return 'pending';
+      if (Number.isFinite(status.confirmedPeerCount)) {
+        const prefix = status.settled ? 'Confirmed reach' : 'Aggregating reach';
+        return `${prefix} (${status.confirmedPeerCount}/${status.knownPeers})`;
+      }
+      return `Inferred reach (${status.reachablePeers}/${status.knownPeers})`;
+    },
+
+    deliveryInferenceClass(messageId) {
+      const status = this.deliveryInferences[messageId];
+      if (!status) return '';
+      const representedPeers = Math.max(
+        Number(status.reachablePeers || 0),
+        Number(status.confirmedPeerCount || 0),
+      );
+      return status.knownPeers > 0 && representedPeers >= status.knownPeers
+        ? 'complete'
+        : 'partial';
     },
 
     entryBubbleClass(entry) {
@@ -4066,18 +3758,32 @@ export default {
       return entry.local ? 'me' : 'peer';
     },
 
+    formatHopLatency,
+    formatHopTrace,
+    formatMessagePeerId,
+    messagePeerSha1,
+
     addLog(type, text, sender = 'System', hops = 0, local = false, options = {}) {
+      const requestedTimestamp = Number(options.receivedAt);
+      const latencyMs = Number(options.latencyMs);
+      const normalizedHops = type === 'received' && !local && !options.direct
+        ? Math.max(1, Math.floor(Number(hops) || 0))
+        : Math.max(0, Math.floor(Number(hops) || 0));
       const entry = {
         type,
         text,
         sender,
-        hops,
-        timestamp: new Date(),
+        hops: normalizedHops,
+        timestamp: new Date(Number.isFinite(requestedTimestamp) && requestedTimestamp > 0 ? requestedTimestamp : Date.now()),
         local,
         system: options.system === true || sender === 'System',
         direct: !!options.direct,
         icon: String(options.icon || ''),
-        messageId: String(options.messageId || '')
+        messageId: String(options.messageId || ''),
+        latencyMs: Number.isFinite(latencyMs) && latencyMs >= 0 ? Math.round(latencyMs) : null,
+        hopPath: Array.isArray(options.hopPath)
+          ? options.hopPath.filter((peerId) => typeof peerId === 'string' && peerId.length > 0)
+          : [],
       };
 
       this.messageLog.push(entry);
@@ -4376,6 +4082,25 @@ export default {
     if (this.networkGraphResizeHandler) {
       window.removeEventListener('resize', this.networkGraphResizeHandler);
       this.networkGraphResizeHandler = null;
+    }
+    if (this.pageLifecycleFreezeHandler) {
+      document.removeEventListener('freeze', this.pageLifecycleFreezeHandler);
+      this.pageLifecycleFreezeHandler = null;
+    }
+    if (this.pageLifecycleResumeHandler) {
+      document.removeEventListener('resume', this.pageLifecycleResumeHandler);
+      window.removeEventListener('pageshow', this.pageLifecycleResumeHandler);
+      window.removeEventListener('focus', this.pageLifecycleResumeHandler);
+      window.removeEventListener('online', this.pageLifecycleResumeHandler);
+      this.pageLifecycleResumeHandler = null;
+    }
+    if (this.pageLifecycleVisibilityHandler) {
+      document.removeEventListener('visibilitychange', this.pageLifecycleVisibilityHandler);
+      this.pageLifecycleVisibilityHandler = null;
+    }
+    if (this.pageLifecyclePageHideHandler) {
+      window.removeEventListener('pagehide', this.pageLifecyclePageHideHandler);
+      this.pageLifecyclePageHideHandler = null;
     }
     this.stopCryptoAnnounceLoop();
     this.stopDebugMonitor();
@@ -5324,7 +5049,7 @@ section {
 .network-graph-gossip-status {
   position: absolute;
   right: 0.8rem;
-  bottom: 0.72rem;
+  top: 0.72rem;
   z-index: 4;
   display: inline-flex;
   align-items: center;
@@ -5558,7 +5283,7 @@ section {
   color: #d1fae5;
 }
 
-.bubble-delivery.timed-out {
+.bubble-delivery.partial {
   color: #fee2e2;
 }
 
@@ -5566,6 +5291,7 @@ section {
   margin-top: 0.25rem;
   font-size: 0.75rem;
   opacity: 0.7;
+  cursor: help;
 }
 
 .modal-backdrop {

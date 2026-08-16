@@ -15,9 +15,9 @@ type GossipProtocolOptions = {
     cecrConvergenceRounds?: number;
     /** Default deadline for opt-in tracked gossip delivery. Default 30 seconds. */
     deliveryTimeoutMs?: number;
-    /** Delay before a tracked message is eligible for targeted repair. Default 4 seconds. */
+    /** @deprecated Initial targeted repair is immediate; retained for API compatibility. */
     deliveryRepairDelayMs?: number;
-    /** Minimum delay between repair attempts for the same target. Default 5 seconds. */
+    /** Minimum delay between repeated repair attempts for the same target. Default 5 seconds. */
     deliveryRepairIntervalMs?: number;
     /** Maximum recent broadcast IDs advertised per epidemic anti-entropy summary. Default 256. */
     antiEntropySummarySize?: number;
@@ -59,6 +59,8 @@ type CecrStateSnapshot = {
     viewStableForMs: number;
     requiredStableForMs: number;
     size: number;
+    /** Largest fresh CECR/aggregate observation of total live network size. */
+    networkSizeEstimate: number;
     minHex: string | null;
     maxHex: string | null;
     coordinateReady: boolean;
@@ -79,7 +81,13 @@ type CecrStateSnapshot = {
 type GossipBroadcastOptions = {
     /** Track delivery to the canonical known-peer snapshot captured at send time. */
     trackDelivery?: boolean;
-    /** Override the protocol's tracked-delivery deadline for this message. */
+    /**
+     * Confirm reach with a reverse convergecast. Each peer reports one aggregate
+     * subtree count to its first-arrival parent; no peer list or per-peer bitset
+     * is attached to the message or collected by the sender.
+     */
+    aggregateDelivery?: boolean;
+    /** Override the deadline for this message's initial dissemination and delivery inference. */
     deliveryTimeoutMs?: number;
 };
 type GossipDeliveryStatus = {
@@ -97,10 +105,37 @@ type GossipDeliveryStatus = {
     updatedAt: number;
     deadlineAt: number;
 };
+type GossipAggregateDeliveryStatus = {
+    messageId: string;
+    sender: string;
+    /** Confirmed remote holders, excluding the sender. */
+    confirmedPeerCount: number;
+    /** Larger of current CECR membership and confirmed holders. */
+    inferredAudienceCount: number;
+    /** Deepest first-arrival hop represented by the aggregate. */
+    maxConfirmedHops: number;
+    /** True when the current dissemination tree has returned every branch. */
+    settled: boolean;
+    createdAt: number;
+    updatedAt: number;
+    deadlineAt: number;
+};
 type GossipDeliveryEnvelope = {
     setHash: string;
     size: number;
     bits: string;
+    deadlineAt: number;
+};
+type GossipAggregateEnvelope = {
+    protocol: 'gossip-echo/1';
+    deadlineAt: number;
+};
+type GossipSpreadEnvelope = {
+    protocol: 'gossip-spread/1';
+    /** Initial CECR membership view. Payload repair is invalid after this view changes. */
+    setHash: string;
+    size: number;
+    /** Hard cutoff after which this payload must never be replayed. */
     deadlineAt: number;
 };
 type GossipMessage = {
@@ -112,7 +147,11 @@ type GossipMessage = {
     data: unknown;
     metadata: Record<string, unknown>;
     type: 'gossip';
+    /** Bounded first-arrival route trace for diagnostics. */
+    path?: string[];
+    spread?: GossipSpreadEnvelope;
     delivery?: GossipDeliveryEnvelope;
+    aggregate?: GossipAggregateEnvelope;
 };
 type DirectMessage = {
     id: string;
@@ -123,6 +162,8 @@ type DirectMessage = {
     hops: number;
     maxHops: number;
     timestamp: number;
+    /** Bounded routed path, including source and current destination. */
+    path?: string[];
     originConfigId?: string;
     originViewId?: string;
 };
@@ -170,6 +211,7 @@ type GossipEvents = {
         message: GossipMessage;
         local: boolean;
         fromPeer?: string;
+        receivedAt: number;
     }) => void;
     peerConnected: (data: {
         peerId: string;
@@ -183,6 +225,9 @@ type GossipEvents = {
     deliveryProgress: (status: GossipDeliveryStatus) => void;
     deliveryComplete: (status: GossipDeliveryStatus) => void;
     deliveryTimeout: (status: GossipDeliveryStatus) => void;
+    aggregateProgress: (status: GossipAggregateDeliveryStatus) => void;
+    aggregateSettled: (status: GossipAggregateDeliveryStatus) => void;
+    cecrStateChanged: (state: CecrStateSnapshot) => void;
 };
 /**
  * GossipProtocol
@@ -191,7 +236,7 @@ type GossipEvents = {
  *
  * - De-duplicates messages by `id`
  * - Re-broadcasts unseen messages to connected peers until `maxHops`
- * - Repairs missed recent broadcasts with bounded summary/request anti-entropy
+ * - Repairs missed broadcasts only during their bounded initial CECR spread
  */
 declare class GossipProtocol {
     private mesh;
@@ -209,7 +254,6 @@ declare class GossipProtocol {
     private cecrConvergenceRounds;
     private cecrViewChangedAtMs;
     private deliveryTimeoutMs;
-    private deliveryRepairDelayMs;
     private deliveryRepairIntervalMs;
     private cecrCurrentExtrema;
     private cecrRemoteStates;
@@ -217,11 +261,14 @@ declare class GossipProtocol {
     private trackingCleanupTimer;
     private seenDirectIds;
     private deliveryStates;
+    private aggregateStates;
     private retainedMessages;
     private dirtyDeliveryReceiptIds;
     private gossipFanoutCursor;
     private cecrFanoutCursor;
     private antiEntropyFanoutCursor;
+    private initialSpreadRepairQueued;
+    private destroyed;
     private callbacks;
     private peers;
     constructor(mesh: MeshLike, options?: GossipProtocolOptions);
@@ -244,15 +291,32 @@ declare class GossipProtocol {
      * Propagate to the CECR v1 fan-out budget. Selection rotates over the
      * sorted neighbor set so every eligible connection is chosen fairly.
      */
-    propagate(message: GossipMessage, exceptPeerId?: string): void;
+    propagate(message: GossipMessage, exceptPeerId?: string): string[];
     /**
      * Handle an incoming message from the mesh.
      */
     handleIncomingMessage(message: GossipMessage, fromPeerId: string): void;
     private retainGossipMessage;
+    private extendRoutePath;
+    private compactRoutePeerId;
+    private scheduleInitialSpreadRepair;
+    private validSpreadEnvelope;
+    private initialSpreadDeadlineAt;
+    private canContinueInitialSpread;
+    private initialSpreadComplete;
     private recentRetainedMessageIds;
     private publishGossipAntiEntropy;
     private handleGossipAntiEntropy;
+    private registerAggregateDelivery;
+    private refreshAggregateState;
+    private aggregateStatusForState;
+    /** Return the sender's constant-size reverse aggregate for a broadcast. */
+    getAggregateDeliveryStatus(messageId: string): GossipAggregateDeliveryStatus | null;
+    private emitAggregateStatus;
+    private sendAggregateResponse;
+    private publishAggregateState;
+    private handleIncomingAggregate;
+    private maintainAggregateDeliveries;
     private createDeliveryBits;
     private setDeliveryBit;
     private hasDeliveryBit;
@@ -279,6 +343,7 @@ declare class GossipProtocol {
     private updateCecrExtremaSnapshot;
     private effectiveCecrCoordinateWeight;
     private hasCecrConsensus;
+    private cecrNetworkSizeEstimate;
     private publishCecrState;
     private publishCecrDeliveryState;
     private handleIncomingCecrState;
@@ -555,6 +620,7 @@ type PeerPigeonCryptoEvents = {
         message: GossipMessage;
         local: boolean;
         fromPeer?: string;
+        receivedAt: number;
     }) => void;
     encryptedDirectReceived: (data: {
         plaintext: string;
@@ -583,6 +649,7 @@ interface CryptoGossipLike {
         message: GossipMessage;
         local: boolean;
         fromPeer?: string;
+        receivedAt?: number;
     }) => void): void;
     on(event: 'directMessageReceived', callback: (data: {
         message: DirectMessage;
@@ -591,6 +658,7 @@ interface CryptoGossipLike {
         message: GossipMessage;
         local: boolean;
         fromPeer?: string;
+        receivedAt?: number;
     }) => void): void;
     off(event: 'directMessageReceived', callback: (data: {
         message: DirectMessage;
@@ -649,6 +717,9 @@ declare class PeerPigeonCryptoProtocol {
     private emitError;
     private emit;
 }
+
+/** Deterministic SHA-1 hex for compact, non-routing public display IDs. */
+declare function sha1Hex(value: unknown): string;
 
 declare const DEFAULT_SIGNALING_SERVERS: readonly string[];
 declare const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
@@ -733,11 +804,7 @@ interface PartialMeshConfig {
      * this long. Existing FreeRTC negotiations are preserved.
      */
     underConnectedResetMs?: number;
-    /**
-     * Optional fallback for environments where asymmetric discovery can stall.
-     * When set (>0), non-initiators may place a delayed assist dial if no inbound
-     * negotiation appears within this window.
-     */
+    /** @deprecated Offers are immediate from either side; retained for API compatibility. */
     nonInitiatorFallbackDialMs?: number;
     /**
      * Age after which a relayed capacity advertisement stops influencing dial
@@ -865,6 +932,8 @@ declare class PartialMesh {
     private orphanRtcFirstSeenAtMs;
     private peerConnectedAtMs;
     private discoveredAtMs;
+    /** Peers present in the relay's latest un-graced discovery snapshot. */
+    private activeSignalingPeers;
     private maintenanceTimer;
     private membershipTimer;
     private underConnectedSinceMs;
@@ -872,10 +941,8 @@ declare class PartialMesh {
     private lastUnderConnectedRecoveryAtMs;
     private lastDiscoveryRefreshAtMs;
     private lastSignalingReconnectAtMs;
-    private restoreGraceUntilMs;
     private dialFailureCount;
     private dialBackoffUntilMs;
-    private nonInitiatorFallbackTimers;
     private rebalanceCooldownUntilMs;
     private rebalanceAttemptAtMs;
     private pendingRebalanceDropByTarget;
@@ -899,9 +966,11 @@ declare class PartialMesh {
     private addSelfAlias;
     private isSelfAlias;
     private addDiscoveredPeer;
-    private rotateBrowserPeerId;
+    private loadOrCreateBrowserPeerId;
+    private rememberBrowserPeerSignalUrls;
     private retirePeerId;
     private reconcileSignalingPeers;
+    private handleSignalingPeerLeft;
     private getConnectedPeerCount;
     private getPendingPeerCount;
     private noteLocalCapacityChanged;
@@ -912,6 +981,8 @@ declare class PartialMesh {
      */
     private compareCapacityPriority;
     private compareDialCandidates;
+    /** Direct neighbors whose local edge is the only known path to part of the mesh. */
+    private localBridgeConnectedPeerIds;
     private trimExcessPeers;
     private getOldestPendingAgeMs;
     private isHexId;
@@ -995,6 +1066,8 @@ declare class PartialMesh {
      * Get list of discovered peer IDs
      */
     getDiscoveredPeers(): string[];
+    /** Return peers in the relay's latest non-graced discovery snapshot. */
+    getActiveSignalingPeers(): string[];
     /**
      * Get the converged global peer set (all peers known via membership gossip).
      */
@@ -1055,7 +1128,6 @@ declare class PartialMesh {
     private broadcastMembership;
     private tryParseMembership;
     private mergeMembership;
-    private removeFromGlobalMembership;
     /**
      * Disconnect from all peers and close signaling connection
      */
@@ -1094,6 +1166,9 @@ type PeerPigeonNodeEvents = {
     deliveryProgress: (status: GossipDeliveryStatus) => void;
     deliveryComplete: (status: GossipDeliveryStatus) => void;
     deliveryTimeout: (status: GossipDeliveryStatus) => void;
+    aggregateProgress: (status: GossipAggregateDeliveryStatus) => void;
+    aggregateSettled: (status: GossipAggregateDeliveryStatus) => void;
+    cecrStateChanged: (state: CecrStateSnapshot) => void;
     error: (error: Error) => void;
 };
 /**
@@ -1124,11 +1199,13 @@ declare class PeerPigeonNode {
     getClientId(): string | null;
     getConnectedPeers(): string[];
     getDiscoveredPeers(): string[];
+    getActiveSignalingPeers(): string[];
     getGlobalPeers(): string[];
     broadcast(data: unknown, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): string;
     broadcastReliable(data: unknown, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): string;
     sendDirect(peerId: string, data: unknown): string | null;
     getDeliveryStatus(messageId: string): GossipDeliveryStatus | null;
+    getAggregateDeliveryStatus(messageId: string): GossipAggregateDeliveryStatus | null;
     broadcastEncrypted(plaintext: string, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): Promise<string>;
     broadcastEncryptedReliable(plaintext: string, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): Promise<string>;
     sendEncryptedDirect(peerId: string, plaintext: string, timeoutMs?: number): Promise<string>;
@@ -1147,4 +1224,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, rankSignalingServersByDistance, selectClosestSignalingServer };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, rankSignalingServersByDistance, selectClosestSignalingServer, sha1Hex };

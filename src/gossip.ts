@@ -1,3 +1,5 @@
+import { sha1Hex } from './sha1.js';
+
 export type GossipProtocolOptions = {
   /** Maximum number of re-propagation hops for a message. */
   maxHops?: number;
@@ -15,9 +17,9 @@ export type GossipProtocolOptions = {
   cecrConvergenceRounds?: number;
   /** Default deadline for opt-in tracked gossip delivery. Default 30 seconds. */
   deliveryTimeoutMs?: number;
-  /** Delay before a tracked message is eligible for targeted repair. Default 4 seconds. */
+  /** @deprecated Initial targeted repair is immediate; retained for API compatibility. */
   deliveryRepairDelayMs?: number;
-  /** Minimum delay between repair attempts for the same target. Default 5 seconds. */
+  /** Minimum delay between repeated repair attempts for the same target. Default 5 seconds. */
   deliveryRepairIntervalMs?: number;
   /** Maximum recent broadcast IDs advertised per epidemic anti-entropy summary. Default 256. */
   antiEntropySummarySize?: number;
@@ -62,6 +64,8 @@ export type CecrStateSnapshot = {
   viewStableForMs: number;
   requiredStableForMs: number;
   size: number;
+  /** Largest fresh CECR/aggregate observation of total live network size. */
+  networkSizeEstimate: number;
   minHex: string | null;
   maxHex: string | null;
   coordinateReady: boolean;
@@ -83,7 +87,13 @@ export type CecrStateSnapshot = {
 export type GossipBroadcastOptions = {
   /** Track delivery to the canonical known-peer snapshot captured at send time. */
   trackDelivery?: boolean;
-  /** Override the protocol's tracked-delivery deadline for this message. */
+  /**
+   * Confirm reach with a reverse convergecast. Each peer reports one aggregate
+   * subtree count to its first-arrival parent; no peer list or per-peer bitset
+   * is attached to the message or collected by the sender.
+   */
+  aggregateDelivery?: boolean;
+  /** Override the deadline for this message's initial dissemination and delivery inference. */
   deliveryTimeoutMs?: number;
 };
 
@@ -103,6 +113,22 @@ export type GossipDeliveryStatus = {
   deadlineAt: number;
 };
 
+export type GossipAggregateDeliveryStatus = {
+  messageId: string;
+  sender: string;
+  /** Confirmed remote holders, excluding the sender. */
+  confirmedPeerCount: number;
+  /** Larger of current CECR membership and confirmed holders. */
+  inferredAudienceCount: number;
+  /** Deepest first-arrival hop represented by the aggregate. */
+  maxConfirmedHops: number;
+  /** True when the current dissemination tree has returned every branch. */
+  settled: boolean;
+  createdAt: number;
+  updatedAt: number;
+  deadlineAt: number;
+};
+
 type GossipDeliveryEnvelope = {
   setHash: string;
   size: number;
@@ -115,6 +141,20 @@ type GossipDeliveryReceipt = GossipDeliveryEnvelope & {
   sender: string;
 };
 
+type GossipAggregateEnvelope = {
+  protocol: 'gossip-echo/1';
+  deadlineAt: number;
+};
+
+export type GossipSpreadEnvelope = {
+  protocol: 'gossip-spread/1';
+  /** Initial CECR membership view. Payload repair is invalid after this view changes. */
+  setHash: string;
+  size: number;
+  /** Hard cutoff after which this payload must never be replayed. */
+  deadlineAt: number;
+};
+
 export type GossipMessage = {
   id: string;
   timestamp: number;
@@ -124,7 +164,11 @@ export type GossipMessage = {
   data: unknown;
   metadata: Record<string, unknown>;
   type: 'gossip';
+  /** Bounded first-arrival route trace for diagnostics. */
+  path?: string[];
+  spread?: GossipSpreadEnvelope;
   delivery?: GossipDeliveryEnvelope;
+  aggregate?: GossipAggregateEnvelope;
 };
 
 export type DirectMessage = {
@@ -136,6 +180,8 @@ export type DirectMessage = {
   hops: number;
   maxHops: number;
   timestamp: number;
+  /** Bounded routed path, including source and current destination. */
+  path?: string[];
   originConfigId?: string;
   originViewId?: string;
 };
@@ -149,6 +195,8 @@ type CecrStateMessage = {
   minHex: string;
   maxHex: string;
   size: number;
+  networkSizeEstimate?: number;
+  networkSizeObservedAt?: number;
   protocol?: 'cecr/1';
   configId?: string;
   viewId?: string;
@@ -161,6 +209,20 @@ type CecrDeliveryStateMessage = {
   timestamp: number;
   protocol: 'cecr-dr/1';
   receipts: GossipDeliveryReceipt[];
+};
+
+type GossipAggregateMessage = {
+  id: string;
+  type: 'gossip-echo';
+  protocol: 'gossip-echo/1';
+  messageId: string;
+  sender: string;
+  from: string;
+  timestamp: number;
+  /** Cumulative unique first-arrival subtree size, including the child. */
+  confirmedTotal: number;
+  maxHops: number;
+  settled: boolean;
 };
 
 type GossipAntiEntropyMessage = {
@@ -212,13 +274,16 @@ interface MeshLike {
 }
 
 type GossipEvents = {
-  messageReceived: (data: { message: GossipMessage; local: boolean; fromPeer?: string }) => void;
+  messageReceived: (data: { message: GossipMessage; local: boolean; fromPeer?: string; receivedAt: number }) => void;
   peerConnected: (data: { peerId: string }) => void;
   peerDisconnected: (data: { peerId: string }) => void;
   directMessageReceived: (data: { message: DirectMessage }) => void;
   deliveryProgress: (status: GossipDeliveryStatus) => void;
   deliveryComplete: (status: GossipDeliveryStatus) => void;
   deliveryTimeout: (status: GossipDeliveryStatus) => void;
+  aggregateProgress: (status: GossipAggregateDeliveryStatus) => void;
+  aggregateSettled: (status: GossipAggregateDeliveryStatus) => void;
+  cecrStateChanged: (state: CecrStateSnapshot) => void;
 };
 
 type CecrExtrema = {
@@ -236,6 +301,8 @@ type CecrRemoteState = {
   min: bigint;
   max: bigint;
   size: number;
+  networkSizeEstimate: number;
+  networkSizeObservedAt: number;
   updatedAtMs: number;
   matchingRounds: number;
 };
@@ -257,7 +324,31 @@ type GossipDeliveryState = {
   repairAttemptsByPeer: Map<string, { attempts: number; lastAttemptAt: number }>;
 };
 
+type GossipAggregateChildState = {
+  confirmedTotal: number;
+  maxHops: number;
+  settled: boolean;
+};
+
+type GossipAggregateState = {
+  messageId: string;
+  sender: string;
+  parentPeerId: string | null;
+  localHops: number;
+  children: Map<string, GossipAggregateChildState>;
+  confirmedTotal: number;
+  maxHops: number;
+  settled: boolean;
+  createdAt: number;
+  updatedAt: number;
+  deadlineAt: number;
+  lastSentSignature: string;
+  lastStatusSignature: string;
+  settledEmitted: boolean;
+};
+
 const RELIABLE_REPAIR_TYPE = 'pp-gossip-repair-v1';
+const GOSSIP_AGGREGATE_PROTOCOL = 'gossip-echo/1';
 const CECR_ID_WIDTH_BITS = 256;
 const CECR_ID_HEX_LENGTH = CECR_ID_WIDTH_BITS / 4;
 const CECR_ID_MAX = (1n << BigInt(CECR_ID_WIDTH_BITS)) - 1n;
@@ -267,7 +358,7 @@ const MAX_DELIVERY_PEERS = 4096;
 const MAX_REPAIR_ATTEMPTS_PER_TARGET = 3;
 const DEFAULT_ANTI_ENTROPY_SUMMARY_SIZE = 256;
 const DEFAULT_ANTI_ENTROPY_REQUEST_SIZE = 64;
-
+const MAX_ROUTE_TRACE_PEERS = 32;
 /**
  * GossipProtocol
  *
@@ -275,7 +366,7 @@ const DEFAULT_ANTI_ENTROPY_REQUEST_SIZE = 64;
  *
  * - De-duplicates messages by `id`
  * - Re-broadcasts unseen messages to connected peers until `maxHops`
- * - Repairs missed recent broadcasts with bounded summary/request anti-entropy
+ * - Repairs missed broadcasts only during their bounded initial CECR spread
  */
 export class GossipProtocol {
   private mesh: MeshLike;
@@ -293,7 +384,6 @@ export class GossipProtocol {
   private cecrConvergenceRounds: number;
   private cecrViewChangedAtMs: number = Date.now();
   private deliveryTimeoutMs: number;
-  private deliveryRepairDelayMs: number;
   private deliveryRepairIntervalMs: number;
   private cecrCurrentExtrema: CecrExtrema | null = null;
   private cecrRemoteStates: Map<string, CecrRemoteState> = new Map();
@@ -301,11 +391,19 @@ export class GossipProtocol {
   private trackingCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private seenDirectIds: Map<string, number> = new Map();
   private deliveryStates: Map<string, GossipDeliveryState> = new Map();
-  private retainedMessages: Map<string, { message: GossipMessage; retainedAt: number }> = new Map();
+  private aggregateStates: Map<string, GossipAggregateState> = new Map();
+  private retainedMessages: Map<string, {
+    message: GossipMessage;
+    retainedAt: number;
+    viewId: string;
+    viewSize: number;
+  }> = new Map();
   private dirtyDeliveryReceiptIds: Set<string> = new Set();
   private gossipFanoutCursor = 0;
   private cecrFanoutCursor = 0;
   private antiEntropyFanoutCursor = 0;
+  private initialSpreadRepairQueued = false;
+  private destroyed = false;
   private callbacks: Partial<Record<keyof GossipEvents, Set<Function>>> = {};
   private peers: Map<string, { connected: boolean; timestamp: number }> = new Map();
 
@@ -318,7 +416,6 @@ export class GossipProtocol {
     this.cecrRequireConsensus = options.cecrRequireConsensus ?? true;
     this.cecrConvergenceRounds = Math.max(1, Math.floor(options.cecrConvergenceRounds ?? 3));
     this.deliveryTimeoutMs = Math.max(2_000, options.deliveryTimeoutMs ?? 30_000);
-    this.deliveryRepairDelayMs = Math.max(1_000, options.deliveryRepairDelayMs ?? 4_000);
     this.deliveryRepairIntervalMs = Math.max(1_000, options.deliveryRepairIntervalMs ?? 5_000);
     this.antiEntropySummarySize = Math.max(
       1,
@@ -343,6 +440,8 @@ export class GossipProtocol {
         this.handleIncomingCecrState(parsed as unknown as CecrStateMessage, peerId);
       } else if (parsed.type === 'cecr-dr') {
         this.handleIncomingCecrDeliveryState(parsed as unknown as CecrDeliveryStateMessage, peerId);
+      } else if (parsed.type === 'gossip-echo') {
+        this.handleIncomingAggregate(parsed as unknown as GossipAggregateMessage, peerId);
       } else if (parsed.type === 'gossip-ae') {
         this.handleGossipAntiEntropy(parsed as unknown as GossipAntiEntropyMessage, peerId);
       } else {
@@ -372,6 +471,7 @@ export class GossipProtocol {
     if (this.cecrSyncTimer) return;
     this.cecrSyncTimer = setInterval(() => {
       this.maintainTrackedDeliveries();
+      this.maintainAggregateDeliveries();
       this.publishCecrState();
       this.publishGossipAntiEntropy();
     }, 2_000);
@@ -381,6 +481,7 @@ export class GossipProtocol {
     if (this.trackingCleanupTimer) return;
     this.trackingCleanupTimer = setInterval(() => {
       this.maintainTrackedDeliveries();
+      this.maintainAggregateDeliveries();
       this.pruneTracking();
     }, 30_000);
   }
@@ -397,12 +498,15 @@ export class GossipProtocol {
     const connected = this.mesh.getConnectedPeers();
     const global = this.mesh.getGlobalPeers?.() ?? connected;
     const networkSize = Math.max(connected.length, global.length, 1);
+    const canonicalPeers = this.canonicalPeerSet();
+    const timestamp = Date.now();
+    const spreadDeadlineAt = timestamp + Math.max(2_000, options.deliveryTimeoutMs ?? this.deliveryTimeoutMs);
 
     const messageId = this.generateMessageId(sender);
     let delivery: GossipDeliveryEnvelope | undefined;
     let deliveryPeers: string[] | null = null;
     if (options.trackDelivery && sender) {
-      deliveryPeers = this.canonicalPeerSet();
+      deliveryPeers = canonicalPeers;
       const senderIndex = deliveryPeers.indexOf(sender);
       const bits = this.createDeliveryBits(deliveryPeers.length);
       if (senderIndex >= 0) this.setDeliveryBit(bits, senderIndex);
@@ -410,13 +514,19 @@ export class GossipProtocol {
         setHash: this.canonicalSetHash(deliveryPeers),
         size: deliveryPeers.length,
         bits: this.deliveryBitsToHex(bits),
-        deadlineAt: Date.now() + Math.max(2_000, options.deliveryTimeoutMs ?? this.deliveryTimeoutMs),
+        deadlineAt: spreadDeadlineAt,
       };
     }
+    const aggregate = options.aggregateDelivery && sender
+      ? {
+          protocol: GOSSIP_AGGREGATE_PROTOCOL as 'gossip-echo/1',
+          deadlineAt: spreadDeadlineAt,
+        }
+      : undefined;
 
     const message: GossipMessage = {
       id: messageId,
-      timestamp: Date.now(),
+      timestamp,
       hops: 0,
       // Ensure messages can cross long sparse paths (e.g. saturation/rebalance chains).
       maxHops: Math.max(this.maxHops, networkSize * 2),
@@ -424,7 +534,15 @@ export class GossipProtocol {
       data,
       metadata,
       type: 'gossip',
-      ...(delivery ? { delivery } : {})
+      ...(sender ? { path: [this.compactRoutePeerId(sender)] } : {}),
+      spread: {
+        protocol: 'gossip-spread/1',
+        setHash: this.canonicalSetHash(canonicalPeers),
+        size: canonicalPeers.length,
+        deadlineAt: spreadDeadlineAt,
+      },
+      ...(delivery ? { delivery } : {}),
+      ...(aggregate ? { aggregate } : {}),
     };
 
     this.messageLog.set(message.id, {
@@ -440,9 +558,12 @@ export class GossipProtocol {
     if (delivery && deliveryPeers) {
       this.registerTrackedDelivery(message, deliveryPeers, true);
     }
+    if (aggregate && sender) {
+      this.registerAggregateDelivery(message, null);
+    }
 
     this.propagate(message);
-    this.emit('messageReceived', { message, local: true });
+    this.emit('messageReceived', { message, local: true, receivedAt: message.timestamp });
 
     return message.id;
   }
@@ -471,32 +592,61 @@ export class GossipProtocol {
    * Propagate to the CECR v1 fan-out budget. Selection rotates over the
    * sorted neighbor set so every eligible connection is chosen fairly.
    */
-  propagate(message: GossipMessage, exceptPeerId?: string): void {
+  propagate(message: GossipMessage, exceptPeerId?: string): string[] {
+    if (Date.now() > this.initialSpreadDeadlineAt(message)) return [];
     const excluded = new Set<string>();
     if (message.sender) excluded.add(message.sender);
     if (exceptPeerId) excluded.add(exceptPeerId);
     const connectedPeers = this.selectFanoutPeers(excluded, 'gossip');
     const deliveryState = this.deliveryStates.get(message.id);
+    const aggregateState = message.aggregate ? this.aggregateStates.get(message.id) : null;
+    if (aggregateState) {
+      for (const peerId of connectedPeers) {
+        if (!aggregateState.children.has(peerId)) {
+          aggregateState.children.set(peerId, {
+            confirmedTotal: 0,
+            maxHops: message.hops,
+            settled: false,
+          });
+        }
+      }
+      this.refreshAggregateState(aggregateState);
+    }
+
+    const sentPeers: string[] = [];
 
     for (const peerId of connectedPeers) {
       const forwarded: GossipMessage = {
         ...message,
         hops: message.hops + 1,
+        path: this.extendRoutePath(message.path, peerId),
         ...(deliveryState ? { delivery: this.deliveryEnvelopeForState(deliveryState) } : {})
       };
 
       try {
         this.mesh.send(peerId, JSON.stringify(forwarded));
+        sentPeers.push(peerId);
       } catch {
-        // best-effort
+        if (aggregateState) {
+          aggregateState.children.set(peerId, {
+            confirmedTotal: 0,
+            maxHops: message.hops,
+            settled: true,
+          });
+          this.refreshAggregateState(aggregateState);
+        }
       }
     }
+    if (aggregateState) this.publishAggregateState(aggregateState);
+    return sentPeers;
   }
 
   /**
    * Handle an incoming message from the mesh.
    */
   handleIncomingMessage(message: GossipMessage, fromPeerId: string): void {
+    const receivedAt = Date.now();
+    if (receivedAt > this.initialSpreadDeadlineAt(message)) return;
     const alreadySeen = this.messageLog.has(message.id);
 
     // Store before the duplicate check. A repeated envelope may restore a
@@ -509,10 +659,23 @@ export class GossipProtocol {
       this.registerTrackedDelivery(message, null, true);
     }
 
+    if (message.aggregate) {
+      const aggregateState = this.aggregateStates.get(message.id);
+      if (alreadySeen) {
+        if (aggregateState?.parentPeerId === fromPeerId) {
+          this.publishAggregateState(aggregateState, true);
+        } else {
+          this.sendAggregateResponse(message, fromPeerId, 0, message.hops, true);
+        }
+      } else {
+        this.registerAggregateDelivery(message, fromPeerId);
+      }
+    }
+
     if (alreadySeen) return;
 
     this.messageLog.set(message.id, {
-      timestamp: Date.now(),
+      timestamp: receivedAt,
       sender: message.sender,
       hops: message.hops
     });
@@ -520,7 +683,7 @@ export class GossipProtocol {
       this.pruneTracking();
     }
 
-    this.emit('messageReceived', { message, local: false, fromPeer: fromPeerId });
+    this.emit('messageReceived', { message, local: false, fromPeer: fromPeerId, receivedAt });
 
     if (message.hops < message.maxHops) {
       this.propagate(message, fromPeerId);
@@ -533,7 +696,14 @@ export class GossipProtocol {
     if (this.retainedMessages.has(message.id)) return;
     try {
       const snapshot = JSON.parse(JSON.stringify(message)) as GossipMessage;
-      this.retainedMessages.set(message.id, { message: snapshot, retainedAt });
+      const peers = this.canonicalPeerSet();
+      this.retainedMessages.set(message.id, {
+        message: snapshot,
+        retainedAt,
+        viewId: this.canonicalSetHash(peers),
+        viewSize: peers.length,
+      });
+      this.scheduleInitialSpreadRepair(retainedAt);
     } catch {
       // A payload that cannot cross the JSON mesh boundary cannot be repaired.
       return;
@@ -546,10 +716,105 @@ export class GossipProtocol {
     }
   }
 
-  private recentRetainedMessageIds(now: number = Date.now()): string[] {
+  private extendRoutePath(path: unknown, ...peerIds: string[]): string[] {
+    const normalized = Array.isArray(path)
+      ? path
+          .filter((peerId): peerId is string => typeof peerId === 'string' && peerId.length > 0 && peerId.length <= 512)
+          .map((peerId) => this.compactRoutePeerId(peerId))
+          .slice(-MAX_ROUTE_TRACE_PEERS)
+      : [];
+    for (const peerId of peerIds) {
+      const compactPeerId = this.compactRoutePeerId(peerId);
+      if (!compactPeerId || normalized[normalized.length - 1] === compactPeerId) continue;
+      normalized.push(compactPeerId);
+    }
+    if (normalized.length <= MAX_ROUTE_TRACE_PEERS) return normalized;
+    return [normalized[0], ...normalized.slice(-(MAX_ROUTE_TRACE_PEERS - 1))];
+  }
+
+  private compactRoutePeerId(peerId: string): string {
+    const value = String(peerId ?? '').trim();
+    return /^[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : sha1Hex(value);
+  }
+
+  private scheduleInitialSpreadRepair(_startedAt: number = Date.now()): void {
+    if (this.initialSpreadRepairQueued || this.destroyed) return;
+    this.initialSpreadRepairQueued = true;
+    queueMicrotask(() => {
+      this.initialSpreadRepairQueued = false;
+      if (this.destroyed) return;
+      this.publishGossipAntiEntropy();
+      this.maintainTrackedDeliveries();
+    });
+  }
+
+  private validSpreadEnvelope(message: GossipMessage): GossipSpreadEnvelope | null {
+    const spread = message.spread;
+    if (
+      !spread
+      || spread.protocol !== 'gossip-spread/1'
+      || typeof spread.setHash !== 'string'
+      || !/^[0-9a-f]{16}$/i.test(spread.setHash)
+      || !Number.isInteger(spread.size)
+      || spread.size < 1
+      || spread.size > MAX_DELIVERY_PEERS
+      || !Number.isFinite(spread.deadlineAt)
+      || spread.deadlineAt <= message.timestamp
+    ) return null;
+    return spread;
+  }
+
+  private initialSpreadDeadlineAt(message: GossipMessage): number {
+    const spread = this.validSpreadEnvelope(message);
+    if (spread) return spread.deadlineAt;
+    const envelopeDeadlines = [message.delivery?.deadlineAt, message.aggregate?.deadlineAt]
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > message.timestamp);
+    if (envelopeDeadlines.length > 0) return Math.min(...envelopeDeadlines);
+    return Number(message.timestamp) + this.deliveryTimeoutMs;
+  }
+
+  private canContinueInitialSpread(
+    message: GossipMessage,
+    targetPeerId?: string,
+    now: number = Date.now(),
+  ): boolean {
+    if (now > this.initialSpreadDeadlineAt(message)) return false;
+    const spread = this.validSpreadEnvelope(message);
+    // Legacy envelopes may finish their already-active fan-out, but are never
+    // eligible for later anti-entropy replay because they have no view proof.
+    if (!spread) return targetPeerId == null;
+    if (!targetPeerId) return true;
+    const retained = this.retainedMessages.get(message.id);
+    if (!retained) return false;
+    const peers = this.canonicalPeerSet();
+    if (peers.length !== retained.viewSize || this.canonicalSetHash(peers) !== retained.viewId) return false;
+    return peers.includes(targetPeerId);
+  }
+
+  private initialSpreadComplete(message: GossipMessage): boolean {
+    const spread = this.validSpreadEnvelope(message);
+    if (!spread) return false;
+    const deliveryState = this.deliveryStates.get(message.id);
+    if (deliveryState && this.deliveryStatusForState(deliveryState).complete) return true;
+    const aggregateState = this.aggregateStates.get(message.id);
+    const retained = this.retainedMessages.get(message.id);
+    const expectedSize = Math.max(
+      spread.size,
+      retained?.viewSize ?? 0,
+      this.cecrNetworkSizeEstimate().size,
+    );
+    return !!aggregateState
+      && aggregateState.settled
+      && aggregateState.confirmedTotal >= expectedSize;
+  }
+
+  private recentRetainedMessageIds(targetPeerId: string, now: number = Date.now()): string[] {
     const minRetainedAt = now - this.trackingRetentionMs;
     return Array.from(this.retainedMessages.entries())
-      .filter(([, retained]) => retained.retainedAt >= minRetainedAt)
+      .filter(([, retained]) => retained.retainedAt >= minRetainedAt
+        && !this.initialSpreadComplete(retained.message)
+        && this.canContinueInitialSpread(retained.message, targetPeerId, now))
       .slice(-this.antiEntropySummarySize)
       .map(([messageId]) => messageId);
   }
@@ -563,19 +828,20 @@ export class GossipProtocol {
       : this.selectFanoutPeers(new Set(), 'anti-entropy');
     if (targets.length === 0) return;
 
-    const message: GossipAntiEntropyMessage = {
-      id: this.generateMessageId(self),
-      type: 'gossip-ae',
-      protocol: 'gossip-ae/1',
-      from: self,
-      timestamp: Date.now(),
-      mode: 'summary',
-      messageIds: this.recentRetainedMessageIds(),
-    };
-    const encoded = JSON.stringify(message);
     for (const peerId of targets) {
+      const messageIds = this.recentRetainedMessageIds(peerId);
+      if (messageIds.length === 0) continue;
+      const message: GossipAntiEntropyMessage = {
+        id: this.generateMessageId(self),
+        type: 'gossip-ae',
+        protocol: 'gossip-ae/1',
+        from: self,
+        timestamp: Date.now(),
+        mode: 'summary',
+        messageIds,
+      };
       try {
-        this.mesh.send(peerId, encoded);
+        this.mesh.send(peerId, JSON.stringify(message));
       } catch {
         // best-effort; a later round retries through the rotating fan-out
       }
@@ -625,16 +891,231 @@ export class GossipProtocol {
     for (const messageId of messageIds) {
       const retained = this.retainedMessages.get(messageId);
       if (!retained) continue;
+      if (
+        this.initialSpreadComplete(retained.message)
+        || !this.canContinueInitialSpread(retained.message, fromPeerId)
+      ) continue;
       const deliveryState = this.deliveryStates.get(messageId);
       const repaired: GossipMessage = {
         ...retained.message,
+        hops: Math.max(0, Math.floor(Number(retained.message.hops) || 0)) + 1,
+        path: this.extendRoutePath(retained.message.path, fromPeerId),
         ...(deliveryState ? { delivery: this.deliveryEnvelopeForState(deliveryState) } : {}),
       };
+      const aggregateState = repaired.aggregate ? this.aggregateStates.get(messageId) : null;
+      if (aggregateState && !aggregateState.children.has(fromPeerId)) {
+        aggregateState.children.set(fromPeerId, {
+          confirmedTotal: 0,
+          maxHops: repaired.hops,
+          settled: false,
+        });
+        this.refreshAggregateState(aggregateState);
+      }
       try {
         this.mesh.send(fromPeerId, JSON.stringify(repaired));
       } catch {
-        // best-effort; remaining requested messages may still be served
+        if (aggregateState) {
+          aggregateState.children.set(fromPeerId, {
+            confirmedTotal: 0,
+            maxHops: repaired.hops,
+            settled: true,
+          });
+          this.refreshAggregateState(aggregateState);
+          this.publishAggregateState(aggregateState);
+        }
       }
+    }
+  }
+
+  // ─── Reverse aggregate delivery inference ──────────────────────────────
+
+  private registerAggregateDelivery(
+    message: GossipMessage,
+    parentPeerId: string | null,
+  ): GossipAggregateState | null {
+    if (!message.aggregate || !message.sender) return null;
+    const existing = this.aggregateStates.get(message.id);
+    if (existing) return existing;
+    if (
+      message.aggregate.protocol !== GOSSIP_AGGREGATE_PROTOCOL
+      || !Number.isFinite(message.aggregate.deadlineAt)
+      || message.aggregate.deadlineAt <= 0
+    ) return null;
+
+    const now = Date.now();
+    const state: GossipAggregateState = {
+      messageId: message.id,
+      sender: message.sender,
+      parentPeerId,
+      localHops: Math.max(0, Math.floor(Number(message.hops) || 0)),
+      children: new Map(),
+      confirmedTotal: 1,
+      maxHops: Math.max(0, Math.floor(Number(message.hops) || 0)),
+      settled: false,
+      createdAt: message.timestamp,
+      updatedAt: now,
+      deadlineAt: message.aggregate.deadlineAt,
+      lastSentSignature: '',
+      lastStatusSignature: '',
+      settledEmitted: false,
+    };
+    this.aggregateStates.set(message.id, state);
+    return state;
+  }
+
+  private refreshAggregateState(state: GossipAggregateState): boolean {
+    let confirmedTotal = 1;
+    let maxHops = state.localHops;
+    let settled = true;
+    for (const child of state.children.values()) {
+      confirmedTotal += Math.max(0, Math.floor(child.confirmedTotal));
+      maxHops = Math.max(maxHops, Math.max(0, Math.floor(child.maxHops)));
+      if (!child.settled) settled = false;
+    }
+    const changed = confirmedTotal !== state.confirmedTotal
+      || maxHops !== state.maxHops
+      || settled !== state.settled;
+    if (!changed) return false;
+    state.confirmedTotal = confirmedTotal;
+    state.maxHops = maxHops;
+    state.settled = settled;
+    state.updatedAt = Date.now();
+    if (!settled) state.settledEmitted = false;
+    return true;
+  }
+
+  private aggregateStatusForState(state: GossipAggregateState): GossipAggregateDeliveryStatus {
+    const confirmedPeerCount = Math.max(0, state.confirmedTotal - 1);
+    const knownPeerCount = Math.max(0, this.canonicalPeerSet().length - 1);
+    return {
+      messageId: state.messageId,
+      sender: state.sender,
+      confirmedPeerCount,
+      inferredAudienceCount: Math.max(knownPeerCount, confirmedPeerCount),
+      maxConfirmedHops: state.maxHops,
+      settled: state.settled,
+      createdAt: state.createdAt,
+      updatedAt: state.updatedAt,
+      deadlineAt: state.deadlineAt,
+    };
+  }
+
+  /** Return the sender's constant-size reverse aggregate for a broadcast. */
+  getAggregateDeliveryStatus(messageId: string): GossipAggregateDeliveryStatus | null {
+    const state = this.aggregateStates.get(messageId);
+    if (!state || state.sender !== this.mesh.getClientId()) return null;
+    return this.aggregateStatusForState(state);
+  }
+
+  private emitAggregateStatus(state: GossipAggregateState): void {
+    if (state.sender !== this.mesh.getClientId()) return;
+    const status = this.aggregateStatusForState(state);
+    const signature = [
+      status.confirmedPeerCount,
+      status.inferredAudienceCount,
+      status.maxConfirmedHops,
+      status.settled,
+    ].join(':');
+    if (signature === state.lastStatusSignature) return;
+    state.lastStatusSignature = signature;
+    this.emit('aggregateProgress', status);
+    if (status.settled && !state.settledEmitted) {
+      state.settledEmitted = true;
+      this.emit('aggregateSettled', status);
+    }
+  }
+
+  private sendAggregateResponse(
+    source: Pick<GossipMessage, 'id' | 'sender'>,
+    toPeerId: string,
+    confirmedTotal: number,
+    maxHops: number,
+    settled: boolean,
+  ): boolean {
+    const self = this.mesh.getClientId();
+    if (!self || !source.sender || !toPeerId) return false;
+    const response: GossipAggregateMessage = {
+      id: this.generateMessageId(self),
+      type: 'gossip-echo',
+      protocol: GOSSIP_AGGREGATE_PROTOCOL,
+      messageId: source.id,
+      sender: source.sender,
+      from: self,
+      timestamp: Date.now(),
+      confirmedTotal: Math.max(0, Math.floor(confirmedTotal)),
+      maxHops: Math.max(0, Math.floor(maxHops)),
+      settled,
+    };
+    try {
+      this.mesh.send(toPeerId, JSON.stringify(response));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private publishAggregateState(state: GossipAggregateState, force: boolean = false): void {
+    if (!state.parentPeerId) {
+      this.emitAggregateStatus(state);
+      return;
+    }
+    // Classic echo/convergecast: wait for every selected child branch, merge
+    // them locally, then send one cumulative result to the parent. This keeps
+    // a million-peer tree from turning into a million replies at the root or
+    // cascading one update per descendant through every hop tier.
+    if (!state.settled) return;
+    const signature = `${state.confirmedTotal}:${state.maxHops}:${state.settled}`;
+    if (!force && signature === state.lastSentSignature) return;
+    if (this.sendAggregateResponse(
+      { id: state.messageId, sender: state.sender },
+      state.parentPeerId,
+      state.confirmedTotal,
+      state.maxHops,
+      state.settled,
+    )) {
+      state.lastSentSignature = signature;
+    }
+  }
+
+  private handleIncomingAggregate(message: GossipAggregateMessage, fromPeerId: string): void {
+    if (
+      message.protocol !== GOSSIP_AGGREGATE_PROTOCOL
+      || message.from !== fromPeerId
+      || !Number.isSafeInteger(message.confirmedTotal)
+      || message.confirmedTotal < 0
+      || !Number.isSafeInteger(message.maxHops)
+      || message.maxHops < 0
+    ) return;
+    const state = this.aggregateStates.get(message.messageId);
+    if (!state || state.sender !== message.sender) return;
+    const child = state.children.get(fromPeerId);
+    if (!child) return;
+    const next: GossipAggregateChildState = {
+      confirmedTotal: Math.max(child.confirmedTotal, message.confirmedTotal),
+      maxHops: Math.max(child.maxHops, message.maxHops),
+      settled: message.settled,
+    };
+    if (
+      next.confirmedTotal === child.confirmedTotal
+      && next.maxHops === child.maxHops
+      && next.settled === child.settled
+    ) return;
+    state.children.set(fromPeerId, next);
+    this.refreshAggregateState(state);
+    this.publishAggregateState(state);
+  }
+
+  private maintainAggregateDeliveries(now: number = Date.now()): void {
+    for (const state of this.aggregateStates.values()) {
+      if (now >= state.deadlineAt && !state.settled) {
+        for (const [peerId, child] of state.children.entries()) {
+          if (child.settled) continue;
+          state.children.set(peerId, { ...child, settled: true });
+        }
+        this.refreshAggregateState(state);
+      }
+      this.publishAggregateState(state);
+      if (!state.parentPeerId) this.emitAggregateStatus(state);
     }
   }
 
@@ -903,9 +1384,10 @@ export class GossipProtocol {
         }
         continue;
       }
-      if (!state.message || !peers || now - state.createdAt < this.deliveryRepairDelayMs) continue;
+      if (!state.message || !peers) continue;
 
       for (const targetPeerId of status.pendingPeerIds) {
+        if (!this.canContinueInitialSpread(state.message, targetPeerId, now)) continue;
         if (this.selectRepairOwner(state, targetPeerId) !== self) continue;
         const attempt = state.repairAttemptsByPeer.get(targetPeerId) ?? { attempts: 0, lastAttemptAt: 0 };
         if (attempt.attempts >= MAX_REPAIR_ATTEMPTS_PER_TARGET) continue;
@@ -1111,6 +1593,44 @@ export class GossipProtocol {
     return true;
   }
 
+  private cecrNetworkSizeEstimate(now: number = Date.now()): { size: number; observedAt: number } {
+    let best = {
+      size: Math.max(1, this.canonicalPeerSet().length),
+      observedAt: now,
+    };
+    const maxAgeMs = this.cecrExtremaMaxAgeMs;
+
+    // A reverse broadcast aggregate is direct evidence that this many unique
+    // first-arrival tree nodes held a message, even if local membership has
+    // not converged to all of them yet.
+    for (const state of this.aggregateStates.values()) {
+      if (now - state.updatedAt > maxAgeMs) continue;
+      if (
+        state.confirmedTotal > best.size
+        || state.confirmedTotal === best.size && state.updatedAt > best.observedAt
+      ) {
+        best = { size: state.confirmedTotal, observedAt: state.updatedAt };
+      }
+    }
+
+    // Relay the largest fresh scalar observation through CECR. Preserve the
+    // origin observation time so an old high-water mark cannot circulate and
+    // keep a departed network size alive forever.
+    for (const remote of this.cecrRemoteStates.values()) {
+      if (now - remote.networkSizeObservedAt > maxAgeMs) continue;
+      if (
+        remote.networkSizeEstimate > best.size
+        || remote.networkSizeEstimate === best.size && remote.networkSizeObservedAt > best.observedAt
+      ) {
+        best = {
+          size: remote.networkSizeEstimate,
+          observedAt: remote.networkSizeObservedAt,
+        };
+      }
+    }
+    return best;
+  }
+
   private publishCecrState(targetPeerId?: string): void {
     const self = this.mesh.getClientId();
     if (!self) return;
@@ -1133,6 +1653,7 @@ export class GossipProtocol {
       if (value < min) min = value;
       if (value > max) max = value;
     }
+    const networkSize = this.cecrNetworkSizeEstimate();
 
     const message: CecrStateMessage = {
       id: this.generateMessageId(self),
@@ -1146,6 +1667,8 @@ export class GossipProtocol {
       minHex: (extrema?.min ?? min).toString(16).padStart(CECR_ID_HEX_LENGTH, '0'),
       maxHex: (extrema?.max ?? max).toString(16).padStart(CECR_ID_HEX_LENGTH, '0'),
       size: extrema?.size ?? canonicalPeers.length,
+      networkSizeEstimate: networkSize.size,
+      networkSizeObservedAt: networkSize.observedAt,
     };
 
     let sent = false;
@@ -1194,6 +1717,7 @@ export class GossipProtocol {
     if (!Number.isFinite(message.size) || message.size < 1) return;
 
     try {
+      const now = Date.now();
       const min = BigInt('0x' + message.minHex);
       const max = BigInt('0x' + message.maxHex);
       if (min > max) return;
@@ -1203,6 +1727,16 @@ export class GossipProtocol {
       const matchingRounds = previous && previous.configId === configId && previous.viewId === viewId
         ? previous.matchingRounds + 1
         : 1;
+      const networkSizeEstimate = Number.isSafeInteger(message.networkSizeEstimate)
+        ? Math.max(Math.floor(message.size), Math.floor(message.networkSizeEstimate ?? message.size))
+        : Math.floor(message.size);
+      const requestedObservedAt = Number.isSafeInteger(message.networkSizeObservedAt)
+        ? Math.floor(message.networkSizeObservedAt ?? message.timestamp)
+        : Math.floor(message.timestamp);
+      const clockSkewMs = this.mesh.getCecrMembershipConfig?.().clockSkewMs ?? 5_000;
+      const networkSizeObservedAt = requestedObservedAt > 0 && requestedObservedAt <= now + clockSkewMs
+        ? requestedObservedAt
+        : now;
       this.cecrRemoteStates.set(fromPeerId, {
         configId,
         viewId,
@@ -1210,9 +1744,12 @@ export class GossipProtocol {
         min,
         max,
         size: Math.floor(message.size),
-        updatedAtMs: Date.now(),
+        networkSizeEstimate,
+        networkSizeObservedAt,
+        updatedAtMs: now,
         matchingRounds,
       });
+      this.emit('cecrStateChanged', this.getCecrState());
     } catch {
       // ignore malformed state
     }
@@ -1361,6 +1898,7 @@ export class GossipProtocol {
       hops: 0,
       maxHops: this.maxDirectHops,
       timestamp: Date.now(),
+      path: [this.compactRoutePeerId(from)],
       originConfigId: this.cecrConfigId(),
       originViewId: this.canonicalSetHash(this.canonicalPeerSet()),
     };
@@ -1377,7 +1915,16 @@ export class GossipProtocol {
     if (message.to === self) {
       const repairedMessage = this.reliableRepairMessage(message.data);
       if (repairedMessage) {
-        this.handleIncomingMessage(repairedMessage, fromPeerId ?? message.from);
+        const repairPath = this.extendRoutePath(
+          repairedMessage.path,
+          ...(Array.isArray(message.path) ? message.path.slice(1) : [self].filter(Boolean) as string[]),
+        );
+        this.handleIncomingMessage({
+          ...repairedMessage,
+          hops: Math.max(0, Math.floor(Number(repairedMessage.hops) || 0))
+            + Math.max(1, Math.floor(Number(message.hops) || 0)),
+          path: repairPath,
+        }, fromPeerId ?? message.from);
         return;
       }
       this.emit('directMessageReceived', { message });
@@ -1394,7 +1941,11 @@ export class GossipProtocol {
     const connected = this.mesh.getConnectedPeers();
     if (connected.includes(message.to)) {
       try {
-        this.mesh.send(message.to, JSON.stringify({ ...message, hops: message.hops + 1 }));
+        this.mesh.send(message.to, JSON.stringify({
+          ...message,
+          hops: message.hops + 1,
+          path: this.extendRoutePath(message.path, message.to),
+        }));
       } catch { /* best-effort */ }
       return;
     }
@@ -1407,7 +1958,11 @@ export class GossipProtocol {
       message.originConfigId,
     )) {
       try {
-        this.mesh.send(next, JSON.stringify({ ...message, hops: message.hops + 1 }));
+        this.mesh.send(next, JSON.stringify({
+          ...message,
+          hops: message.hops + 1,
+          path: this.extendRoutePath(message.path, next),
+        }));
         return;
       } catch {
         // try the next eligible progress candidate
@@ -1464,6 +2019,7 @@ export class GossipProtocol {
       viewStableForMs: Math.max(0, Date.now() - this.cecrViewChangedAtMs),
       requiredStableForMs: this.cecrConvergenceRounds * gossipIntervalMs,
       size: livePeerIds.length,
+      networkSizeEstimate: this.cecrNetworkSizeEstimate().size,
       minHex: extrema?.min.toString(16).padStart(CECR_ID_HEX_LENGTH, '0') ?? null,
       maxHex: extrema?.max.toString(16).padStart(CECR_ID_HEX_LENGTH, '0') ?? null,
       coordinateReady: !!extrema && this.hasCecrConsensus(extrema) && !overlay.degraded,
@@ -1538,8 +2094,10 @@ export class GossipProtocol {
     }
 
     for (const [id, retained] of this.retainedMessages.entries()) {
-      if (retained.retainedAt >= minTimestamp) break;
-      this.retainedMessages.delete(id);
+      if (
+        retained.retainedAt < minTimestamp
+        || now > this.initialSpreadDeadlineAt(retained.message)
+      ) this.retainedMessages.delete(id);
     }
     while (this.retainedMessages.size > this.maxTrackedMessages) {
       const oldest = this.retainedMessages.keys().next().value;
@@ -1568,6 +2126,10 @@ export class GossipProtocol {
       this.deliveryStates.delete(id);
       this.dirtyDeliveryReceiptIds.delete(id);
     }
+    for (const [id, state] of this.aggregateStates.entries()) {
+      if (now - Math.max(state.updatedAt, state.deadlineAt) <= this.trackingRetentionMs) continue;
+      this.aggregateStates.delete(id);
+    }
   }
 
   on<K extends keyof GossipEvents>(event: K, callback: GossipEvents[K]): void {
@@ -1586,11 +2148,14 @@ export class GossipProtocol {
   }
 
   destroy(): void {
+    this.destroyed = true;
     this.messageLog.clear();
     this.peers.clear();
     this.seenDirectIds.clear();
     this.deliveryStates.clear();
+    this.aggregateStates.clear();
     this.retainedMessages.clear();
+    this.initialSpreadRepairQueued = false;
     this.dirtyDeliveryReceiptIds.clear();
     this.cecrRemoteStates.clear();
     if (this.cecrSyncTimer) {
@@ -1618,7 +2183,7 @@ export class GossipProtocol {
 
   private tryParseGossipMessage(
     raw: any
-  ): GossipMessage | DirectMessage | CecrStateMessage | CecrDeliveryStateMessage | GossipAntiEntropyMessage | null {
+  ): GossipMessage | DirectMessage | CecrStateMessage | CecrDeliveryStateMessage | GossipAggregateMessage | GossipAntiEntropyMessage | null {
     const toEnvelope = (value: any): any | null => {
       if (!value) return null;
       if (typeof value === 'object' && typeof value.id === 'string' && typeof value.type === 'string') {
@@ -1677,6 +2242,19 @@ export class GossipProtocol {
     }
 
     if (
+      parsed.type === 'gossip-echo' &&
+      parsed.protocol === GOSSIP_AGGREGATE_PROTOCOL &&
+      typeof parsed.messageId === 'string' &&
+      typeof parsed.sender === 'string' &&
+      typeof parsed.from === 'string' &&
+      typeof parsed.confirmedTotal === 'number' &&
+      typeof parsed.maxHops === 'number' &&
+      typeof parsed.settled === 'boolean'
+    ) {
+      return parsed as GossipAggregateMessage;
+    }
+
+    if (
       parsed.type === 'gossip-ae' &&
       parsed.protocol === 'gossip-ae/1' &&
       typeof parsed.from === 'string' &&
@@ -1691,13 +2269,14 @@ export class GossipProtocol {
 
   private generateMessageId(sender: string | null): string {
     const safeSender = (sender ?? 'unknown').toString();
+    const senderId = sha1Hex(safeSender);
     try {
       const bytes = new Uint8Array(16);
       globalThis.crypto.getRandomValues(bytes);
       const nonce = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
-      return `${safeSender}-${nonce}`;
+      return `${senderId}-${nonce}`;
     } catch {
-      return `${safeSender}-${Date.now()}-${Math.random().toString(36).slice(2, 15)}`;
+      return `${senderId}-${Date.now()}-${Math.random().toString(36).slice(2, 15)}`;
     }
   }
 }

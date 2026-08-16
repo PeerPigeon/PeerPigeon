@@ -1,14 +1,12 @@
-import { createSignalingClient } from 'freertc/client';
+import { createSignalingClient, withdrawSignalingIdentity } from 'freertc/client';
 
 type Handler = (...args: any[]) => void;
 
-const RTC_REANNOUNCE_GRACE_MS = 12_000;
-const RTC_REDIAL_GRACE_MS = 20_000;
 const RECOVERY_PROBE_TIMEOUT_MS = 5_000;
 const RECOVERY_PROBE_THROTTLE_MS = 1_500;
 const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
-const SIGNALING_RECONNECT_FALLBACK_MS = 1_000;
 const DISCOVERY_ABSENCE_GRACE_MS = 30_000;
+const DISCOVERY_ACTIVE_MAX_AGE_MS = 18_000;
 
 function generateMessageId(bytesLength = 8): string {
   const bytes = new Uint8Array(bytesLength);
@@ -51,29 +49,31 @@ export class FreeRTCClientAdapter {
   private readonly requestedPeerId: string;
   private readonly previousPeerId: string | null;
   private readonly retiredPeerIds: string[];
+  private readonly previousPeerSignalUrls: readonly string[];
   private readonly defaultIceServers: RTCIceServer[] | null;
+  private readonly trickleIce: boolean;
   private readonly emitter = new Emitter();
   private readonly knownPeers = new Set<string>();
   private readonly knownPeerLastSeenAtMs = new Map<string, number>();
   private readonly selfAliases = new Set<string>();
   private readonly connectedPeers = new Set<string>();
   private readonly pendingTransportRestorePeerIds = new Set<string>();
-  private readonly openChannelTimers = new Map<string, ReturnType<typeof setInterval>>();
-  private readonly disconnectGraceTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private readonly peerRecoveryReannounced = new Set<string>();
+  private readonly recoveringPeerIds = new Set<string>();
+  private readonly observedDataChannels = new WeakSet<object>();
   private client: any = null;
   private joinedOnce = false;
   private intentionallyDisconnected = false;
   private signalingConnected = false;
   private recoveryProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private signalingHealthTimer: ReturnType<typeof setInterval> | null = null;
-  private signalingReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private lastRecoveryProbeAtMs = 0;
   private lastBootstrapAtMs = 0;
   private recyclingSignalingTransport = false;
   private waitingForTransportClose = false;
   private clientGeneration = 0;
   private lifecycleListenersAttached = false;
+  private previousIdentityWithdrawalStarted = false;
+  private previousIdentityWithdrawalHandles: Array<{ close(): void }> = [];
 
   private readonly handleVisibilityChange = (): void => {
     if (typeof document !== 'undefined' && document.hidden) return;
@@ -97,6 +97,7 @@ export class FreeRTCClientAdapter {
     roomId?: string;
     peerId?: string;
     previousPeerId?: string | null;
+    previousPeerSignalUrls?: string[];
     retiredPeerIds?: string[];
     iceServers?: RTCIceServer[] | null;
     trickleIce?: boolean;
@@ -114,12 +115,18 @@ export class FreeRTCClientAdapter {
     this.roomId = options?.roomId ?? this.networkId;
     this.requestedPeerId = options?.peerId ?? generateMessageId(32);
     this.previousPeerId = this.normalizePeerId(options?.previousPeerId) || null;
+    this.previousPeerSignalUrls = Array.from(new Set(
+      (options?.previousPeerSignalUrls?.length ? options.previousPeerSignalUrls : normalizedSignalUrls)
+        .map((url) => String(url || '').trim())
+        .filter(Boolean)
+    ));
     this.retiredPeerIds = Array.from(new Set(
       (options?.retiredPeerIds ?? [])
         .map((peerId) => this.normalizePeerId(peerId))
         .filter((peerId) => peerId && peerId !== this.requestedPeerId)
     ));
     this.defaultIceServers = options?.iceServers ?? null;
+    this.trickleIce = options?.trickleIce ?? true;
     this.addSelfAlias(this.requestedPeerId);
     this.addSelfAlias(this.previousPeerId);
     for (const peerId of this.retiredPeerIds) this.addSelfAlias(peerId);
@@ -155,10 +162,32 @@ export class FreeRTCClientAdapter {
     this.startRecoveryProbe(`${reason} registration`, true);
   }
 
+  private withdrawPreviousIdentity(): void {
+    if (this.previousIdentityWithdrawalStarted || !this.previousPeerId) return;
+    this.previousIdentityWithdrawalStarted = true;
+    for (const signalUrl of this.previousPeerSignalUrls) {
+      try {
+        this.previousIdentityWithdrawalHandles.push(withdrawSignalingIdentity({
+          peerId: this.previousPeerId,
+          networkId: this.networkId,
+          roomId: this.roomId,
+          signalUrl,
+          reason: 'peer_reload',
+        }));
+        this.emitter.emit('signaling:log', {
+          message: `[signal] withdrawing previous reload identity ${this.previousPeerId.slice(0, 8)} from ${signalUrl}`,
+        });
+      } catch {
+        // The relay lease remains the final fallback if cleanup cannot connect.
+      }
+    }
+  }
+
   connect(): void {
     this.intentionallyDisconnected = false;
     this.attachLifecycleListeners();
     this.startSignalingHealthLoop();
+    this.withdrawPreviousIdentity();
     if (this.client) {
       if (this.client.isRegistered) {
         this.emitConnectedIfNeeded();
@@ -182,6 +211,7 @@ export class FreeRTCClientAdapter {
       roomId: this.roomId,
       signalUrl,
       iceServers: this.defaultIceServers ?? undefined,
+      trickleIce: this.trickleIce,
       autoConnect: false,
       onLog: (message: string) => {
         if (!isCurrentClient()) return;
@@ -190,6 +220,9 @@ export class FreeRTCClientAdapter {
       onRegistered: () => {
         if (!isCurrentClient()) return;
         this.emitConnectedIfNeeded(signalUrl);
+        // The relay can accept offers as soon as registration is acknowledged;
+        // do not wait for a later discovery snapshot to release replacement dials.
+        this.flushPendingTransportRestoreFailures();
         this.startRecoveryProbe('registration', false);
         nextClient?.requestBootstrap?.(Array.from(this.selfAliases));
       },
@@ -198,7 +231,6 @@ export class FreeRTCClientAdapter {
         this.lastBootstrapAtMs = Date.now();
         this.clearRecoveryProbeTimer();
         this.handleBootstrapCandidates(candidates);
-        this.flushPendingTransportRestoreFailures();
       },
       onConnectionStateChange: (data: { peerId?: string; state?: string }) => {
         if (!isCurrentClient()) return;
@@ -249,10 +281,12 @@ export class FreeRTCClientAdapter {
     this.detachLifecycleListeners();
     this.clearRecoveryProbeTimer();
     this.stopSignalingHealthLoop();
-    this.clearSignalingReconnectTimer();
     this.clientGeneration += 1;
-    this.clearOpenChannelTimers();
     this.clearDisconnectGraceTimers();
+    for (const handle of this.previousIdentityWithdrawalHandles) {
+      try { handle.close(); } catch { /* best effort */ }
+    }
+    this.previousIdentityWithdrawalHandles = [];
     try { this.client?.disconnect?.(); } catch { /* best effort */ }
     this.client = null;
     this.connectedPeers.clear();
@@ -312,12 +346,12 @@ export class FreeRTCClientAdapter {
       const channelState = String(entry?.channel?.readyState ?? '').toLowerCase();
 
       if (!entry || channelState !== 'open' || connectionState === 'failed' || connectionState === 'closed' || connectionState === 'dead') {
-        this.scheduleDisconnectedPeerRecovery(peerId);
+        this.releaseStalePeerImmediately(peerId);
         continue;
       }
 
       if (connectionState === 'disconnected' || connectionState === 'recovering') {
-        this.scheduleDisconnectedPeerRecovery(peerId);
+        this.releaseStalePeerImmediately(peerId);
       }
     }
 
@@ -338,7 +372,6 @@ export class FreeRTCClientAdapter {
     const id = this.normalizePeerId(peerId);
     if (!id) return;
     this.clearDisconnectGraceTimer(id);
-    this.clearOpenChannelTimer(id);
     const entry = this.client?.mesh?.connections?.get?.(id);
     this.client?.mesh?.connections?.delete?.(id);
     const wasConnected = this.connectedPeers.delete(id);
@@ -350,12 +383,23 @@ export class FreeRTCClientAdapter {
   }
 
   send(peerId: string, data: string | ArrayBuffer | ArrayBufferView): void {
-    this.client?.sendData(data, peerId);
+    try {
+      this.client?.sendData(data, peerId);
+    } catch (error) {
+      this.releaseStalePeerImmediately(this.normalizePeerId(peerId));
+      throw error;
+    }
   }
 
   broadcast(data: string | ArrayBuffer | ArrayBufferView): void {
-    for (const peerId of this.connectedPeers) {
-      try { this.client?.sendData(data, peerId); } catch { /* isolate peer send failures */ }
+    for (const peerId of Array.from(this.connectedPeers)) {
+      try {
+        this.client?.sendData(data, peerId);
+      } catch {
+        // A synchronous send failure is already proof that this edge is not
+        // usable. Release it now so the mesh can replace it immediately.
+        this.releaseStalePeerImmediately(peerId);
+      }
     }
   }
 
@@ -375,10 +419,17 @@ export class FreeRTCClientAdapter {
 
   private handleBootstrapCandidates(candidates: any[]): void {
     const now = Date.now();
-    const snapshotPeers = new Set<string>(
-      (Array.isArray(candidates) ? candidates : [])
-        .map((candidate) => this.normalizePeerId(candidate?.peerId))
-        .filter((peerId) => peerId && !this.isSelfAlias(peerId))
+    const normalizedCandidates = (Array.isArray(candidates) ? candidates : [])
+      .map((candidate) => ({
+        peerId: this.normalizePeerId(candidate?.peerId),
+        advertisedAt: Number(candidate?.advertisedAt),
+      }))
+      .filter(({ peerId }) => peerId && !this.isSelfAlias(peerId));
+    const snapshotPeers = new Set<string>(normalizedCandidates.map(({ peerId }) => peerId));
+    const activeSnapshotPeers = new Set<string>(
+      normalizedCandidates
+        .filter(({ advertisedAt }) => !Number.isFinite(advertisedAt) || now - advertisedAt <= DISCOVERY_ACTIVE_MAX_AGE_MS)
+        .map(({ peerId }) => peerId)
     );
     for (const peerId of snapshotPeers) this.knownPeerLastSeenAtMs.set(peerId, now);
 
@@ -407,7 +458,14 @@ export class FreeRTCClientAdapter {
     }
     this.knownPeers.clear();
     for (const peerId of nextPeers) this.knownPeers.add(peerId);
-    this.emitter.emit('peers-updated', { peers: peerList });
+    // Keep the grace-preserved membership list for continuity, but also expose
+    // the relay's current snapshot. PartialMesh uses the latter for dial
+    // selection so a suspended peer cannot occupy every recovery slot while
+    // currently announced alternatives are available.
+    this.emitter.emit('peers-updated', {
+      peers: peerList,
+      activePeers: Array.from(activeSnapshotPeers),
+    });
   }
 
   private handleConnectionState(data: { peerId?: string; state?: string }): void {
@@ -419,111 +477,96 @@ export class FreeRTCClientAdapter {
       return;
     }
 
+    if (state === 'connecting') {
+      // A fresh FreeRTC generation now owns this peer ID. Allow its own
+      // failure/close events to trigger another immediate replacement.
+      this.recoveringPeerIds.delete(peerId);
+      return;
+    }
     if (state === 'connected') {
-      this.clearDisconnectGraceTimer(peerId);
+      this.recoveringPeerIds.delete(peerId);
       this.waitForOpenDataChannel(peerId);
       return;
     }
     if (state === 'disconnected' || state === 'recovering') {
-      this.scheduleDisconnectedPeerRecovery(peerId);
+      this.markPeerTransportStale(peerId);
       return;
     }
     if (state === 'failed' || state === 'closed') {
-      // A failed/closed event can be part of FreeRTC's resume restoration.
-      // Defer the PeerPigeon disconnect until the restore grace expires.
-      this.scheduleDisconnectedPeerRecovery(peerId);
+      this.markPeerTransportStale(peerId);
     }
   }
 
-  private scheduleDisconnectedPeerRecovery(peerId: string): void {
-    if (this.disconnectGraceTimers.has(peerId)) return;
-    const delayMs = this.peerRecoveryReannounced.has(peerId)
-      ? RTC_REDIAL_GRACE_MS
-      : RTC_REANNOUNCE_GRACE_MS;
-    const timer = setTimeout(() => {
-      this.disconnectGraceTimers.delete(peerId);
-      if (this.intentionallyDisconnected) return;
-      const entry = this.client?.mesh?.connections?.get?.(peerId);
-      const state = String(entry?.connection?.connectionState ?? entry?.state ?? '').toLowerCase();
-      const channelState = String(entry?.channel?.readyState ?? '').toLowerCase();
-      if (state === 'connected' && channelState === 'open') {
-        this.peerRecoveryReannounced.delete(peerId);
-        return;
-      }
+  private markPeerTransportStale(peerId: string): void {
+    this.releaseStalePeerImmediately(peerId);
+  }
 
-      if (!this.peerRecoveryReannounced.has(peerId)) {
-        this.peerRecoveryReannounced.add(peerId);
-        this.emitter.emit('signaling:log', {
-          message: `[webrtc] connection to ${peerId} is still stale; re-announcing before redial`,
-        });
-        this.nudgeSignaling();
-        this.scheduleDisconnectedPeerRecovery(peerId);
-        return;
-      }
+  private observeDataChannel(peerId: string, channel: any): void {
+    if (!channel || (typeof channel !== 'object' && typeof channel !== 'function')) return;
+    if (this.observedDataChannels.has(channel)) return;
+    this.observedDataChannels.add(channel);
+    channel.addEventListener?.('open', () => {
+      const current = this.client?.mesh?.connections?.get?.(peerId);
+      if (current?.channel !== channel || channel.readyState !== 'open') return;
+      this.activateOpenDataChannel(peerId, channel);
+    }, { once: true });
+    channel.addEventListener?.('close', () => {
+      const current = this.client?.mesh?.connections?.get?.(peerId);
+      if (this.intentionallyDisconnected || current?.channel !== channel) return;
+      this.markPeerTransportStale(peerId);
+    }, { once: true });
+  }
 
-      this.emitter.emit('signaling:log', {
-        message: `[webrtc] connection to ${peerId} did not recover after re-announcement; redialing`
-      });
-      this.peerRecoveryReannounced.delete(peerId);
-      this.closeConnection(peerId);
-      this.client?.requestBootstrap?.(Array.from(this.selfAliases));
-    }, delayMs);
-    this.disconnectGraceTimers.set(peerId, timer);
+  private activateOpenDataChannel(peerId: string, channel: any): void {
+    const current = this.client?.mesh?.connections?.get?.(peerId);
+    if (current?.channel !== channel || channel?.readyState !== 'open') return;
+    this.observeDataChannel(peerId, channel);
+    if (this.connectedPeers.has(peerId)) return;
+    this.connectedPeers.add(peerId);
+    this.emitter.emit('rtc:connected', { peerId });
+  }
+
+  private releaseStalePeerImmediately(peerId: string): void {
+    if (this.intentionallyDisconnected || this.recoveringPeerIds.has(peerId)) return;
+    const entry = this.client?.mesh?.connections?.get?.(peerId);
+    const wasConnected = this.connectedPeers.has(peerId);
+    if (!entry && !wasConnected) return;
+
+    this.recoveringPeerIds.add(peerId);
+    this.client?.mesh?.connections?.delete?.(peerId);
+    this.connectedPeers.delete(peerId);
+    try { entry?.channel?.close?.(); } catch { /* best effort */ }
+    try { entry?.connection?.close?.(); } catch { /* best effort */ }
+
+    this.emitter.emit('signaling:log', {
+      message: `[webrtc] stale transport to ${peerId} released immediately; redialing`,
+    });
+    this.nudgeSignaling();
+    this.emitter.emit('rtc:disconnected', { peerId });
+    this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
 
   private waitForOpenDataChannel(peerId: string): void {
-    if (this.connectedPeers.has(peerId) || this.openChannelTimers.has(peerId)) return;
-    const startedAt = Date.now();
-    const check = () => {
-      const entry = this.client?.mesh?.connections?.get?.(peerId);
-      if (entry?.channel?.readyState === 'open') {
-        this.clearOpenChannelTimer(peerId);
-        if (!this.connectedPeers.has(peerId)) {
-          this.connectedPeers.add(peerId);
-          this.emitter.emit('rtc:connected', { peerId });
-        }
-        return;
-      }
-      const restorationFailed = !entry
-        || entry?.connection?.connectionState === 'failed'
-        || entry?.connection?.connectionState === 'closed';
-      if (restorationFailed) {
-        this.clearOpenChannelTimer(peerId);
-        this.scheduleDisconnectedPeerRecovery(peerId);
-        return;
-      }
-      if (Date.now() - startedAt > 15_000) {
-        this.clearOpenChannelTimer(peerId);
-        this.closeConnection(peerId);
-      }
-    };
-    const timer = setInterval(check, 50);
-    this.openChannelTimers.set(peerId, timer);
-    check();
-  }
-
-  private clearOpenChannelTimer(peerId: string): void {
-    const timer = this.openChannelTimers.get(peerId);
-    if (timer) clearInterval(timer);
-    this.openChannelTimers.delete(peerId);
-  }
-
-  private clearOpenChannelTimers(): void {
-    for (const timer of this.openChannelTimers.values()) clearInterval(timer);
-    this.openChannelTimers.clear();
+    if (this.connectedPeers.has(peerId)) return;
+    const entry = this.client?.mesh?.connections?.get?.(peerId);
+    const failed = !entry
+      || entry?.connection?.connectionState === 'failed'
+      || entry?.connection?.connectionState === 'closed';
+    if (failed) {
+      this.releaseStalePeerImmediately(peerId);
+      return;
+    }
+    if (!entry.channel) return;
+    this.observeDataChannel(peerId, entry.channel);
+    this.activateOpenDataChannel(peerId, entry.channel);
   }
 
   private clearDisconnectGraceTimer(peerId: string): void {
-    const timer = this.disconnectGraceTimers.get(peerId);
-    if (timer) clearTimeout(timer);
-    this.disconnectGraceTimers.delete(peerId);
-    this.peerRecoveryReannounced.delete(peerId);
+    this.recoveringPeerIds.delete(peerId);
   }
 
   private clearDisconnectGraceTimers(): void {
-    for (const timer of this.disconnectGraceTimers.values()) clearTimeout(timer);
-    this.disconnectGraceTimers.clear();
-    this.peerRecoveryReannounced.clear();
+    this.recoveringPeerIds.clear();
   }
 
   private clearRecoveryProbeTimer(): void {
@@ -572,18 +615,12 @@ export class FreeRTCClientAdapter {
     this.signalingHealthTimer = null;
   }
 
-  private clearSignalingReconnectTimer(): void {
-    if (this.signalingReconnectTimer) clearTimeout(this.signalingReconnectTimer);
-    this.signalingReconnectTimer = null;
-  }
-
   private recycleStaleSignalingTransport(reason: string): void {
     if (this.intentionallyDisconnected || this.recyclingSignalingTransport || !this.client) return;
     this.recyclingSignalingTransport = true;
     this.waitingForTransportClose = true;
     this.signalingConnected = false;
     this.clearRecoveryProbeTimer();
-    this.clearOpenChannelTimers();
     this.clearDisconnectGraceTimers();
     for (const peerId of this.connectedPeers) this.pendingTransportRestorePeerIds.add(peerId);
     this.emitter.emit('signaling:log', {
@@ -595,19 +632,15 @@ export class FreeRTCClientAdapter {
       this.resumeSameClientTransport();
       return;
     }
-    // Some browsers do not dispatch the close event for a zombie socket.
-    this.clearSignalingReconnectTimer();
-    this.signalingReconnectTimer = setTimeout(() => {
-      this.signalingReconnectTimer = null;
-      this.resumeSameClientTransport();
-    }, SIGNALING_RECONNECT_FALLBACK_MS);
+    // disconnect() has already completed local teardown; do not wait for a
+    // close event from a potentially zombie socket before reopening.
+    this.resumeSameClientTransport();
   }
 
   private resumeSameClientTransport(): void {
     if (!this.recyclingSignalingTransport || !this.waitingForTransportClose || this.intentionallyDisconnected) return;
     this.waitingForTransportClose = false;
     this.recyclingSignalingTransport = false;
-    this.clearSignalingReconnectTimer();
     this.emitter.emit('signaling:log', {
       message: '[signal] reconnecting stale transport with existing FreeRTC client',
     });
@@ -624,7 +657,6 @@ export class FreeRTCClientAdapter {
     if (!this.recyclingSignalingTransport && this.pendingTransportRestorePeerIds.size === 0) return;
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
-    this.clearSignalingReconnectTimer();
     for (const peerId of Array.from(this.pendingTransportRestorePeerIds)) {
       this.pendingTransportRestorePeerIds.delete(peerId);
       if (!this.connectedPeers.delete(peerId)) continue;

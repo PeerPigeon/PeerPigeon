@@ -1,17 +1,8 @@
-export const PEER_COLOR_ALGORITHM_VERSION = 7;
+export const PEER_COLOR_ALGORITHM_VERSION = 8;
 export const PEER_NODE_IDLE_ALPHA = 0.72;
 export const SELF_NODE_IDLE_ALPHA = 0.64;
 export const MIN_PEER_NODE_IDLE_ALPHA = 0.54;
-const PEER_ID_PREFIX_HUE_COUNT = 16;
-// Spread adjacent hexadecimal prefixes across all 16 sectors instead of
-// walking around the wheel sequentially. The graph canvas is deliberately
-// neutral, so every one of these chromatic families remains visible.
-const PEER_ID_PREFIX_HUE = [
-  0, 180, 90, 270,
-  45, 225, 135, 315,
-  22.5, 202.5, 112.5, 337.5,
-  67.5, 247.5, 157.5, 292.5,
-];
+const PEER_ID_PREFIX_HUE_COUNT = 256;
 
 function hashText(value) {
   const text = String(value || 'peer');
@@ -31,6 +22,16 @@ function avalancheHash(hash) {
   mixed = Math.imul(mixed, 0x846ca68b);
   mixed ^= mixed >>> 16;
   return mixed >>> 0;
+}
+
+function reverseByteBits(value) {
+  let input = value & 0xff;
+  let output = 0;
+  for (let bit = 0; bit < 8; bit += 1) {
+    output = (output << 1) | (input & 1);
+    input >>>= 1;
+  }
+  return output;
 }
 
 function srgbToLinear(channel) {
@@ -158,14 +159,17 @@ function hslToRgb(hue, saturation, lightness) {
 
 export function assignPeerColor(peerId) {
   const canonicalId = String(peerId || 'peer');
-  // The leading hex nibble owns one of 16 distinct hues. The remaining ID
-  // varies saturation and lightness without rotating the hue.
-  const parsedPrefix = Number.parseInt(canonicalId.slice(0, 1), 16);
-  const prefixIndex = Number.isInteger(parsedPrefix)
-    ? parsedPrefix
-    : avalancheHash(hashText(canonicalId)) % PEER_ID_PREFIX_HUE_COUNT;
+  // Use the complete leading byte, not only its first nibble. Bit reversal
+  // deliberately throws visually similar hexadecimal prefixes into distant
+  // parts of the wheel (for example 1a/ef and f9/f4). This also gives all 256
+  // displayed two-character prefixes their own deterministic hue.
+  const prefixText = canonicalId.slice(0, 2);
+  const parsedPrefix = /^[0-9a-f]{2}$/i.test(prefixText)
+    ? Number.parseInt(prefixText, 16)
+    : avalancheHash(hashText(canonicalId)) & 0xff;
+  const prefixIndex = reverseByteBits(parsedPrefix);
   const variation = avalancheHash(hashText(`${canonicalId}\u0000peer-color-variation`));
-  const hue = PEER_ID_PREFIX_HUE[prefixIndex];
+  const hue = prefixIndex * (360 / PEER_ID_PREFIX_HUE_COUNT);
   // The neutral graph canvas supports the complete pastel wheel. Keep enough
   // saturation to distinguish neighboring prefix families, with high stable
   // lightness so low-opacity distant circles remain visible.
