@@ -21,9 +21,16 @@
         aria-hidden="true"
       ></span>
     </button>
-    <div class="peer-network-status" aria-hidden="true">
+    <div
+      class="peer-network-status"
+      :title="`Direct peers: ${networkPeerSummary.direct}; indirect peers: ${networkPeerSummary.indirect}; total peers: ${networkPeerSummary.total}`"
+      :aria-label="`Network: ${networkPeerSummary.direct} direct peers, ${networkPeerSummary.indirect} indirect peers, ${networkPeerSummary.total} total peers`"
+    >
       <FontAwesomeIcon :icon="networkGraphIcon" class="peer-network-status-icon" />
-      <span>NETWORK GRAPH</span>
+      <span class="peer-network-status-copy">
+        NETWORK
+        <span class="peer-network-metric peer-network-metric-direct">{{ networkPeerSummary.direct }}</span><span class="peer-network-metric-separator">:</span><span class="peer-network-metric peer-network-metric-indirect">{{ networkPeerSummary.indirect }}</span><span class="peer-network-metric-separator">:</span><span class="peer-network-metric peer-network-metric-total">{{ networkPeerSummary.total }}</span>
+      </span>
     </div>
     <div
       v-if="tooltip.visible"
@@ -48,6 +55,7 @@ import {
   SELF_NODE_IDLE_ALPHA,
 } from '../peer-color.js';
 import { canonicalPeerId, formatPeerId } from '../peer-id.js';
+import { graphPeerSummary } from '../graph-coverage.js';
 
 const DISTANT_STAR_RADIUS_THRESHOLD = 5;
 const DISTANT_STAR_POINT_RADIUS = 1.65;
@@ -169,22 +177,6 @@ function peerSizeProfile(peerId, hopDistance, isSelf) {
   };
 }
 
-function hexToRgb(hex) {
-  const normalized = String(hex || '#ffffff').replace('#', '');
-  const value = Number.parseInt(normalized, 16);
-  return {
-    r: (value >> 16) & 255,
-    g: (value >> 8) & 255,
-    b: value & 255,
-  };
-}
-
-function blendTowardWhite(hex, amount) {
-  const { r, g, b } = hexToRgb(hex);
-  const blend = Math.max(0, Math.min(1, amount));
-  return `rgb(${Math.round(r + (255 - r) * blend)}, ${Math.round(g + (255 - g) * blend)}, ${Math.round(b + (255 - b) * blend)})`;
-}
-
 function nodeCoreAppearance(node) {
   const growthProgress = node?.distantPoint
     ? 0
@@ -194,7 +186,6 @@ function nodeCoreAppearance(node) {
     ? Math.max(0, Math.min(1, Number(node?.starShrinkProgress) || 0))
     : 0;
   const easedShrink = shrinkProgress * shrinkProgress * (3 - 2 * shrinkProgress);
-  const transitionWhite = node?.distantPoint ? easedShrink : 1 - easedGrowth;
   const activity = Math.max(0, Math.min(1, Number(node?.activity) || 0));
   const distanceScale = Math.max(0.35, Math.min(1, Number(node?.distanceScale) || 0.35));
   const minimumCircleScale = DISTANT_STAR_RADIUS_THRESHOLD / 8;
@@ -212,10 +203,10 @@ function nodeCoreAppearance(node) {
     growthProgress,
     easedGrowth,
     easedShrink,
-    color: blendTowardWhite(
-      node?.color || '#7df9ff',
-      Math.max(activity * 0.8, transitionWhite),
-    ),
+    // Identity color must never be washed toward white by activity or by a
+    // star/circle transition. Activity is already conveyed by opacity, size,
+    // and the outer glow; changing the core color made distinct peers merge.
+    color: node?.color || '#7df9ff',
     alpha: node?.distantPoint
       ? circleAlpha + (0.96 - circleAlpha) * easedShrink
       : 0.96 + (circleAlpha - 0.96) * easedGrowth,
@@ -254,6 +245,11 @@ export default {
         detail: '',
       },
     };
+  },
+  computed: {
+    networkPeerSummary() {
+      return graphPeerSummary({ nodes: this.nodes });
+    },
   },
   watch: {
     nodes: {
@@ -299,10 +295,18 @@ export default {
       width: 1,
     };
     this._scene.paint = (timestamp) => this.paintFrame(timestamp);
+    this._resumeAnimationHandler = () => this.restartAnimationLoop();
+    this._visibilityAnimationHandler = () => {
+      if (!document.hidden) this.restartAnimationLoop();
+    };
     this._resizeObserver = typeof ResizeObserver !== 'undefined'
       ? new ResizeObserver(() => this.resizeCanvas())
       : null;
     this._resizeObserver?.observe(this.$el);
+    document.addEventListener('resume', this._resumeAnimationHandler);
+    document.addEventListener('visibilitychange', this._visibilityAnimationHandler);
+    window.addEventListener('pageshow', this._resumeAnimationHandler);
+    window.addEventListener('focus', this._resumeAnimationHandler);
     this.applyActivity(this.activityByPeer);
     this.rebuildScene();
     this.resizeCanvas();
@@ -316,7 +320,13 @@ export default {
     }
   },
   beforeUnmount() {
-    if (this._scene?.animationFrame) cancelAnimationFrame(this._scene.animationFrame);
+    if (this._scene?.animationFrame != null) cancelAnimationFrame(this._scene.animationFrame);
+    document.removeEventListener('resume', this._resumeAnimationHandler);
+    document.removeEventListener('visibilitychange', this._visibilityAnimationHandler);
+    window.removeEventListener('pageshow', this._resumeAnimationHandler);
+    window.removeEventListener('focus', this._resumeAnimationHandler);
+    this._resumeAnimationHandler = null;
+    this._visibilityAnimationHandler = null;
     this._resizeObserver?.disconnect();
     this._resizeObserver = null;
     this._scene = null;
@@ -327,6 +337,21 @@ export default {
     this._pointerPosition = null;
   },
   methods: {
+    restartAnimationLoop() {
+      const scene = this._scene;
+      if (!scene?.ctx || !scene.canvas?.isConnected) return;
+
+      // A suspended browser may never invoke the previously queued frame. Drop
+      // that stale handle, redraw synchronously, and establish a fresh loop.
+      // Pointer handlers deliberately do not participate in this recovery.
+      if (scene.animationFrame != null) cancelAnimationFrame(scene.animationFrame);
+      scene.animationFrame = null;
+      scene.lastFrameAt = 0;
+      this.resizeCanvas();
+      this.rebuildScene();
+      this.paintFrame(performance.now());
+    },
+
     applyActivity(activity) {
       if (!this._activity) return;
       for (const [peerId, timestamp] of Object.entries(activity || {})) {
@@ -426,13 +451,8 @@ export default {
         })
         .filter(Boolean);
       const activeLinkKeys = new Set(links.map((link) => link.key));
-      for (const previousLink of scene.links) {
-        if (activeLinkKeys.has(previousLink.key)) continue;
-        links.push({ ...previousLink, exiting: true });
-      }
-      const retainedLinkKeys = new Set(links.map((link) => link.key));
       for (const linkKey of this._linkVisualStateByKey?.keys() || []) {
-        if (!retainedLinkKeys.has(linkKey)) this._linkVisualStateByKey.delete(linkKey);
+        if (!activeLinkKeys.has(linkKey)) this._linkVisualStateByKey.delete(linkKey);
       }
 
       scene.nodes = renderNodes;
@@ -871,8 +891,10 @@ export default {
           directStartedAt: now,
           glow: 0,
           lastFrameAt: now,
-          visibility: 0,
-          visibilityFrom: 0,
+          // Topology lines appear and disappear atomically with the CECR
+          // snapshot so the canvas can never contradict the Gossip count.
+          visibility: visibilityTarget,
+          visibilityFrom: visibilityTarget,
           visibilityTarget,
           visibilityStartedAt: now,
           sourceScreenX: liveSource.screenX,
@@ -1040,6 +1062,7 @@ export default {
     paintFrame(timestamp) {
       const scene = this._scene;
       if (!scene?.ctx || !scene.canvas?.isConnected) return;
+      scene.animationFrame = null;
 
       const elapsed = scene.lastFrameAt ? Math.min(50, timestamp - scene.lastFrameAt) : 16;
       scene.lastFrameAt = timestamp;
@@ -1190,7 +1213,7 @@ export default {
 .peer-network-rotation-toggle {
   position: absolute;
   z-index: 2;
-  top: 14px;
+  bottom: 14px;
   right: 16px;
   display: grid;
   width: 30px;
@@ -1259,6 +1282,28 @@ export default {
   width: 1em;
   color: #8ff7ff;
   flex: 0 0 auto;
+}
+
+.peer-network-status-copy {
+  white-space: nowrap;
+}
+
+.peer-network-metric-direct,
+.peer-network-metric-total {
+  color: rgba(255, 255, 255, 0.92);
+  opacity: 1;
+  -webkit-text-fill-color: rgba(255, 255, 255, 0.92);
+}
+
+.peer-network-metric-indirect {
+  display: inline-block;
+  color: #fff;
+  opacity: 0.42;
+  -webkit-text-fill-color: #fff;
+}
+
+.peer-network-metric-separator {
+  color: rgba(255, 255, 255, 0.66);
 }
 
 .peer-network-tooltip {

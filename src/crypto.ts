@@ -67,6 +67,7 @@ export type PeerPigeonCryptoEvents = {
     message: GossipMessage;
     local: boolean;
     fromPeer?: string;
+    receivedAt: number;
   }) => void;
   encryptedDirectReceived: (data: {
     plaintext: string;
@@ -89,9 +90,9 @@ interface CryptoGossipLike {
   broadcast(data: unknown, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): string;
   broadcastReliable(data: unknown, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): string;
   sendDirect(targetPeerId: string, data: unknown): string | null;
-  on(event: 'messageReceived', callback: (data: { message: GossipMessage; local: boolean; fromPeer?: string }) => void): void;
+  on(event: 'messageReceived', callback: (data: { message: GossipMessage; local: boolean; fromPeer?: string; receivedAt?: number }) => void): void;
   on(event: 'directMessageReceived', callback: (data: { message: DirectMessage }) => void): void;
-  off(event: 'messageReceived', callback: (data: { message: GossipMessage; local: boolean; fromPeer?: string }) => void): void;
+  off(event: 'messageReceived', callback: (data: { message: GossipMessage; local: boolean; fromPeer?: string; receivedAt?: number }) => void): void;
   off(event: 'directMessageReceived', callback: (data: { message: DirectMessage }) => void): void;
 }
 
@@ -120,7 +121,7 @@ export class PeerPigeonCryptoProtocol {
   private announceTimer: ReturnType<typeof setInterval> | null = null;
   private initialized = false;
 
-  private readonly onGossipMessageBound = (data: { message: GossipMessage; local: boolean; fromPeer?: string }): void => {
+  private readonly onGossipMessageBound = (data: { message: GossipMessage; local: boolean; fromPeer?: string; receivedAt?: number }): void => {
     this.handleGossipMessage(data).catch((error) => this.emitError(error));
   };
   private readonly onDirectMessageBound = (data: { message: DirectMessage }): void => {
@@ -418,7 +419,7 @@ export class PeerPigeonCryptoProtocol {
       && typeof payload.from === 'string' && typeof payload.to === 'string' && payload.cipher != null;
   }
 
-  private async handleGossipMessage(data: { message: GossipMessage; local: boolean; fromPeer?: string }): Promise<void> {
+  private async handleGossipMessage(data: { message: GossipMessage; local: boolean; fromPeer?: string; receivedAt?: number }): Promise<void> {
     const payload = data.message.data;
     if (this.isPublicInfo(payload)) {
       if (data.local || !data.message.sender || payload.from === data.message.sender) this.upsertPublicKey(payload.from, payload);
@@ -430,7 +431,10 @@ export class PeerPigeonCryptoProtocol {
     }
     if (!this.isEncryptedBroadcast(payload)) return;
     const plaintext = await this.decryptEncryptedBroadcast(payload);
-    this.emit('encryptedBroadcastReceived', { plaintext, payload, ...data });
+    const receivedAt = Number.isFinite(data.receivedAt) && Number(data.receivedAt) > 0
+      ? Number(data.receivedAt)
+      : Date.now();
+    this.emit('encryptedBroadcastReceived', { plaintext, payload, ...data, receivedAt });
   }
 
   private async handleDirectMessage(message: DirectMessage): Promise<void> {

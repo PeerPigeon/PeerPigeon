@@ -4,14 +4,18 @@ import test from 'node:test';
 import {
   assignPeerColor,
   peerColorBackgroundVisibility,
+  peerColorDistance,
 } from '../examples/vue3/src/peer-color.js';
 
-const PREFIX_HUES = [
-  0, 180, 90, 270,
-  45, 225, 135, 315,
-  22.5, 202.5, 112.5, 337.5,
-  67.5, 247.5, 157.5, 292.5,
-];
+function reverseByteBits(value) {
+  let input = value & 0xff;
+  let output = 0;
+  for (let bit = 0; bit < 8; bit += 1) {
+    output = (output << 1) | (input & 1);
+    input >>>= 1;
+  }
+  return output;
+}
 
 function hueOf(color) {
   const value = Number.parseInt(color.slice(1), 16);
@@ -53,33 +57,35 @@ function circularHueDistance(first, second) {
   return Math.min(direct, 360 - direct);
 }
 
-test('0-F prefixes own 16 distinct, non-overlapping hue sectors', () => {
-  const used = [...'0123456789abcdef'].map((prefix) => {
-    const peerId = `${prefix}${'0123456789abcdef'.repeat(4).slice(1)}`;
-    return assignPeerColor(peerId);
+test('all 256 two-character prefixes own deterministic bit-spread hues', () => {
+  const hues = Array.from({ length: 256 }, (_, prefix) => {
+    const prefixText = prefix.toString(16).padStart(2, '0');
+    return hueOf(assignPeerColor(`${prefixText}${'0123456789abcdef'.repeat(4).slice(2)}`));
   });
 
-  assert.equal(new Set(used).size, 16);
-  const hues = used.map(hueOf);
-  hues.forEach((hue, index) => {
-    const expected = PREFIX_HUES[index];
+  hues.forEach((hue, prefix) => {
+    const expected = reverseByteBits(prefix) * (360 / 256);
     assert.ok(
-      circularHueDistance(hue, expected) <= 0.5,
-      `${used[index]} escaped prefix ${index.toString(16).toUpperCase()}'s hue sector`,
+      circularHueDistance(hue, expected) <= 0.75,
+      `${prefix.toString(16).padStart(2, '0')} escaped its hue`,
     );
   });
-  for (let left = 0; left < used.length; left += 1) {
-    for (let right = left + 1; right < used.length; right += 1) {
-      assert.ok(
-        circularHueDistance(hues[left], hues[right]) >= 15,
-        `${used[left]} and ${used[right]} share a hue sector`,
-      );
-    }
+});
+
+test('reported lookalike peer prefixes are visibly separated', () => {
+  const suffix = '0123456789abcdef'.repeat(4).slice(2);
+  for (const [first, second] of [['1a', 'ef'], ['f9', 'f4']]) {
+    const firstColor = assignPeerColor(`${first}${suffix}`);
+    const secondColor = assignPeerColor(`${second}${suffix}`);
+    assert.ok(
+      circularHueDistance(hueOf(firstColor), hueOf(secondColor)) >= 100,
+      `${first} ${firstColor} and ${second} ${secondColor} still share a hue family`,
+    );
+    assert.ok(
+      peerColorDistance(firstColor, secondColor) >= 0.2,
+      `${first} ${firstColor} and ${second} ${secondColor} remain perceptually similar`,
+    );
   }
-  assert.ok(
-    Math.abs(circularHueDistance(hues[0xa], hues[0xf]) - 180) <= 0.5,
-    'A and F must remain opposite on the color wheel',
-  );
 });
 
 test('every prefix color remains visibly separated from the neutral graph background', () => {

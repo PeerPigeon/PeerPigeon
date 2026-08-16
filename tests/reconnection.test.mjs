@@ -3,6 +3,74 @@ import test from 'node:test';
 
 import { FreeRTCClientAdapter } from '../src/freertc-client-adapter.ts';
 
+test('adapter withdraws the previous reload identity before registering its replacement', () => {
+  const originalWebSocket = globalThis.WebSocket;
+  const sockets = [];
+
+  class RecordingWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+
+    constructor(url) {
+      this.url = String(url);
+      this.readyState = RecordingWebSocket.CONNECTING;
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(value) {
+      this.sent.push(JSON.parse(value));
+    }
+
+    open() {
+      this.readyState = RecordingWebSocket.OPEN;
+      this.onopen?.();
+    }
+
+    close(code = 1000) {
+      this.readyState = RecordingWebSocket.CLOSED;
+      this.onclose?.({ code });
+    }
+  }
+
+  globalThis.WebSocket = RecordingWebSocket;
+  const currentPeerId = '1'.repeat(64);
+  const previousPeerId = '2'.repeat(64);
+  const adapter = new FreeRTCClientAdapter('wss://new-relay.example/ws', {
+    networkId: 'reload-network',
+    roomId: 'reload-room',
+    peerId: currentPeerId,
+    previousPeerId,
+    previousPeerSignalUrls: ['wss://old-relay.example/ws'],
+  });
+
+  try {
+    adapter.connect();
+    assert.equal(sockets.length, 2);
+
+    const [cleanupSocket, currentSocket] = sockets;
+    assert.match(cleanupSocket.url, /^wss:\/\/old-relay\.example\/ws/);
+    assert.match(currentSocket.url, /^wss:\/\/new-relay\.example\/ws/);
+
+    cleanupSocket.open();
+    assert.equal(cleanupSocket.sent.length, 1);
+    assert.equal(cleanupSocket.sent[0].type, 'withdraw');
+    assert.equal(cleanupSocket.sent[0].from, previousPeerId);
+    assert.equal(cleanupSocket.sent[0].network, 'reload-network');
+    assert.equal(cleanupSocket.sent[0].session_id, 'reload-room');
+    assert.equal(cleanupSocket.readyState, RecordingWebSocket.CLOSED);
+
+    currentSocket.open();
+    assert.equal(currentSocket.sent[0].type, 'announce');
+    assert.equal(currentSocket.sent[0].from, currentPeerId);
+  } finally {
+    adapter.disconnect();
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 test('Vue-style proxying does not suppress FreeRTC registration callbacks', () => {
   const originalWebSocket = globalThis.WebSocket;
   const sockets = [];
@@ -118,11 +186,12 @@ test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) =
 
     // FreeRTC owns every retry and its backoff on the original client.
     failLatestSocket();
+    t.mock.timers.tick(0);
+    assert.equal(attempts.length, 2);
+    failLatestSocket();
     t.mock.timers.tick(1_000);
     failLatestSocket();
     t.mock.timers.tick(1_500);
-    failLatestSocket();
-    t.mock.timers.tick(2_250);
 
     assert.equal(attempts.length, 4);
     assert.match(attempts[0], /^wss:\/\/nearest\.example\/ws/);
@@ -136,9 +205,10 @@ test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) =
   }
 });
 
-test('failed FreeRTC transport gets the full offer retry window before PeerPigeon redials', (t) => {
+test('a failed transport is released and redialed immediately even with another healthy edge', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const peerId = '2'.repeat(64);
+  const healthyPeerId = '3'.repeat(64);
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
     peerId: '1'.repeat(64),
   });
@@ -146,35 +216,182 @@ test('failed FreeRTC transport gets the full offer retry window before PeerPigeo
   let reannouncements = 0;
   const connection = { connectionState: 'failed', close() {} };
   const channel = { readyState: 'closed', close() {} };
+  const healthyEntry = {
+    connection: { connectionState: 'connected', close() {} },
+    channel: { readyState: 'open', close() {} },
+    state: 'connected',
+  };
 
   adapter.client = {
-    mesh: { connections: new Map([[peerId, { connection, channel, state: 'failed' }]]) },
+    mesh: { connections: new Map([
+      [peerId, { connection, channel, state: 'failed' }],
+      [healthyPeerId, healthyEntry],
+    ]) },
     advertise() { reannouncements += 1; },
     requestBootstrap() {},
   };
   adapter.connectedPeers.add(peerId);
+  adapter.connectedPeers.add(healthyPeerId);
   adapter.on('rtc:disconnected', ({ peerId: disconnectedPeerId }) => {
     disconnected.push(disconnectedPeerId);
   });
 
   adapter.handleConnectionState({ peerId, state: 'failed' });
-  assert.deepEqual(disconnected, []);
-
-  t.mock.timers.tick(11_999);
-  assert.deepEqual(disconnected, []);
-
-  t.mock.timers.tick(1);
-  assert.deepEqual(disconnected, []);
-  assert.equal(reannouncements, 1);
-
-  t.mock.timers.tick(19_999);
-  assert.deepEqual(disconnected, []);
-
-  t.mock.timers.tick(1);
   assert.deepEqual(disconnected, [peerId]);
+  assert.equal(reannouncements, 1);
+  assert.equal(adapter.client.mesh.connections.has(peerId), false);
+  assert.equal(adapter.client.mesh.connections.has(healthyPeerId), true);
+
+  // A new FreeRTC generation clears the old recovery guard. If that
+  // replacement also fails, it must be released immediately as well.
+  adapter.client.mesh.connections.set(peerId, { connection, channel, state: 'connecting' });
+  adapter.handleConnectionState({ peerId, state: 'connecting' });
+  adapter.handleConnectionState({ peerId, state: 'failed' });
+  assert.deepEqual(disconnected, [peerId, peerId]);
+  assert.equal(reannouncements, 2);
 });
 
-test('an unacknowledged suspend probe recycles transport without replacing the FreeRTC client', (t) => {
+test('an isolated adapter releases every stale direct edge immediately', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const peerIds = ['2'.repeat(64), '3'.repeat(64)];
+  let reannouncements = 0;
+  const disconnected = [];
+  const entries = new Map(peerIds.map((peerId) => [peerId, {
+    state: 'connected',
+    connection: { connectionState: 'connected', close() {} },
+    channel: { readyState: 'open', close() {} },
+  }]));
+  adapter.client = {
+    isRegistered: true,
+    mesh: { connections: entries },
+    advertise() { reannouncements += 1; },
+    requestBootstrap() {},
+  };
+  for (const peerId of peerIds) adapter.connectedPeers.add(peerId);
+  adapter.on('rtc:disconnected', ({ peerId }) => disconnected.push(peerId));
+
+  entries.get(peerIds[0]).state = 'recovering';
+  entries.get(peerIds[0]).connection.connectionState = 'disconnected';
+  entries.get(peerIds[0]).channel.readyState = 'closed';
+  adapter.handleConnectionState({ peerId: peerIds[0], state: 'disconnected' });
+
+  assert.equal(reannouncements, 1);
+  assert.deepEqual(disconnected, [peerIds[0]]);
+  assert.equal(entries.size, 1);
+
+  entries.get(peerIds[1]).state = 'recovering';
+  entries.get(peerIds[1]).connection.connectionState = 'disconnected';
+  entries.get(peerIds[1]).channel.readyState = 'closed';
+  adapter.handleConnectionState({ peerId: peerIds[1], state: 'disconnected' });
+
+  assert.equal(reannouncements, 2);
+  assert.deepEqual(new Set(disconnected), new Set(peerIds));
+  assert.equal(entries.size, 0);
+
+  adapter.disconnect();
+});
+
+test('data-channel closure starts recovery before peer-connection state changes', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const peerId = '2'.repeat(64);
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const listeners = new Map();
+  const channel = {
+    readyState: 'open',
+    close() {},
+    addEventListener(type, listener) { listeners.set(type, listener); },
+  };
+  const entry = {
+    state: 'connected',
+    connection: { connectionState: 'connected', close() {} },
+    channel,
+  };
+  let reannouncements = 0;
+  adapter.client = {
+    isRegistered: true,
+    mesh: { connections: new Map([[peerId, entry]]) },
+    advertise() { reannouncements += 1; },
+    requestBootstrap() {},
+  };
+
+  adapter.waitForOpenDataChannel(peerId);
+  assert.equal(adapter.connectedPeers.has(peerId), true);
+  assert.equal(typeof listeners.get('close'), 'function');
+
+  channel.readyState = 'closed';
+  listeners.get('close')();
+  assert.equal(reannouncements, 1);
+
+  adapter.disconnect();
+});
+
+test('data-channel open is event-driven with no polling delay', () => {
+  const peerId = '2'.repeat(64);
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const listeners = new Map();
+  const channel = {
+    readyState: 'connecting',
+    close() {},
+    addEventListener(type, listener) { listeners.set(type, listener); },
+  };
+  adapter.client = {
+    mesh: { connections: new Map([[peerId, {
+      state: 'connected',
+      connection: { connectionState: 'connected', close() {} },
+      channel,
+    }]]) },
+    requestBootstrap() {},
+    advertise() {},
+  };
+  const connected = [];
+  adapter.on('rtc:connected', ({ peerId: connectedPeerId }) => connected.push(connectedPeerId));
+
+  adapter.handleConnectionState({ peerId, state: 'connected' });
+  assert.deepEqual(connected, []);
+  assert.equal(typeof listeners.get('open'), 'function');
+
+  channel.readyState = 'open';
+  listeners.get('open')();
+  assert.deepEqual(connected, [peerId]);
+
+  adapter.disconnect();
+});
+
+test('broadcast send failure releases the unusable edge immediately', () => {
+  const peerId = '2'.repeat(64);
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const connections = new Map([[peerId, {
+    state: 'connected',
+    connection: { connectionState: 'connected', close() {} },
+    channel: { readyState: 'open', close() {} },
+  }]]);
+  adapter.client = {
+    mesh: { connections },
+    sendData() { throw new Error('channel is no longer writable'); },
+    requestBootstrap() {},
+    advertise() {},
+  };
+  adapter.connectedPeers.add(peerId);
+  const disconnected = [];
+  adapter.on('rtc:disconnected', ({ peerId: disconnectedPeerId }) => disconnected.push(disconnectedPeerId));
+
+  adapter.broadcast('payload');
+
+  assert.deepEqual(disconnected, [peerId]);
+  assert.equal(connections.has(peerId), false);
+  adapter.disconnect();
+});
+
+test('suspend recovery releases missing peer edges immediately and recycles the same FreeRTC client', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const peerId = '2'.repeat(64);
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
@@ -197,27 +414,20 @@ test('an unacknowledged suspend probe recycles transport without replacing the F
   adapter.on('rtc:disconnected', (data) => peerDisconnects.push(data));
 
   adapter.recoverAfterInactivity('visible');
+  assert.deepEqual(peerDisconnects, [{ peerId }]);
   t.mock.timers.tick(4_999);
   assert.equal(disconnects, 0);
 
   t.mock.timers.tick(1);
   assert.equal(disconnects, 1);
   assert.equal(adapter.client, client);
-  assert.equal(connects, 0);
-
-  // A zombie WebSocket may never dispatch close, so the same client resumes
-  // through the bounded fallback.
-  t.mock.timers.tick(1_000);
   assert.equal(connects, 1);
   assert.equal(adapter.client, client);
-  assert.deepEqual(peerDisconnects, []);
 
-  // Peer redials are released only after the relay acknowledges registration.
+  // The missing edge was already released; a later registration flush must
+  // not emit a duplicate disconnect.
   adapter.flushPendingTransportRestoreFailures();
-  assert.deepEqual(peerDisconnects, [{
-    peerId,
-    reason: 'signaling-transport-restore-failed',
-  }]);
+  assert.deepEqual(peerDisconnects, [{ peerId }]);
 });
 
 test('an unregistered signaling transport recovers without another peer announcing', (t) => {
@@ -248,8 +458,6 @@ test('an unregistered signaling transport recovers without another peer announci
   t.mock.timers.tick(1);
   assert.equal(disconnects, 1);
   assert.equal(adapter.client, client);
-
-  t.mock.timers.tick(1_000);
   assert.equal(connects, 2);
   assert.equal(adapter.client, client);
 
@@ -257,7 +465,6 @@ test('an unregistered signaling transport recovers without another peer announci
   // the adapter cannot remain trapped in "reconnect in progress".
   t.mock.timers.tick(5_000);
   assert.equal(disconnects, 2);
-  t.mock.timers.tick(1_000);
   assert.equal(connects, 3);
 
   adapter.disconnect();
@@ -314,7 +521,6 @@ test('periodic relay acknowledgement checks detect zombie sockets without lifecy
   assert.equal(adapter.client.isRegistered, true);
 
   adapter.stopSignalingHealthLoop();
-  adapter.clearSignalingReconnectTimer();
 });
 
 test('a transient empty discovery snapshot after resume preserves recent peers', () => {
@@ -323,11 +529,35 @@ test('a transient empty discovery snapshot after resume preserves recent peers',
   });
   const peerIds = ['2', '3', '4', '5'].map((digit) => digit.repeat(64));
   const snapshots = [];
-  adapter.on('peers-updated', ({ peers }) => snapshots.push(peers));
+  const activeSnapshots = [];
+  adapter.on('peers-updated', ({ peers, activePeers }) => {
+    snapshots.push(peers);
+    activeSnapshots.push(activePeers);
+  });
 
   adapter.handleBootstrapCandidates(peerIds.map((peerId) => ({ peerId })));
   adapter.handleBootstrapCandidates([]);
 
   assert.deepEqual(new Set(snapshots[0]), new Set(peerIds));
   assert.deepEqual(new Set(snapshots[1]), new Set(peerIds));
+  assert.deepEqual(new Set(activeSnapshots[0]), new Set(peerIds));
+  assert.deepEqual(activeSnapshots[1], []);
+});
+
+test('stale relay leases remain in discovery grace but not in the active peer count', () => {
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const currentPeerId = '2'.repeat(64);
+  const stalePeerId = '3'.repeat(64);
+  let snapshot = null;
+  adapter.on('peers-updated', (peers) => { snapshot = peers; });
+
+  adapter.handleBootstrapCandidates([
+    { peerId: currentPeerId, advertisedAt: Date.now() },
+    { peerId: stalePeerId, advertisedAt: Date.now() - 20_000 },
+  ]);
+
+  assert.deepEqual(new Set(snapshot.peers), new Set([currentPeerId, stalePeerId]));
+  assert.deepEqual(snapshot.activePeers, [currentPeerId]);
 });
