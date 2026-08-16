@@ -242,9 +242,7 @@ export class FreeRTCClientAdapter {
       },
       onNegotiationFailure: (data: { peerId?: string; reason?: string }) => {
         if (!isCurrentClient()) return;
-        this.emitter.emit('signaling:log', {
-          message: `[webrtc] ${this.normalizePeerId(data?.peerId)} negotiation failed: ${String(data?.reason ?? 'unknown')}`
-        });
+        this.handleNegotiationFailure(data);
       },
       onStatusChange: (status: string) => {
         if (!isCurrentClient()) return;
@@ -499,6 +497,21 @@ export class FreeRTCClientAdapter {
     if (state === 'failed' || state === 'closed') {
       this.markPeerTransportStale(peerId);
     }
+  }
+
+  private handleNegotiationFailure(data: { peerId?: string; reason?: string }): void {
+    const peerId = this.normalizePeerId(data?.peerId);
+    const reason = String(data?.reason ?? 'unknown');
+    this.emitter.emit('signaling:log', {
+      message: `[webrtc] ${peerId} negotiation failed: ${reason}`,
+    });
+    if (!peerId || this.isSelfAlias(peerId)) return;
+
+    // FreeRTC emits this only after it has exhausted ownership of the current
+    // negotiation. Release that dead generation immediately so PartialMesh can
+    // remove its pending dial and use a fresh discovery candidate instead of
+    // waiting for a browser-specific connection-state event or the 45s guard.
+    this.releaseStalePeerImmediately(peerId);
   }
 
   private markPeerTransportStale(peerId: string): void {
