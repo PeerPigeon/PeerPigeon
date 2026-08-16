@@ -6,7 +6,7 @@ import https from 'node:https'
 import fs from 'node:fs'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
-import { createPrivateKey } from 'node:crypto'
+import { createPrivateKey, X509Certificate } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import multicastDns from 'multicast-dns'
 import { generateRandomPair } from 'unsea'
@@ -343,6 +343,25 @@ function createHttpsBridge(targetPort, tlsOptions) {
 
 function createHttpRedirectServer(httpsPort) {
   const server = http.createServer((req, res) => {
+    const requestUrl = new URL(req.url || '/', `http://${req.headers.host || DEV_HOSTNAME}`)
+    if (req.method === 'GET' && requestUrl.pathname === '/peerpigeon-dev-ca.cer') {
+      try {
+        const caCertificate = new X509Certificate(fs.readFileSync(TLS_CA_CERT_PATH))
+        res.writeHead(200, {
+          'content-type': 'application/x-x509-ca-cert',
+          'content-disposition': 'attachment; filename="PeerPigeon-Local-Development-CA.cer"',
+          'content-length': String(caCertificate.raw.byteLength),
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff'
+        })
+        res.end(caCertificate.raw)
+      } catch {
+        res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
+        res.end('PeerPigeon development CA is unavailable')
+      }
+      return
+    }
+
     const rawHost = String(req.headers.host || DEV_HOSTNAME)
     const host = rawHost.split(':')[0] || DEV_HOSTNAME
     const portSegment = httpsPort === 443 ? '' : `:${httpsPort}`
