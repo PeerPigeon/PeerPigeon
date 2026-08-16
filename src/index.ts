@@ -1157,9 +1157,10 @@ export class PartialMesh {
         limit: DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
       })
       : [this.normalizeSignalingUrl(this.config.signalingServer)];
-    // The adapter currently registers with the first (closest) relay. Remember
-    // that exact relay so the next same-tab reload can clean up this identity.
-    this.rememberBrowserPeerSignalUrls(signalingUrls.slice(0, 1));
+    // Recovery can move the same identity through this bounded relay set.
+    // Remember every possible relay so a same-tab reload withdraws any prior
+    // announcement instead of leaving a ghost on the relay used before sleep.
+    this.rememberBrowserPeerSignalUrls(signalingUrls);
     this.emit('signaling:log', {
       message: `[signal] close federated relays ${signalingUrls.join(' -> ')}`,
     });
