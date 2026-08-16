@@ -190,9 +190,7 @@ var FreeRTCClientAdapter = class {
       },
       onNegotiationFailure: (data) => {
         if (!isCurrentClient()) return;
-        this.emitter.emit("signaling:log", {
-          message: `[webrtc] ${this.normalizePeerId(data?.peerId)} negotiation failed: ${String(data?.reason ?? "unknown")}`
-        });
+        this.handleNegotiationFailure(data);
       },
       onStatusChange: (status) => {
         if (!isCurrentClient()) return;
@@ -416,6 +414,15 @@ var FreeRTCClientAdapter = class {
     if (state === "failed" || state === "closed") {
       this.markPeerTransportStale(peerId);
     }
+  }
+  handleNegotiationFailure(data) {
+    const peerId = this.normalizePeerId(data?.peerId);
+    const reason = String(data?.reason ?? "unknown");
+    this.emitter.emit("signaling:log", {
+      message: `[webrtc] ${peerId} negotiation failed: ${reason}`
+    });
+    if (!peerId || this.isSelfAlias(peerId)) return;
+    this.releaseStalePeerImmediately(peerId);
   }
   markPeerTransportStale(peerId) {
     this.releaseStalePeerImmediately(peerId);
