@@ -63,6 +63,8 @@ export class FreeRTCClientAdapter {
   private joinedOnce = false;
   private intentionallyDisconnected = false;
   private signalingConnected = false;
+  private activeSignalUrlIndex = 0;
+  private recoveryRelayAttemptsRemaining = 0;
   private recoveryProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private signalingHealthTimer: ReturnType<typeof setInterval> | null = null;
   private lastBootstrapAtMs = 0;
@@ -109,6 +111,7 @@ export class FreeRTCClientAdapter {
       throw new Error('At least one FreeRTC signaling relay is required');
     }
     this.signalUrls = normalizedSignalUrls;
+    this.recoveryRelayAttemptsRemaining = Math.max(0, normalizedSignalUrls.length - 1);
     this.networkId = options?.networkId ?? 'default-session';
     this.roomId = options?.roomId ?? this.networkId;
     this.requestedPeerId = options?.peerId ?? generateMessageId(32);
@@ -135,7 +138,7 @@ export class FreeRTCClientAdapter {
   }
 
   private get activeSignalUrl(): string {
-    return this.signalUrls[0];
+    return this.signalUrls[this.activeSignalUrlIndex] ?? this.signalUrls[0];
   }
 
   private emitConnectedIfNeeded(signalUrl = this.activeSignalUrl): void {
@@ -339,6 +342,7 @@ export class FreeRTCClientAdapter {
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
     this.lastBootstrapAtMs = 0;
+    this.recoveryRelayAttemptsRemaining = Math.max(0, this.signalUrls.length - 1);
     this.client?.resetRecoveryBackoffs?.();
     // Notify PartialMesh so it can reset stale-age baselines. FreeRTC retains
     // ownership of restoration; this event must not trigger immediate redials.
@@ -435,6 +439,12 @@ export class FreeRTCClientAdapter {
         .filter(({ advertisedAt }) => !Number.isFinite(advertisedAt) || now - advertisedAt <= DISCOVERY_ACTIVE_MAX_AGE_MS)
         .map(({ peerId }) => peerId)
     );
+    const shouldTryNextRelay = (
+      activeSnapshotPeers.size === 0
+      && this.connectedPeers.size === 0
+      && this.recoveryRelayAttemptsRemaining > 0
+    );
+    if (activeSnapshotPeers.size > 0) this.recoveryRelayAttemptsRemaining = 0;
     for (const peerId of snapshotPeers) this.knownPeerLastSeenAtMs.set(peerId, now);
 
     // A freshly re-announced peer can briefly receive an empty relay-local
@@ -470,6 +480,46 @@ export class FreeRTCClientAdapter {
       peers: peerList,
       activePeers: Array.from(activeSnapshotPeers),
     });
+    if (shouldTryNextRelay) {
+      this.advanceToNextSignalingRelay('empty discovery while isolated');
+    }
+  }
+
+  private advanceToNextSignalingRelay(reason: string): boolean {
+    if (
+      this.intentionallyDisconnected
+      || this.signalUrls.length < 2
+      || this.recoveryRelayAttemptsRemaining <= 0
+    ) {
+      return false;
+    }
+
+    const previousSignalUrl = this.activeSignalUrl;
+    this.recoveryRelayAttemptsRemaining -= 1;
+    this.activeSignalUrlIndex = (this.activeSignalUrlIndex + 1) % this.signalUrls.length;
+    const nextSignalUrl = this.activeSignalUrl;
+    const staleClient = this.client;
+    const wasConnected = this.signalingConnected;
+
+    this.clearRecoveryProbeTimer();
+    this.signalingConnected = false;
+    this.recyclingSignalingTransport = false;
+    this.waitingForTransportClose = false;
+    this.lastBootstrapAtMs = 0;
+    for (const peerId of this.connectedPeers) this.pendingTransportRestorePeerIds.add(peerId);
+
+    // Invalidate the old client's callbacks before withdrawing from its relay.
+    // The replacement keeps the same peer identity and immediately announces
+    // on the next closest relay; there is no retry timer between candidates.
+    this.clientGeneration += 1;
+    this.client = null;
+    this.emitter.emit('signaling:log', {
+      message: `[signal] ${reason}: ${previousSignalUrl} returned no peers; trying ${nextSignalUrl} immediately`,
+    });
+    try { staleClient?.disconnect?.(); } catch { /* replacement continues */ }
+    if (wasConnected) this.emitter.emit('disconnected');
+    this.connect();
+    return true;
   }
 
   private handleConnectionState(data: { peerId?: string; state?: string }): void {

@@ -205,6 +205,89 @@ test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) =
   }
 });
 
+test('an isolated restored tab immediately advances past an empty relay', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const originalWebSocket = globalThis.WebSocket;
+  const sockets = [];
+
+  class DiscoveryWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
+
+    constructor(url) {
+      this.url = String(url);
+      this.readyState = DiscoveryWebSocket.CONNECTING;
+      this.sent = [];
+      sockets.push(this);
+    }
+
+    send(value) {
+      this.sent.push(JSON.parse(value));
+    }
+
+    open() {
+      this.readyState = DiscoveryWebSocket.OPEN;
+      this.onopen?.();
+    }
+
+    receive(message) {
+      this.onmessage?.({ data: JSON.stringify(message) });
+    }
+
+    close(code = 1000) {
+      this.readyState = DiscoveryWebSocket.CLOSED;
+      this.onclose?.({ code });
+    }
+  }
+
+  globalThis.WebSocket = DiscoveryWebSocket;
+  const selfPeerId = '1'.repeat(64);
+  const remotePeerId = '2'.repeat(64);
+  const adapter = new FreeRTCClientAdapter([
+    'wss://nearest.example/ws',
+    'wss://next-nearest.example/ws',
+    'wss://third-nearest.example/ws',
+  ], { peerId: selfPeerId });
+  const activeSnapshots = [];
+  adapter.on('peers-updated', ({ activePeers }) => activeSnapshots.push(activePeers));
+
+  try {
+    adapter.connect();
+    const firstSocket = sockets[0];
+    firstSocket.open();
+    firstSocket.receive({ type: 'ack', body: { status: 'ok' } });
+    firstSocket.receive({
+      type: 'peer_list',
+      body: { peers: [{ peer_id: remotePeerId, timestamp: Date.now() }] },
+    });
+    assert.equal(sockets.length, 1);
+
+    adapter.recoverAfterInactivity('pageshow');
+    firstSocket.receive({ type: 'peer_list', body: { peers: [] } });
+
+    // No backoff or timer tick: the empty active snapshot replaces the stale
+    // signaling client with the next closest relay in the same task.
+    assert.equal(sockets.length, 2);
+    assert.match(sockets[1].url, /^wss:\/\/next-nearest\.example\/ws/);
+    assert.deepEqual(activeSnapshots.at(-1), []);
+
+    const secondSocket = sockets[1];
+    secondSocket.open();
+    secondSocket.receive({ type: 'ack', body: { status: 'ok' } });
+    secondSocket.receive({
+      type: 'peer_list',
+      body: { peers: [{ peer_id: remotePeerId, timestamp: Date.now() }] },
+    });
+    assert.equal(sockets.length, 2);
+    assert.deepEqual(activeSnapshots.at(-1), [remotePeerId]);
+  } finally {
+    adapter.disconnect();
+    globalThis.WebSocket = originalWebSocket;
+  }
+});
+
 test('resume clears every adapter and FreeRTC recovery backoff immediately', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
