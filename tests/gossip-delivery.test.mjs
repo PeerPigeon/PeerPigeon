@@ -791,7 +791,7 @@ test('tolerantPeers is a real temporary connected-plus-pending overflow budget',
   }
 });
 
-test('the default negotiation timeout releases an isolated slot after four seconds', (t) => {
+test('PartialMesh does not run a second timer against FreeRTC negotiation ownership', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const self = '0'.repeat(63) + '1';
   const target = '0'.repeat(63) + '2';
@@ -818,13 +818,73 @@ test('the default negotiation timeout releases an isolated slot after four secon
     mesh.on('peer:error', ({ peerId, error }) => errors.push({ peerId, message: error.message }));
 
     mesh.connectToPeer(target);
-    t.mock.timers.tick(3_999);
+    t.mock.timers.tick(4_000);
+    // FreeRTC or the state-aware maintenance watchdog owns failure. Merely
+    // advancing a duplicate PartialMesh timer must not close the transport.
     assert.equal(errors.length, 0);
-    t.mock.timers.tick(1);
+    assert.deepEqual(closed, []);
 
-    assert.deepEqual(errors, [{ peerId: target, message: 'Connection timeout' }]);
+    mesh.connectionStartedAtMs.set(target, Date.now() - 4_000);
+    mesh.maybeRecoverStalledNegotiations();
+
+    assert.deepEqual(errors, [{
+      peerId: target,
+      message: 'Negotiation stalled (unknown/unknown/closed)',
+    }]);
     assert.deepEqual(closed, [target]);
     assert.equal(mesh.connecting.has(target), false);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('an inbound FreeRTC connecting event is tracked and never treated as an orphan', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const now = Date.now();
+  const connections = new Map([[target, {
+    state: 'connecting',
+    lastSeen: now,
+    connection: { connectionState: 'connecting', signalingState: 'stable' },
+    channel: { readyState: 'connecting' },
+  }]]);
+  const closed = [];
+  const mesh = new PartialMesh({ autoDiscover: false, autoConnect: false });
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.signalingClient = {
+      closeConnection(peerId) { closed.push(peerId); },
+      disconnect() {},
+      client: { mesh: { connections } },
+    };
+
+    mesh.trackRtcNegotiation(target);
+    mesh.recoverOrphanedRtcNegotiations(now + 60_000);
+
+    assert.equal(mesh.peers.get(target)?.initiator, false);
+    assert.equal(mesh.connecting.has(target), true);
+    assert.equal(mesh.connectionStartedAtMs.has(target), true);
+    assert.deepEqual(closed, []);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('a flapping relay snapshot does not erase failed-peer backoff', () => {
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({ autoDiscover: false, autoConnect: false });
+  try {
+    mesh.discoveredPeers.add(target);
+    mesh.activeSignalingPeers.add(target);
+    mesh.noteDialFailure(target);
+
+    mesh.handleSignalingPeerLeft(target);
+
+    assert.equal(mesh.discoveredPeers.has(target), false);
+    assert.equal(mesh.activeSignalingPeers.has(target), false);
+    assert.equal(mesh.dialFailureCount.get(target), 1);
+    assert.equal(mesh.isPeerBackedOff(target), true);
   } finally {
     mesh.destroy();
   }

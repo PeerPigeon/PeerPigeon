@@ -501,6 +501,10 @@ export class FreeRTCClientAdapter {
       // A fresh FreeRTC generation now owns this peer ID. Allow its own
       // failure/close events to trigger another immediate replacement.
       this.recoveringPeerIds.delete(peerId);
+      // FreeRTC creates responder transports before a data channel exists.
+      // Surface that pending transport so PartialMesh counts it as owned
+      // instead of misclassifying every inbound negotiation as an orphan.
+      this.emitter.emit('rtc:connecting', { peerId });
       return;
     }
     if (state === 'connected') {

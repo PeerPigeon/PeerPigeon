@@ -417,6 +417,7 @@ var FreeRTCClientAdapter = class {
     }
     if (state === "connecting") {
       this.recoveringPeerIds.delete(peerId);
+      this.emitter.emit("rtc:connecting", { peerId });
       return;
     }
     if (state === "connected") {
@@ -3684,7 +3685,6 @@ var PartialMesh = class {
     this.retiredPeerIds = /* @__PURE__ */ new Set();
     this.eventHandlers = /* @__PURE__ */ new Map();
     this.connecting = /* @__PURE__ */ new Set();
-    this.connectionTimers = /* @__PURE__ */ new Map();
     this.connectionStartedAtMs = /* @__PURE__ */ new Map();
     /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
     this.orphanRtcFirstSeenAtMs = /* @__PURE__ */ new Map();
@@ -3736,9 +3736,9 @@ var PartialMesh = class {
       autoConnect: config.autoConnect ?? true,
       // Prefer FreeRTC's richer built-in ICE profile by default.
       iceServers: config.iceServers ?? null,
-      // FreeRTC exhausts an unanswered offer in 2.85s. A negotiation that has
-      // not opened its data channel after four seconds must release the slot so
-      // an isolated peer can immediately try another discovered candidate.
+      // Used by the state-aware stalled-negotiation watchdog. FreeRTC owns the
+      // unanswered-offer deadline and browser ICE remains authoritative while
+      // it is actively checking candidates.
       connectionTimeoutMs: config.connectionTimeoutMs ?? 4e3,
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 1e3,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
@@ -3980,10 +3980,30 @@ var PartialMesh = class {
     const discoveryChanged = this.discoveredPeers.delete(peerId);
     const activeChanged = this.activeSignalingPeers.delete(peerId);
     this.discoveredAtMs.delete(peerId);
-    this.dialFailureCount.delete(peerId);
-    this.dialBackoffUntilMs.delete(peerId);
     if (discoveryChanged || activeChanged) {
       this.emit("mesh:graph", this.getGraphSnapshot());
+    }
+  }
+  trackRtcNegotiation(rawPeerId) {
+    const peerId = this.normalizePeerId(rawPeerId);
+    if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) {
+      if (peerId) {
+        try {
+          this.signalingClient?.closeConnection?.(peerId);
+        } catch {
+        }
+      }
+      return;
+    }
+    this.orphanRtcFirstSeenAtMs.delete(peerId);
+    const existing = this.peers.get(peerId);
+    if (existing?.connected) return;
+    if (!existing) {
+      this.peers.set(peerId, { id: peerId, connected: false, initiator: false });
+    }
+    this.connecting.add(peerId);
+    if (!this.connectionStartedAtMs.has(peerId)) {
+      this.connectionStartedAtMs.set(peerId, Date.now());
     }
   }
   getConnectedPeerCount() {
@@ -4375,6 +4395,9 @@ var PartialMesh = class {
         this.maintainPeerConnections();
       }
     });
+    this.signalingClient.on("rtc:connecting", (data) => {
+      this.trackRtcNegotiation(data?.peerId);
+    });
     this.signalingClient.on("rtc:connected", (data) => {
       const peerId = this.normalizePeerId(data.peerId);
       if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) {
@@ -4391,11 +4414,6 @@ var PartialMesh = class {
         this.peers.set(peerId, peerConnection);
       }
       if (peerConnection.connected) return;
-      const t = this.connectionTimers.get(peerId);
-      if (t) {
-        clearTimeout(t);
-        this.connectionTimers.delete(peerId);
-      }
       this.connectionStartedAtMs.delete(peerId);
       peerConnection.connected = true;
       this.peerConnectedAtMs.set(peerId, Date.now());
@@ -4434,11 +4452,6 @@ var PartialMesh = class {
       }
       const peerConnection = this.peers.get(peerId);
       if (peerConnection) {
-        const t = this.connectionTimers.get(peerId);
-        if (t) {
-          clearTimeout(t);
-          this.connectionTimers.delete(peerId);
-        }
         this.connectionStartedAtMs.delete(peerId);
         const wasConnected = peerConnection.connected;
         this.peers.delete(peerId);
@@ -4564,7 +4577,6 @@ var PartialMesh = class {
   recoverOrphanedRtcNegotiations(now = Date.now()) {
     const connections = this.signalingClient?.client?.mesh?.connections;
     if (!connections || typeof connections.entries !== "function") return;
-    const staleAfterMs = Math.max(4e3, this.config.connectionTimeoutMs);
     for (const [rawPeerId, entry] of Array.from(connections.entries())) {
       const peerId = this.normalizePeerId(rawPeerId);
       if (!peerId) continue;
@@ -4583,6 +4595,8 @@ var PartialMesh = class {
       const firstSeenAt = this.orphanRtcFirstSeenAtMs.get(peerId) ?? initialObservation;
       this.orphanRtcFirstSeenAtMs.set(peerId, firstSeenAt);
       const orphanAgeMs = Math.max(0, now - firstSeenAt);
+      const terminalTransport = connectionState === "failed" || connectionState === "closed" || String(entry?.state ?? "").toLowerCase() === "dead";
+      const staleAfterMs = terminalTransport ? 0 : Math.max(3e4, this.config.connectionTimeoutMs);
       if (orphanAgeMs < staleAfterMs) continue;
       this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.noteDialFailure(peerId);
@@ -4610,12 +4624,12 @@ var PartialMesh = class {
     const now = Date.now();
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
-    const stallMs = Math.max(4e3, this.config.connectionTimeoutMs);
+    const ownerTimeoutMs = Math.max(4e3, this.config.connectionTimeoutMs);
+    const activeIceTimeoutMs = Math.max(3e4, this.config.connectionTimeoutMs);
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
       const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
       const ageMs = Math.max(0, now - startedAt);
-      if (ageMs < stallMs) continue;
       const rtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(peer.id);
       const pc = rtcEntry?.connection;
       const signalingState = pc?.signalingState ?? "unknown";
@@ -4624,9 +4638,12 @@ var PartialMesh = class {
       const stalledOffer = signalingState === "have-local-offer" && dataState !== "open";
       const deadTransport = connectionState === "failed" || connectionState === "closed" || rtcEntry?.state === "dead";
       const noRtcProgress = !rtcEntry && this.connecting.has(peer.id);
-      const answeredButNoChannel = signalingState === "stable" && dataState !== "open" && connectionState !== "connected";
+      const connectedWithoutChannel = signalingState === "stable" && dataState !== "open" && connectionState === "connected";
+      const activeIce = signalingState === "stable" && dataState !== "open" && (connectionState === "new" || connectionState === "connecting");
       const repeatedlyFailing = (this.dialFailureCount.get(peer.id) ?? 0) >= 2;
-      if (!stalledOffer && !deadTransport && !noRtcProgress && !answeredButNoChannel) {
+      const timeoutMs = activeIce ? activeIceTimeoutMs : ownerTimeoutMs;
+      if (ageMs < timeoutMs) continue;
+      if (!stalledOffer && !deadTransport && !noRtcProgress && !connectedWithoutChannel && !activeIce) {
         continue;
       }
       this.noteDialFailure(peer.id);
@@ -4636,7 +4653,7 @@ var PartialMesh = class {
       });
       this.removePeer(peer.id);
       if (isolated) {
-        if (answeredButNoChannel || repeatedlyFailing) this.maybeHardResetUnderConnected();
+        if (connectedWithoutChannel || activeIce || repeatedlyFailing) this.maybeHardResetUnderConnected();
       }
       return;
     }
@@ -4729,10 +4746,6 @@ var PartialMesh = class {
   hardReset(reason = "manual") {
     this.lastHardResetAtMs = Date.now();
     this.underConnectedSinceMs = null;
-    for (const t of this.connectionTimers.values()) {
-      clearTimeout(t);
-    }
-    this.connectionTimers.clear();
     this.connectionStartedAtMs.clear();
     this.peerConnectedAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
@@ -4784,7 +4797,6 @@ var PartialMesh = class {
       connected: false,
       initiator
     };
-    this.scheduleConnectionTimeout(peerId);
     this.connectionStartedAtMs.set(peerId, Date.now());
     this.peers.set(peerId, peerConnection);
     if (initiator) {
@@ -4792,31 +4804,12 @@ var PartialMesh = class {
       this.signalingClient.initiateConnection(peerId, this.config.iceServers, this.config.trickleIce).catch((err) => {
         this.connecting.delete(peerId);
         this.noteDialFailure(peerId);
-        const t = this.connectionTimers.get(peerId);
-        if (t) {
-          clearTimeout(t);
-          this.connectionTimers.delete(peerId);
-        }
         this.connectionStartedAtMs.delete(peerId);
         this.emit("peer:error", { peerId, error: err });
         this.removePeer(peerId);
       });
     }
     return peerConnection;
-  }
-  scheduleConnectionTimeout(peerId) {
-    const existingTimer = this.connectionTimers.get(peerId);
-    if (existingTimer) clearTimeout(existingTimer);
-    const timer = setTimeout(() => {
-      const current = this.peers.get(peerId);
-      if (!current || current.connected) return;
-      this.connecting.delete(peerId);
-      this.connectionStartedAtMs.delete(peerId);
-      this.noteDialFailure(peerId);
-      this.emit("peer:error", { peerId, error: new Error("Connection timeout") });
-      this.removePeer(peerId);
-    }, this.config.connectionTimeoutMs);
-    this.connectionTimers.set(peerId, timer);
   }
   /**
    * Maintain the target number of peer connections
@@ -4947,11 +4940,6 @@ var PartialMesh = class {
     const peerConnection = this.peers.get(peerId);
     if (peerConnection) {
       const wasConnected = peerConnection.connected;
-      const t = this.connectionTimers.get(peerId);
-      if (t) {
-        clearTimeout(t);
-        this.connectionTimers.delete(peerId);
-      }
       this.connectionStartedAtMs.delete(peerId);
       this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.peers.delete(peerId);
@@ -5518,10 +5506,6 @@ var PartialMesh = class {
       clearInterval(this.membershipTimer);
       this.membershipTimer = null;
     }
-    for (const t of this.connectionTimers.values()) {
-      clearTimeout(t);
-    }
-    this.connectionTimers.clear();
     for (const peerId of this.peers.keys()) {
       try {
         this.signalingClient?.closeConnection(peerId);

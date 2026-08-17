@@ -657,3 +657,16 @@ test('terminal negotiation failure requires a newer relay advertisement before r
   assert.ok(activeSnapshots.slice(1, -1).every((activePeers) => activePeers.length === 0));
   assert.deepEqual(activeSnapshots.at(-1), [peerId]);
 });
+
+test('adapter exposes FreeRTC connecting state so inbound negotiations are owned', () => {
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const peerId = '2'.repeat(64);
+  const pending = [];
+  adapter.on('rtc:connecting', (data) => pending.push(data));
+
+  adapter.handleConnectionState({ peerId, state: 'connecting' });
+
+  assert.deepEqual(pending, [{ peerId }]);
+});
