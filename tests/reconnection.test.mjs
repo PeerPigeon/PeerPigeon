@@ -513,7 +513,7 @@ test('broadcast send failure releases the unusable edge immediately', () => {
   adapter.disconnect();
 });
 
-test('suspend recovery releases missing peer edges immediately and recycles the same FreeRTC client', (t) => {
+test('suspend recovery releases missing peer edges and reconnects signaling without a full client teardown', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const peerId = '2'.repeat(64);
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
@@ -521,6 +521,7 @@ test('suspend recovery releases missing peer edges immediately and recycles the 
   });
   let disconnects = 0;
   let connects = 0;
+  let signalingReconnects = 0;
   const client = {
     isRegistered: true,
     mesh: { connections: new Map() },
@@ -528,6 +529,7 @@ test('suspend recovery releases missing peer edges immediately and recycles the 
     requestBootstrap() {},
     disconnect() { disconnects += 1; },
     connect() { connects += 1; },
+    reconnectSignaling() { signalingReconnects += 1; },
   };
   const peerDisconnects = [];
   adapter.client = client;
@@ -541,9 +543,10 @@ test('suspend recovery releases missing peer edges immediately and recycles the 
   assert.equal(disconnects, 0);
 
   t.mock.timers.tick(1);
-  assert.equal(disconnects, 1);
+  assert.equal(disconnects, 0);
+  assert.equal(signalingReconnects, 1);
   assert.equal(adapter.client, client);
-  assert.equal(connects, 1);
+  assert.equal(connects, 0);
   assert.equal(adapter.client, client);
 
   // The missing edge was already released; a later registration flush must
@@ -559,6 +562,7 @@ test('an unregistered signaling transport recovers without another peer announci
   });
   let disconnects = 0;
   let connects = 0;
+  let signalingReconnects = 0;
   const client = {
     isRegistered: false,
     mesh: { connections: new Map() },
@@ -566,6 +570,7 @@ test('an unregistered signaling transport recovers without another peer announci
     requestBootstrap() {},
     disconnect() { disconnects += 1; },
     connect() { connects += 1; },
+    reconnectSignaling() { signalingReconnects += 1; },
   };
   adapter.client = client;
 
@@ -575,19 +580,21 @@ test('an unregistered signaling transport recovers without another peer announci
   t.mock.timers.tick(4_999);
   assert.equal(disconnects, 0);
 
-  // A FreeRTC connect call is a no-op while its old WebSocket remains OPEN or
-  // CONNECTING. The registration deadline must therefore recycle that socket.
+  // A FreeRTC connect call can be a no-op while its old WebSocket remains
+  // OPEN/CONNECTING. The deadline replaces signaling only, not WebRTC peers.
   t.mock.timers.tick(1);
-  assert.equal(disconnects, 1);
+  assert.equal(disconnects, 0);
+  assert.equal(signalingReconnects, 1);
   assert.equal(adapter.client, client);
-  assert.equal(connects, 2);
+  assert.equal(connects, 1);
   assert.equal(adapter.client, client);
 
   // Missing a second acknowledgement must start another bounded recycle;
   // the adapter cannot remain trapped in "reconnect in progress".
   t.mock.timers.tick(5_000);
-  assert.equal(disconnects, 2);
-  assert.equal(connects, 3);
+  assert.equal(disconnects, 0);
+  assert.equal(signalingReconnects, 2);
+  assert.equal(connects, 1);
 
   adapter.disconnect();
 });
@@ -625,13 +632,22 @@ test('periodic relay acknowledgement checks detect zombie sockets without lifecy
   });
   let bootstrapRequests = 0;
   let disconnects = 0;
+  let signalingReconnects = 0;
+  let peerConnectionClosed = false;
+  const remotePeerId = '2'.repeat(64);
   adapter.client = {
     isRegistered: true,
-    mesh: { connections: new Map() },
+    mesh: { connections: new Map([[remotePeerId, {
+      state: 'connected',
+      connection: { connectionState: 'connected', close() { peerConnectionClosed = true; } },
+      channel: { readyState: 'open', close() { peerConnectionClosed = true; } },
+    }]]) },
     requestBootstrap() { bootstrapRequests += 1; },
     disconnect() { disconnects += 1; },
+    reconnectSignaling() { signalingReconnects += 1; },
     connect() {},
   };
+  adapter.connectedPeers.add(remotePeerId);
 
   adapter.startSignalingHealthLoop();
   t.mock.timers.tick(15_000);
@@ -639,7 +655,10 @@ test('periodic relay acknowledgement checks detect zombie sockets without lifecy
   assert.equal(disconnects, 0);
 
   t.mock.timers.tick(5_000);
-  assert.equal(disconnects, 1);
+  assert.equal(disconnects, 0);
+  assert.equal(signalingReconnects, 1);
+  assert.equal(peerConnectionClosed, false);
+  assert.equal(adapter.connectedPeers.has(remotePeerId), true);
   assert.equal(adapter.client.isRegistered, true);
 
   adapter.stopSignalingHealthLoop();
