@@ -934,6 +934,8 @@ declare class PartialMesh {
     private discoveredAtMs;
     /** Peers present in the relay's latest un-graced discovery snapshot. */
     private activeSignalingPeers;
+    /** Whether the relay has supplied an authoritative active snapshot yet. */
+    private hasActiveSignalingSnapshot;
     private maintenanceTimer;
     private membershipTimer;
     private underConnectedSinceMs;
@@ -1021,7 +1023,6 @@ declare class PartialMesh {
     private noteDialFailure;
     private noteDialSuccess;
     private noteIntentionalShed;
-    private clearDialBackoff;
     /**
      * Hard reset peer connections (keeps signaling + discovered peers).
      * Useful for recovering from rare stuck negotiation/ICE states.

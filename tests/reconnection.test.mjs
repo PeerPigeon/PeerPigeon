@@ -299,6 +299,7 @@ test('an exhausted FreeRTC offer releases its pending slot and refreshes discove
   const connection = { connectionState: 'new', closeCalls: 0, close() { this.closeCalls += 1; } };
   const channel = { readyState: 'connecting', closeCalls: 0, close() { this.closeCalls += 1; } };
   const disconnected = [];
+  const failures = [];
   const logs = [];
   let reannouncements = 0;
   let discoveryRequests = 0;
@@ -309,6 +310,7 @@ test('an exhausted FreeRTC offer releases its pending slot and refreshes discove
     requestBootstrap() { discoveryRequests += 1; },
   };
   adapter.on('rtc:disconnected', ({ peerId: disconnectedPeerId }) => disconnected.push(disconnectedPeerId));
+  adapter.on('rtc:negotiation-failed', (details) => failures.push(details));
   adapter.on('signaling:log', ({ message }) => logs.push(message));
 
   adapter.handleNegotiationFailure({ peerId, reason: 'offer_retries_exhausted' });
@@ -319,6 +321,7 @@ test('an exhausted FreeRTC offer releases its pending slot and refreshes discove
   assert.equal(reannouncements, 1);
   assert.equal(discoveryRequests, 2);
   assert.deepEqual(disconnected, [peerId]);
+  assert.deepEqual(failures, [{ peerId, reason: 'offer_retries_exhausted' }]);
   assert.ok(logs.some((message) => message.includes('offer_retries_exhausted')));
   assert.ok(logs.some((message) => message.includes('released immediately; redialing')));
 });

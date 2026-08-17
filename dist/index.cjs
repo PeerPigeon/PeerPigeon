@@ -460,6 +460,7 @@ var FreeRTCClientAdapter = class {
       message: `[webrtc] ${peerId} negotiation failed: ${reason}`
     });
     if (!peerId || this.isSelfAlias(peerId)) return;
+    this.emitter.emit("rtc:negotiation-failed", { peerId, reason });
     this.releaseStalePeerImmediately(peerId);
   }
   markPeerTransportStale(peerId) {
@@ -3707,6 +3708,8 @@ var PartialMesh = class {
     this.discoveredAtMs = /* @__PURE__ */ new Map();
     /** Peers present in the relay's latest un-graced discovery snapshot. */
     this.activeSignalingPeers = /* @__PURE__ */ new Set();
+    /** Whether the relay has supplied an authoritative active snapshot yet. */
+    this.hasActiveSignalingSnapshot = false;
     this.maintenanceTimer = null;
     this.membershipTimer = null;
     this.underConnectedSinceMs = null;
@@ -3957,13 +3960,8 @@ var PartialMesh = class {
       const nextActiveSignalingPeers = new Set(
         rawActivePeerIds.map((peerId) => this.normalizePeerId(peerId)).filter((peerId) => nextPeers.has(peerId))
       );
-      if (nextActiveSignalingPeers.size > 0 || nextPeers.size === 0) {
-        this.activeSignalingPeers = nextActiveSignalingPeers;
-      } else {
-        this.activeSignalingPeers = new Set(
-          Array.from(this.activeSignalingPeers).filter((peerId) => nextPeers.has(peerId))
-        );
-      }
+      this.hasActiveSignalingSnapshot = true;
+      this.activeSignalingPeers = nextActiveSignalingPeers;
     } else {
       this.activeSignalingPeers = new Set(
         Array.from(this.activeSignalingPeers).filter((peerId) => nextPeers.has(peerId))
@@ -4472,6 +4470,12 @@ var PartialMesh = class {
         }
       }
     });
+    this.signalingClient.on("rtc:negotiation-failed", (data) => {
+      const peerId = this.normalizePeerId(data?.peerId);
+      if (!peerId || this.isSelfAlias(peerId)) return;
+      this.noteDialFailure(peerId);
+      this.activeSignalingPeers.delete(peerId);
+    });
     this.signalingClient.on("rtc:data", (data) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
@@ -4648,10 +4652,6 @@ var PartialMesh = class {
       });
       this.removePeer(peer.id);
       if (isolated) {
-        this.clearDialBackoff(peer.id);
-        if (this.discoveredPeers.has(peer.id)) {
-          this.connectToPeerInternal(peer.id, true);
-        }
         if (answeredButNoChannel || repeatedlyFailing) this.maybeHardResetUnderConnected();
       }
       return;
@@ -4728,11 +4728,7 @@ var PartialMesh = class {
   noteDialFailure(peerId) {
     const failures = (this.dialFailureCount.get(peerId) ?? 0) + 1;
     this.dialFailureCount.set(peerId, failures);
-    if (failures === 1) {
-      this.dialBackoffUntilMs.delete(peerId);
-      return;
-    }
-    const backoffMs = Math.min(3e4, 500 * Math.pow(2, Math.min(failures - 2, 6)));
+    const backoffMs = Math.min(3e4, 1e3 * Math.pow(2, Math.min(failures - 1, 5)));
     this.dialBackoffUntilMs.set(peerId, Date.now() + backoffMs);
   }
   noteDialSuccess(peerId) {
@@ -4741,9 +4737,6 @@ var PartialMesh = class {
   }
   noteIntentionalShed(peerId) {
     this.dialBackoffUntilMs.set(peerId, Date.now() + 5e3);
-  }
-  clearDialBackoff(peerId) {
-    this.dialBackoffUntilMs.delete(peerId);
   }
   /**
    * Hard reset peer connections (keeps signaling + discovered peers).
@@ -4847,7 +4840,7 @@ var PartialMesh = class {
   dialCandidatePeerIds(includeLiveMembership) {
     const activeDiscoveredPeers = Array.from(this.discoveredPeers).filter((peerId) => this.activeSignalingPeers.has(peerId));
     const candidates = new Set(
-      activeDiscoveredPeers.length > 0 ? activeDiscoveredPeers : this.discoveredPeers
+      this.hasActiveSignalingSnapshot ? activeDiscoveredPeers : this.discoveredPeers
     );
     if (includeLiveMembership && activeDiscoveredPeers.length === 0) {
       for (const peerId of this.getGlobalPeers()) candidates.add(peerId);
@@ -4867,11 +4860,10 @@ var PartialMesh = class {
     const allCandidates = candidatePeerIds.filter(
       (peerId) => !this.isSelfAlias(peerId) && !this.peers.has(peerId) && !this.connecting.has(peerId)
     );
-    const available = emergencyIsolated ? allCandidates : allCandidates.filter((peerId) => !this.isPeerBackedOff(peerId));
+    const available = allCandidates.filter((peerId) => !this.isPeerBackedOff(peerId));
     const pickCandidates = (count) => {
-      if (available.length === 0 && allCandidates.length === 0 || count <= 0) return [];
-      const source = available.length > 0 ? available : allCandidates;
-      const sorted = source.slice().sort((a, b) => this.compareDialCandidates(a, b));
+      if (available.length === 0 || count <= 0) return [];
+      const sorted = available.slice().sort((a, b) => this.compareDialCandidates(a, b));
       return sorted.slice(0, Math.min(count, sorted.length));
     };
     if (totalInProgress < this.config.minPeers) {
@@ -4933,11 +4925,8 @@ var PartialMesh = class {
       } catch {
       }
     }
-    if (this.isPeerBackedOff(normalizedPeerId) && !emergencyIsolated) {
+    if (this.isPeerBackedOff(normalizedPeerId)) {
       return;
-    }
-    if (emergencyIsolated) {
-      this.clearDialBackoff(normalizedPeerId);
     }
     const totalInProgress = this.getConnectedPeerCount() + this.getPendingPeerCount();
     const useToleranceBudget = allowTemporaryOverflow || emergencyIsolated;
