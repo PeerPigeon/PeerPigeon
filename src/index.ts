@@ -937,7 +937,7 @@ export class PartialMesh {
       const target = dropOrder[i];
       if (!target) break;
       this.noteIntentionalShed(target.peerId);
-      this.disconnectFromPeer(target.peerId);
+      this.disconnectFromPeer(target.peerId, 'capacity_shed');
     }
   }
 
@@ -1304,7 +1304,7 @@ export class PartialMesh {
         this.pendingRebalanceDropByTarget.delete(peerId);
         if (rebalanceDropPeerId !== peerId && this.peers.get(rebalanceDropPeerId)?.connected) {
           if (this.getConnectedPeerCount() > this.config.maxPeers) {
-            this.disconnectFromPeer(rebalanceDropPeerId);
+            this.disconnectFromPeer(rebalanceDropPeerId, 'capacity_shed');
           }
         }
       }
@@ -1987,17 +1987,17 @@ export class PartialMesh {
   /**
    * Disconnect from a specific peer
    */
-  public disconnectFromPeer(peerId: string): void {
+  public disconnectFromPeer(peerId: string, reason: string = 'local_close'): void {
     const normalizedPeerId = this.normalizePeerId(peerId);
     if (!normalizedPeerId) return;
     // Use the same teardown path as close/error to ensure timers and reconnection logic stay consistent.
-    this.removePeer(normalizedPeerId, false);
+    this.removePeer(normalizedPeerId, false, reason);
   }
 
   /**
    * Remove a peer connection
    */
-  private removePeer(peerId: string, forgetDiscovered: boolean = false): void {
+  private removePeer(peerId: string, forgetDiscovered: boolean = false, reason: string = 'local_close'): void {
     if (this.pendingRebalanceDropByTarget.has(peerId)) {
       this.pendingRebalanceDropByTarget.delete(peerId);
     }
@@ -2017,7 +2017,7 @@ export class PartialMesh {
       this.connecting.delete(peerId);
       // Close the underlying FreeRTC connection (no-op if already closed).
       try {
-        this.signalingClient?.closeConnection(peerId);
+        this.signalingClient?.closeConnection(peerId, reason);
       } catch {
         // ignore
       }

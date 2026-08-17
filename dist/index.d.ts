@@ -1045,7 +1045,7 @@ declare class PartialMesh {
     /**
      * Disconnect from a specific peer
      */
-    disconnectFromPeer(peerId: string): void;
+    disconnectFromPeer(peerId: string, reason?: string): void;
     /**
      * Remove a peer connection
      */

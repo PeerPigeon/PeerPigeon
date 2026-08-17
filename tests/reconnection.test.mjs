@@ -359,18 +359,24 @@ test('closing a pending transport emits disconnected even before its channel ope
     peerId: '1'.repeat(64),
   });
   const disconnected = [];
+  const coordinatedCloses = [];
   adapter.client = {
     mesh: { connections: new Map([[peerId, {
       connection: { close() {} },
       channel: { close() {} },
       state: 'connecting',
     }]]) },
+    closePeerConnection(closedPeerId, reason) {
+      coordinatedCloses.push({ peerId: closedPeerId, reason });
+      this.mesh.connections.delete(closedPeerId);
+    },
   };
   adapter.on('rtc:disconnected', ({ peerId: disconnectedPeerId }) => disconnected.push(disconnectedPeerId));
 
-  adapter.closeConnection(peerId);
+  adapter.closeConnection(peerId, 'capacity_shed');
 
   assert.deepEqual(disconnected, [peerId]);
+  assert.deepEqual(coordinatedCloses, [{ peerId, reason: 'capacity_shed' }]);
 });
 
 test('an isolated adapter releases every stale direct edge immediately', (t) => {
