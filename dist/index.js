@@ -561,11 +561,34 @@ var FreeRTCClientAdapter = class {
   recycleStaleSignalingTransport(reason) {
     if (this.intentionallyDisconnected || this.recyclingSignalingTransport || !this.client) return;
     this.recyclingSignalingTransport = true;
-    this.waitingForTransportClose = true;
     this.signalingConnected = false;
     this.clearRecoveryProbeTimer();
     this.clearDisconnectGraceTimers();
-    for (const peerId of this.connectedPeers) this.pendingTransportRestorePeerIds.add(peerId);
+    if (typeof this.client.reconnectSignaling === "function") {
+      this.waitingForTransportClose = false;
+      this.emitter.emit("signaling:log", {
+        message: `[signal] ${reason}: relay did not acknowledge; reconnecting signaling without closing peer channels`
+      });
+      try {
+        this.ensureRegistrationRecoveryProbe("transport reconnect");
+        this.client.reconnectSignaling(reason);
+        this.recyclingSignalingTransport = false;
+      } catch (error) {
+        this.recyclingSignalingTransport = false;
+        this.clearRecoveryProbeTimer();
+        this.emitter.emit("error", error);
+      }
+      return;
+    }
+    if (this.connectedPeers.size > 0) {
+      this.recyclingSignalingTransport = false;
+      this.emitter.emit("signaling:log", {
+        message: `[signal] ${reason}: relay acknowledgement missing; preserving healthy peer channels and refreshing discovery`
+      });
+      this.nudgeSignaling();
+      return;
+    }
+    this.waitingForTransportClose = true;
     this.emitter.emit("signaling:log", {
       message: `[signal] ${reason}: relay did not acknowledge; recycling stale transport in the same FreeRTC client`
     });
