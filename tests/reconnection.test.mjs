@@ -326,6 +326,49 @@ test('an exhausted FreeRTC offer releases its pending slot and refreshes discove
   assert.ok(logs.some((message) => message.includes('released immediately; redialing')));
 });
 
+test('an exhausted offer still releases PartialMesh after FreeRTC already removed its entry', () => {
+  const peerId = '2'.repeat(64);
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const disconnected = [];
+  let reannouncements = 0;
+  let discoveryRequests = 0;
+
+  adapter.client = {
+    mesh: { connections: new Map() },
+    advertise() { reannouncements += 1; },
+    requestBootstrap() { discoveryRequests += 1; },
+  };
+  adapter.on('rtc:disconnected', ({ peerId: disconnectedPeerId }) => disconnected.push(disconnectedPeerId));
+
+  adapter.handleNegotiationFailure({ peerId, reason: 'offer_retries_exhausted' });
+
+  assert.deepEqual(disconnected, [peerId]);
+  assert.equal(reannouncements, 1);
+  assert.equal(discoveryRequests, 2);
+});
+
+test('closing a pending transport emits disconnected even before its channel opens', () => {
+  const peerId = '2'.repeat(64);
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const disconnected = [];
+  adapter.client = {
+    mesh: { connections: new Map([[peerId, {
+      connection: { close() {} },
+      channel: { close() {} },
+      state: 'connecting',
+    }]]) },
+  };
+  adapter.on('rtc:disconnected', ({ peerId: disconnectedPeerId }) => disconnected.push(disconnectedPeerId));
+
+  adapter.closeConnection(peerId);
+
+  assert.deepEqual(disconnected, [peerId]);
+});
+
 test('an isolated adapter releases every stale direct edge immediately', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
