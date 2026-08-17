@@ -636,3 +636,20 @@ test('stale relay leases remain in discovery grace but not in the active peer co
   assert.deepEqual(new Set(snapshot.peers), new Set([currentPeerId, stalePeerId]));
   assert.deepEqual(snapshot.activePeers, [currentPeerId]);
 });
+
+test('terminal negotiation failure requires a newer relay advertisement before redial', () => {
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const peerId = '2'.repeat(64);
+  const advertisedAt = Date.now();
+  const activeSnapshots = [];
+  adapter.on('peers-updated', ({ activePeers }) => activeSnapshots.push(activePeers));
+
+  adapter.handleBootstrapCandidates([{ peerId, advertisedAt }]);
+  adapter.handleNegotiationFailure({ peerId, reason: 'offer_retries_exhausted' });
+  adapter.handleBootstrapCandidates([{ peerId, advertisedAt }]);
+  adapter.handleBootstrapCandidates([{ peerId, advertisedAt: advertisedAt + 1 }]);
+
+  assert.deepEqual(activeSnapshots, [[peerId], [], [peerId]]);
+});
