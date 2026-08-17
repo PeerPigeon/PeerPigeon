@@ -363,7 +363,7 @@ var FreeRTCClientAdapter = class {
       entry?.connection?.close?.();
     } catch {
     }
-    if (wasConnected) {
+    if (entry || wasConnected) {
       this.emitter.emit("rtc:disconnected", { peerId: id });
     }
   }
@@ -484,7 +484,7 @@ var FreeRTCClientAdapter = class {
       this.knownPeerAdvertisedAtMs.get(peerId) ?? Date.now()
     );
     this.emitter.emit("rtc:negotiation-failed", { peerId, reason });
-    this.releaseStalePeerImmediately(peerId);
+    this.releaseStalePeerImmediately(peerId, true);
   }
   markPeerTransportStale(peerId) {
     this.releaseStalePeerImmediately(peerId);
@@ -512,11 +512,11 @@ var FreeRTCClientAdapter = class {
     this.connectedPeers.add(peerId);
     this.emitter.emit("rtc:connected", { peerId });
   }
-  releaseStalePeerImmediately(peerId) {
+  releaseStalePeerImmediately(peerId, forceNotify = false) {
     if (this.intentionallyDisconnected || this.recoveringPeerIds.has(peerId)) return;
     const entry = this.client?.mesh?.connections?.get?.(peerId);
     const wasConnected = this.connectedPeers.has(peerId);
-    if (!entry && !wasConnected) return;
+    if (!entry && !wasConnected && !forceNotify) return;
     this.recoveringPeerIds.add(peerId);
     this.client?.mesh?.connections?.delete?.(peerId);
     this.connectedPeers.delete(peerId);

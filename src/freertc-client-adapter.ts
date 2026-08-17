@@ -383,7 +383,7 @@ export class FreeRTCClientAdapter {
     const wasConnected = this.connectedPeers.delete(id);
     try { entry?.channel?.close?.(); } catch { /* best effort */ }
     try { entry?.connection?.close?.(); } catch { /* best effort */ }
-    if (wasConnected) {
+    if (entry || wasConnected) {
       this.emitter.emit('rtc:disconnected', { peerId: id });
     }
   }
@@ -546,7 +546,7 @@ export class FreeRTCClientAdapter {
     // negotiation. Release that dead generation immediately so PartialMesh can
     // remove its pending dial and use a fresh discovery candidate instead of
     // waiting for a browser-specific connection-state event or the 45s guard.
-    this.releaseStalePeerImmediately(peerId);
+    this.releaseStalePeerImmediately(peerId, true);
   }
 
   private markPeerTransportStale(peerId: string): void {
@@ -578,11 +578,11 @@ export class FreeRTCClientAdapter {
     this.emitter.emit('rtc:connected', { peerId });
   }
 
-  private releaseStalePeerImmediately(peerId: string): void {
+  private releaseStalePeerImmediately(peerId: string, forceNotify = false): void {
     if (this.intentionallyDisconnected || this.recoveringPeerIds.has(peerId)) return;
     const entry = this.client?.mesh?.connections?.get?.(peerId);
     const wasConnected = this.connectedPeers.has(peerId);
-    if (!entry && !wasConnected) return;
+    if (!entry && !wasConnected && !forceNotify) return;
 
     this.recoveringPeerIds.add(peerId);
     this.client?.mesh?.connections?.delete?.(peerId);
