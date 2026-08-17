@@ -475,7 +475,8 @@ var FreeRTCClientAdapter = class {
     this.emitter.emit("rtc:connected", { peerId });
   }
   releaseStalePeerImmediately(peerId, forceNotify = false) {
-    if (this.intentionallyDisconnected || this.recoveringPeerIds.has(peerId)) return;
+    if (this.intentionallyDisconnected) return;
+    if (this.recoveringPeerIds.has(peerId) && !forceNotify) return;
     const entry = this.client?.mesh?.connections?.get?.(peerId);
     const wasConnected = this.connectedPeers.has(peerId);
     if (!entry && !wasConnected && !forceNotify) return;
