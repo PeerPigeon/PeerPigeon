@@ -54,6 +54,8 @@ export class FreeRTCClientAdapter {
   private readonly emitter = new Emitter();
   private readonly knownPeers = new Set<string>();
   private readonly knownPeerLastSeenAtMs = new Map<string, number>();
+  private readonly knownPeerAdvertisedAtMs = new Map<string, number>();
+  private readonly failedPeerAdvertisementAtMs = new Map<string, number>();
   private readonly selfAliases = new Set<string>();
   private readonly connectedPeers = new Set<string>();
   private readonly pendingTransportRestorePeerIds = new Set<string>();
@@ -291,6 +293,8 @@ export class FreeRTCClientAdapter {
     this.waitingForTransportClose = false;
     this.knownPeers.clear();
     this.knownPeerLastSeenAtMs.clear();
+    this.knownPeerAdvertisedAtMs.clear();
+    this.failedPeerAdvertisementAtMs.clear();
     this.joinedOnce = false;
   }
 
@@ -428,12 +432,24 @@ export class FreeRTCClientAdapter {
       }))
       .filter(({ peerId }) => peerId && !this.isSelfAlias(peerId));
     const snapshotPeers = new Set<string>(normalizedCandidates.map(({ peerId }) => peerId));
-    const activeSnapshotPeers = new Set<string>(
-      normalizedCandidates
-        .filter(({ advertisedAt }) => !Number.isFinite(advertisedAt) || now - advertisedAt <= DISCOVERY_ACTIVE_MAX_AGE_MS)
-        .map(({ peerId }) => peerId)
-    );
-    for (const peerId of snapshotPeers) this.knownPeerLastSeenAtMs.set(peerId, now);
+    const activeSnapshotPeers = new Set<string>();
+    for (const { peerId, advertisedAt } of normalizedCandidates) {
+      this.knownPeerLastSeenAtMs.set(peerId, now);
+      if (Number.isFinite(advertisedAt)) {
+        const previous = this.knownPeerAdvertisedAtMs.get(peerId) ?? Number.NEGATIVE_INFINITY;
+        this.knownPeerAdvertisedAtMs.set(peerId, Math.max(previous, advertisedAt));
+      }
+
+      const failedAdvertisementAt = this.failedPeerAdvertisementAtMs.get(peerId);
+      const hasNewAdvertisement = failedAdvertisementAt == null
+        || (Number.isFinite(advertisedAt) && advertisedAt > failedAdvertisementAt);
+      const isFresh = !Number.isFinite(advertisedAt)
+        || now - advertisedAt <= DISCOVERY_ACTIVE_MAX_AGE_MS;
+      if (hasNewAdvertisement && isFresh) {
+        activeSnapshotPeers.add(peerId);
+        if (failedAdvertisementAt != null) this.failedPeerAdvertisementAtMs.delete(peerId);
+      }
+    }
 
     // A freshly re-announced peer can briefly receive an empty relay-local
     // snapshot before federation converges. Preserve recently seen peers for
@@ -446,6 +462,8 @@ export class FreeRTCClientAdapter {
         nextPeers.add(peerId);
       } else {
         this.knownPeerLastSeenAtMs.delete(peerId);
+        this.knownPeerAdvertisedAtMs.delete(peerId);
+        this.failedPeerAdvertisementAtMs.delete(peerId);
         this.emitter.emit('peer-left', { peerId });
       }
     }
@@ -487,6 +505,7 @@ export class FreeRTCClientAdapter {
     }
     if (state === 'connected') {
       this.recoveringPeerIds.delete(peerId);
+      this.failedPeerAdvertisementAtMs.delete(peerId);
       this.waitForOpenDataChannel(peerId);
       return;
     }
@@ -506,6 +525,14 @@ export class FreeRTCClientAdapter {
       message: `[webrtc] ${peerId} negotiation failed: ${reason}`,
     });
     if (!peerId || this.isSelfAlias(peerId)) return;
+
+    // Replaying the same discovery row is not evidence that a target recovered.
+    // Require a newer relay heartbeat before this failed peer becomes active
+    // again, otherwise every discovery refresh recreates the exhausted offer.
+    this.failedPeerAdvertisementAtMs.set(
+      peerId,
+      this.knownPeerAdvertisedAtMs.get(peerId) ?? Date.now(),
+    );
 
     // Surface terminal ownership failure separately from an ordinary close so
     // the mesh can quarantine this exact candidate while rotating to another.

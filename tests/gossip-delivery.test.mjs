@@ -1100,6 +1100,43 @@ test('an isolated mesh can redial a live CECR member missing from signaling disc
   }
 });
 
+test('CECR fallback cannot resurrect a grace-preserved inactive relay peer', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  const dials = [];
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.mergeMembership([target], [], {}, 'relay');
+    mesh.reconcileSignalingPeers([target], []);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      initiateConnection(peerId) {
+        dials.push(peerId);
+        return new Promise(() => {});
+      },
+      closeConnection() {},
+      disconnect() {},
+      client: { mesh: { connections: new Map() } },
+    };
+
+    mesh.maintainPeerConnections();
+
+    assert.deepEqual(mesh.getDiscoveredPeers(), [target]);
+    assert.deepEqual(mesh.getActiveSignalingPeers(), []);
+    assert.deepEqual(dials, []);
+  } finally {
+    mesh.destroy();
+  }
+});
+
 test('a current relay snapshot replaces a pending dial to a suspended peer', () => {
   const self = '0'.repeat(64);
   const suspended = '1'.repeat(64);

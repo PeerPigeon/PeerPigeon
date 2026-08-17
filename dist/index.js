@@ -35,6 +35,8 @@ var FreeRTCClientAdapter = class {
     this.emitter = new Emitter();
     this.knownPeers = /* @__PURE__ */ new Set();
     this.knownPeerLastSeenAtMs = /* @__PURE__ */ new Map();
+    this.knownPeerAdvertisedAtMs = /* @__PURE__ */ new Map();
+    this.failedPeerAdvertisementAtMs = /* @__PURE__ */ new Map();
     this.selfAliases = /* @__PURE__ */ new Set();
     this.connectedPeers = /* @__PURE__ */ new Set();
     this.pendingTransportRestorePeerIds = /* @__PURE__ */ new Set();
@@ -243,6 +245,8 @@ var FreeRTCClientAdapter = class {
     this.waitingForTransportClose = false;
     this.knownPeers.clear();
     this.knownPeerLastSeenAtMs.clear();
+    this.knownPeerAdvertisedAtMs.clear();
+    this.failedPeerAdvertisementAtMs.clear();
     this.joinedOnce = false;
   }
   isConnected() {
@@ -360,10 +364,21 @@ var FreeRTCClientAdapter = class {
       advertisedAt: Number(candidate?.advertisedAt)
     })).filter(({ peerId }) => peerId && !this.isSelfAlias(peerId));
     const snapshotPeers = new Set(normalizedCandidates.map(({ peerId }) => peerId));
-    const activeSnapshotPeers = new Set(
-      normalizedCandidates.filter(({ advertisedAt }) => !Number.isFinite(advertisedAt) || now - advertisedAt <= DISCOVERY_ACTIVE_MAX_AGE_MS).map(({ peerId }) => peerId)
-    );
-    for (const peerId of snapshotPeers) this.knownPeerLastSeenAtMs.set(peerId, now);
+    const activeSnapshotPeers = /* @__PURE__ */ new Set();
+    for (const { peerId, advertisedAt } of normalizedCandidates) {
+      this.knownPeerLastSeenAtMs.set(peerId, now);
+      if (Number.isFinite(advertisedAt)) {
+        const previous = this.knownPeerAdvertisedAtMs.get(peerId) ?? Number.NEGATIVE_INFINITY;
+        this.knownPeerAdvertisedAtMs.set(peerId, Math.max(previous, advertisedAt));
+      }
+      const failedAdvertisementAt = this.failedPeerAdvertisementAtMs.get(peerId);
+      const hasNewAdvertisement = failedAdvertisementAt == null || Number.isFinite(advertisedAt) && advertisedAt > failedAdvertisementAt;
+      const isFresh = !Number.isFinite(advertisedAt) || now - advertisedAt <= DISCOVERY_ACTIVE_MAX_AGE_MS;
+      if (hasNewAdvertisement && isFresh) {
+        activeSnapshotPeers.add(peerId);
+        if (failedAdvertisementAt != null) this.failedPeerAdvertisementAtMs.delete(peerId);
+      }
+    }
     const nextPeers = new Set(snapshotPeers);
     for (const peerId of this.knownPeers) {
       if (snapshotPeers.has(peerId)) continue;
@@ -372,6 +387,8 @@ var FreeRTCClientAdapter = class {
         nextPeers.add(peerId);
       } else {
         this.knownPeerLastSeenAtMs.delete(peerId);
+        this.knownPeerAdvertisedAtMs.delete(peerId);
+        this.failedPeerAdvertisementAtMs.delete(peerId);
         this.emitter.emit("peer-left", { peerId });
       }
     }
@@ -404,6 +421,7 @@ var FreeRTCClientAdapter = class {
     }
     if (state === "connected") {
       this.recoveringPeerIds.delete(peerId);
+      this.failedPeerAdvertisementAtMs.delete(peerId);
       this.waitForOpenDataChannel(peerId);
       return;
     }
@@ -422,6 +440,10 @@ var FreeRTCClientAdapter = class {
       message: `[webrtc] ${peerId} negotiation failed: ${reason}`
     });
     if (!peerId || this.isSelfAlias(peerId)) return;
+    this.failedPeerAdvertisementAtMs.set(
+      peerId,
+      this.knownPeerAdvertisedAtMs.get(peerId) ?? Date.now()
+    );
     this.emitter.emit("rtc:negotiation-failed", { peerId, reason });
     this.releaseStalePeerImmediately(peerId);
   }
@@ -4805,7 +4827,10 @@ var PartialMesh = class {
       this.hasActiveSignalingSnapshot ? activeDiscoveredPeers : this.discoveredPeers
     );
     if (includeLiveMembership && activeDiscoveredPeers.length === 0) {
-      for (const peerId of this.getGlobalPeers()) candidates.add(peerId);
+      for (const peerId of this.getGlobalPeers()) {
+        if (this.hasActiveSignalingSnapshot && this.discoveredPeers.has(peerId) && !this.activeSignalingPeers.has(peerId)) continue;
+        candidates.add(peerId);
+      }
     }
     return Array.from(candidates).filter(
       (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId)

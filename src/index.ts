@@ -1826,7 +1826,17 @@ export class PartialMesh {
       this.hasActiveSignalingSnapshot ? activeDiscoveredPeers : this.discoveredPeers
     );
     if (includeLiveMembership && activeDiscoveredPeers.length === 0) {
-      for (const peerId of this.getGlobalPeers()) candidates.add(peerId);
+      for (const peerId of this.getGlobalPeers()) {
+        // Discovery grace can retain an expired peer after the authoritative
+        // active snapshot has rejected it. CECR must not make that exact stale
+        // ID dialable again; it only fills peers absent from discovery.
+        if (
+          this.hasActiveSignalingSnapshot
+          && this.discoveredPeers.has(peerId)
+          && !this.activeSignalingPeers.has(peerId)
+        ) continue;
+        candidates.add(peerId);
+      }
     }
     return Array.from(candidates).filter(
       (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId),
