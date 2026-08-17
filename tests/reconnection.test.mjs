@@ -342,6 +342,10 @@ test('an exhausted offer still releases PartialMesh after FreeRTC already remove
   };
   adapter.on('rtc:disconnected', ({ peerId: disconnectedPeerId }) => disconnected.push(disconnectedPeerId));
 
+  // A previous stale generation may have set the recovery guard before the
+  // replacement disappeared. Terminal failure must still release the owner.
+  adapter.recoveringPeerIds.add(peerId);
+
   adapter.handleNegotiationFailure({ peerId, reason: 'offer_retries_exhausted' });
 
   assert.deepEqual(disconnected, [peerId]);
