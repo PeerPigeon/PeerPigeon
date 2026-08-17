@@ -376,7 +376,6 @@ export class PartialMesh {
   private retiredPeerIds: Set<string> = new Set();
   private eventHandlers: Map<keyof PartialMeshEvents, Set<Function>> = new Map();
   private connecting: Set<string> = new Set();
-  private connectionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private connectionStartedAtMs: Map<string, number> = new Map();
   /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
   private orphanRtcFirstSeenAtMs: Map<string, number> = new Map();
@@ -436,9 +435,9 @@ export class PartialMesh {
       autoConnect: config.autoConnect ?? true,
       // Prefer FreeRTC's richer built-in ICE profile by default.
       iceServers: config.iceServers ?? null,
-      // FreeRTC exhausts an unanswered offer in 2.85s. A negotiation that has
-      // not opened its data channel after four seconds must release the slot so
-      // an isolated peer can immediately try another discovered candidate.
+      // Used by the state-aware stalled-negotiation watchdog. FreeRTC owns the
+      // unanswered-offer deadline and browser ICE remains authoritative while
+      // it is actively checking candidates.
       connectionTimeoutMs: config.connectionTimeoutMs ?? 4_000,
       maintenanceIntervalMs: config.maintenanceIntervalMs ?? 1_000,
       underConnectedResetMs: config.underConnectedResetMs ?? 0,
@@ -759,10 +758,33 @@ export class PartialMesh {
     const discoveryChanged = this.discoveredPeers.delete(peerId);
     const activeChanged = this.activeSignalingPeers.delete(peerId);
     this.discoveredAtMs.delete(peerId);
-    this.dialFailureCount.delete(peerId);
-    this.dialBackoffUntilMs.delete(peerId);
+    // Relay snapshots are advisory and can flap during federation. Absence is
+    // not a successful transport, so it must not erase accumulated failure
+    // backoff and restart a rapid offer loop when the same peer reappears.
     if (discoveryChanged || activeChanged) {
       this.emit('mesh:graph', this.getGraphSnapshot());
+    }
+  }
+
+  private trackRtcNegotiation(rawPeerId: string): void {
+    const peerId = this.normalizePeerId(rawPeerId);
+    if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) {
+      if (peerId) {
+        try { this.signalingClient?.closeConnection?.(peerId); } catch { /* ignore */ }
+      }
+      return;
+    }
+
+    this.orphanRtcFirstSeenAtMs.delete(peerId);
+    const existing = this.peers.get(peerId);
+    if (existing?.connected) return;
+
+    if (!existing) {
+      this.peers.set(peerId, { id: peerId, connected: false, initiator: false });
+    }
+    this.connecting.add(peerId);
+    if (!this.connectionStartedAtMs.has(peerId)) {
+      this.connectionStartedAtMs.set(peerId, Date.now());
     }
   }
 
@@ -1248,6 +1270,10 @@ export class PartialMesh {
       }
     });
 
+    this.signalingClient.on('rtc:connecting', (data: { peerId: string }) => {
+      this.trackRtcNegotiation(data?.peerId);
+    });
+
     this.signalingClient.on('rtc:connected', (data: { peerId: string }) => {
       const peerId = this.normalizePeerId(data.peerId);
       if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) {
@@ -1262,11 +1288,6 @@ export class PartialMesh {
         this.peers.set(peerId, peerConnection);
       }
       if (peerConnection.connected) return; // guard against duplicate events
-      const t = this.connectionTimers.get(peerId);
-      if (t) {
-        clearTimeout(t);
-        this.connectionTimers.delete(peerId);
-      }
       this.connectionStartedAtMs.delete(peerId);
       peerConnection.connected = true;
       this.peerConnectedAtMs.set(peerId, Date.now());
@@ -1317,11 +1338,6 @@ export class PartialMesh {
       // FreeRTC already closed the connection; clean up tracking state only.
       const peerConnection = this.peers.get(peerId);
       if (peerConnection) {
-        const t = this.connectionTimers.get(peerId);
-        if (t) {
-          clearTimeout(t);
-          this.connectionTimers.delete(peerId);
-        }
         this.connectionStartedAtMs.delete(peerId);
         const wasConnected = peerConnection.connected;
         this.peers.delete(peerId);
@@ -1486,10 +1502,6 @@ export class PartialMesh {
     const connections = (this.signalingClient as any)?.client?.mesh?.connections;
     if (!connections || typeof connections.entries !== 'function') return;
 
-    // FreeRTC owns an outgoing offer for 2.85 seconds. Keep the orphan guard
-    // just beyond that bound, then release a half-open data channel promptly.
-    const staleAfterMs = Math.max(4_000, this.config.connectionTimeoutMs);
-
     for (const [rawPeerId, entry] of Array.from(connections.entries()) as Array<[string, any]>) {
       const peerId = this.normalizePeerId(rawPeerId);
       if (!peerId) continue;
@@ -1518,6 +1530,15 @@ export class PartialMesh {
       // Age the orphan from our first observation so relayed retries cannot
       // keep a permanently non-open negotiation alive forever.
       const orphanAgeMs = Math.max(0, now - firstSeenAt);
+      const terminalTransport = connectionState === 'failed'
+        || connectionState === 'closed'
+        || String(entry?.state ?? '').toLowerCase() === 'dead';
+      // A genuine inbound negotiation is now registered through
+      // rtc:connecting. Anything still untracked is internal FreeRTC residue;
+      // close terminal residue immediately but do not race active browser ICE.
+      const staleAfterMs = terminalTransport
+        ? 0
+        : Math.max(30_000, this.config.connectionTimeoutMs);
       if (orphanAgeMs < staleAfterMs) continue;
 
       this.orphanRtcFirstSeenAtMs.delete(peerId);
@@ -1545,15 +1566,17 @@ export class PartialMesh {
     const now = Date.now();
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
-    // Never race FreeRTC's 2.85-second offer retry loop.
-    const stallMs = Math.max(4_000, this.config.connectionTimeoutMs);
+    // Never race FreeRTC's 2.85-second offer retry loop. Browser ICE can
+    // legitimately remain in new/connecting after signaling has stabilized,
+    // so only an explicit failure closes it early.
+    const ownerTimeoutMs = Math.max(4_000, this.config.connectionTimeoutMs);
+    const activeIceTimeoutMs = Math.max(30_000, this.config.connectionTimeoutMs);
 
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
 
       const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
       const ageMs = Math.max(0, now - startedAt);
-      if (ageMs < stallMs) continue;
 
       const rtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(peer.id);
       const pc = rtcEntry?.connection;
@@ -1564,10 +1587,17 @@ export class PartialMesh {
       const stalledOffer = signalingState === 'have-local-offer' && dataState !== 'open';
       const deadTransport = connectionState === 'failed' || connectionState === 'closed' || rtcEntry?.state === 'dead';
       const noRtcProgress = !rtcEntry && this.connecting.has(peer.id);
-      const answeredButNoChannel = signalingState === 'stable' && dataState !== 'open' && connectionState !== 'connected';
+      const connectedWithoutChannel = signalingState === 'stable'
+        && dataState !== 'open'
+        && connectionState === 'connected';
+      const activeIce = signalingState === 'stable'
+        && dataState !== 'open'
+        && (connectionState === 'new' || connectionState === 'connecting');
       const repeatedlyFailing = (this.dialFailureCount.get(peer.id) ?? 0) >= 2;
+      const timeoutMs = activeIce ? activeIceTimeoutMs : ownerTimeoutMs;
 
-      if (!stalledOffer && !deadTransport && !noRtcProgress && !answeredButNoChannel) {
+      if (ageMs < timeoutMs) continue;
+      if (!stalledOffer && !deadTransport && !noRtcProgress && !connectedWithoutChannel && !activeIce) {
         continue;
       }
 
@@ -1581,7 +1611,7 @@ export class PartialMesh {
       if (isolated) {
         // removePeer immediately runs maintenance. The failed target remains
         // quarantined so another candidate gets the recovery slot.
-        if (answeredButNoChannel || repeatedlyFailing) this.maybeHardResetUnderConnected();
+        if (connectedWithoutChannel || activeIce || repeatedlyFailing) this.maybeHardResetUnderConnected();
       }
       return;
     }
@@ -1701,10 +1731,6 @@ export class PartialMesh {
     this.lastHardResetAtMs = Date.now();
     this.underConnectedSinceMs = null;
 
-    for (const t of this.connectionTimers.values()) {
-      clearTimeout(t);
-    }
-    this.connectionTimers.clear();
     this.connectionStartedAtMs.clear();
     this.peerConnectedAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
@@ -1770,7 +1796,6 @@ export class PartialMesh {
       initiator
     };
 
-    this.scheduleConnectionTimeout(peerId);
     this.connectionStartedAtMs.set(peerId, Date.now());
     this.peers.set(peerId, peerConnection);
 
@@ -1782,11 +1807,6 @@ export class PartialMesh {
       this.signalingClient.initiateConnection(peerId, this.config.iceServers, this.config.trickleIce).catch((err: any) => {
         this.connecting.delete(peerId);
         this.noteDialFailure(peerId);
-        const t = this.connectionTimers.get(peerId);
-        if (t) {
-          clearTimeout(t);
-          this.connectionTimers.delete(peerId);
-        }
         this.connectionStartedAtMs.delete(peerId);
         this.emit('peer:error', { peerId, error: err });
         this.removePeer(peerId);
@@ -1795,22 +1815,6 @@ export class PartialMesh {
     // Inbound-only records still use initiator=false; FreeRTC owns their answer.
 
     return peerConnection;
-  }
-
-  private scheduleConnectionTimeout(peerId: string): void {
-    const existingTimer = this.connectionTimers.get(peerId);
-    if (existingTimer) clearTimeout(existingTimer);
-    const timer = setTimeout(() => {
-      const current = this.peers.get(peerId);
-      if (!current || current.connected) return;
-
-      this.connecting.delete(peerId);
-      this.connectionStartedAtMs.delete(peerId);
-      this.noteDialFailure(peerId);
-      this.emit('peer:error', { peerId, error: new Error('Connection timeout') });
-      this.removePeer(peerId);
-    }, this.config.connectionTimeoutMs);
-    this.connectionTimers.set(peerId, timer);
   }
 
   /**
@@ -2003,11 +2007,6 @@ export class PartialMesh {
     const peerConnection = this.peers.get(peerId);
     if (peerConnection) {
       const wasConnected = peerConnection.connected;
-      const t = this.connectionTimers.get(peerId);
-      if (t) {
-        clearTimeout(t);
-        this.connectionTimers.delete(peerId);
-      }
       this.connectionStartedAtMs.delete(peerId);
       this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.peers.delete(peerId);
@@ -2709,11 +2708,6 @@ export class PartialMesh {
       clearInterval(this.membershipTimer);
       this.membershipTimer = null;
     }
-
-    for (const t of this.connectionTimers.values()) {
-      clearTimeout(t);
-    }
-    this.connectionTimers.clear();
 
     // Close all peer connections
     for (const peerId of this.peers.keys()) {

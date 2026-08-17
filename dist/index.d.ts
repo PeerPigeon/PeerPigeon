@@ -926,7 +926,6 @@ declare class PartialMesh {
     private retiredPeerIds;
     private eventHandlers;
     private connecting;
-    private connectionTimers;
     private connectionStartedAtMs;
     /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
     private orphanRtcFirstSeenAtMs;
@@ -973,6 +972,7 @@ declare class PartialMesh {
     private retirePeerId;
     private reconcileSignalingPeers;
     private handleSignalingPeerLeft;
+    private trackRtcNegotiation;
     private getConnectedPeerCount;
     private getPendingPeerCount;
     private noteLocalCapacityChanged;
@@ -1032,7 +1032,6 @@ declare class PartialMesh {
      * Create a new peer connection
      */
     private createPeerConnection;
-    private scheduleConnectionTimeout;
     /**
      * Maintain the target number of peer connections
      */
