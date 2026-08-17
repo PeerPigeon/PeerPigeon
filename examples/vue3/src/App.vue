@@ -189,21 +189,64 @@
           class="network-graph-container"
           data-testid="mesh-visualizer"
         >
-          <PeerNetworkGraph
-            ref="peerNetworkGraph"
-            :nodes="networkGraphModel.nodes"
-            :links="networkGraphModel.links"
-            :activity-by-peer="networkGraphActivityByPeer"
-          />
+          <div class="network-graph-viewport">
+            <PeerNetworkGraph
+              ref="peerNetworkGraph"
+              :nodes="networkGraphModel.nodes"
+              :links="networkGraphModel.links"
+              :activity-by-peer="networkGraphActivityByPeer"
+              :show-network-status="false"
+            />
+          </div>
           <div
-            class="network-graph-gossip-status"
-            :class="`gossip-state-${networkGossipState}`"
-            data-testid="status-message"
-            role="status"
-            aria-live="polite"
+            class="network-graph-sticky-badges"
+            :class="{ 'is-viewport-pinned': networkGraphBadgesPinned }"
           >
-            <FontAwesomeIcon :icon="icons.state" class="network-graph-gossip-icon" aria-hidden="true" />
-            <span>{{ networkGraphStatusLabel }}</span>
+            <div class="network-graph-network-cluster">
+              <span
+                class="network-graph-combined-health"
+                :class="[
+                  `combined-health-${combinedNetworkHealth.state}`,
+                  { 'is-offline': connectedPeers === 0 },
+                ]"
+                :style="{
+                  '--network-health-fill': `${combinedNetworkHealth.fillPercent}%`,
+                  '--network-health-mask': connectedPeers === 0 || combinedNetworkHealth.state === 'suspended'
+                    ? wifiOfflineIconMask
+                    : wifiIconMask,
+                }"
+                :title="combinedNetworkHealth.title"
+                :aria-label="combinedNetworkHealth.title"
+                data-testid="network-combined-health"
+                role="img"
+              >
+                <span class="network-graph-combined-health-base" aria-hidden="true"></span>
+                <span class="network-graph-combined-health-mask" aria-hidden="true">
+                  <span class="network-graph-combined-health-fill"></span>
+                </span>
+              </span>
+              <div
+                class="network-graph-network-status"
+                :title="`Direct peers: ${networkGraphPeerSummary.direct}; indirect peers: ${networkGraphPeerSummary.indirect}; total peers: ${networkGraphPeerSummary.total}`"
+                :aria-label="`Network: ${networkGraphPeerSummary.direct} direct peers, ${networkGraphPeerSummary.indirect} indirect peers, ${networkGraphPeerSummary.total} total peers`"
+              >
+                <FontAwesomeIcon :icon="icons.network" class="network-graph-network-icon" aria-hidden="true" />
+                <span class="network-graph-network-copy">
+                  NETWORK
+                  <span class="network-graph-metric network-graph-metric-direct">{{ networkGraphPeerSummary.direct }}</span><span class="network-graph-metric-separator">:</span><span class="network-graph-metric network-graph-metric-indirect">{{ networkGraphPeerSummary.indirect }}</span><span class="network-graph-metric-separator">:</span><span class="network-graph-metric network-graph-metric-total">{{ networkGraphPeerSummary.total }}</span>
+                </span>
+              </div>
+            </div>
+            <div
+              class="network-graph-gossip-status"
+              :class="`gossip-state-${networkGossipState}`"
+              data-testid="status-message"
+              role="status"
+              aria-live="polite"
+            >
+              <span>{{ networkGraphStatusLabel }}</span>
+              <FontAwesomeIcon :icon="icons.state" class="network-graph-gossip-icon" aria-hidden="true" />
+            </div>
           </div>
         </div>
 
@@ -503,11 +546,87 @@
 
       <!-- Diagnostics -->
       <section class="chat diagnostics" v-if="isRunning">
-        <h3 class="section-heading">
-          <FontAwesomeIcon :icon="icons.diagnostics" class="section-heading-icon" aria-hidden="true" />
-          <span>Diagnostics</span>
-        </h3>
-        <div ref="diagLogContainer" class="log-container diag-container" data-testid="diag-log">
+        <div class="diagnostics-header">
+          <h3 class="section-heading">
+            <FontAwesomeIcon :icon="icons.diagnostics" class="section-heading-icon" aria-hidden="true" />
+            <span>Diagnostics</span>
+          </h3>
+          <div class="diagnostics-filters">
+            <fieldset class="diagnostics-capture-options">
+              <legend>Capture</legend>
+              <label class="diagnostics-capture-toggle">
+                <input
+                  v-model="chatLoggingEnabled"
+                  type="checkbox"
+                  data-testid="chat-logging-enabled"
+                />
+                <span>Chat</span>
+              </label>
+              <label class="diagnostics-capture-toggle">
+                <input
+                  v-model="diagnosticLoggingEnabled"
+                  type="checkbox"
+                  data-testid="diagnostic-logging-enabled"
+                />
+                <span>Diagnostics</span>
+              </label>
+            </fieldset>
+            <label class="diagnostics-filter">
+              <span>Verbosity</span>
+              <select
+                v-model.number="diagnosticSyslogLevel"
+                class="diagnostics-filter-select diagnostics-verbosity-select"
+                data-testid="diagnostics-verbosity"
+                aria-label="Diagnostics syslog verbosity"
+              >
+                <option
+                  v-for="level in diagnosticSyslogLevels"
+                  :key="level.value"
+                  :value="level.value"
+                >
+                  {{ level.name }} ({{ level.value }})
+                </option>
+              </select>
+            </label>
+            <label class="diagnostics-filter">
+              <span>Source</span>
+              <select
+                v-model="diagnosticSourceFilter"
+                class="diagnostics-filter-select diagnostics-source-select"
+                data-testid="diagnostics-source"
+                aria-label="Diagnostics source filter"
+              >
+                <option
+                  v-for="source in diagnosticSourceFilters"
+                  :key="source.value"
+                  :value="source.value"
+                >
+                  {{ source.name }}
+                </option>
+              </select>
+            </label>
+            <input
+              v-if="diagnosticSourceFilter === 'custom'"
+              v-model="diagnosticCustomSearch"
+              class="diagnostics-custom-search"
+              data-testid="diagnostics-custom-search"
+              type="search"
+              placeholder="Search diagnostics"
+              aria-label="Search diagnostics"
+            />
+          </div>
+        </div>
+        <div
+          ref="diagLogContainer"
+          class="log-container diag-container"
+          data-testid="diag-log"
+          tabindex="0"
+          @scroll.passive="handleDiagnosticScroll"
+          @wheel.passive="markDiagnosticScrollIntent"
+          @touchstart.passive="markDiagnosticScrollIntent"
+          @keydown="handleDiagnosticScrollKey"
+          @pointerdown="handleDiagnosticPointerDown"
+        >
           <div
             v-for="(entry, idx) in diagnosticMessages"
             :key="`diag-${idx}`"
@@ -515,9 +634,16 @@
           >
             <span class="diag-time">{{ formatTime(entry.timestamp) }}</span>
             <span class="diag-sender">{{ entry.sender }}</span>
-            <span class="diag-text">{{ entry.text }}</span>
+            <span class="diag-text">
+              {{ entry.text }}
+              <span
+                v-if="entry.duplicateCount > 1"
+                class="diag-duplicate-count"
+                :aria-label="`${entry.duplicateCount} occurrences`"
+              >×{{ entry.duplicateCount }}</span>
+            </span>
           </div>
-          <div v-if="diagnosticMessages.length === 0" class="diag-empty">No diagnostics yet</div>
+          <div v-if="diagnosticMessages.length === 0" class="diag-empty">No diagnostics match these filters</div>
         </div>
       </section>
 
@@ -584,6 +710,7 @@ import {
   faCommentDots,
   faCircle,
   faDatabase,
+  faDiagramProject,
   faEnvelope,
   faEye,
   faEyeSlash,
@@ -594,17 +721,36 @@ import {
   faSatelliteDish,
   faScrewdriverWrench,
   faTriangleExclamation,
+  faWifi,
   faXmark,
 } from '@fortawesome/free-solid-svg-icons';
 import PeerNetworkGraph from './components/PeerNetworkGraph.vue';
 import { canonicalPeerId } from './peer-id.js';
 import {
+  CHAT_LOG_BUFFER_LIMIT,
+  DEFAULT_DIAGNOSTIC_SYSLOG_LEVEL,
+  DIAGNOSTIC_LOG_BUFFER_LIMIT,
+  DIAGNOSTIC_SOURCE_FILTERS,
+  SYSLOG_LEVELS,
+  appendBoundedLogEntry,
+  collapseDuplicateDiagnosticEntries,
+  diagnosticEntryMatchesSource,
+  diagnosticEntryVisible,
+  inferDiagnosticSyslogLevel,
+  normalizeDiagnosticSourceFilter,
+  normalizeSyslogLevel,
+} from './diagnostic-syslog.js';
+import {
+  combinedNetworkGossipHealth,
+  gossipBadgeState,
   gossipQualityForCoverage,
   graphCoverageSnapshot as calculateGraphCoverageSnapshot,
+  graphPeerSummary,
 } from './graph-coverage.js';
 
 const APP_ICONS = Object.freeze({
   state: faCircle,
+  network: faDiagramProject,
   message: faCommentDots,
   media: faFilm,
   storage: faDatabase,
@@ -620,6 +766,19 @@ const APP_ICONS = Object.freeze({
   warning: faTriangleExclamation,
   close: faXmark,
 });
+
+const [wifiIconWidth, wifiIconHeight, , , wifiIconPathData] = faWifi.icon;
+const wifiIconPaths = (Array.isArray(wifiIconPathData) ? wifiIconPathData : [wifiIconPathData])
+  .map((pathData) => `<path d="${pathData}"/>`)
+  .join('');
+const FONT_AWESOME_WIFI_MASK = `url("data:image/svg+xml,${encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${wifiIconWidth} ${wifiIconHeight}">${wifiIconPaths}</svg>`,
+)}")`;
+const wifiSlashInset = Math.round(Math.min(wifiIconWidth, wifiIconHeight) * 0.08);
+const wifiSlashWidth = Math.round(Math.min(wifiIconWidth, wifiIconHeight) * 0.12);
+const FONT_AWESOME_WIFI_OFFLINE_MASK = `url("data:image/svg+xml,${encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${wifiIconWidth} ${wifiIconHeight}">${wifiIconPaths}<path d="M ${wifiSlashInset} ${wifiSlashInset} L ${wifiIconWidth - wifiSlashInset} ${wifiIconHeight - wifiSlashInset}" fill="none" stroke="black" stroke-width="${wifiSlashWidth}" stroke-linecap="round"/></svg>`,
+)}")`;
 
 const DEFAULT_TOPOLOGY = 'token-ring';
 const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
@@ -676,6 +835,8 @@ export default {
     return {
       mesh: null,
       icons: APP_ICONS,
+      wifiIconMask: FONT_AWESOME_WIFI_MASK,
+      wifiOfflineIconMask: FONT_AWESOME_WIFI_OFFLINE_MASK,
       gossip: null,
       cryptoProtocol: null,
       isRunning: false,
@@ -701,7 +862,18 @@ export default {
       signalingServer: 'auto',
       activeSignalingServer: '',
       signalingServerOptions: [...DEFAULT_SIGNALING_SERVERS],
-      messageLog: [],
+      chatLogBuffer: [],
+      diagnosticLogBuffer: [],
+      chatLoggingEnabled: true,
+      diagnosticLoggingEnabled: true,
+      diagnosticSyslogLevel: DEFAULT_DIAGNOSTIC_SYSLOG_LEVEL,
+      diagnosticSyslogLevels: SYSLOG_LEVELS,
+      diagnosticSourceFilter: 'all',
+      diagnosticSourceFilters: DIAGNOSTIC_SOURCE_FILTERS,
+      diagnosticCustomSearch: '',
+      diagnosticAutoScroll: true,
+      diagnosticScrollIntentUntil: 0,
+      diagnosticScrollFrame: null,
       autoScroll: true,
       status: {
         title: '',
@@ -749,6 +921,9 @@ export default {
       networkGraphResizeHandler: null,
       networkGraphResizeObserver: null,
       networkGraphResizeObservedElement: null,
+      networkGraphBadgeScrollHandler: null,
+      networkGraphBadgeScrollFrame: null,
+      networkGraphBadgesPinned: false,
       browserSuspended: false,
       pageLifecycleFreezeHandler: null,
       pageLifecycleResumeHandler: null,
@@ -853,8 +1028,12 @@ export default {
     this.updateUrlState();
     this.networkGraphResizeHandler = () => {
       this.scheduleNetworkGraphRender({ immediate: true, reason: 'resize' });
+      this.scheduleNetworkGraphBadgePinUpdate();
     };
     window.addEventListener('resize', this.networkGraphResizeHandler);
+    this.networkGraphBadgeScrollHandler = () => this.scheduleNetworkGraphBadgePinUpdate();
+    window.addEventListener('scroll', this.networkGraphBadgeScrollHandler, { passive: true });
+    this.$nextTick(() => this.scheduleNetworkGraphBadgePinUpdate());
     this.pageLifecycleFreezeHandler = () => {
       this.browserSuspended = true;
       this.syncGossipStatus();
@@ -922,39 +1101,25 @@ export default {
     ) {
       this.restartUnexpectedlyStoppedMesh('hot update');
     }
+    this.scheduleNetworkGraphBadgePinUpdate();
   },
   computed: {
+    gossipBadgeSnapshot() {
+      return gossipBadgeState({
+        running: this.isRunning,
+        suspended: this.browserSuspended,
+        connectedPeerCount: this.connectedPeersList.length,
+        coverageSnapshot: this.gossipCoverageSnapshot(),
+      });
+    },
+
     networkGraphStatusLabel() {
-      const coverage = this.gossipCoverageSnapshot();
-      const label = String(this.status?.title || 'Idle').replace(/^Gossip\s+/i, '');
-      return `Gossip ${label} (${coverage.reachablePeers}/${coverage.knownPeers})`;
+      const badge = this.gossipBadgeSnapshot;
+      return `Gossip ${badge.label} (${badge.reachablePeers}/${badge.knownPeers})`;
     },
 
     networkGossipState() {
-      if (!this.isRunning) return 'grey';
-      if (this.browserSuspended) return 'grey';
-
-      const message = String(this.status?.message || '').toLowerCase();
-      const type = String(this.status?.type || '').toLowerCase();
-
-      if (
-        type === 'error'
-        || message.includes('offline')
-        || message.includes('poor')
-      ) {
-        return 'red';
-      }
-      if (
-        !this.signalingConnected
-        || type === 'connecting'
-        || type === 'info'
-        || message.includes('fair')
-        || message.includes('degraded')
-      ) {
-        return 'yellow';
-      }
-      if (type === 'success') return 'green';
-      return 'grey';
+      return this.gossipBadgeSnapshot.state;
     },
 
     networkGraphModel() {
@@ -965,6 +1130,18 @@ export default {
       void this.globalPeersList.join('|');
       void this.networkGraphRevision;
       return this.networkGraphData();
+    },
+
+    networkGraphPeerSummary() {
+      return graphPeerSummary(this.networkGraphModel);
+    },
+
+    combinedNetworkHealth() {
+      return combinedNetworkGossipHealth(
+        this.networkGraphPeerSummary,
+        this.gossipCoverageSnapshot(this.networkGraphModel),
+        this.browserSuspended,
+      );
     },
 
     effectiveSessionId() {
@@ -990,14 +1167,30 @@ export default {
       return this.discoveredPeersList.length;
     },
     chatMessages() {
-      return this.messageLog.filter(e => (
+      return this.chatLogBuffer.filter(e => (
         (e.type === 'sent' || e.type === 'received') &&
         !e.system &&
         !isInternalChatText(e.text)
       ));
     },
+    messageLog() {
+      return [...this.chatLogBuffer, ...this.diagnosticLogBuffer]
+        .sort((left, right) => Number(left?.timestamp || 0) - Number(right?.timestamp || 0));
+    },
     diagnosticMessages() {
-      return this.messageLog.filter(e => (e.type !== 'sent' && e.type !== 'received') || e.system);
+      const visibleEntries = this.diagnosticLogBuffer.filter((entry) => {
+        const diagnostic = (entry.type !== 'sent' && entry.type !== 'received') || entry.system;
+        return diagnostic
+          && diagnosticEntryVisible(entry, this.diagnosticSyslogLevel)
+          && diagnosticEntryMatchesSource(
+            entry,
+            this.diagnosticSourceFilter,
+            this.diagnosticCustomSearch,
+          );
+      });
+      return this.diagnosticSourceFilter === 'duplicate'
+        ? collapseDuplicateDiagnosticEntries(visibleEntries)
+        : visibleEntries;
     },
     localPublicCryptoInfo() {
       if (!this.cryptoKeys?.pub || !this.cryptoKeys?.epub) return null;
@@ -1036,15 +1229,27 @@ export default {
     }
   },
   watch: {
-    messageLog() {
-      const last = this.messageLog[this.messageLog.length - 1];
-      if (!last) return;
-      if ((last.type === 'sent' || last.type === 'received') && this.autoScroll) {
-        this.$nextTick(() => this.scrollToBottom());
-      }
-      if ((last.type !== 'sent' && last.type !== 'received') && this.autoScroll) {
-        this.$nextTick(() => this.scrollDiagToBottom());
-      }
+    isRunning(running) {
+      this.$nextTick(() => this.scheduleNetworkGraphBadgePinUpdate());
+      if (running) this.scheduleDiagnosticScroll();
+    },
+    diagnosticSyslogLevel() {
+      this.saveUiState();
+      this.scheduleDiagnosticScroll();
+    },
+    diagnosticSourceFilter() {
+      this.saveUiState();
+      this.scheduleDiagnosticScroll();
+    },
+    diagnosticCustomSearch() {
+      this.saveUiState();
+      this.scheduleDiagnosticScroll();
+    },
+    chatLoggingEnabled() {
+      this.saveUiState();
+    },
+    diagnosticLoggingEnabled() {
+      this.saveUiState();
     },
     activeTab(nextTab) {
       if (nextTab === 'storage') {
@@ -2277,7 +2482,8 @@ export default {
       if (window.__gossip === stoppedGossip) window.__gossip = null;
       this.isRunning = false;
       this.signalingConnected = false;
-      this.messageLog = [];
+      this.chatLogBuffer = [];
+      this.diagnosticLogBuffer = [];
       this.deliveryInferences = {};
       this.dmTarget = '';
       this.directMode = false;
@@ -2920,6 +3126,22 @@ export default {
       }
 
       this.syncGossipStatus();
+    },
+
+    scheduleNetworkGraphBadgePinUpdate() {
+      if (this.networkGraphBadgeScrollFrame != null) return;
+      this.networkGraphBadgeScrollFrame = window.requestAnimationFrame(() => {
+        this.networkGraphBadgeScrollFrame = null;
+        this.updateNetworkGraphBadgePinning();
+      });
+    },
+
+    updateNetworkGraphBadgePinning() {
+      const graph = this.$refs.networkGraphContainer;
+      const shouldPin = Boolean(this.isRunning && graph && graph.getBoundingClientRect().top < 0);
+      if (this.networkGraphBadgesPinned !== shouldPin) {
+        this.networkGraphBadgesPinned = shouldPin;
+      }
     },
 
     networkNodeHue(peerId) {
@@ -3769,10 +3991,15 @@ export default {
       const normalizedHops = type === 'received' && !local && !options.direct
         ? Math.max(1, Math.floor(Number(hops) || 0))
         : Math.max(0, Math.floor(Number(hops) || 0));
+      const syslogLevel = normalizeSyslogLevel(
+        options.syslogLevel ?? options.severity,
+        inferDiagnosticSyslogLevel({ type, text, sender }),
+      );
       const entry = {
         type,
         text,
         sender,
+        syslogLevel,
         hops: normalizedHops,
         timestamp: new Date(Number.isFinite(requestedTimestamp) && requestedTimestamp > 0 ? requestedTimestamp : Date.now()),
         local,
@@ -3786,7 +4013,10 @@ export default {
           : [],
       };
 
-      this.messageLog.push(entry);
+      const chatEntry = (entry.type === 'sent' || entry.type === 'received')
+        && !entry.system
+        && !isInternalChatText(entry.text);
+      const diagnosticEntry = (entry.type !== 'sent' && entry.type !== 'received') || entry.system;
 
       if (import.meta.env.DEV && type !== 'info') {
         // Mirror all app logs to browser console for rapid debugging.
@@ -3794,24 +4024,18 @@ export default {
         console.log(`[mesh:${type}] ${sender} ${text}`);
       }
 
-      // Keep log size manageable without dropping peer chat history first.
-      // Rebalance/connectivity churn can generate many diagnostics, so trim
-      // non-chat entries before ever trimming sent/received chat entries.
-      const MAX_LOG_ENTRIES = 300;
-      if (this.messageLog.length > MAX_LOG_ENTRIES) {
-        const firstNonChatIndex = this.messageLog.findIndex(
-          (entry) => entry.type !== 'sent' && entry.type !== 'received'
-        );
-        if (firstNonChatIndex >= 0) {
-          this.messageLog.splice(firstNonChatIndex, 1);
-        } else {
-          this.messageLog.shift();
-        }
+      if (chatEntry && this.chatLoggingEnabled) {
+        appendBoundedLogEntry(this.chatLogBuffer, entry, CHAT_LOG_BUFFER_LIMIT);
+        if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
+      } else if (diagnosticEntry && this.diagnosticLoggingEnabled) {
+        appendBoundedLogEntry(this.diagnosticLogBuffer, entry, DIAGNOSTIC_LOG_BUFFER_LIMIT);
+        this.scheduleDiagnosticScroll();
       }
     },
 
     clearLog() {
-      this.messageLog = [];
+      this.chatLogBuffer = [];
+      this.diagnosticLogBuffer = [];
     },
 
     showStatus(title, message, type = 'info') {
@@ -3986,6 +4210,52 @@ export default {
       const container = this.$refs.diagLogContainer;
       if (!container) return;
       container.scrollTop = container.scrollHeight;
+      this.diagnosticAutoScroll = true;
+    },
+
+    scheduleDiagnosticScroll() {
+      if (!this.diagnosticAutoScroll) return;
+      this.$nextTick(() => {
+        if (!this.diagnosticAutoScroll) return;
+        this.scrollDiagToBottom();
+        if (this.diagnosticScrollFrame != null) {
+          window.cancelAnimationFrame(this.diagnosticScrollFrame);
+        }
+        this.diagnosticScrollFrame = window.requestAnimationFrame(() => {
+          this.diagnosticScrollFrame = null;
+          if (this.diagnosticAutoScroll) this.scrollDiagToBottom();
+        });
+      });
+    },
+
+    markDiagnosticScrollIntent() {
+      this.diagnosticScrollIntentUntil = Date.now() + 1000;
+    },
+
+    handleDiagnosticScrollKey(event) {
+      const scrollKeys = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ']);
+      if (scrollKeys.has(event?.key)) this.markDiagnosticScrollIntent();
+    },
+
+    handleDiagnosticPointerDown(event) {
+      const container = event?.currentTarget;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const scrollbarGutter = Math.max(16, container.offsetWidth - container.clientWidth + 4);
+      if (event.clientX >= rect.right - scrollbarGutter) {
+        this.diagnosticScrollIntentUntil = Date.now() + 5000;
+      }
+    },
+
+    handleDiagnosticScroll(event) {
+      const container = event?.currentTarget || this.$refs.diagLogContainer;
+      if (!container) return;
+      const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+      if (distanceFromBottom <= 8) {
+        this.diagnosticAutoScroll = true;
+      } else if (Date.now() <= this.diagnosticScrollIntentUntil) {
+        this.diagnosticAutoScroll = false;
+      }
     },
 
     saveUiState() {
@@ -4001,6 +4271,11 @@ export default {
           dmTarget: this.dmTarget || '',
           directMode: !!this.directMode,
           showPrivateCrypto: !!this.showPrivateCrypto,
+          diagnosticSyslogLevel: normalizeSyslogLevel(this.diagnosticSyslogLevel),
+          diagnosticSourceFilter: normalizeDiagnosticSourceFilter(this.diagnosticSourceFilter),
+          diagnosticCustomSearch: String(this.diagnosticCustomSearch || ''),
+          chatLoggingEnabled: this.chatLoggingEnabled !== false,
+          diagnosticLoggingEnabled: this.diagnosticLoggingEnabled !== false,
           storageActiveSpace: this.storageActiveSpace || 'user',
           storageLookupOwnerId: String(this.storageLookupOwnerId || '').trim(),
         });
@@ -4034,6 +4309,20 @@ export default {
         }
         if (typeof parsed.showPrivateCrypto === 'boolean') {
           this.showPrivateCrypto = parsed.showPrivateCrypto;
+        }
+        this.diagnosticSyslogLevel = normalizeSyslogLevel(
+          parsed.diagnosticSyslogLevel,
+          DEFAULT_DIAGNOSTIC_SYSLOG_LEVEL,
+        );
+        this.diagnosticSourceFilter = normalizeDiagnosticSourceFilter(parsed.diagnosticSourceFilter);
+        if (typeof parsed.diagnosticCustomSearch === 'string') {
+          this.diagnosticCustomSearch = parsed.diagnosticCustomSearch;
+        }
+        if (typeof parsed.chatLoggingEnabled === 'boolean') {
+          this.chatLoggingEnabled = parsed.chatLoggingEnabled;
+        }
+        if (typeof parsed.diagnosticLoggingEnabled === 'boolean') {
+          this.diagnosticLoggingEnabled = parsed.diagnosticLoggingEnabled;
         }
         const allowedSpaces = new Set(['public', 'user', 'frozen', 'private', 'epublic']);
         if (typeof parsed.storageActiveSpace === 'string' && allowedSpaces.has(parsed.storageActiveSpace)) {
@@ -4074,6 +4363,10 @@ export default {
   beforeUnmount() {
     clearTimeout(this.storageTableScrollTimer);
     this.storageTableScrollTimer = null;
+    if (this.diagnosticScrollFrame != null) {
+      window.cancelAnimationFrame(this.diagnosticScrollFrame);
+      this.diagnosticScrollFrame = null;
+    }
     if (this.networkGraphResizeObserver) {
       this.networkGraphResizeObserver.disconnect();
       this.networkGraphResizeObserver = null;
@@ -4082,6 +4375,14 @@ export default {
     if (this.networkGraphResizeHandler) {
       window.removeEventListener('resize', this.networkGraphResizeHandler);
       this.networkGraphResizeHandler = null;
+    }
+    if (this.networkGraphBadgeScrollHandler) {
+      window.removeEventListener('scroll', this.networkGraphBadgeScrollHandler);
+      this.networkGraphBadgeScrollHandler = null;
+    }
+    if (this.networkGraphBadgeScrollFrame != null) {
+      window.cancelAnimationFrame(this.networkGraphBadgeScrollFrame);
+      this.networkGraphBadgeScrollFrame = null;
     }
     if (this.pageLifecycleFreezeHandler) {
       document.removeEventListener('freeze', this.pageLifecycleFreezeHandler);
@@ -4130,7 +4431,7 @@ export default {
 
 #app {
   min-height: 100vh;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: #e2e8f0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   color: #333;
 }
@@ -4145,10 +4446,7 @@ header {
 header h1 {
   font-size: 2.5rem;
   margin: 0;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  background-clip: text;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+  color: #0f172a;
 }
 
 .header-brand {
@@ -4197,7 +4495,7 @@ section {
 
 .section-heading-icon {
   width: 1em;
-  color: #667eea;
+  color: #0e7490;
   flex: 0 0 auto;
 }
 
@@ -4227,7 +4525,7 @@ section {
 }
 
 .tab-btn:hover {
-  background: #f3f6ff;
+  background: #f1f5f9;
   color: #334155;
 }
 
@@ -4243,10 +4541,10 @@ section {
 }
 
 .feature-panel {
-  border: 1px dashed #c7d1f0;
+  border: 1px dashed #cbd5e1;
   border-radius: 10px;
   padding: 1rem;
-  background: linear-gradient(180deg, #f8faff 0%, #ffffff 100%);
+  background: #f8fafc;
 }
 
 .feature-copy {
@@ -4361,7 +4659,7 @@ section {
 
 .storage-interest-list {
   margin-top: 0.6rem;
-  border: 1px solid #dbe3f6;
+  border: 1px solid #e2e8f0;
   border-radius: 8px;
   background: #f8fbff;
   padding: 0.45rem 0.55rem;
@@ -4390,7 +4688,7 @@ section {
 }
 
 .storage-interest-chip {
-  border: 1px solid #bfd5fb;
+  border: 1px solid #bae6fd;
   background: #ffffff;
   color: #1e293b;
   border-radius: 999px;
@@ -4420,7 +4718,7 @@ section {
   margin-top: 0.7rem;
   max-height: 240px;
   overflow: auto;
-  border: 1px solid #dbe3f6;
+  border: 1px solid #e2e8f0;
   border-radius: 8px;
   background: #ffffff;
 }
@@ -4433,7 +4731,7 @@ section {
 
 .storage-table th,
 .storage-table td {
-  border-bottom: 1px solid #edf1fb;
+  border-bottom: 1px solid #e2e8f0;
   padding: 0.42rem 0.5rem;
   text-align: left;
   vertical-align: top;
@@ -4443,7 +4741,7 @@ section {
   position: sticky;
   top: 0;
   z-index: 1;
-  background: #f8faff;
+  background: #f8fafc;
   color: #334155;
   font-size: 0.72rem;
   text-transform: uppercase;
@@ -4515,7 +4813,7 @@ section {
 }
 
 .crypto-card {
-  border: 1px solid #d6def6;
+  border: 1px solid #cbd5e1;
   border-radius: 10px;
   background: #ffffff;
   padding: 0.7rem;
@@ -4728,7 +5026,7 @@ section {
   font-family: 'Monaco', 'Courier New', monospace;
   font-size: 0.84rem;
   font-weight: 700;
-  color: #3f51b5;
+  color: #0369a1;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -4786,7 +5084,7 @@ section {
 .control-stat-value {
   font-size: 0.82rem;
   font-weight: 700;
-  color: #3f51b5;
+  color: #0369a1;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
@@ -4860,38 +5158,145 @@ section {
   border-top: 4px solid #2f6fec;
 }
 
-.diag-container {
+.diagnostics-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.diagnostics-header .section-heading {
+  margin-bottom: 0;
+}
+
+.diagnostics-filters {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.diagnostics-capture-options {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: #334155;
+  font-size: 0.78rem;
+}
+
+.diagnostics-capture-options legend {
+  float: left;
+  margin-right: 0.05rem;
+  font-weight: 700;
+}
+
+.diagnostics-capture-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.diagnostics-capture-toggle input {
+  margin: 0;
+  accent-color: #2f6fec;
+}
+
+.diagnostics-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #334155;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.diagnostics-filter-select,
+.diagnostics-custom-search {
+  padding: 0.38rem 1.8rem 0.38rem 0.55rem;
+  border: 1px solid #94a3b8;
+  border-radius: 7px;
+  background: #ffffff;
+  color: #0f172a;
+  font: inherit;
+}
+
+.diagnostics-verbosity-select {
+  min-width: 9.5rem;
+}
+
+.diagnostics-source-select {
+  min-width: 7rem;
+}
+
+.diagnostics-custom-search {
+  width: min(16rem, 42vw);
+  min-width: 10rem;
+  padding-right: 0.55rem;
+  font-size: 0.78rem;
+}
+
+.diagnostics-filter-select:focus-visible,
+.diagnostics-custom-search:focus-visible {
+  outline: 2px solid #2f6fec;
+  outline-offset: 2px;
+}
+
+.log-container.diag-container {
   max-height: 260px;
   overflow: auto;
+  overflow-anchor: none;
   background: #0f172a;
-  color: #d1e3ff;
-  border: 1px solid #1e293b;
+  color: #f8fafc;
+  border-color: #334155;
 }
 
 .diag-entry {
   display: grid;
-  grid-template-columns: 90px 120px 1fr;
-  gap: 0.5rem;
-  padding: 0.35rem 0.5rem;
+  grid-template-columns: 6rem 8.5rem minmax(0, 1fr);
+  gap: 0.65rem;
+  padding: 0.5rem 0.6rem;
   font-family: 'Monaco', 'Courier New', monospace;
-  font-size: 0.82rem;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: clamp(0.84rem, 1.3vw, 0.92rem);
+  line-height: 1.45;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
 }
 
 .diag-time {
-  color: #8ec5ff;
+  color: #bfdbfe;
 }
 
 .diag-sender {
-  color: #b0f2c2;
+  color: #bbf7d0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .diag-text {
-  color: #e5e7eb;
-  word-break: break-word;
+  color: #f8fafc;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.diag-duplicate-count {
+  display: inline-block;
+  margin-left: 0.45rem;
+  padding: 0.08rem 0.4rem;
+  border: 1px solid #64748b;
+  border-radius: 999px;
+  background: #1e293b;
+  color: #f8fafc;
+  font-size: 0.76rem;
+  font-weight: 800;
+  line-height: 1.25;
+  white-space: nowrap;
 }
 
 .diag-empty {
@@ -4902,7 +5307,7 @@ section {
 
 .input:focus {
   outline: none;
-  border-color: #667eea;
+  border-color: #0e7490;
 }
 
 .input:disabled {
@@ -4934,7 +5339,7 @@ section {
 }
 
 .btn-primary {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: #0e7490;
   color: white;
 }
 
@@ -4944,7 +5349,7 @@ section {
 }
 
 .btn-danger {
-  background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+  background: #dc2626;
   color: white;
 }
 
@@ -4965,7 +5370,7 @@ section {
   justify-content: space-between;
   padding: 0.5rem 0.6rem;
   background: #f8f9fa;
-  border-left: 4px solid #667eea;
+  border-left: 4px solid #0e7490;
   border-radius: 6px;
   align-items: center;
   min-height: 2.15rem;
@@ -4979,7 +5384,7 @@ section {
 
 .stat-box .value {
   font-weight: 700;
-  color: #667eea;
+  color: #0e7490;
   font-size: 0.95rem;
 }
 
@@ -5030,9 +5435,16 @@ section {
   min-height: 410px;
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 18px;
-  box-shadow: 0 24px 55px rgba(38, 20, 88, 0.34), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  box-shadow: 0 24px 55px rgba(15, 23, 42, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.12);
   background: linear-gradient(135deg, #151515 0%, #262626 100%);
+  overflow: visible;
+}
+
+.network-graph-viewport {
+  position: absolute;
+  inset: 0;
   overflow: hidden;
+  border-radius: inherit;
 }
 
 .network-graph-container::before {
@@ -5046,16 +5458,100 @@ section {
     radial-gradient(circle at 84% 78%, rgba(255, 255, 255, 0.035), transparent 35%);
 }
 
-.network-graph-gossip-status {
+.network-graph-sticky-badges {
   position: absolute;
-  right: 0.8rem;
-  top: 0.72rem;
+  top: 0;
+  left: 0;
   z-index: 4;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  width: 100%;
+  height: 2.85rem;
+  padding: 0.72rem 0.8rem 0;
+  pointer-events: none;
+}
+
+.network-graph-sticky-badges.is-viewport-pinned {
+  position: fixed;
+  left: 50%;
+  z-index: 999;
+  width: min(calc(100vw - 1.6rem), 1040px);
+  transform: translateX(-50%);
+}
+
+.network-graph-network-cluster {
+  display: flex;
+  align-items: center;
+  gap: 0.48rem;
+  min-width: 0;
+  max-width: calc(50% - 0.375rem);
+}
+
+.network-graph-combined-health {
+  --network-health-fill: 0%;
+  --network-health-mask: none;
+  --network-health-backdrop-filter: grayscale(1) invert(1) contrast(4);
+  position: relative;
+  display: inline-flex;
+  width: 1.25em;
+  height: 1.25em;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.625rem;
+  pointer-events: auto;
+  cursor: help;
+}
+
+.network-graph-combined-health-base {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.001);
+  -webkit-mask: var(--network-health-mask) center / contain no-repeat;
+  mask: var(--network-health-mask) center / contain no-repeat;
+  -webkit-backdrop-filter: var(--network-health-backdrop-filter);
+  backdrop-filter: var(--network-health-backdrop-filter);
+  opacity: 0;
+}
+
+.network-graph-combined-health-mask {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: var(--network-health-fill);
+  overflow: hidden;
+}
+
+.network-graph-combined-health-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 1.25em;
+  background: rgba(255, 255, 255, 0.001);
+  -webkit-mask: var(--network-health-mask) center / contain no-repeat;
+  mask: var(--network-health-mask) center / contain no-repeat;
+  -webkit-backdrop-filter: var(--network-health-backdrop-filter);
+  backdrop-filter: var(--network-health-backdrop-filter);
+}
+
+.network-graph-combined-health.is-offline .network-graph-combined-health-base,
+.combined-health-suspended .network-graph-combined-health-base {
+  opacity: 1;
+}
+
+.network-graph-network-status,
+.network-graph-gossip-status {
   display: inline-flex;
   align-items: center;
   gap: 0.42rem;
   width: max-content;
-  max-width: calc(100% - 1.6rem);
+  max-width: calc(50% - 0.375rem);
   padding: 0.38rem 0.62rem;
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 999px;
@@ -5068,6 +5564,52 @@ section {
   pointer-events: none;
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
+}
+
+.network-graph-network-status {
+  max-width: 100%;
+  background: rgba(15, 23, 42, 0.82);
+  color: rgba(255, 255, 255, 0.8);
+  font-family: Monaco, 'Courier New', monospace;
+  font-size: 0.625rem;
+  letter-spacing: 0.08em;
+}
+
+.network-graph-network-icon {
+  width: 1em;
+  color: #8ff7ff;
+  flex: 0 0 auto;
+}
+
+.network-graph-network-copy {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-graph-gossip-status > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.network-graph-metric-direct,
+.network-graph-metric-total {
+  color: rgba(255, 255, 255, 0.92);
+  opacity: 1;
+  -webkit-text-fill-color: rgba(255, 255, 255, 0.92);
+}
+
+.network-graph-metric-indirect {
+  display: inline-block;
+  color: #fff;
+  opacity: 0.42;
+  -webkit-text-fill-color: #fff;
+}
+
+.network-graph-metric-separator {
+  color: rgba(255, 255, 255, 0.66);
 }
 
 .network-graph-gossip-icon {
@@ -5232,18 +5774,18 @@ section {
 
 .bubble.dm-me {
   margin-left: auto;
-  background: #4f46e5 !important;
+  background: #0369a1 !important;
   color: #fff !important;
   border-bottom-right-radius: 4px;
-  border: 1px solid #3730a3;
+  border: 1px solid #075985;
 }
 
 .bubble.dm-peer {
   margin-right: auto;
-  background: #fdf4ff !important;
-  color: #6b21a8 !important;
+  background: #ecfeff !important;
+  color: #155e75 !important;
   border-bottom-left-radius: 4px;
-  border: 1px solid #e9d5ff;
+  border: 1px solid #a5f3fc;
 }
 
 /* Ensure the chat section itself clips any inner overflow */
@@ -5301,7 +5843,7 @@ section {
   display: grid;
   place-items: center;
   padding: 1rem;
-  background: rgba(15, 8, 48, 0.66);
+  background: rgba(15, 23, 42, 0.72);
   backdrop-filter: blur(5px);
 }
 
@@ -5311,7 +5853,7 @@ section {
   border: 1px solid rgba(255, 255, 255, 0.22);
   border-radius: 14px;
   background: #ffffff;
-  box-shadow: 0 24px 70px rgba(15, 8, 48, 0.4);
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.38);
   color: #1f2937;
 }
 
@@ -5393,6 +5935,24 @@ section {
 
   .storage-actions {
     flex-wrap: wrap;
+  }
+
+  .diagnostics-header {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .diagnostics-filters {
+    justify-content: flex-start;
+  }
+
+  .diag-entry {
+    grid-template-columns: 6rem minmax(0, 1fr);
+    gap: 0.2rem 0.6rem;
+  }
+
+  .diag-text {
+    grid-column: 1 / -1;
   }
 }
 </style>

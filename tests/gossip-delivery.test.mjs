@@ -791,6 +791,52 @@ test('tolerantPeers is a real temporary connected-plus-pending overflow budget',
   }
 });
 
+test('a stale excluded candidate cannot churn a healthy saturated CECR overlay', () => {
+  const self = '0'.repeat(64);
+  const near = `${'0'.repeat(63)}1`;
+  const bucket = `${'0'.repeat(63)}8`;
+  const fartherCoveredCandidate = `${'0'.repeat(62)}0a`;
+  const now = Date.now();
+  const dials = [];
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    tolerantPeers: 1,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.mergeMembership([near, bucket, fartherCoveredCandidate], [], {}, {}, near);
+    for (const peerId of [near, bucket]) {
+      mesh.peers.set(peerId, { id: peerId, connected: true, initiator: false });
+      mesh.peerConnectedAtMs.set(peerId, now - 60_000);
+    }
+    mesh.discoveredPeers.add(fartherCoveredCandidate);
+    mesh.activeSignalingPeers.add(fartherCoveredCandidate);
+    mesh.hasActiveSignalingSnapshot = true;
+    mesh.discoveredAtMs.set(fartherCoveredCandidate, now - 60_000);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      initiateConnection(peerId) {
+        dials.push(peerId);
+        return new Promise(() => {});
+      },
+      closeConnection() {},
+      disconnect() {},
+      client: { mesh: { connections: new Map() } },
+    };
+
+    assert.equal(mesh.maybeRebalanceForCloserPeer([fartherCoveredCandidate]), false);
+    assert.deepEqual(dials, []);
+    assert.deepEqual(new Set(mesh.getConnectedPeers()), new Set([near, bucket]));
+  } finally {
+    mesh.destroy();
+  }
+});
+
 test('PartialMesh does not run a second timer against FreeRTC negotiation ownership', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const self = '0'.repeat(63) + '1';

@@ -1110,13 +1110,16 @@ export class PartialMesh {
       return false;
     }
 
-    // Prefer genuinely closer candidates, but do not exclude late joiners forever
-    // when random peer IDs produce a stable yet closed cluster.
-    const candidateDiscoveredAgeMs = now - closestCandidate.discoveredAt;
+    // A saturated CECR overlay must converge. Replacing a healthy edge merely
+    // because another candidate has waited a few seconds creates a permanent
+    // dial/drop cycle: every excluded peer eventually qualifies, displaces a
+    // live edge, and makes the displaced peer the next "stale" candidate.
+    // Rebalance only for an actual CECR coverage repair or a materially closer
+    // coordinate. Cross-component admission is handled separately by tolerant
+    // overflow plus trimExcessPeers(), which preserves graph bridges.
     const repairsCecrOverlay = this.cecrOverlayDialPriority(closestCandidate.peerId) === 0;
     const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 4n < farthestConnected.distance * 3n;
-    const staleExcludedCandidate = candidateDiscoveredAgeMs >= 3_000;
-    if (!materiallyCloser && !staleExcludedCandidate) {
+    if (!materiallyCloser) {
       return false;
     }
 
