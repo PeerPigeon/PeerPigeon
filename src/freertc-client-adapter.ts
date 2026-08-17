@@ -232,7 +232,7 @@ export class FreeRTCClientAdapter {
         this.clearRecoveryProbeTimer();
         this.handleBootstrapCandidates(candidates);
       },
-      onConnectionStateChange: (data: { peerId?: string; state?: string }) => {
+      onConnectionStateChange: (data: { peerId?: string; state?: string; reason?: string }) => {
         if (!isCurrentClient()) return;
         this.handleConnectionState(data);
       },
@@ -374,17 +374,26 @@ export class FreeRTCClientAdapter {
     return true;
   }
 
-  closeConnection(peerId: string): void {
+  closeConnection(peerId: string, reason = 'local_close'): void {
     const id = this.normalizePeerId(peerId);
     if (!id) return;
     this.clearDisconnectGraceTimer(id);
     const entry = this.client?.mesh?.connections?.get?.(id);
-    this.client?.mesh?.connections?.delete?.(id);
     const wasConnected = this.connectedPeers.delete(id);
-    try { entry?.channel?.close?.(); } catch { /* best effort */ }
-    try { entry?.connection?.close?.(); } catch { /* best effort */ }
+    let closedByClient = false;
+    if (typeof this.client?.closePeerConnection === 'function') {
+      try {
+        this.client.closePeerConnection(id, reason);
+        closedByClient = true;
+      } catch { /* use fallback below */ }
+    }
+    if (!closedByClient) {
+      this.client?.mesh?.connections?.delete?.(id);
+      try { entry?.channel?.close?.(); } catch { /* best effort */ }
+      try { entry?.connection?.close?.(); } catch { /* best effort */ }
+    }
     if (entry || wasConnected) {
-      this.emitter.emit('rtc:disconnected', { peerId: id });
+      this.emitter.emit('rtc:disconnected', { peerId: id, reason });
     }
   }
 
@@ -488,7 +497,7 @@ export class FreeRTCClientAdapter {
     });
   }
 
-  private handleConnectionState(data: { peerId?: string; state?: string }): void {
+  private handleConnectionState(data: { peerId?: string; state?: string; reason?: string }): void {
     if (this.recyclingSignalingTransport || this.pendingTransportRestorePeerIds.size > 0) return;
     const peerId = this.normalizePeerId(data?.peerId);
     const state = String(data?.state ?? '').toLowerCase();
@@ -518,7 +527,7 @@ export class FreeRTCClientAdapter {
       return;
     }
     if (state === 'failed' || state === 'closed') {
-      this.markPeerTransportStale(peerId);
+      this.markPeerTransportStale(peerId, Boolean(data?.reason));
     }
   }
 
@@ -549,8 +558,8 @@ export class FreeRTCClientAdapter {
     this.releaseStalePeerImmediately(peerId, true);
   }
 
-  private markPeerTransportStale(peerId: string): void {
-    this.releaseStalePeerImmediately(peerId);
+  private markPeerTransportStale(peerId: string, forceNotify = false): void {
+    this.releaseStalePeerImmediately(peerId, forceNotify);
   }
 
   private observeDataChannel(peerId: string, channel: any): void {

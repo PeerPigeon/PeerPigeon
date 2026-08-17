@@ -348,23 +348,33 @@ var FreeRTCClientAdapter = class {
     this.nudgeSignaling();
     return true;
   }
-  closeConnection(peerId) {
+  closeConnection(peerId, reason = "local_close") {
     const id = this.normalizePeerId(peerId);
     if (!id) return;
     this.clearDisconnectGraceTimer(id);
     const entry = this.client?.mesh?.connections?.get?.(id);
-    this.client?.mesh?.connections?.delete?.(id);
     const wasConnected = this.connectedPeers.delete(id);
-    try {
-      entry?.channel?.close?.();
-    } catch {
+    let closedByClient = false;
+    if (typeof this.client?.closePeerConnection === "function") {
+      try {
+        this.client.closePeerConnection(id, reason);
+        closedByClient = true;
+      } catch {
+      }
     }
-    try {
-      entry?.connection?.close?.();
-    } catch {
+    if (!closedByClient) {
+      this.client?.mesh?.connections?.delete?.(id);
+      try {
+        entry?.channel?.close?.();
+      } catch {
+      }
+      try {
+        entry?.connection?.close?.();
+      } catch {
+      }
     }
     if (entry || wasConnected) {
-      this.emitter.emit("rtc:disconnected", { peerId: id });
+      this.emitter.emit("rtc:disconnected", { peerId: id, reason });
     }
   }
   send(peerId, data) {
@@ -469,7 +479,7 @@ var FreeRTCClientAdapter = class {
       return;
     }
     if (state === "failed" || state === "closed") {
-      this.markPeerTransportStale(peerId);
+      this.markPeerTransportStale(peerId, Boolean(data?.reason));
     }
   }
   handleNegotiationFailure(data) {
@@ -486,8 +496,8 @@ var FreeRTCClientAdapter = class {
     this.emitter.emit("rtc:negotiation-failed", { peerId, reason });
     this.releaseStalePeerImmediately(peerId, true);
   }
-  markPeerTransportStale(peerId) {
-    this.releaseStalePeerImmediately(peerId);
+  markPeerTransportStale(peerId, forceNotify = false) {
+    this.releaseStalePeerImmediately(peerId, forceNotify);
   }
   observeDataChannel(peerId, channel) {
     if (!channel || typeof channel !== "object" && typeof channel !== "function") return;
@@ -4189,7 +4199,7 @@ var PartialMesh = class {
       const target = dropOrder[i];
       if (!target) break;
       this.noteIntentionalShed(target.peerId);
-      this.disconnectFromPeer(target.peerId);
+      this.disconnectFromPeer(target.peerId, "capacity_shed");
     }
   }
   getOldestPendingAgeMs() {
@@ -4486,7 +4496,7 @@ var PartialMesh = class {
         this.pendingRebalanceDropByTarget.delete(peerId);
         if (rebalanceDropPeerId !== peerId && this.peers.get(rebalanceDropPeerId)?.connected) {
           if (this.getConnectedPeerCount() > this.config.maxPeers) {
-            this.disconnectFromPeer(rebalanceDropPeerId);
+            this.disconnectFromPeer(rebalanceDropPeerId, "capacity_shed");
           }
         }
       }
@@ -4980,15 +4990,15 @@ var PartialMesh = class {
   /**
    * Disconnect from a specific peer
    */
-  disconnectFromPeer(peerId) {
+  disconnectFromPeer(peerId, reason = "local_close") {
     const normalizedPeerId = this.normalizePeerId(peerId);
     if (!normalizedPeerId) return;
-    this.removePeer(normalizedPeerId, false);
+    this.removePeer(normalizedPeerId, false, reason);
   }
   /**
    * Remove a peer connection
    */
-  removePeer(peerId, forgetDiscovered = false) {
+  removePeer(peerId, forgetDiscovered = false, reason = "local_close") {
     if (this.pendingRebalanceDropByTarget.has(peerId)) {
       this.pendingRebalanceDropByTarget.delete(peerId);
     }
@@ -5006,7 +5016,7 @@ var PartialMesh = class {
       this.peerConnectedAtMs.delete(peerId);
       this.connecting.delete(peerId);
       try {
-        this.signalingClient?.closeConnection(peerId);
+        this.signalingClient?.closeConnection(peerId, reason);
       } catch {
       }
       if (forgetDiscovered) {

@@ -18,7 +18,7 @@
     "@fortawesome/free-solid-svg-icons": "^7.3.1",
     "@fortawesome/vue-fontawesome": "^3.3.3",
     "d3": "^7.9.0",
-    "freertc": "github:draeder/freertc#62fd893f12849bf0cddf0de7a66bda1e55235d04",
+    "freertc": "github:draeder/freertc#614254cf4b5185da917dca714ba7f65581191aae",
     "peerpigeon": "file:../..",
     "unsea": "^1.1.2",
     "vue": "^3.3.0"
