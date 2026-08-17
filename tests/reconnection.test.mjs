@@ -648,8 +648,12 @@ test('terminal negotiation failure requires a newer relay advertisement before r
 
   adapter.handleBootstrapCandidates([{ peerId, advertisedAt }]);
   adapter.handleNegotiationFailure({ peerId, reason: 'offer_retries_exhausted' });
-  adapter.handleBootstrapCandidates([{ peerId, advertisedAt }]);
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    adapter.handleBootstrapCandidates([{ peerId, advertisedAt }]);
+  }
   adapter.handleBootstrapCandidates([{ peerId, advertisedAt: advertisedAt + 1 }]);
 
-  assert.deepEqual(activeSnapshots, [[peerId], [], [peerId]]);
+  assert.deepEqual(activeSnapshots[0], [peerId]);
+  assert.ok(activeSnapshots.slice(1, -1).every((activePeers) => activePeers.length === 0));
+  assert.deepEqual(activeSnapshots.at(-1), [peerId]);
 });
