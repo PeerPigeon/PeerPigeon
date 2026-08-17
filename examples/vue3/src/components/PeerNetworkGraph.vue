@@ -22,6 +22,7 @@
       ></span>
     </button>
     <div
+      v-if="showNetworkStatus"
       class="peer-network-status"
       :title="`Direct peers: ${networkPeerSummary.direct}; indirect peers: ${networkPeerSummary.indirect}; total peers: ${networkPeerSummary.total}`"
       :aria-label="`Network: ${networkPeerSummary.direct} direct peers, ${networkPeerSummary.indirect} indirect peers, ${networkPeerSummary.total} total peers`"
@@ -230,6 +231,10 @@ export default {
     activityByPeer: {
       type: Object,
       default: () => ({}),
+    },
+    showNetworkStatus: {
+      type: Boolean,
+      default: true,
     },
   },
   data() {
@@ -806,7 +811,7 @@ export default {
           alpha: selfAppearance?.alpha ?? 1,
         },
         { label: '1 HOP', type: 'node', radius: 8, color: 'rgba(125, 249, 255, 0.72)' },
-        { label: '2 HOPS', type: 'node', radius: 8 / Math.sqrt(2), color: 'rgba(255, 153, 220, 0.7)' },
+        { label: '2 HOPS', type: 'node', radius: 8 / Math.sqrt(2), color: 'rgba(125, 211, 252, 0.7)' },
         { label: '3+ HOPS', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: '#ffffff' },
         { label: 'DIRECT', type: 'line' },
         { label: 'RELAYED', type: 'line', dashed: true },
@@ -1048,7 +1053,7 @@ export default {
       const labelOpacity = Math.max(0, Math.min(1, Number(node.labelOpacity) || 0));
       if (labelOpacity > 0) {
         ctx.globalAlpha = labelOpacity * visibilityOpacity;
-        ctx.shadowColor = 'rgba(18, 8, 52, 0.95)';
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.78)';
         ctx.shadowBlur = 4;
         ctx.fillStyle = 'rgba(255, 255, 255, 0.94)';
         ctx.font = '700 10px Monaco, "Courier New", monospace';
@@ -1222,7 +1227,7 @@ export default {
   place-items: center;
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 50%;
-  background: rgba(31, 18, 81, 0.26);
+  background: rgba(15, 23, 42, 0.55);
   color: rgba(255, 255, 255, 0.82);
   cursor: pointer;
   backdrop-filter: blur(8px);
@@ -1231,7 +1236,7 @@ export default {
 .peer-network-rotation-toggle:hover,
 .peer-network-rotation-toggle:focus-visible {
   border-color: rgba(143, 247, 255, 0.72);
-  background: rgba(55, 35, 120, 0.5);
+  background: rgba(30, 41, 59, 0.82);
   color: #8ff7ff;
   outline: none;
 }
@@ -1270,7 +1275,7 @@ export default {
   padding: 6px 10px;
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 999px;
-  background: rgba(31, 18, 81, 0.26);
+  background: rgba(15, 23, 42, 0.55);
   color: rgba(255, 255, 255, 0.8);
   font: 700 10px/1 Monaco, "Courier New", monospace;
   letter-spacing: 0.08em;
@@ -1315,8 +1320,8 @@ export default {
   padding: 8px 10px;
   border: 1px solid rgba(255, 255, 255, 0.24);
   border-radius: 8px;
-  background: rgba(24, 12, 67, 0.88);
-  box-shadow: 0 12px 30px rgba(23, 10, 58, 0.38);
+  background: rgba(15, 23, 42, 0.94);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.42);
   color: #ffffff;
   text-align: left;
   pointer-events: none;

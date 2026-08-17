@@ -4308,11 +4308,9 @@ var PartialMesh = class {
     if (connectedAgeMs < 4e3) {
       return false;
     }
-    const candidateDiscoveredAgeMs = now - closestCandidate.discoveredAt;
     const repairsCecrOverlay = this.cecrOverlayDialPriority(closestCandidate.peerId) === 0;
     const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 4n < farthestConnected.distance * 3n;
-    const staleExcludedCandidate = candidateDiscoveredAgeMs >= 3e3;
-    if (!materiallyCloser && !staleExcludedCandidate) {
+    if (!materiallyCloser) {
       return false;
     }
     const otherDiscoveredPeers = Array.from(this.discoveredPeers).filter((p) => {
