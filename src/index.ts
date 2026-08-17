@@ -384,6 +384,8 @@ export class PartialMesh {
   private discoveredAtMs: Map<string, number> = new Map();
   /** Peers present in the relay's latest un-graced discovery snapshot. */
   private activeSignalingPeers: Set<string> = new Set();
+  /** Whether the relay has supplied an authoritative active snapshot yet. */
+  private hasActiveSignalingSnapshot: boolean = false;
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
   private membershipTimer: ReturnType<typeof setInterval> | null = null;
   private underConnectedSinceMs: number | null = null;
@@ -701,16 +703,12 @@ export class PartialMesh {
           .map((peerId) => this.normalizePeerId(peerId))
           .filter((peerId) => nextPeers.has(peerId))
       );
-      // Empty snapshots can occur briefly while federation converges after a
-      // re-announcement. Retain the last non-empty current set until the grace
-      // list itself expires, but accept any non-empty snapshot immediately.
-      if (nextActiveSignalingPeers.size > 0 || nextPeers.size === 0) {
-        this.activeSignalingPeers = nextActiveSignalingPeers;
-      } else {
-        this.activeSignalingPeers = new Set(
-          Array.from(this.activeSignalingPeers).filter((peerId) => nextPeers.has(peerId))
-        );
-      }
+      // Empty is meaningful: the relay may be preserving expired peers only in
+      // discovery grace. Keeping the previous non-empty active set made a dead
+      // peer eligible forever when repeated federated snapshots contained only
+      // stale leases.
+      this.hasActiveSignalingSnapshot = true;
+      this.activeSignalingPeers = nextActiveSignalingPeers;
     } else {
       this.activeSignalingPeers = new Set(
         Array.from(this.activeSignalingPeers).filter((peerId) => nextPeers.has(peerId))
@@ -1340,6 +1338,15 @@ export class PartialMesh {
       }
     });
 
+    this.signalingClient.on('rtc:negotiation-failed', (data: { peerId: string; reason?: string }) => {
+      const peerId = this.normalizePeerId(data?.peerId);
+      if (!peerId || this.isSelfAlias(peerId)) return;
+      this.noteDialFailure(peerId);
+      // Do not reuse the same relay snapshot after terminal offer exhaustion.
+      // A subsequent fresh snapshot can make this peer active again.
+      this.activeSignalingPeers.delete(peerId);
+    });
+
     this.signalingClient.on('rtc:data', (data: { peerId: string; data: any }) => {
       const msg = this.tryParseMembership(data.data);
       if (msg) {
@@ -1572,13 +1579,8 @@ export class PartialMesh {
       this.removePeer(peer.id);
 
       if (isolated) {
-        // Isolation recovery prefers immediate retries over passive backoff timers.
-        this.clearDialBackoff(peer.id);
-
-        if (this.discoveredPeers.has(peer.id)) {
-          this.connectToPeerInternal(peer.id, true);
-        }
-
+        // removePeer immediately runs maintenance. The failed target remains
+        // quarantined so another candidate gets the recovery slot.
         if (answeredButNoChannel || repeatedlyFailing) this.maybeHardResetUnderConnected();
       }
       return;
@@ -1674,14 +1676,10 @@ export class PartialMesh {
   private noteDialFailure(peerId: string): void {
     const failures = (this.dialFailureCount.get(peerId) ?? 0) + 1;
     this.dialFailureCount.set(peerId, failures);
-    // FreeRTC has already exhausted its own negotiation deadline before this
-    // callback. Permit one immediate replacement attempt; only repeated hard
-    // failures receive backpressure to prevent a signaling storm.
-    if (failures === 1) {
-      this.dialBackoffUntilMs.delete(peerId);
-      return;
-    }
-    const backoffMs = Math.min(30_000, 500 * Math.pow(2, Math.min(failures - 2, 6)));
+    // FreeRTC has already exhausted the current negotiation generation. Keep
+    // this exact target out for at least one maintenance turn so isolation can
+    // rotate to a different live candidate instead of recreating it inline.
+    const backoffMs = Math.min(30_000, 1_000 * Math.pow(2, Math.min(failures - 1, 5)));
     this.dialBackoffUntilMs.set(peerId, Date.now() + backoffMs);
   }
 
@@ -1693,10 +1691,6 @@ export class PartialMesh {
   private noteIntentionalShed(peerId: string): void {
     // Avoid immediate reconnect loops for peers intentionally dropped due to saturation.
     this.dialBackoffUntilMs.set(peerId, Date.now() + 5_000);
-  }
-
-  private clearDialBackoff(peerId: string): void {
-    this.dialBackoffUntilMs.delete(peerId);
   }
 
   /**
@@ -1829,7 +1823,7 @@ export class PartialMesh {
     // discovered set intentionally carries a short absence grace, but using
     // that grace list for dials can strand a ring behind suspended peers.
     const candidates = new Set<string>(
-      activeDiscoveredPeers.length > 0 ? activeDiscoveredPeers : this.discoveredPeers
+      this.hasActiveSignalingSnapshot ? activeDiscoveredPeers : this.discoveredPeers
     );
     if (includeLiveMembership && activeDiscoveredPeers.length === 0) {
       for (const peerId of this.getGlobalPeers()) candidates.add(peerId);
@@ -1850,17 +1844,14 @@ export class PartialMesh {
     const allCandidates = candidatePeerIds.filter(
       peerId => !this.isSelfAlias(peerId) && !this.peers.has(peerId) && !this.connecting.has(peerId)
     );
-    const available = emergencyIsolated
-      ? allCandidates
-      : allCandidates.filter(peerId => !this.isPeerBackedOff(peerId));
+    const available = allCandidates.filter(peerId => !this.isPeerBackedOff(peerId));
 
     const pickCandidates = (count: number): string[] => {
-      if ((available.length === 0 && allCandidates.length === 0) || count <= 0) return [];
+      if (available.length === 0 || count <= 0) return [];
 
       // Capacity comes first; the per-peer hash tie-breaker still spreads equal
       // candidates deterministically instead of creating a shared first target.
-      const source = available.length > 0 ? available : allCandidates;
-      const sorted = source.slice().sort((a, b) => this.compareDialCandidates(a, b));
+      const sorted = available.slice().sort((a, b) => this.compareDialCandidates(a, b));
       return sorted.slice(0, Math.min(count, sorted.length));
     };
 
@@ -1956,12 +1947,8 @@ export class PartialMesh {
       }
     }
 
-    if (this.isPeerBackedOff(normalizedPeerId) && !emergencyIsolated) {
+    if (this.isPeerBackedOff(normalizedPeerId)) {
       return;
-    }
-
-    if (emergencyIsolated) {
-      this.clearDialBackoff(normalizedPeerId);
     }
 
     const totalInProgress = this.getConnectedPeerCount() + this.getPendingPeerCount();

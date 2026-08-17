@@ -507,6 +507,10 @@ export class FreeRTCClientAdapter {
     });
     if (!peerId || this.isSelfAlias(peerId)) return;
 
+    // Surface terminal ownership failure separately from an ordinary close so
+    // the mesh can quarantine this exact candidate while rotating to another.
+    this.emitter.emit('rtc:negotiation-failed', { peerId, reason });
+
     // FreeRTC emits this only after it has exhausted ownership of the current
     // negotiation. Release that dead generation immediately so PartialMesh can
     // remove its pending dial and use a fresh discovery candidate instead of

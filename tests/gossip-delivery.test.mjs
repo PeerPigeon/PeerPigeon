@@ -830,7 +830,7 @@ test('the default negotiation timeout releases an isolated slot after four secon
   }
 });
 
-test('an isolated mesh redials an orphan only after FreeRTC exhausts offer recovery', () => {
+test('an isolated mesh quarantines an orphan after FreeRTC exhausts offer recovery', () => {
   const self = '0'.repeat(63) + '1';
   const target = '0'.repeat(63) + '2';
   const mesh = new PartialMesh({
@@ -871,8 +871,9 @@ test('an isolated mesh redials an orphan only after FreeRTC exhausts offer recov
     mesh.maintainPeerConnections();
 
     assert.deepEqual(closed, [target]);
-    assert.deepEqual(dials, [target]);
-    assert.equal(mesh.connecting.has(target), true);
+    assert.deepEqual(dials, []);
+    assert.equal(mesh.connecting.has(target), false);
+    assert.equal(mesh.isPeerBackedOff(target), true);
   } finally {
     mesh.destroy();
   }
@@ -1173,10 +1174,10 @@ test('relay discovery does not become graph membership until CECR confirms it', 
     mesh.mergeMembership([active], [], {}, active);
     assert.deepEqual(mesh.getGraphSnapshot().nodes.map((node) => node.peerId), [self, active]);
 
-    // A transient empty raw snapshot retains the last non-empty current view
-    // while the adapter's discovery grace is still carrying known peers.
+    // An empty active snapshot is authoritative even while discovery grace
+    // retains old peer IDs. Expired candidates must not remain dialable.
     mesh.reconcileSignalingPeers([ghost, active], []);
-    assert.deepEqual(mesh.getActiveSignalingPeers(), [active]);
+    assert.deepEqual(mesh.getActiveSignalingPeers(), []);
   } finally {
     mesh.destroy();
   }
@@ -1247,6 +1248,45 @@ test('isolated recovery uses tolerantPeers as parallel dial headroom', () => {
 
     assert.deepEqual(new Set(dials), new Set(candidates));
     assert.equal(mesh.getPendingPeerCount(), 3);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('isolated recovery rotates around a quarantined failed candidate', () => {
+  const self = '0'.repeat(64);
+  const failed = '1'.repeat(64);
+  const alternatives = ['2'.repeat(64), '3'.repeat(64)];
+  const candidates = [failed, ...alternatives];
+  const dials = [];
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    tolerantPeers: 1,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.reconcileSignalingPeers(candidates, candidates);
+    mesh.noteDialFailure(failed);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      initiateConnection(peerId) {
+        dials.push(peerId);
+        return new Promise(() => {});
+      },
+      closeConnection() {},
+      disconnect() {},
+      client: { mesh: { connections: new Map() } },
+    };
+
+    mesh.maintainPeerConnections();
+
+    assert.deepEqual(new Set(dials), new Set(alternatives));
+    assert.equal(dials.includes(failed), false);
   } finally {
     mesh.destroy();
   }
