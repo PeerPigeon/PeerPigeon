@@ -90,6 +90,7 @@ var FreeRTCClientAdapter = class {
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
     this.clientGeneration = 0;
+    this.activeSignalIndex = 0;
     this.lifecycleListenersAttached = false;
     this.previousIdentityWithdrawalStarted = false;
     this.previousIdentityWithdrawalHandles = [];
@@ -133,7 +134,7 @@ var FreeRTCClientAdapter = class {
     this.emitter.on(event, handler);
   }
   get activeSignalUrl() {
-    return this.signalUrls[0];
+    return this.signalUrls[this.activeSignalIndex % this.signalUrls.length];
   }
   emitConnectedIfNeeded(signalUrl = this.activeSignalUrl) {
     const wasConnected = this.signalingConnected;
@@ -612,6 +613,24 @@ var FreeRTCClientAdapter = class {
     this.signalingConnected = false;
     this.clearRecoveryProbeTimer();
     this.clearDisconnectGraceTimers();
+    if (this.signalUrls.length > 1 && this.connectedPeers.size === 0) {
+      const previousSignalUrl = this.activeSignalUrl;
+      const staleClient = this.client;
+      this.clientGeneration += 1;
+      this.client = null;
+      this.activeSignalIndex = (this.activeSignalIndex + 1) % this.signalUrls.length;
+      this.recyclingSignalingTransport = false;
+      this.waitingForTransportClose = false;
+      try {
+        staleClient?.disconnect?.();
+      } catch {
+      }
+      this.emitter.emit("signaling:log", {
+        message: `[signal] ${reason}: ${previousSignalUrl} did not acknowledge; trying federated relay ${this.activeSignalUrl}`
+      });
+      this.connect();
+      return;
+    }
     if (typeof this.client.reconnectSignaling === "function") {
       this.waitingForTransportClose = false;
       this.emitter.emit("signaling:log", {
