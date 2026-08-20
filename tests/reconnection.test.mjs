@@ -132,7 +132,7 @@ test('Vue-style proxying does not suppress FreeRTC registration callbacks', () =
   }
 });
 
-test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) => {
+test('adapter leaves short retries in FreeRTC, then rotates an unresponsive federated relay', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const originalWebSocket = globalThis.WebSocket;
   const attempts = [];
@@ -184,7 +184,8 @@ test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) =
       socket.onclose?.({ code: 1006 });
     };
 
-    // FreeRTC owns every retry and its backoff on the selected federated relay.
+    // FreeRTC owns short retries and their backoff on the selected federated
+    // relay, avoiding one new client for every transient WebSocket close.
     failLatestSocket();
     t.mock.timers.tick(0);
     assert.equal(attempts.length, 2);
@@ -199,6 +200,11 @@ test('adapter leaves relay retries and backoff inside one FreeRTC client', (t) =
     assert.match(attempts[2], /^wss:\/\/nearest\.example\/ws/);
     assert.match(attempts[3], /^wss:\/\/nearest\.example\/ws/);
     assert.equal(attempts.some((url) => /^wss:\/\/next-nearest\.example\/ws/.test(url)), false);
+
+    // The adapter's bounded registration deadline then advances to the next
+    // configured relay instead of reconnecting to the dead first relay forever.
+    t.mock.timers.tick(2_500);
+    assert.match(attempts.at(-1), /^wss:\/\/next-nearest\.example\/ws/);
   } finally {
     adapter.disconnect();
     globalThis.WebSocket = originalWebSocket;
