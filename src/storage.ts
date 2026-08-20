@@ -846,7 +846,10 @@ export class PeerPigeonStorage {
       }
     }
 
-    if (typeof localStorage !== 'undefined') {
+    // localStorage is the fallback transport. Pulsing a set/remove event when
+    // BroadcastChannel already delivered the same notice creates needless
+    // storage churn for every heartbeat and mutation.
+    if (!this.crossTabChannel && typeof localStorage !== 'undefined') {
       try {
         const key = this.crossTabStorageKey();
         localStorage.setItem(key, JSON.stringify(notice));

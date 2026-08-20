@@ -71,6 +71,7 @@ export class FreeRTCClientAdapter {
   private recyclingSignalingTransport = false;
   private waitingForTransportClose = false;
   private clientGeneration = 0;
+  private activeSignalIndex = 0;
   private lifecycleListenersAttached = false;
   private previousIdentityWithdrawalStarted = false;
   private previousIdentityWithdrawalHandles: Array<{ close(): void }> = [];
@@ -137,7 +138,7 @@ export class FreeRTCClientAdapter {
   }
 
   private get activeSignalUrl(): string {
-    return this.signalUrls[0];
+    return this.signalUrls[this.activeSignalIndex % this.signalUrls.length];
   }
 
   private emitConnectedIfNeeded(signalUrl = this.activeSignalUrl): void {
@@ -683,6 +684,28 @@ export class FreeRTCClientAdapter {
     this.signalingConnected = false;
     this.clearRecoveryProbeTimer();
     this.clearDisconnectGraceTimers();
+
+    // FreeRTC owns backoff while a selected relay may still recover. Once the
+    // adapter's acknowledgement deadline expires, however, an isolated client
+    // must try the next configured federated relay instead of reconnecting to
+    // the same dead WebSocket forever. Never replace the client while an open
+    // WebRTC edge exists: those data channels do not depend on signaling and
+    // must survive a transient relay outage.
+    if (this.signalUrls.length > 1 && this.connectedPeers.size === 0) {
+      const previousSignalUrl = this.activeSignalUrl;
+      const staleClient = this.client;
+      this.clientGeneration += 1;
+      this.client = null;
+      this.activeSignalIndex = (this.activeSignalIndex + 1) % this.signalUrls.length;
+      this.recyclingSignalingTransport = false;
+      this.waitingForTransportClose = false;
+      try { staleClient?.disconnect?.(); } catch { /* best effort */ }
+      this.emitter.emit('signaling:log', {
+        message: `[signal] ${reason}: ${previousSignalUrl} did not acknowledge; trying federated relay ${this.activeSignalUrl}`,
+      });
+      this.connect();
+      return;
+    }
 
     if (typeof this.client.reconnectSignaling === 'function') {
       this.waitingForTransportClose = false;
