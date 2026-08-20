@@ -2834,7 +2834,7 @@ var PeerPigeonStorage = class {
       } catch {
       }
     }
-    if (typeof localStorage !== "undefined") {
+    if (!this.crossTabChannel && typeof localStorage !== "undefined") {
       try {
         const key = this.crossTabStorageKey();
         localStorage.setItem(key, JSON.stringify(notice));
