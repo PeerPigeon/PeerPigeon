@@ -884,6 +884,52 @@ test('PartialMesh does not run a second timer against FreeRTC negotiation owners
   }
 });
 
+test('PartialMesh releases a stuck active ICE negotiation after six seconds', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  const connections = new Map([[target, {
+    state: 'connecting',
+    connection: { connectionState: 'connecting', signalingState: 'stable' },
+    channel: { readyState: 'connecting' },
+  }]]);
+  const closed = [];
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.discoveredPeers.add(target);
+    mesh.peers.set(target, { id: target, connected: false, initiator: true });
+    mesh.connecting.add(target);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      closeConnection(peerId) {
+        closed.push(peerId);
+        connections.delete(peerId);
+      },
+      disconnect() {},
+      client: { mesh: { connections } },
+    };
+
+    mesh.connectionStartedAtMs.set(target, Date.now() - 5_900);
+    mesh.maybeRecoverStalledNegotiations();
+    assert.deepEqual(closed, []);
+
+    mesh.connectionStartedAtMs.set(target, Date.now() - 6_100);
+    mesh.maybeRecoverStalledNegotiations();
+    assert.deepEqual(closed, [target]);
+    assert.equal(mesh.connecting.has(target), false);
+    assert.equal(mesh.isPeerBackedOff(target), true);
+  } finally {
+    mesh.destroy();
+  }
+});
+
 test('an inbound FreeRTC connecting event is tracked and never treated as an orphan', () => {
   const self = '0'.repeat(63) + '1';
   const target = '0'.repeat(63) + '2';
