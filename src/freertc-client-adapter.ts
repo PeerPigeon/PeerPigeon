@@ -2,7 +2,8 @@ import { createSignalingClient, withdrawSignalingIdentity } from 'freertc/client
 
 type Handler = (...args: any[]) => void;
 
-const RECOVERY_PROBE_TIMEOUT_MS = 5_000;
+const RECOVERY_PROBE_TIMEOUT_MS = 4_000;
+const INITIAL_SIGNALING_HEALTH_DELAY_MS = 1_000;
 const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
 const DISCOVERY_ABSENCE_GRACE_MS = 30_000;
 const DISCOVERY_ACTIVE_MAX_AGE_MS = 18_000;
@@ -66,6 +67,7 @@ export class FreeRTCClientAdapter {
   private intentionallyDisconnected = false;
   private signalingConnected = false;
   private recoveryProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  private initialSignalingHealthTimer: ReturnType<typeof setTimeout> | null = null;
   private signalingHealthTimer: ReturnType<typeof setInterval> | null = null;
   private lastBootstrapAtMs = 0;
   private recyclingSignalingTransport = false;
@@ -151,6 +153,7 @@ export class FreeRTCClientAdapter {
         previousClientId: this.previousPeerId,
         signalUrl,
       });
+      this.scheduleInitialSignalingHealthCheck();
     }
     this.startSignalingHealthLoop();
   }
@@ -673,7 +676,29 @@ export class FreeRTCClientAdapter {
     }, SIGNALING_HEALTH_INTERVAL_MS);
   }
 
+  private scheduleInitialSignalingHealthCheck(): void {
+    if (this.initialSignalingHealthTimer) clearTimeout(this.initialSignalingHealthTimer);
+    this.initialSignalingHealthTimer = setTimeout(() => {
+      this.initialSignalingHealthTimer = null;
+      if (this.intentionallyDisconnected || this.recyclingSignalingTransport || this.recoveryProbeTimer) return;
+      if (typeof document !== 'undefined' && document.hidden) return;
+      if (!this.client?.isRegistered) {
+        this.ensureRegistrationRecoveryProbe('initial health check');
+        this.client?.connect?.();
+        return;
+      }
+      if (this.connectedPeers.size > 0) return;
+      this.emitter.emit('signaling:log', {
+        message: '[signal] initial health check: awaiting relay acknowledgement',
+      });
+      this.startRecoveryProbe('initial health check', true);
+      this.client?.requestBootstrap?.(Array.from(this.selfAliases));
+    }, INITIAL_SIGNALING_HEALTH_DELAY_MS);
+  }
+
   private stopSignalingHealthLoop(): void {
+    if (this.initialSignalingHealthTimer) clearTimeout(this.initialSignalingHealthTimer);
+    this.initialSignalingHealthTimer = null;
     if (this.signalingHealthTimer) clearInterval(this.signalingHealthTimer);
     this.signalingHealthTimer = null;
   }

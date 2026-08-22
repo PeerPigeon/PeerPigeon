@@ -676,6 +676,44 @@ test('periodic relay acknowledgement checks detect zombie sockets without lifecy
   adapter.stopSignalingHealthLoop();
 });
 
+test('initial relay acknowledgement failure rotates within five seconds', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const adapter = new FreeRTCClientAdapter([
+    'wss://stale.example/ws',
+    'wss://healthy.example/ws',
+  ], { peerId: '1'.repeat(64) });
+  let bootstrapRequests = 0;
+  let disconnects = 0;
+  let connects = 0;
+  const client = {
+    isRegistered: true,
+    mesh: { connections: new Map() },
+    requestBootstrap() { bootstrapRequests += 1; },
+    disconnect() { disconnects += 1; },
+    connect() { connects += 1; },
+  };
+  adapter.client = client;
+  adapter.signalingConnected = true;
+  adapter.scheduleInitialSignalingHealthCheck();
+
+  t.mock.timers.tick(999);
+  assert.equal(bootstrapRequests, 0);
+  assert.equal(disconnects, 0);
+
+  t.mock.timers.tick(1);
+  assert.equal(bootstrapRequests, 1);
+  assert.equal(disconnects, 0);
+
+  t.mock.timers.tick(3_999);
+  assert.equal(disconnects, 0);
+  t.mock.timers.tick(1);
+  assert.equal(disconnects, 1);
+  assert.equal(adapter.activeSignalIndex, 1);
+  assert.equal(connects, 0);
+
+  adapter.disconnect();
+});
+
 test('a transient empty discovery snapshot after resume preserves recent peers', () => {
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
     peerId: '1'.repeat(64),

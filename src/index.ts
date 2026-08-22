@@ -29,6 +29,13 @@ export const DEFAULT_SIGNALING_SERVERS = Object.freeze([
 
 export const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
 
+// When both peers discover each other at the same time, only the lower stable
+// peer ID dials initially. This prevents two simultaneous data channels from
+// replacing one another during perfect-negotiation glare (notably in WebKit).
+// The other side may still dial after this short grace window so asymmetric
+// relay discovery cannot strand the pair.
+const PREFERRED_INITIATOR_GRACE_MS = 2_000;
+
 function canonicalSignalingUrl(value: string): string | null {
   try {
     const url = new URL(String(value || '').trim());
@@ -1979,9 +1986,15 @@ export class PartialMesh {
       return;
     }
 
-    // FreeRTC implements deterministic perfect-negotiation glare handling, so
-    // both sides may offer immediately. Waiting for a preferred initiator made
-    // asymmetric discovery add an avoidable multi-second connection delay.
+    const discoveredAt = this.discoveredAtMs.get(normalizedPeerId) ?? Date.now();
+    const preferredInitiator = selfId.localeCompare(normalizedPeerId) < 0;
+    if (!preferredInitiator && Date.now() - discoveredAt < PREFERRED_INITIATOR_GRACE_MS) {
+      return;
+    }
+
+    // A single deterministic initiator avoids dual data-channel replacement.
+    // After the bounded grace window the non-owner is allowed to dial too,
+    // preserving recovery when relay discovery is asymmetric.
     this.connecting.add(normalizedPeerId);
     this.createPeerConnection(normalizedPeerId, true);
   }
