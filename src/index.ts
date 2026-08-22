@@ -1537,11 +1537,13 @@ export class PartialMesh {
         || connectionState === 'closed'
         || String(entry?.state ?? '').toLowerCase() === 'dead';
       // A genuine inbound negotiation is now registered through
-      // rtc:connecting. Anything still untracked is internal FreeRTC residue;
-      // close terminal residue immediately but do not race active browser ICE.
+      // rtc:connecting. Anything still untracked is internal FreeRTC residue.
+      // FreeRTC exhausts its offer retry loop in under three seconds, so six
+      // seconds leaves a full second attempt without retaining a dead ICE/data
+      // channel for the old 30-second window.
       const staleAfterMs = terminalTransport
         ? 0
-        : Math.max(30_000, this.config.connectionTimeoutMs);
+        : Math.max(6_000, this.config.connectionTimeoutMs);
       if (orphanAgeMs < staleAfterMs) continue;
 
       this.orphanRtcFirstSeenAtMs.delete(peerId);
@@ -1569,11 +1571,11 @@ export class PartialMesh {
     const now = Date.now();
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
-    // Never race FreeRTC's 2.85-second offer retry loop. Browser ICE can
-    // legitimately remain in new/connecting after signaling has stabilized,
-    // so only an explicit failure closes it early.
+    // Never race FreeRTC's 2.85-second offer retry loop. Six seconds permits a
+    // complete retry but bounds stuck ICE/data-channel state instead of
+    // retaining it for 30 seconds (and multiplying it across browser tabs).
     const ownerTimeoutMs = Math.max(4_000, this.config.connectionTimeoutMs);
-    const activeIceTimeoutMs = Math.max(30_000, this.config.connectionTimeoutMs);
+    const activeIceTimeoutMs = Math.max(6_000, this.config.connectionTimeoutMs);
 
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;

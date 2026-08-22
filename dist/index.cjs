@@ -4685,7 +4685,7 @@ var PartialMesh = class {
       this.orphanRtcFirstSeenAtMs.set(peerId, firstSeenAt);
       const orphanAgeMs = Math.max(0, now - firstSeenAt);
       const terminalTransport = connectionState === "failed" || connectionState === "closed" || String(entry?.state ?? "").toLowerCase() === "dead";
-      const staleAfterMs = terminalTransport ? 0 : Math.max(3e4, this.config.connectionTimeoutMs);
+      const staleAfterMs = terminalTransport ? 0 : Math.max(6e3, this.config.connectionTimeoutMs);
       if (orphanAgeMs < staleAfterMs) continue;
       this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.noteDialFailure(peerId);
@@ -4714,7 +4714,7 @@ var PartialMesh = class {
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
     const ownerTimeoutMs = Math.max(4e3, this.config.connectionTimeoutMs);
-    const activeIceTimeoutMs = Math.max(3e4, this.config.connectionTimeoutMs);
+    const activeIceTimeoutMs = Math.max(6e3, this.config.connectionTimeoutMs);
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
       const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
