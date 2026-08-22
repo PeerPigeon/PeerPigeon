@@ -1022,6 +1022,8 @@ declare class PartialMesh {
     private isPeerBackedOff;
     private noteDialFailure;
     private noteDialSuccess;
+    private noteTransportDisconnect;
+    private noteStablePeerConnections;
     private noteIntentionalShed;
     /**
      * Hard reset peer connections (keeps signaling + discovered peers).

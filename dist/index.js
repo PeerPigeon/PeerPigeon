@@ -1,6 +1,7 @@
 // src/freertc-client-adapter.ts
 import { createSignalingClient, withdrawSignalingIdentity } from "freertc/client";
-var RECOVERY_PROBE_TIMEOUT_MS = 5e3;
+var RECOVERY_PROBE_TIMEOUT_MS = 4e3;
+var INITIAL_SIGNALING_HEALTH_DELAY_MS = 1e3;
 var SIGNALING_HEALTH_INTERVAL_MS = 15e3;
 var DISCOVERY_ABSENCE_GRACE_MS = 3e4;
 var DISCOVERY_ACTIVE_MAX_AGE_MS = 18e3;
@@ -47,6 +48,7 @@ var FreeRTCClientAdapter = class {
     this.intentionallyDisconnected = false;
     this.signalingConnected = false;
     this.recoveryProbeTimer = null;
+    this.initialSignalingHealthTimer = null;
     this.signalingHealthTimer = null;
     this.lastBootstrapAtMs = 0;
     this.recyclingSignalingTransport = false;
@@ -108,6 +110,7 @@ var FreeRTCClientAdapter = class {
         previousClientId: this.previousPeerId,
         signalUrl
       });
+      this.scheduleInitialSignalingHealthCheck();
     }
     this.startSignalingHealthLoop();
   }
@@ -565,7 +568,28 @@ var FreeRTCClientAdapter = class {
       this.client?.requestBootstrap?.(Array.from(this.selfAliases));
     }, SIGNALING_HEALTH_INTERVAL_MS);
   }
+  scheduleInitialSignalingHealthCheck() {
+    if (this.initialSignalingHealthTimer) clearTimeout(this.initialSignalingHealthTimer);
+    this.initialSignalingHealthTimer = setTimeout(() => {
+      this.initialSignalingHealthTimer = null;
+      if (this.intentionallyDisconnected || this.recyclingSignalingTransport || this.recoveryProbeTimer) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+      if (!this.client?.isRegistered) {
+        this.ensureRegistrationRecoveryProbe("initial health check");
+        this.client?.connect?.();
+        return;
+      }
+      if (this.connectedPeers.size > 0) return;
+      this.emitter.emit("signaling:log", {
+        message: "[signal] initial health check: awaiting relay acknowledgement"
+      });
+      this.startRecoveryProbe("initial health check", true);
+      this.client?.requestBootstrap?.(Array.from(this.selfAliases));
+    }, INITIAL_SIGNALING_HEALTH_DELAY_MS);
+  }
   stopSignalingHealthLoop() {
+    if (this.initialSignalingHealthTimer) clearTimeout(this.initialSignalingHealthTimer);
+    this.initialSignalingHealthTimer = null;
     if (this.signalingHealthTimer) clearInterval(this.signalingHealthTimer);
     this.signalingHealthTimer = null;
   }
@@ -3636,6 +3660,8 @@ var DEFAULT_SIGNALING_SERVERS = Object.freeze([
   "wss://oooooooooooooooooooooooooooo.ooo/ws"
 ]);
 var DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
+var PREFERRED_INITIATOR_GRACE_MS = 4e3;
+var STABLE_PEER_CONNECTION_MS = 1e4;
 function canonicalSignalingUrl(value) {
   try {
     const url = new URL(String(value || "").trim());
@@ -4469,7 +4495,6 @@ var PartialMesh = class {
       peerConnection.connected = true;
       this.peerConnectedAtMs.set(peerId, Date.now());
       this.connecting.delete(peerId);
-      this.noteDialSuccess(peerId);
       this.noteLocalCapacityChanged();
       this.emit("peer:connected", peerId);
       const rebalanceDropPeerId = this.pendingRebalanceDropByTarget.get(peerId);
@@ -4505,10 +4530,12 @@ var PartialMesh = class {
       if (peerConnection) {
         this.connectionStartedAtMs.delete(peerId);
         const wasConnected = peerConnection.connected;
+        const connectedAt = this.peerConnectedAtMs.get(peerId) ?? 0;
         this.peers.delete(peerId);
         this.peerConnectedAtMs.delete(peerId);
         this.connecting.delete(peerId);
         if (wasConnected) {
+          this.noteTransportDisconnect(peerId, connectedAt, data.reason);
           this.noteLocalCapacityChanged();
           this.emit("peer:disconnected", peerId);
           this.broadcastMembership();
@@ -4787,6 +4814,23 @@ var PartialMesh = class {
     this.dialFailureCount.delete(peerId);
     this.dialBackoffUntilMs.delete(peerId);
   }
+  noteTransportDisconnect(peerId, connectedAt, reason) {
+    if (reason === "local_close" || reason === "capacity_shed") return;
+    const connectedForMs = connectedAt > 0 ? Date.now() - connectedAt : 0;
+    if (connectedForMs < STABLE_PEER_CONNECTION_MS) {
+      this.noteDialFailure(peerId);
+      return;
+    }
+    this.noteDialSuccess(peerId);
+  }
+  noteStablePeerConnections(now) {
+    for (const [peerId, connectedAt] of this.peerConnectedAtMs) {
+      if (!this.peers.get(peerId)?.connected) continue;
+      if (now - connectedAt >= STABLE_PEER_CONNECTION_MS) {
+        this.noteDialSuccess(peerId);
+      }
+    }
+  }
   noteIntentionalShed(peerId) {
     this.dialBackoffUntilMs.set(peerId, Date.now() + 5e3);
   }
@@ -4882,6 +4926,7 @@ var PartialMesh = class {
   }
   maintainPeerConnections() {
     const now = Date.now();
+    this.noteStablePeerConnections(now);
     this.recoverOrphanedRtcNegotiations(now);
     const connectedCount = this.getConnectedPeerCount();
     const pendingCount = this.getPendingPeerCount();
@@ -4963,6 +5008,11 @@ var PartialMesh = class {
     const useToleranceBudget = allowTemporaryOverflow || emergencyIsolated;
     const maxAllowed = this.config.maxPeers + (useToleranceBudget ? this.config.tolerantPeers : 0);
     if (totalInProgress >= maxAllowed) {
+      return;
+    }
+    const discoveredAt = this.discoveredAtMs.get(normalizedPeerId) ?? Date.now();
+    const preferredInitiator = selfId.localeCompare(normalizedPeerId) < 0;
+    if (!preferredInitiator && Date.now() - discoveredAt < PREFERRED_INITIATOR_GRACE_MS) {
       return;
     }
     this.connecting.add(normalizedPeerId);

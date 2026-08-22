@@ -36,6 +36,12 @@ export const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
 // relay discovery cannot strand the pair.
 const PREFERRED_INITIATOR_GRACE_MS = 4_000;
 
+// Opening a data channel is not enough to prove that a peer is healthy. Older
+// clients can replace a newly-open channel during simultaneous negotiation,
+// producing an open/close/redial loop. Preserve accumulated dial failures until
+// the edge has remained usable for a full maintenance window.
+const STABLE_PEER_CONNECTION_MS = 10_000;
+
 function canonicalSignalingUrl(value: string): string | null {
   try {
     const url = new URL(String(value || '').trim());
@@ -1302,7 +1308,6 @@ export class PartialMesh {
       peerConnection.connected = true;
       this.peerConnectedAtMs.set(peerId, Date.now());
       this.connecting.delete(peerId);
-      this.noteDialSuccess(peerId);
       this.noteLocalCapacityChanged();
       this.emit('peer:connected', peerId);
 
@@ -1332,7 +1337,7 @@ export class PartialMesh {
       this.broadcastMembership();
     });
 
-    this.signalingClient.on('rtc:disconnected', (data: { peerId: string }) => {
+    this.signalingClient.on('rtc:disconnected', (data: { peerId: string; reason?: string }) => {
       const peerId = this.normalizePeerId(data.peerId);
       if (!peerId || this.isSelfAlias(peerId)) return;
 
@@ -1350,10 +1355,12 @@ export class PartialMesh {
       if (peerConnection) {
         this.connectionStartedAtMs.delete(peerId);
         const wasConnected = peerConnection.connected;
+        const connectedAt = this.peerConnectedAtMs.get(peerId) ?? 0;
         this.peers.delete(peerId);
         this.peerConnectedAtMs.delete(peerId);
         this.connecting.delete(peerId);
         if (wasConnected) {
+          this.noteTransportDisconnect(peerId, connectedAt, data.reason);
           this.noteLocalCapacityChanged();
           this.emit('peer:disconnected', peerId);
           this.broadcastMembership();
@@ -1730,6 +1737,29 @@ export class PartialMesh {
     this.dialBackoffUntilMs.delete(peerId);
   }
 
+  private noteTransportDisconnect(peerId: string, connectedAt: number, reason?: string): void {
+    // Locally-requested topology changes are not transport failures and should
+    // not delay a later intentional reconnect.
+    if (reason === 'local_close' || reason === 'capacity_shed') return;
+
+    const connectedForMs = connectedAt > 0 ? Date.now() - connectedAt : 0;
+    if (connectedForMs < STABLE_PEER_CONNECTION_MS) {
+      this.noteDialFailure(peerId);
+      return;
+    }
+
+    this.noteDialSuccess(peerId);
+  }
+
+  private noteStablePeerConnections(now: number): void {
+    for (const [peerId, connectedAt] of this.peerConnectedAtMs) {
+      if (!this.peers.get(peerId)?.connected) continue;
+      if (now - connectedAt >= STABLE_PEER_CONNECTION_MS) {
+        this.noteDialSuccess(peerId);
+      }
+    }
+  }
+
   private noteIntentionalShed(peerId: string): void {
     // Avoid immediate reconnect loops for peers intentionally dropped due to saturation.
     this.dialBackoffUntilMs.set(peerId, Date.now() + 5_000);
@@ -1861,6 +1891,7 @@ export class PartialMesh {
 
   private maintainPeerConnections(): void {
     const now = Date.now();
+    this.noteStablePeerConnections(now);
     this.recoverOrphanedRtcNegotiations(now);
     const connectedCount = this.getConnectedPeerCount();
     const pendingCount = this.getPendingPeerCount();

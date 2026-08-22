@@ -1029,6 +1029,50 @@ test('a flapping relay snapshot does not erase failed-peer backoff', () => {
   }
 });
 
+test('a rapidly disconnected open channel accumulates exponential dial backoff', () => {
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({ autoDiscover: false, autoConnect: false });
+  try {
+    mesh.noteDialFailure(target);
+    mesh.noteTransportDisconnect(target, Date.now() - 100);
+
+    assert.equal(mesh.dialFailureCount.get(target), 2);
+    assert.equal(mesh.dialBackoffUntilMs.get(target) - Date.now() > 1_500, true);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('a stable open channel clears accumulated dial backoff', () => {
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({ autoDiscover: false, autoConnect: false });
+  try {
+    mesh.noteDialFailure(target);
+    mesh.peers.set(target, { id: target, connected: true, initiator: true });
+    mesh.peerConnectedAtMs.set(target, Date.now() - 11_000);
+
+    mesh.noteStablePeerConnections(Date.now());
+
+    assert.equal(mesh.dialFailureCount.has(target), false);
+    assert.equal(mesh.dialBackoffUntilMs.has(target), false);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('an intentional local disconnect does not create transport-failure backoff', () => {
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({ autoDiscover: false, autoConnect: false });
+  try {
+    mesh.noteTransportDisconnect(target, Date.now() - 100, 'capacity_shed');
+
+    assert.equal(mesh.dialFailureCount.has(target), false);
+    assert.equal(mesh.dialBackoffUntilMs.has(target), false);
+  } finally {
+    mesh.destroy();
+  }
+});
+
 test('an isolated mesh quarantines an orphan after FreeRTC exhausts offer recovery', () => {
   const self = '0'.repeat(63) + '1';
   const target = '0'.repeat(63) + '2';
