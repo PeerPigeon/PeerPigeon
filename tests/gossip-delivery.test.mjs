@@ -918,7 +918,7 @@ test('PartialMesh assigns one initial dial owner and bounds asymmetric fallback'
     assert.deepEqual(owner.dials, [higher]);
     assert.deepEqual(waiter.dials, []);
 
-    t.mock.timers.tick(1_999);
+    t.mock.timers.tick(3_999);
     waiter.mesh.connectToPeer(lower);
     assert.deepEqual(waiter.dials, []);
 

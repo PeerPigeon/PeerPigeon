@@ -34,7 +34,7 @@ export const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
 // replacing one another during perfect-negotiation glare (notably in WebKit).
 // The other side may still dial after this short grace window so asymmetric
 // relay discovery cannot strand the pair.
-const PREFERRED_INITIATOR_GRACE_MS = 2_000;
+const PREFERRED_INITIATOR_GRACE_MS = 4_000;
 
 function canonicalSignalingUrl(value: string): string | null {
   try {
