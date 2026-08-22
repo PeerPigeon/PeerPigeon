@@ -884,6 +884,53 @@ test('PartialMesh does not run a second timer against FreeRTC negotiation owners
   }
 });
 
+test('PartialMesh assigns one initial dial owner and bounds asymmetric fallback', (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const lower = '0'.repeat(63) + '1';
+  const higher = 'f'.repeat(64);
+  const makeMesh = (self, target) => {
+    const dials = [];
+    const mesh = new PartialMesh({
+      minPeers: 1,
+      maxPeers: 2,
+      autoDiscover: false,
+      autoConnect: false,
+    });
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.discoveredPeers.add(target);
+    mesh.discoveredAtMs.set(target, Date.now());
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      initiateConnection(peerId) { dials.push(peerId); return Promise.resolve(); },
+      disconnect() {},
+      client: { mesh: { connections: new Map() } },
+    };
+    return { mesh, dials };
+  };
+
+  const owner = makeMesh(lower, higher);
+  const waiter = makeMesh(higher, lower);
+  try {
+    owner.mesh.connectToPeer(higher);
+    waiter.mesh.connectToPeer(lower);
+    assert.deepEqual(owner.dials, [higher]);
+    assert.deepEqual(waiter.dials, []);
+
+    t.mock.timers.tick(1_999);
+    waiter.mesh.connectToPeer(lower);
+    assert.deepEqual(waiter.dials, []);
+
+    t.mock.timers.tick(1);
+    waiter.mesh.connectToPeer(lower);
+    assert.deepEqual(waiter.dials, [lower]);
+  } finally {
+    owner.mesh.destroy();
+    waiter.mesh.destroy();
+  }
+});
+
 test('PartialMesh releases a stuck active ICE negotiation after six seconds', () => {
   const self = '0'.repeat(63) + '1';
   const target = '0'.repeat(63) + '2';
