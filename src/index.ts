@@ -1623,7 +1623,7 @@ export class PartialMesh {
       this.noteDialFailure(peer.id);
       this.emit('peer:error', {
         peerId: peer.id,
-        error: new Error(`Negotiation stalled (${signalingState}/${connectionState}/${dataState})`)
+        error: new Error(`Negotiation stalled (signaling=${signalingState} connection=${connectionState} dataChannel=${dataState})`)
       });
       this.removePeer(peer.id);
 
