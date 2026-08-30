@@ -405,7 +405,13 @@ export class FreeRTCClientAdapter {
     try {
       this.client?.sendData(data, peerId);
     } catch (error) {
-      this.releaseStalePeerImmediately(this.normalizePeerId(peerId));
+      // freertc marks refusals over a connection that is merely connecting
+      // or riding out an ICE blip as transient — the edge recovers on its
+      // own, and releasing it here turned every blip into a redial flap.
+      // Only a terminal refusal proves the edge is gone.
+      if (!(error as { transient?: boolean })?.transient) {
+        this.releaseStalePeerImmediately(this.normalizePeerId(peerId));
+      }
       throw error;
     }
   }
@@ -414,10 +420,13 @@ export class FreeRTCClientAdapter {
     for (const peerId of Array.from(this.connectedPeers)) {
       try {
         this.client?.sendData(data, peerId);
-      } catch {
-        // A synchronous send failure is already proof that this edge is not
-        // usable. Release it now so the mesh can replace it immediately.
-        this.releaseStalePeerImmediately(peerId);
+      } catch (error) {
+        // A terminal send failure is proof this edge is not usable; a
+        // transient one is a connection mid-recovery that must be left
+        // alone — gossip anti-entropy re-covers whatever this send missed.
+        if (!(error as { transient?: boolean })?.transient) {
+          this.releaseStalePeerImmediately(peerId);
+        }
       }
     }
   }

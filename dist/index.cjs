@@ -385,7 +385,9 @@ var FreeRTCClientAdapter = class {
     try {
       this.client?.sendData(data, peerId);
     } catch (error) {
-      this.releaseStalePeerImmediately(this.normalizePeerId(peerId));
+      if (!error?.transient) {
+        this.releaseStalePeerImmediately(this.normalizePeerId(peerId));
+      }
       throw error;
     }
   }
@@ -393,8 +395,10 @@ var FreeRTCClientAdapter = class {
     for (const peerId of Array.from(this.connectedPeers)) {
       try {
         this.client?.sendData(data, peerId);
-      } catch {
-        this.releaseStalePeerImmediately(peerId);
+      } catch (error) {
+        if (!error?.transient) {
+          this.releaseStalePeerImmediately(peerId);
+        }
       }
     }
   }
