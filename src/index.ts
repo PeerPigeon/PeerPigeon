@@ -135,14 +135,19 @@ export async function discoverClosestSignalingServers(options: {
   registryUrl.pathname = '/api/v1/relays';
   registryUrl.search = '';
   registryUrl.hash = '';
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(250, options.timeoutMs ?? 4_000));
+  // The timeout RACES the fetch instead of aborting it: Safari logs every
+  // aborted fetch as an "access control checks" console error no catch can
+  // silence, so a slow registry response is simply ignored and finishes
+  // quietly in the background.
+  const timeoutMs = Math.max(250, options.timeoutMs ?? 4_000);
   try {
-    const response = await (options.fetchImpl ?? globalThis.fetch)(registryUrl.toString(), {
-      signal: controller.signal,
-      headers: { Accept: 'application/json' },
-    });
-    if (response.ok) {
+    const response = await Promise.race([
+      (options.fetchImpl ?? globalThis.fetch)(registryUrl.toString(), {
+        headers: { Accept: 'application/json' },
+      }),
+      new Promise<null>((resolve) => { setTimeout(() => resolve(null), timeoutMs); }),
+    ]);
+    if (response?.ok) {
       const body = await response.json() as { relays?: Array<{ url?: string } | string> };
       for (const record of Array.isArray(body?.relays) ? body.relays : []) {
         const normalized = canonicalSignalingUrl(typeof record === 'string' ? record : String(record?.url || ''));
@@ -152,8 +157,6 @@ export async function discoverClosestSignalingServers(options: {
   } catch {
     // The known bootstrap/fallback set remains usable when registry discovery
     // is temporarily unavailable.
-  } finally {
-    clearTimeout(timer);
   }
   const ranked = await rankSignalingServersByDistance(options.peerId, Array.from(candidates));
   const limit = Math.max(1, Math.trunc(options.limit ?? DEFAULT_CLOSE_SIGNALING_RELAY_COUNT));
