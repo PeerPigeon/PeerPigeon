@@ -58,7 +58,7 @@
     "url": "https://github.com/draeder/peerpigeon.git"
   },
   "dependencies": {
-    "freertc": "github:draeder/freertc#58c8996afa833f68eaae347061b5dd9a268f9029",
+    "freertc": "github:draeder/freertc#1055aa5ca84d650f93ed7525e27d0e799d4f011d",
     "unsea": "^1.1.2"
   },
   "devDependencies": {

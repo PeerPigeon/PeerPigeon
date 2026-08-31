@@ -875,7 +875,7 @@ test('PartialMesh does not run a second timer against FreeRTC negotiation owners
 
     assert.deepEqual(errors, [{
       peerId: target,
-      message: 'Negotiation stalled (unknown/unknown/closed)',
+      message: 'Negotiation stalled (signaling=unknown connection=unknown dataChannel=closed)',
     }]);
     assert.deepEqual(closed, [target]);
     assert.equal(mesh.connecting.has(target), false);
@@ -918,7 +918,9 @@ test('PartialMesh assigns one initial dial owner and bounds asymmetric fallback'
     assert.deepEqual(owner.dials, [higher]);
     assert.deepEqual(waiter.dials, []);
 
-    t.mock.timers.tick(3_999);
+    // The fallback grace is deliberately offset from the 4-second stalled
+    // offer deadline so both sides never act in the same instant (glare).
+    t.mock.timers.tick(4_999);
     waiter.mesh.connectToPeer(lower);
     assert.deepEqual(waiter.dials, []);
 
@@ -972,6 +974,143 @@ test('PartialMesh releases a stuck active ICE negotiation after six seconds', ()
     assert.deepEqual(closed, [target]);
     assert.equal(mesh.connecting.has(target), false);
     assert.equal(mesh.isPeerBackedOff(target), true);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('PartialMesh gives a connected transport the full window to open its data channel', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  // The peer connection is connected; SCTP association and data channel are
+  // still opening. A native werift peer routinely spends more than four
+  // seconds here — killing this phase with the short stalled-offer deadline
+  // tore down handshakes that were about to complete.
+  const connections = new Map([[target, {
+    state: 'connected',
+    connection: { connectionState: 'connected', signalingState: 'stable' },
+    channel: { readyState: 'connecting' },
+  }]]);
+  const closed = [];
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.discoveredPeers.add(target);
+    mesh.peers.set(target, { id: target, connected: false, initiator: true });
+    mesh.connecting.add(target);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      closeConnection(peerId) {
+        closed.push(peerId);
+        connections.delete(peerId);
+      },
+      disconnect() {},
+      client: { mesh: { connections } },
+    };
+
+    mesh.connectionStartedAtMs.set(target, Date.now() - 4_500);
+    mesh.maybeRecoverStalledNegotiations();
+    assert.deepEqual(closed, []);
+    assert.equal(mesh.peers.has(target), true);
+
+    mesh.connectionStartedAtMs.set(target, Date.now() - 6_100);
+    mesh.maybeRecoverStalledNegotiations();
+    assert.deepEqual(closed, [target]);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('PartialMesh restarts the negotiation deadline when the handshake makes phase progress', () => {
+  const self = '0'.repeat(63) + '1';
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  const entry = {
+    state: 'connecting',
+    connection: { connectionState: 'connecting', signalingState: 'stable' },
+    channel: { readyState: 'connecting' },
+  };
+  const connections = new Map([[target, entry]]);
+  const closed = [];
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    mesh.discoveredPeers.add(target);
+    mesh.peers.set(target, { id: target, connected: false, initiator: true });
+    mesh.connecting.add(target);
+    mesh.signalingClient = {
+      isConnected: () => true,
+      nudgeSignaling() {},
+      closeConnection(peerId) {
+        closed.push(peerId);
+        connections.delete(peerId);
+      },
+      disconnect() {},
+      client: { mesh: { connections } },
+    };
+
+    // Five seconds into ICE — still inside the six-second window.
+    mesh.connectionStartedAtMs.set(target, Date.now() - 5_000);
+    mesh.maybeRecoverStalledNegotiations();
+    assert.deepEqual(closed, []);
+
+    // ICE completed: the peer connection reached 'connected' with the data
+    // channel still opening. Progress restarts the deadline instead of
+    // inheriting five already-spent seconds.
+    entry.state = 'connected';
+    entry.connection.connectionState = 'connected';
+    mesh.maybeRecoverStalledNegotiations();
+    assert.deepEqual(closed, []);
+    const restartedAt = mesh.connectionStartedAtMs.get(target);
+    assert.ok(Date.now() - restartedAt < 1_000);
+
+    mesh.maybeRecoverStalledNegotiations();
+    assert.deepEqual(closed, []);
+  } finally {
+    mesh.destroy();
+  }
+});
+
+test('PartialMesh forgets dial failures after the memory window so backoff cannot pin a peer forever', (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const target = '0'.repeat(63) + '2';
+  const mesh = new PartialMesh({
+    minPeers: 1,
+    maxPeers: 2,
+    autoDiscover: false,
+    autoConnect: false,
+  });
+  try {
+    mesh.noteDialFailure(target);
+    mesh.noteDialFailure(target);
+    mesh.noteDialFailure(target);
+    assert.equal(mesh.dialFailureCount.get(target), 3);
+
+    // Browsers reset these counters on tab focus; a Node watcher has no
+    // lifecycle events and depends on this decay for the same amnesty.
+    t.mock.timers.tick(59_000);
+    mesh.forgetStaleDialFailures(Date.now());
+    assert.equal(mesh.dialFailureCount.get(target), 3);
+
+    t.mock.timers.tick(1_001);
+    mesh.forgetStaleDialFailures(Date.now());
+    assert.equal(mesh.dialFailureCount.has(target), false);
+
+    // The next failure starts the ladder from the bottom again.
+    mesh.noteDialFailure(target);
+    assert.equal(mesh.dialFailureCount.get(target), 1);
   } finally {
     mesh.destroy();
   }

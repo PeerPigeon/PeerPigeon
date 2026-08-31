@@ -385,7 +385,40 @@ test('closing a pending transport emits disconnected even before its channel ope
   assert.deepEqual(coordinatedCloses, [{ peerId, reason: 'capacity_shed' }]);
 });
 
-test('an isolated adapter releases every stale direct edge immediately', (t) => {
+test('adapter preserves the FreeRTC close reason so intentional closes are not dial failures', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const peerId = '2'.repeat(64);
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
+    peerId: '1'.repeat(64),
+  });
+  const entries = new Map([[peerId, {
+    state: 'closed',
+    connection: { connectionState: 'closed', close() {} },
+    channel: { readyState: 'closed', close() {} },
+  }]]);
+  adapter.client = {
+    isRegistered: true,
+    mesh: { connections: entries },
+    advertise() {},
+    requestBootstrap() {},
+  };
+  adapter.connectedPeers.add(peerId);
+  const disconnects = [];
+  adapter.on('rtc:disconnected', (data) => disconnects.push(data));
+
+  // The remote peer shed this edge for capacity and said so in its `bye`.
+  // PartialMesh must see that reason, or it counts a healthy, intentional
+  // topology change as a dial failure and backs the peer off.
+  adapter.handleConnectionState({ peerId, state: 'closed', reason: 'capacity_shed' });
+
+  assert.equal(disconnects.length, 1);
+  assert.equal(disconnects[0].peerId, peerId);
+  assert.equal(disconnects[0].reason, 'capacity_shed');
+
+  adapter.disconnect();
+});
+
+test('a transient RTC disconnect is released only after the recovery grace expires', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
     peerId: '1'.repeat(64),
@@ -412,18 +445,28 @@ test('an isolated adapter releases every stale direct edge immediately', (t) => 
   entries.get(peerIds[0]).channel.readyState = 'closed';
   adapter.handleConnectionState({ peerId: peerIds[0], state: 'disconnected' });
 
+  // 'disconnected' is transient by spec: nothing may be torn down yet.
+  assert.equal(reannouncements, 0);
+  assert.deepEqual(disconnected, []);
+  assert.equal(entries.size, 2);
+
+  // The edge is still dead when the grace expires, so it is released now.
+  t.mock.timers.tick(3_000);
   assert.equal(reannouncements, 1);
   assert.deepEqual(disconnected, [peerIds[0]]);
   assert.equal(entries.size, 1);
 
+  // A transport that recovered inside the grace window is left alone.
   entries.get(peerIds[1]).state = 'recovering';
   entries.get(peerIds[1]).connection.connectionState = 'disconnected';
-  entries.get(peerIds[1]).channel.readyState = 'closed';
   adapter.handleConnectionState({ peerId: peerIds[1], state: 'disconnected' });
+  entries.get(peerIds[1]).state = 'connected';
+  entries.get(peerIds[1]).connection.connectionState = 'connected';
+  t.mock.timers.tick(3_000);
 
-  assert.equal(reannouncements, 2);
-  assert.deepEqual(new Set(disconnected), new Set(peerIds));
-  assert.equal(entries.size, 0);
+  assert.equal(reannouncements, 1);
+  assert.deepEqual(disconnected, [peerIds[0]]);
+  assert.equal(entries.size, 1);
 
   adapter.disconnect();
 });

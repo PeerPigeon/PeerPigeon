@@ -34,13 +34,29 @@ export const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
 // replacing one another during perfect-negotiation glare (notably in WebKit).
 // The other side may still dial after this short grace window so asymmetric
 // relay discovery cannot strand the pair.
-const PREFERRED_INITIATOR_GRACE_MS = 4_000;
+//
+// This grace must NOT equal the 4-second stalled-offer timeout below: when the
+// two numbers coincide, the preferred dialer abandons its offer at the exact
+// instant the non-preferred side starts dialing, so every retry round begins
+// with glare. Keep the grace offset from every negotiation timeout.
+const PREFERRED_INITIATOR_GRACE_MS = 5_000;
 
 // Opening a data channel is not enough to prove that a peer is healthy. Older
 // clients can replace a newly-open channel during simultaneous negotiation,
 // producing an open/close/redial loop. Preserve accumulated dial failures until
 // the edge has remained usable for a full maintenance window.
 const STABLE_PEER_CONNECTION_MS = 10_000;
+
+// Dial-failure accounting must decay. Browsers reset these counters on every
+// tab focus (lifecycle:resume), but a Node peer — the GitPigeon watcher — has
+// no lifecycle events, so without decay its failure counts only ever grow and
+// it redials the same neighbors at the 30-second ceiling forever.
+const DIAL_FAILURE_MEMORY_MS = 60_000;
+
+// A negotiation that keeps making phase progress (offer answered → ICE
+// connected → SCTP/data channel opening) deserves a fresh window per phase,
+// but no negotiation may extend itself indefinitely by oscillating.
+const NEGOTIATION_TOTAL_BUDGET_MS = 30_000;
 
 function canonicalSignalingUrl(value: string): string | null {
   try {
@@ -393,6 +409,7 @@ export class PartialMesh {
   private eventHandlers: Map<keyof PartialMeshEvents, Set<Function>> = new Map();
   private connecting: Set<string> = new Set();
   private connectionStartedAtMs: Map<string, number> = new Map();
+  private negotiationPhaseByPeerId: Map<string, { phase: string; firstSeenAt: number }> = new Map();
   /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
   private orphanRtcFirstSeenAtMs: Map<string, number> = new Map();
   private peerConnectedAtMs: Map<string, number> = new Map();
@@ -409,6 +426,7 @@ export class PartialMesh {
   private lastDiscoveryRefreshAtMs: number = 0;
   private lastSignalingReconnectAtMs: number = 0;
   private dialFailureCount: Map<string, number> = new Map();
+  private lastDialFailureAtMs: Map<string, number> = new Map();
   private dialBackoffUntilMs: Map<string, number> = new Map();
   private rebalanceCooldownUntilMs: number = 0;
   private rebalanceAttemptAtMs: Map<string, number> = new Map();
@@ -1308,6 +1326,7 @@ export class PartialMesh {
       }
       if (peerConnection.connected) return; // guard against duplicate events
       this.connectionStartedAtMs.delete(peerId);
+      this.negotiationPhaseByPeerId.delete(peerId);
       peerConnection.connected = true;
       this.peerConnectedAtMs.set(peerId, Date.now());
       this.connecting.delete(peerId);
@@ -1357,6 +1376,7 @@ export class PartialMesh {
       const peerConnection = this.peers.get(peerId);
       if (peerConnection) {
         this.connectionStartedAtMs.delete(peerId);
+        this.negotiationPhaseByPeerId.delete(peerId);
         const wasConnected = peerConnection.connected;
         const connectedAt = this.peerConnectedAtMs.get(peerId) ?? 0;
         this.peers.delete(peerId);
@@ -1595,10 +1615,10 @@ export class PartialMesh {
     const activeIceTimeoutMs = Math.max(6_000, this.config.connectionTimeoutMs);
 
     for (const peer of this.peers.values()) {
-      if (peer.connected) continue;
-
-      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
-      const ageMs = Math.max(0, now - startedAt);
+      if (peer.connected) {
+        this.negotiationPhaseByPeerId.delete(peer.id);
+        continue;
+      }
 
       const rtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(peer.id);
       const pc = rtcEntry?.connection;
@@ -1616,12 +1636,42 @@ export class PartialMesh {
         && dataState !== 'open'
         && (connectionState === 'new' || connectionState === 'connecting');
       const repeatedlyFailing = (this.dialFailureCount.get(peer.id) ?? 0) >= 2;
-      const timeoutMs = activeIce ? activeIceTimeoutMs : ownerTimeoutMs;
+      // A werift↔browser handshake reaches "peer connection connected" with
+      // the SCTP association and data channel still opening. Killing that
+      // window with the short stalled-offer deadline tore down handshakes
+      // that were milliseconds from completing — a native Node watcher was
+      // hit on nearly every attempt. Both live transport phases get the
+      // longer deadline; only a stalled offer or a dead transport gets the
+      // short one.
+      const timeoutMs = (activeIce || connectedWithoutChannel) ? activeIceTimeoutMs : ownerTimeoutMs;
 
-      if (ageMs < timeoutMs) continue;
+      // Age the negotiation per phase: every observable step forward (offer
+      // answered → ICE running → peer connection connected) restarts the
+      // deadline, because progress is evidence the handshake is alive. The
+      // total budget still bounds the whole attempt so phase changes cannot
+      // extend it forever.
+      const phase = deadTransport ? 'dead'
+        : connectedWithoutChannel ? 'sctp'
+          : activeIce ? 'ice'
+            : stalledOffer ? 'offer'
+              : noRtcProgress ? 'pending' : 'idle';
+      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
+      const tracked = this.negotiationPhaseByPeerId.get(peer.id);
+      const firstSeenAt = tracked?.firstSeenAt ?? startedAt;
+      if (!tracked || tracked.phase !== phase) {
+        this.negotiationPhaseByPeerId.set(peer.id, { phase, firstSeenAt });
+        // The first observation keeps the dial clock; a phase change restarts
+        // it so the next phase gets its own full window.
+        if (tracked) this.connectionStartedAtMs.set(peer.id, now);
+      }
+      const ageMs = Math.max(0, now - (this.connectionStartedAtMs.get(peer.id) ?? now));
+      const totalAgeMs = Math.max(0, now - firstSeenAt);
+
+      if (ageMs < timeoutMs && totalAgeMs < NEGOTIATION_TOTAL_BUDGET_MS) continue;
       if (!stalledOffer && !deadTransport && !noRtcProgress && !connectedWithoutChannel && !activeIce) {
         continue;
       }
+      this.negotiationPhaseByPeerId.delete(peer.id);
 
       this.noteDialFailure(peer.id);
       this.emit('peer:error', {
@@ -1728,6 +1778,7 @@ export class PartialMesh {
   private noteDialFailure(peerId: string): void {
     const failures = (this.dialFailureCount.get(peerId) ?? 0) + 1;
     this.dialFailureCount.set(peerId, failures);
+    this.lastDialFailureAtMs.set(peerId, Date.now());
     // FreeRTC has already exhausted the current negotiation generation. Keep
     // this exact target out for at least one maintenance turn so isolation can
     // rotate to a different live candidate instead of recreating it inline.
@@ -1737,12 +1788,29 @@ export class PartialMesh {
 
   private noteDialSuccess(peerId: string): void {
     this.dialFailureCount.delete(peerId);
+    this.lastDialFailureAtMs.delete(peerId);
     this.dialBackoffUntilMs.delete(peerId);
+  }
+
+  private forgetStaleDialFailures(now: number): void {
+    // Browsers wipe these counters on every tab focus through
+    // lifecycle:resume. A Node peer (the GitPigeon watcher) has no lifecycle
+    // events, so it needs the same amnesty on a clock: without it, failures
+    // accumulated during one bad negotiation window pin every future redial
+    // at the maximum backoff long after the network has recovered.
+    for (const [peerId, failedAt] of this.lastDialFailureAtMs) {
+      if (now - failedAt < DIAL_FAILURE_MEMORY_MS) continue;
+      this.lastDialFailureAtMs.delete(peerId);
+      this.dialFailureCount.delete(peerId);
+    }
   }
 
   private noteTransportDisconnect(peerId: string, connectedAt: number, reason?: string): void {
     // Locally-requested topology changes are not transport failures and should
-    // not delay a later intentional reconnect.
+    // not delay a later intentional reconnect. The reason string travels in
+    // the FreeRTC `bye` frame, so a remote peer's intentional close arrives
+    // here too — counting those as dial failures put both ends of a healthy
+    // capacity shed into mutual backoff.
     if (reason === 'local_close' || reason === 'capacity_shed') return;
 
     const connectedForMs = connectedAt > 0 ? Date.now() - connectedAt : 0;
@@ -1777,6 +1845,7 @@ export class PartialMesh {
     this.underConnectedSinceMs = null;
 
     this.connectionStartedAtMs.clear();
+    this.negotiationPhaseByPeerId.clear();
     this.peerConnectedAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
 
@@ -1853,6 +1922,7 @@ export class PartialMesh {
         this.connecting.delete(peerId);
         this.noteDialFailure(peerId);
         this.connectionStartedAtMs.delete(peerId);
+        this.negotiationPhaseByPeerId.delete(peerId);
         this.emit('peer:error', { peerId, error: err });
         this.removePeer(peerId);
       });
@@ -1895,6 +1965,7 @@ export class PartialMesh {
   private maintainPeerConnections(): void {
     const now = Date.now();
     this.noteStablePeerConnections(now);
+    this.forgetStaleDialFailures(now);
     this.recoverOrphanedRtcNegotiations(now);
     const connectedCount = this.getConnectedPeerCount();
     const pendingCount = this.getPendingPeerCount();
@@ -2060,6 +2131,7 @@ export class PartialMesh {
     if (peerConnection) {
       const wasConnected = peerConnection.connected;
       this.connectionStartedAtMs.delete(peerId);
+      this.negotiationPhaseByPeerId.delete(peerId);
       this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.peers.delete(peerId);
       this.peerConnectedAtMs.delete(peerId);
@@ -2775,6 +2847,7 @@ export class PartialMesh {
     this.activeSignalingPeers.clear();
     this.discoveredAtMs.clear();
     this.connectionStartedAtMs.clear();
+    this.negotiationPhaseByPeerId.clear();
     this.orphanRtcFirstSeenAtMs.clear();
     this.peerConnectedAtMs.clear();
     this.rebalanceAttemptAtMs.clear();

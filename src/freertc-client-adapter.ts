@@ -3,6 +3,13 @@ import { createSignalingClient, withdrawSignalingIdentity } from 'freertc/client
 type Handler = (...args: any[]) => void;
 
 const RECOVERY_PROBE_TIMEOUT_MS = 4_000;
+// RTCPeerConnection 'disconnected' is transient by specification: ICE consent
+// jitter routinely self-heals within a couple of seconds while the data
+// channel keeps working. Tearing the transport down on the first
+// 'disconnected' turned every blip into a full redial (and a dial-failure
+// penalty on both ends). Give the transport this long to recover before the
+// edge is released.
+const TRANSIENT_DISCONNECT_GRACE_MS = 3_000;
 const INITIAL_SIGNALING_HEALTH_DELAY_MS = 1_000;
 const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
 const DISCOVERY_ABSENCE_GRACE_MS = 30_000;
@@ -61,6 +68,7 @@ export class FreeRTCClientAdapter {
   private readonly connectedPeers = new Set<string>();
   private readonly pendingTransportRestorePeerIds = new Set<string>();
   private readonly recoveringPeerIds = new Set<string>();
+  private readonly transientDisconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly observedDataChannels = new WeakSet<object>();
   private client: any = null;
   private joinedOnce = false;
@@ -523,6 +531,7 @@ export class FreeRTCClientAdapter {
       // A fresh FreeRTC generation now owns this peer ID. Allow its own
       // failure/close events to trigger another immediate replacement.
       this.recoveringPeerIds.delete(peerId);
+      this.clearTransientDisconnectTimer(peerId);
       // FreeRTC creates responder transports before a data channel exists.
       // Surface that pending transport so PartialMesh counts it as owned
       // instead of misclassifying every inbound negotiation as an orphan.
@@ -531,17 +540,52 @@ export class FreeRTCClientAdapter {
     }
     if (state === 'connected') {
       this.recoveringPeerIds.delete(peerId);
+      this.clearTransientDisconnectTimer(peerId);
       this.failedPeerAdvertisementAtMs.delete(peerId);
       this.waitForOpenDataChannel(peerId);
       return;
     }
     if (state === 'disconnected' || state === 'recovering') {
-      this.markPeerTransportStale(peerId);
+      // Transient by specification — schedule a re-check instead of an
+      // immediate teardown, and release only if the transport has not
+      // recovered by then. A terminal failure still arrives as its own
+      // 'failed'/'closed' event and takes the immediate path below.
+      this.scheduleTransientDisconnectCheck(peerId);
       return;
     }
     if (state === 'failed' || state === 'closed') {
-      this.markPeerTransportStale(peerId, Boolean(data?.reason));
+      this.clearTransientDisconnectTimer(peerId);
+      // Keep the close reason: FreeRTC's `bye` frame carries it end-to-end,
+      // and PartialMesh must see 'local_close'/'capacity_shed' to know an
+      // intentional topology change from a transport failure.
+      this.markPeerTransportStale(peerId, Boolean(data?.reason), String(data?.reason ?? ''));
     }
+  }
+
+  private scheduleTransientDisconnectCheck(peerId: string): void {
+    if (this.transientDisconnectTimers.has(peerId)) return;
+    const timer = setTimeout(() => {
+      this.transientDisconnectTimers.delete(peerId);
+      if (this.intentionallyDisconnected) return;
+      const entry = this.client?.mesh?.connections?.get?.(peerId);
+      const connectionState = String(entry?.connection?.connectionState ?? entry?.state ?? '').toLowerCase();
+      const channelOpen = entry?.channel?.readyState === 'open';
+      if (channelOpen || connectionState === 'connected' || connectionState === 'connecting') return;
+      this.markPeerTransportStale(peerId);
+    }, TRANSIENT_DISCONNECT_GRACE_MS);
+    (timer as { unref?: () => void }).unref?.();
+    this.transientDisconnectTimers.set(peerId, timer);
+  }
+
+  private clearTransientDisconnectTimer(peerId: string): void {
+    const timer = this.transientDisconnectTimers.get(peerId);
+    if (timer) clearTimeout(timer);
+    this.transientDisconnectTimers.delete(peerId);
+  }
+
+  private clearTransientDisconnectTimers(): void {
+    for (const timer of this.transientDisconnectTimers.values()) clearTimeout(timer);
+    this.transientDisconnectTimers.clear();
   }
 
   private handleNegotiationFailure(data: { peerId?: string; reason?: string }): void {
@@ -571,8 +615,8 @@ export class FreeRTCClientAdapter {
     this.releaseStalePeerImmediately(peerId, true);
   }
 
-  private markPeerTransportStale(peerId: string, forceNotify = false): void {
-    this.releaseStalePeerImmediately(peerId, forceNotify);
+  private markPeerTransportStale(peerId: string, forceNotify = false, reason = ''): void {
+    this.releaseStalePeerImmediately(peerId, forceNotify, reason);
   }
 
   private observeDataChannel(peerId: string, channel: any): void {
@@ -600,9 +644,10 @@ export class FreeRTCClientAdapter {
     this.emitter.emit('rtc:connected', { peerId });
   }
 
-  private releaseStalePeerImmediately(peerId: string, forceNotify = false): void {
+  private releaseStalePeerImmediately(peerId: string, forceNotify = false, reason = ''): void {
     if (this.intentionallyDisconnected) return;
     if (this.recoveringPeerIds.has(peerId) && !forceNotify) return;
+    this.clearTransientDisconnectTimer(peerId);
     const entry = this.client?.mesh?.connections?.get?.(peerId);
     const wasConnected = this.connectedPeers.has(peerId);
     if (!entry && !wasConnected && !forceNotify) return;
@@ -617,7 +662,7 @@ export class FreeRTCClientAdapter {
       message: `[webrtc] stale transport to ${peerId} released immediately; redialing`,
     });
     this.nudgeSignaling();
-    this.emitter.emit('rtc:disconnected', { peerId });
+    this.emitter.emit('rtc:disconnected', reason ? { peerId, reason } : { peerId });
     this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
 
@@ -638,10 +683,12 @@ export class FreeRTCClientAdapter {
 
   private clearDisconnectGraceTimer(peerId: string): void {
     this.recoveringPeerIds.delete(peerId);
+    this.clearTransientDisconnectTimer(peerId);
   }
 
   private clearDisconnectGraceTimers(): void {
     this.recoveringPeerIds.clear();
+    this.clearTransientDisconnectTimers();
   }
 
   private clearRecoveryProbeTimer(): void {

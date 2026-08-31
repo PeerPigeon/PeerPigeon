@@ -927,6 +927,7 @@ declare class PartialMesh {
     private eventHandlers;
     private connecting;
     private connectionStartedAtMs;
+    private negotiationPhaseByPeerId;
     /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
     private orphanRtcFirstSeenAtMs;
     private peerConnectedAtMs;
@@ -943,6 +944,7 @@ declare class PartialMesh {
     private lastDiscoveryRefreshAtMs;
     private lastSignalingReconnectAtMs;
     private dialFailureCount;
+    private lastDialFailureAtMs;
     private dialBackoffUntilMs;
     private rebalanceCooldownUntilMs;
     private rebalanceAttemptAtMs;
@@ -1022,6 +1024,7 @@ declare class PartialMesh {
     private isPeerBackedOff;
     private noteDialFailure;
     private noteDialSuccess;
+    private forgetStaleDialFailures;
     private noteTransportDisconnect;
     private noteStablePeerConnections;
     private noteIntentionalShed;

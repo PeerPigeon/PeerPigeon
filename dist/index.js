@@ -1,6 +1,7 @@
 // src/freertc-client-adapter.ts
 import { createSignalingClient, withdrawSignalingIdentity } from "freertc/client";
 var RECOVERY_PROBE_TIMEOUT_MS = 4e3;
+var TRANSIENT_DISCONNECT_GRACE_MS = 3e3;
 var INITIAL_SIGNALING_HEALTH_DELAY_MS = 1e3;
 var SIGNALING_HEALTH_INTERVAL_MS = 15e3;
 var DISCOVERY_ABSENCE_GRACE_MS = 3e4;
@@ -42,6 +43,7 @@ var FreeRTCClientAdapter = class {
     this.connectedPeers = /* @__PURE__ */ new Set();
     this.pendingTransportRestorePeerIds = /* @__PURE__ */ new Set();
     this.recoveringPeerIds = /* @__PURE__ */ new Set();
+    this.transientDisconnectTimers = /* @__PURE__ */ new Map();
     this.observedDataChannels = /* @__PURE__ */ new WeakSet();
     this.client = null;
     this.joinedOnce = false;
@@ -435,22 +437,48 @@ var FreeRTCClientAdapter = class {
     }
     if (state === "connecting") {
       this.recoveringPeerIds.delete(peerId);
+      this.clearTransientDisconnectTimer(peerId);
       this.emitter.emit("rtc:connecting", { peerId });
       return;
     }
     if (state === "connected") {
       this.recoveringPeerIds.delete(peerId);
+      this.clearTransientDisconnectTimer(peerId);
       this.failedPeerAdvertisementAtMs.delete(peerId);
       this.waitForOpenDataChannel(peerId);
       return;
     }
     if (state === "disconnected" || state === "recovering") {
-      this.markPeerTransportStale(peerId);
+      this.scheduleTransientDisconnectCheck(peerId);
       return;
     }
     if (state === "failed" || state === "closed") {
-      this.markPeerTransportStale(peerId, Boolean(data?.reason));
+      this.clearTransientDisconnectTimer(peerId);
+      this.markPeerTransportStale(peerId, Boolean(data?.reason), String(data?.reason ?? ""));
     }
+  }
+  scheduleTransientDisconnectCheck(peerId) {
+    if (this.transientDisconnectTimers.has(peerId)) return;
+    const timer = setTimeout(() => {
+      this.transientDisconnectTimers.delete(peerId);
+      if (this.intentionallyDisconnected) return;
+      const entry = this.client?.mesh?.connections?.get?.(peerId);
+      const connectionState = String(entry?.connection?.connectionState ?? entry?.state ?? "").toLowerCase();
+      const channelOpen = entry?.channel?.readyState === "open";
+      if (channelOpen || connectionState === "connected" || connectionState === "connecting") return;
+      this.markPeerTransportStale(peerId);
+    }, TRANSIENT_DISCONNECT_GRACE_MS);
+    timer.unref?.();
+    this.transientDisconnectTimers.set(peerId, timer);
+  }
+  clearTransientDisconnectTimer(peerId) {
+    const timer = this.transientDisconnectTimers.get(peerId);
+    if (timer) clearTimeout(timer);
+    this.transientDisconnectTimers.delete(peerId);
+  }
+  clearTransientDisconnectTimers() {
+    for (const timer of this.transientDisconnectTimers.values()) clearTimeout(timer);
+    this.transientDisconnectTimers.clear();
   }
   handleNegotiationFailure(data) {
     const peerId = this.normalizePeerId(data?.peerId);
@@ -466,8 +494,8 @@ var FreeRTCClientAdapter = class {
     this.emitter.emit("rtc:negotiation-failed", { peerId, reason });
     this.releaseStalePeerImmediately(peerId, true);
   }
-  markPeerTransportStale(peerId, forceNotify = false) {
-    this.releaseStalePeerImmediately(peerId, forceNotify);
+  markPeerTransportStale(peerId, forceNotify = false, reason = "") {
+    this.releaseStalePeerImmediately(peerId, forceNotify, reason);
   }
   observeDataChannel(peerId, channel) {
     if (!channel || typeof channel !== "object" && typeof channel !== "function") return;
@@ -492,9 +520,10 @@ var FreeRTCClientAdapter = class {
     this.connectedPeers.add(peerId);
     this.emitter.emit("rtc:connected", { peerId });
   }
-  releaseStalePeerImmediately(peerId, forceNotify = false) {
+  releaseStalePeerImmediately(peerId, forceNotify = false, reason = "") {
     if (this.intentionallyDisconnected) return;
     if (this.recoveringPeerIds.has(peerId) && !forceNotify) return;
+    this.clearTransientDisconnectTimer(peerId);
     const entry = this.client?.mesh?.connections?.get?.(peerId);
     const wasConnected = this.connectedPeers.has(peerId);
     if (!entry && !wasConnected && !forceNotify) return;
@@ -513,7 +542,7 @@ var FreeRTCClientAdapter = class {
       message: `[webrtc] stale transport to ${peerId} released immediately; redialing`
     });
     this.nudgeSignaling();
-    this.emitter.emit("rtc:disconnected", { peerId });
+    this.emitter.emit("rtc:disconnected", reason ? { peerId, reason } : { peerId });
     this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
   waitForOpenDataChannel(peerId) {
@@ -530,9 +559,11 @@ var FreeRTCClientAdapter = class {
   }
   clearDisconnectGraceTimer(peerId) {
     this.recoveringPeerIds.delete(peerId);
+    this.clearTransientDisconnectTimer(peerId);
   }
   clearDisconnectGraceTimers() {
     this.recoveringPeerIds.clear();
+    this.clearTransientDisconnectTimers();
   }
   clearRecoveryProbeTimer() {
     if (this.recoveryProbeTimer) clearTimeout(this.recoveryProbeTimer);
@@ -3664,8 +3695,10 @@ var DEFAULT_SIGNALING_SERVERS = Object.freeze([
   "wss://oooooooooooooooooooooooooooo.ooo/ws"
 ]);
 var DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
-var PREFERRED_INITIATOR_GRACE_MS = 4e3;
+var PREFERRED_INITIATOR_GRACE_MS = 5e3;
 var STABLE_PEER_CONNECTION_MS = 1e4;
+var DIAL_FAILURE_MEMORY_MS = 6e4;
+var NEGOTIATION_TOTAL_BUDGET_MS = 3e4;
 function canonicalSignalingUrl(value) {
   try {
     const url = new URL(String(value || "").trim());
@@ -3770,6 +3803,7 @@ var PartialMesh = class {
     this.eventHandlers = /* @__PURE__ */ new Map();
     this.connecting = /* @__PURE__ */ new Set();
     this.connectionStartedAtMs = /* @__PURE__ */ new Map();
+    this.negotiationPhaseByPeerId = /* @__PURE__ */ new Map();
     /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
     this.orphanRtcFirstSeenAtMs = /* @__PURE__ */ new Map();
     this.peerConnectedAtMs = /* @__PURE__ */ new Map();
@@ -3786,6 +3820,7 @@ var PartialMesh = class {
     this.lastDiscoveryRefreshAtMs = 0;
     this.lastSignalingReconnectAtMs = 0;
     this.dialFailureCount = /* @__PURE__ */ new Map();
+    this.lastDialFailureAtMs = /* @__PURE__ */ new Map();
     this.dialBackoffUntilMs = /* @__PURE__ */ new Map();
     this.rebalanceCooldownUntilMs = 0;
     this.rebalanceAttemptAtMs = /* @__PURE__ */ new Map();
@@ -4497,6 +4532,7 @@ var PartialMesh = class {
       }
       if (peerConnection.connected) return;
       this.connectionStartedAtMs.delete(peerId);
+      this.negotiationPhaseByPeerId.delete(peerId);
       peerConnection.connected = true;
       this.peerConnectedAtMs.set(peerId, Date.now());
       this.connecting.delete(peerId);
@@ -4534,6 +4570,7 @@ var PartialMesh = class {
       const peerConnection = this.peers.get(peerId);
       if (peerConnection) {
         this.connectionStartedAtMs.delete(peerId);
+        this.negotiationPhaseByPeerId.delete(peerId);
         const wasConnected = peerConnection.connected;
         const connectedAt = this.peerConnectedAtMs.get(peerId) ?? 0;
         this.peers.delete(peerId);
@@ -4710,9 +4747,10 @@ var PartialMesh = class {
     const ownerTimeoutMs = Math.max(4e3, this.config.connectionTimeoutMs);
     const activeIceTimeoutMs = Math.max(6e3, this.config.connectionTimeoutMs);
     for (const peer of this.peers.values()) {
-      if (peer.connected) continue;
-      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
-      const ageMs = Math.max(0, now - startedAt);
+      if (peer.connected) {
+        this.negotiationPhaseByPeerId.delete(peer.id);
+        continue;
+      }
       const rtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(peer.id);
       const pc = rtcEntry?.connection;
       const signalingState = pc?.signalingState ?? "unknown";
@@ -4724,11 +4762,22 @@ var PartialMesh = class {
       const connectedWithoutChannel = signalingState === "stable" && dataState !== "open" && connectionState === "connected";
       const activeIce = signalingState === "stable" && dataState !== "open" && (connectionState === "new" || connectionState === "connecting");
       const repeatedlyFailing = (this.dialFailureCount.get(peer.id) ?? 0) >= 2;
-      const timeoutMs = activeIce ? activeIceTimeoutMs : ownerTimeoutMs;
-      if (ageMs < timeoutMs) continue;
+      const timeoutMs = activeIce || connectedWithoutChannel ? activeIceTimeoutMs : ownerTimeoutMs;
+      const phase = deadTransport ? "dead" : connectedWithoutChannel ? "sctp" : activeIce ? "ice" : stalledOffer ? "offer" : noRtcProgress ? "pending" : "idle";
+      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
+      const tracked = this.negotiationPhaseByPeerId.get(peer.id);
+      const firstSeenAt = tracked?.firstSeenAt ?? startedAt;
+      if (!tracked || tracked.phase !== phase) {
+        this.negotiationPhaseByPeerId.set(peer.id, { phase, firstSeenAt });
+        if (tracked) this.connectionStartedAtMs.set(peer.id, now);
+      }
+      const ageMs = Math.max(0, now - (this.connectionStartedAtMs.get(peer.id) ?? now));
+      const totalAgeMs = Math.max(0, now - firstSeenAt);
+      if (ageMs < timeoutMs && totalAgeMs < NEGOTIATION_TOTAL_BUDGET_MS) continue;
       if (!stalledOffer && !deadTransport && !noRtcProgress && !connectedWithoutChannel && !activeIce) {
         continue;
       }
+      this.negotiationPhaseByPeerId.delete(peer.id);
       this.noteDialFailure(peer.id);
       this.emit("peer:error", {
         peerId: peer.id,
@@ -4812,12 +4861,21 @@ var PartialMesh = class {
   noteDialFailure(peerId) {
     const failures = (this.dialFailureCount.get(peerId) ?? 0) + 1;
     this.dialFailureCount.set(peerId, failures);
+    this.lastDialFailureAtMs.set(peerId, Date.now());
     const backoffMs = Math.min(3e4, 1e3 * Math.pow(2, Math.min(failures - 1, 5)));
     this.dialBackoffUntilMs.set(peerId, Date.now() + backoffMs);
   }
   noteDialSuccess(peerId) {
     this.dialFailureCount.delete(peerId);
+    this.lastDialFailureAtMs.delete(peerId);
     this.dialBackoffUntilMs.delete(peerId);
+  }
+  forgetStaleDialFailures(now) {
+    for (const [peerId, failedAt] of this.lastDialFailureAtMs) {
+      if (now - failedAt < DIAL_FAILURE_MEMORY_MS) continue;
+      this.lastDialFailureAtMs.delete(peerId);
+      this.dialFailureCount.delete(peerId);
+    }
   }
   noteTransportDisconnect(peerId, connectedAt, reason) {
     if (reason === "local_close" || reason === "capacity_shed") return;
@@ -4847,6 +4905,7 @@ var PartialMesh = class {
     this.lastHardResetAtMs = Date.now();
     this.underConnectedSinceMs = null;
     this.connectionStartedAtMs.clear();
+    this.negotiationPhaseByPeerId.clear();
     this.peerConnectedAtMs.clear();
     this.pendingRebalanceDropByTarget.clear();
     const rtcConnections = this.signalingClient?.client?.mesh?.connections;
@@ -4905,6 +4964,7 @@ var PartialMesh = class {
         this.connecting.delete(peerId);
         this.noteDialFailure(peerId);
         this.connectionStartedAtMs.delete(peerId);
+        this.negotiationPhaseByPeerId.delete(peerId);
         this.emit("peer:error", { peerId, error: err });
         this.removePeer(peerId);
       });
@@ -4932,6 +4992,7 @@ var PartialMesh = class {
   maintainPeerConnections() {
     const now = Date.now();
     this.noteStablePeerConnections(now);
+    this.forgetStaleDialFailures(now);
     this.recoverOrphanedRtcNegotiations(now);
     const connectedCount = this.getConnectedPeerCount();
     const pendingCount = this.getPendingPeerCount();
@@ -5047,6 +5108,7 @@ var PartialMesh = class {
     if (peerConnection) {
       const wasConnected = peerConnection.connected;
       this.connectionStartedAtMs.delete(peerId);
+      this.negotiationPhaseByPeerId.delete(peerId);
       this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.peers.delete(peerId);
       this.peerConnectedAtMs.delete(peerId);
@@ -5624,6 +5686,7 @@ var PartialMesh = class {
     this.activeSignalingPeers.clear();
     this.discoveredAtMs.clear();
     this.connectionStartedAtMs.clear();
+    this.negotiationPhaseByPeerId.clear();
     this.orphanRtcFirstSeenAtMs.clear();
     this.peerConnectedAtMs.clear();
     this.rebalanceAttemptAtMs.clear();
