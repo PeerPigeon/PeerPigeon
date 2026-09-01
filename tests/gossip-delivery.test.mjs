@@ -875,7 +875,8 @@ test('PartialMesh does not run a second timer against FreeRTC negotiation owners
 
     assert.deepEqual(errors, [{
       peerId: target,
-      message: 'Negotiation stalled (signaling=unknown connection=unknown dataChannel=closed)',
+      // The message names the peer so relayed diagnostics attribute stalls.
+      message: `Negotiation stalled (signaling=unknown connection=unknown dataChannel=closed) with ${target.slice(0, 12)}`,
     }]);
     assert.deepEqual(closed, [target]);
     assert.equal(mesh.connecting.has(target), false);

@@ -1585,9 +1585,13 @@ export class PartialMesh {
 
       this.orphanRtcFirstSeenAtMs.delete(peerId);
       this.noteDialFailure(peerId);
+      // The peer id travels IN the message: every log line downstream —
+      // including watcher diagnostics relayed to other machines — names who
+      // the failing negotiation was with, or the stall stream is
+      // unattributable noise.
       this.emit('peer:error', {
         peerId,
-        error: new Error(`Untracked negotiation stalled (${connectionState || 'unknown'}/${channelState || 'closed'})`),
+        error: new Error(`Untracked negotiation stalled (${connectionState || 'unknown'}/${channelState || 'closed'}) with ${String(peerId).slice(0, 12)}`),
       });
       this.emit('signaling:log', {
         message: `[webrtc] purging stale untracked negotiation to ${peerId}; retrying`,
@@ -1674,9 +1678,11 @@ export class PartialMesh {
       this.negotiationPhaseByPeerId.delete(peer.id);
 
       this.noteDialFailure(peer.id);
+      // Same rule as the untracked variant: the message names the peer, so
+      // every consumer attributes the stall without code changes.
       this.emit('peer:error', {
         peerId: peer.id,
-        error: new Error(`Negotiation stalled (signaling=${signalingState} connection=${connectionState} dataChannel=${dataState})`)
+        error: new Error(`Negotiation stalled (signaling=${signalingState} connection=${connectionState} dataChannel=${dataState}) with ${peer.id.slice(0, 12)}`)
       });
       this.removePeer(peer.id);
 

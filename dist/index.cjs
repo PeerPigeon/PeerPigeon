@@ -4760,7 +4760,7 @@ var PartialMesh = class {
       this.noteDialFailure(peerId);
       this.emit("peer:error", {
         peerId,
-        error: new Error(`Untracked negotiation stalled (${connectionState || "unknown"}/${channelState || "closed"})`)
+        error: new Error(`Untracked negotiation stalled (${connectionState || "unknown"}/${channelState || "closed"}) with ${String(peerId).slice(0, 12)}`)
       });
       this.emit("signaling:log", {
         message: `[webrtc] purging stale untracked negotiation to ${peerId}; retrying`
@@ -4819,7 +4819,7 @@ var PartialMesh = class {
       this.noteDialFailure(peer.id);
       this.emit("peer:error", {
         peerId: peer.id,
-        error: new Error(`Negotiation stalled (signaling=${signalingState} connection=${connectionState} dataChannel=${dataState})`)
+        error: new Error(`Negotiation stalled (signaling=${signalingState} connection=${connectionState} dataChannel=${dataState}) with ${peer.id.slice(0, 12)}`)
       });
       this.removePeer(peer.id);
       if (isolated) {
