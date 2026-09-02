@@ -43,6 +43,27 @@ function packageIsPinned(packageRoot, dependencySpec, commit) {
     && resolvedCommit(installedLock, 'freertc') === commit;
 }
 
+// No pins: when the manifest follows FreeRTC's main branch, syncing means
+// installing whatever main is right now — not rewriting the manifest to a
+// commit. That keeps every checkout, every CI run and every consumer on the
+// same moving head instead of a hash someone has to remember to bump.
+const followsMain = /draeder\/freertc(?:\.git)?#main$/i.test(String(readJson(path.join(projectRoot, 'package.json')).dependencies?.freertc ?? ''));
+if (followsMain) {
+  for (const packageRoot of packageRoots) {
+    if (!existsSync(path.join(packageRoot, 'package.json'))) continue;
+    const label = path.relative(projectRoot, packageRoot) || '.';
+    try {
+      execFileSync('npm', ['update', 'freertc', '--no-audit', '--no-fund'], {
+        cwd: packageRoot, stdio: 'inherit', timeout: installTimeoutMs, killSignal: 'SIGKILL',
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      });
+      console.log(`FreeRTC follows main in ${label}`);
+    } catch (error) {
+      console.warn(`Could not refresh FreeRTC main in ${label}: ${error?.message || error}`);
+    }
+  }
+  process.exit(0);
+}
 let remoteHead = '';
 try {
   remoteHead = execFileSync('git', [
