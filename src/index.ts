@@ -52,6 +52,10 @@ const STABLE_PEER_CONNECTION_MS = 10_000;
 // no lifecycle events, so without decay its failure counts only ever grow and
 // it redials the same neighbors at the 30-second ceiling forever.
 const DIAL_FAILURE_MEMORY_MS = 60_000;
+// Consecutive failed handshakes after which a peer is quarantined rather than
+// redialled on the short backoff, and for how long.
+const CHRONIC_DIAL_FAILURES = 5;
+const CHRONIC_DIAL_QUARANTINE_MS = 5 * 60_000;
 
 // A negotiation that keeps making phase progress (offer answered → ICE
 // connected → SCTP/data channel opening) deserves a fresh window per phase,
@@ -1788,7 +1792,17 @@ export class PartialMesh {
     // FreeRTC has already exhausted the current negotiation generation. Keep
     // this exact target out for at least one maintenance turn so isolation can
     // rotate to a different live candidate instead of recreating it inline.
-    const backoffMs = Math.min(30_000, 1_000 * Math.pow(2, Math.min(failures - 1, 5)));
+    //
+    // A peer that keeps failing is not a blip: a browser tab the OS has put to
+    // sleep answers the offer and then never completes a channel, stays
+    // registered at the relay for as long as the tab exists, and changes id
+    // only on reload. Retrying it every thirty seconds cost every peer in the
+    // room a six-second failed handshake, all day, and read as "renegotiating"
+    // in every console. After a run of failures, quarantine it for minutes;
+    // the amnesty on a quiet clock (and a real suspend/resume) still forgives.
+    const backoffMs = failures >= CHRONIC_DIAL_FAILURES
+      ? CHRONIC_DIAL_QUARANTINE_MS
+      : Math.min(30_000, 1_000 * Math.pow(2, Math.min(failures - 1, 5)));
     this.dialBackoffUntilMs.set(peerId, Date.now() + backoffMs);
   }
 

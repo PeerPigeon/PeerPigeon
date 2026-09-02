@@ -3742,6 +3742,8 @@ var DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
 var PREFERRED_INITIATOR_GRACE_MS = 5e3;
 var STABLE_PEER_CONNECTION_MS = 1e4;
 var DIAL_FAILURE_MEMORY_MS = 6e4;
+var CHRONIC_DIAL_FAILURES = 5;
+var CHRONIC_DIAL_QUARANTINE_MS = 5 * 6e4;
 var NEGOTIATION_TOTAL_BUDGET_MS = 3e4;
 function canonicalSignalingUrl(value) {
   try {
@@ -4906,7 +4908,7 @@ var PartialMesh = class {
     const failures = (this.dialFailureCount.get(peerId) ?? 0) + 1;
     this.dialFailureCount.set(peerId, failures);
     this.lastDialFailureAtMs.set(peerId, Date.now());
-    const backoffMs = Math.min(3e4, 1e3 * Math.pow(2, Math.min(failures - 1, 5)));
+    const backoffMs = failures >= CHRONIC_DIAL_FAILURES ? CHRONIC_DIAL_QUARANTINE_MS : Math.min(3e4, 1e3 * Math.pow(2, Math.min(failures - 1, 5)));
     this.dialBackoffUntilMs.set(peerId, Date.now() + backoffMs);
   }
   noteDialSuccess(peerId) {
