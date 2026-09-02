@@ -207,6 +207,12 @@ var FreeRTCClientAdapter = class {
       iceServers: this.defaultIceServers ?? void 0,
       trickleIce: this.trickleIce,
       autoConnect: false,
+      // FreeRTC detected a suspend by the clock (a Node peer has no lifecycle
+      // events) and already rebuilt its transports; clear our own expired
+      // recovery state the same way a browser's thaw does.
+      onResume: ({ reason } = {}) => {
+        this.recoverAfterInactivity(String(reason || "clock_jump"));
+      },
       onLog: (message) => {
         if (!isCurrentClient()) return;
         this.emitter.emit("signaling:log", { message: String(message ?? "") });
