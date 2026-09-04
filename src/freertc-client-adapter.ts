@@ -2,7 +2,12 @@ import { createSignalingClient, withdrawSignalingIdentity } from 'freertc/client
 
 type Handler = (...args: any[]) => void;
 
-const RECOVERY_PROBE_TIMEOUT_MS = 4_000;
+const RECOVERY_PROBE_TIMEOUT_MS = 12_000;
+// A slow discovery reply is not a dead relay. Switching relays on every
+// missed probe re-registered the watcher elsewhere every fifteen seconds,
+// every browser's offers were routed to the relay it had just left, and
+// nothing ever converged. Only this many misses in a row move the socket.
+const HEALTH_PROBE_MISSES_BEFORE_RECYCLE = 3;
 // RTCPeerConnection 'disconnected' is transient by specification: ICE consent
 // jitter routinely self-heals within a couple of seconds while the data
 // channel keeps working. Tearing the transport down on the first
@@ -78,6 +83,7 @@ export class FreeRTCClientAdapter {
   private initialSignalingHealthTimer: ReturnType<typeof setTimeout> | null = null;
   private signalingHealthTimer: ReturnType<typeof setInterval> | null = null;
   private lastBootstrapAtMs = 0;
+  private healthProbeMisses = 0;
   private recyclingSignalingTransport = false;
   private waitingForTransportClose = false;
   private clientGeneration = 0;
@@ -247,6 +253,7 @@ export class FreeRTCClientAdapter {
       onBootstrap: (candidates: any[]) => {
         if (!isCurrentClient()) return;
         this.lastBootstrapAtMs = Date.now();
+        this.healthProbeMisses = 0;
         this.clearRecoveryProbeTimer();
         this.handleBootstrapCandidates(candidates);
       },
@@ -359,6 +366,7 @@ export class FreeRTCClientAdapter {
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
     this.lastBootstrapAtMs = 0;
+    this.healthProbeMisses = 0;
     this.client?.resetRecoveryBackoffs?.();
     // Notify PartialMesh so it can reset stale-age baselines. FreeRTC retains
     // ownership of restoration; this event must not trigger immediate redials.
@@ -709,6 +717,15 @@ export class FreeRTCClientAdapter {
       if (this.intentionallyDisconnected) return;
       if (typeof document !== 'undefined' && document.hidden) return;
       if (recycleOnTimeout) {
+        this.healthProbeMisses += 1;
+        if (this.healthProbeMisses < HEALTH_PROBE_MISSES_BEFORE_RECYCLE && this.client?.isRegistered) {
+          this.emitter.emit('signaling:log', {
+            message: `[signal] ${reason}: discovery slow (${this.healthProbeMisses}/${HEALTH_PROBE_MISSES_BEFORE_RECYCLE}); staying on this relay and re-announcing`,
+          });
+          this.nudgeSignaling();
+          return;
+        }
+        this.healthProbeMisses = 0;
         this.recycleStaleSignalingTransport(reason);
         return;
       }

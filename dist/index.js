@@ -1,6 +1,7 @@
 // src/freertc-client-adapter.ts
 import { createSignalingClient, withdrawSignalingIdentity } from "freertc/client";
-var RECOVERY_PROBE_TIMEOUT_MS = 4e3;
+var RECOVERY_PROBE_TIMEOUT_MS = 12e3;
+var HEALTH_PROBE_MISSES_BEFORE_RECYCLE = 3;
 var TRANSIENT_DISCONNECT_GRACE_MS = 3e3;
 var INITIAL_SIGNALING_HEALTH_DELAY_MS = 1e3;
 var SIGNALING_HEALTH_INTERVAL_MS = 15e3;
@@ -53,6 +54,7 @@ var FreeRTCClientAdapter = class {
     this.initialSignalingHealthTimer = null;
     this.signalingHealthTimer = null;
     this.lastBootstrapAtMs = 0;
+    this.healthProbeMisses = 0;
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
     this.clientGeneration = 0;
@@ -189,6 +191,7 @@ var FreeRTCClientAdapter = class {
       onBootstrap: (candidates) => {
         if (!isCurrentClient()) return;
         this.lastBootstrapAtMs = Date.now();
+        this.healthProbeMisses = 0;
         this.clearRecoveryProbeTimer();
         this.handleBootstrapCandidates(candidates);
       },
@@ -297,6 +300,7 @@ var FreeRTCClientAdapter = class {
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
     this.lastBootstrapAtMs = 0;
+    this.healthProbeMisses = 0;
     this.client?.resetRecoveryBackoffs?.();
     this.emitter.emit("lifecycle:resume", { reason });
     for (const peerId of Array.from(this.connectedPeers)) {
@@ -582,6 +586,15 @@ var FreeRTCClientAdapter = class {
       if (this.intentionallyDisconnected) return;
       if (typeof document !== "undefined" && document.hidden) return;
       if (recycleOnTimeout) {
+        this.healthProbeMisses += 1;
+        if (this.healthProbeMisses < HEALTH_PROBE_MISSES_BEFORE_RECYCLE && this.client?.isRegistered) {
+          this.emitter.emit("signaling:log", {
+            message: `[signal] ${reason}: discovery slow (${this.healthProbeMisses}/${HEALTH_PROBE_MISSES_BEFORE_RECYCLE}); staying on this relay and re-announcing`
+          });
+          this.nudgeSignaling();
+          return;
+        }
+        this.healthProbeMisses = 0;
         this.recycleStaleSignalingTransport(reason);
         return;
       }
