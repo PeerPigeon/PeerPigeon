@@ -4781,6 +4781,10 @@ var PartialMesh = class {
         continue;
       }
       const rtcEntry = this.signalingClient?.client?.mesh?.connections?.get?.(peer.id);
+      if (rtcEntry?.channel?.readyState === "open") {
+        this.negotiationPhaseByPeerId.delete(peer.id);
+        continue;
+      }
       const pc = rtcEntry?.connection;
       const signalingState = pc?.signalingState ?? "unknown";
       const connectionState = pc?.connectionState ?? rtcEntry?.state ?? "unknown";

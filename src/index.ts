@@ -1645,6 +1645,13 @@ export class PartialMesh {
       }
 
       const rtcEntry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(peer.id);
+      // An open data channel is a working transport whatever the handshake
+      // above it is still doing; executing the peer here closed channels
+      // that had opened a second earlier and the pair redialed forever.
+      if (rtcEntry?.channel?.readyState === 'open') {
+        this.negotiationPhaseByPeerId.delete(peer.id);
+        continue;
+      }
       const pc = rtcEntry?.connection;
       const signalingState = pc?.signalingState ?? 'unknown';
       const connectionState = pc?.connectionState ?? rtcEntry?.state ?? 'unknown';
