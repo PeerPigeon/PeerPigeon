@@ -771,9 +771,25 @@ export class PartialMesh {
     // healthy. Pending dials to peers missing from that snapshot should not
     // consume every bounded connection slot while announced alternatives wait.
     if (this.activeSignalingPeers.size > 0) {
+      // Only a dial that has made NO transport progress is replaced. A peer
+      // whose RTCPeerConnection is connecting or connected, or whose data
+      // channel is opening or open, is mid-handshake, not idle: killing it
+      // because one relay snapshot omitted it (federated lists are partial
+      // and peers on other relays are routinely missing) closed channels
+      // seconds after they opened, the remote read the close as transport
+      // death and redialed, and the pair looped for hours.
+      const transportInProgress = (peerId: string): boolean => {
+        const entry = this.signalingClient?.client?.mesh?.connections?.get?.(peerId);
+        if (!entry) return false;
+        const channelState = entry.channel?.readyState;
+        if (channelState === 'open' || channelState === 'connecting') return true;
+        const connectionState = entry.connection?.connectionState;
+        return connectionState === 'connected' || connectionState === 'connecting';
+      };
       const inactivePendingPeers = Array.from(this.peers.values()).filter((peer) => (
         !peer.connected
         && !this.activeSignalingPeers.has(peer.id)
+        && !transportInProgress(peer.id)
         && Array.from(this.activeSignalingPeers).some((peerId) => peerId !== peer.id)
       ));
       for (const peer of inactivePendingPeers) {

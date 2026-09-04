@@ -4091,7 +4091,15 @@ var PartialMesh = class {
       this.emit("mesh:graph", this.getGraphSnapshot());
     }
     if (this.activeSignalingPeers.size > 0) {
-      const inactivePendingPeers = Array.from(this.peers.values()).filter((peer) => !peer.connected && !this.activeSignalingPeers.has(peer.id) && Array.from(this.activeSignalingPeers).some((peerId) => peerId !== peer.id));
+      const transportInProgress = (peerId) => {
+        const entry = this.signalingClient?.client?.mesh?.connections?.get?.(peerId);
+        if (!entry) return false;
+        const channelState = entry.channel?.readyState;
+        if (channelState === "open" || channelState === "connecting") return true;
+        const connectionState = entry.connection?.connectionState;
+        return connectionState === "connected" || connectionState === "connecting";
+      };
+      const inactivePendingPeers = Array.from(this.peers.values()).filter((peer) => !peer.connected && !this.activeSignalingPeers.has(peer.id) && !transportInProgress(peer.id) && Array.from(this.activeSignalingPeers).some((peerId) => peerId !== peer.id));
       for (const peer of inactivePendingPeers) {
         this.emit("signaling:log", {
           message: `[webrtc] replacing pending dial to ${peer.id}; peer is absent from the current relay snapshot`
