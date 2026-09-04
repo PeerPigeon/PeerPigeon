@@ -308,11 +308,11 @@ var FreeRTCClientAdapter = class {
       const connectionState = String(entry?.connection?.connectionState ?? entry?.state ?? "").toLowerCase();
       const channelState = String(entry?.channel?.readyState ?? "").toLowerCase();
       if (!entry || channelState !== "open" || connectionState === "failed" || connectionState === "closed" || connectionState === "dead") {
-        this.releaseStalePeerImmediately(peerId);
+        this.releaseStalePeerImmediately(peerId, false, "", "resume-channel-not-open");
         continue;
       }
       if (connectionState === "disconnected" || connectionState === "recovering") {
-        this.releaseStalePeerImmediately(peerId);
+        this.releaseStalePeerImmediately(peerId, false, "", "resume-disconnected");
       }
     }
     if (!this.client?.isRegistered) {
@@ -359,8 +359,8 @@ var FreeRTCClientAdapter = class {
     try {
       this.client?.sendData(data, peerId);
     } catch (error) {
-      if (!error?.transient) {
-        this.releaseStalePeerImmediately(this.normalizePeerId(peerId));
+      if (!error?.transient && !this.transportStillOpening(this.normalizePeerId(peerId))) {
+        this.releaseStalePeerImmediately(this.normalizePeerId(peerId), false, String(error?.message ?? ""), "send-refused");
       }
       throw error;
     }
@@ -370,8 +370,8 @@ var FreeRTCClientAdapter = class {
       try {
         this.client?.sendData(data, peerId);
       } catch (error) {
-        if (!error?.transient) {
-          this.releaseStalePeerImmediately(peerId);
+        if (!error?.transient && !this.transportStillOpening(peerId)) {
+          this.releaseStalePeerImmediately(peerId, false, String(error?.message ?? ""), "broadcast-refused");
         }
       }
     }
@@ -464,7 +464,7 @@ var FreeRTCClientAdapter = class {
     }
     if (state === "failed" || state === "closed") {
       this.clearTransientDisconnectTimer(peerId);
-      this.markPeerTransportStale(peerId, Boolean(data?.reason), String(data?.reason ?? ""));
+      this.markPeerTransportStale(peerId, Boolean(data?.reason), String(data?.reason ?? ""), `connection-${state}`);
     }
   }
   scheduleTransientDisconnectCheck(peerId) {
@@ -476,7 +476,7 @@ var FreeRTCClientAdapter = class {
       const connectionState = String(entry?.connection?.connectionState ?? entry?.state ?? "").toLowerCase();
       const channelOpen = entry?.channel?.readyState === "open";
       if (channelOpen || connectionState === "connected" || connectionState === "connecting") return;
-      this.markPeerTransportStale(peerId);
+      this.markPeerTransportStale(peerId, false, "", "transient-disconnect-timeout");
     }, TRANSIENT_DISCONNECT_GRACE_MS);
     timer.unref?.();
     this.transientDisconnectTimers.set(peerId, timer);
@@ -502,10 +502,10 @@ var FreeRTCClientAdapter = class {
       this.knownPeerAdvertisedAtMs.get(peerId) ?? Date.now()
     );
     this.emitter.emit("rtc:negotiation-failed", { peerId, reason });
-    this.releaseStalePeerImmediately(peerId, true);
+    this.releaseStalePeerImmediately(peerId, true, reason, "negotiation-failed");
   }
-  markPeerTransportStale(peerId, forceNotify = false, reason = "") {
-    this.releaseStalePeerImmediately(peerId, forceNotify, reason);
+  markPeerTransportStale(peerId, forceNotify = false, reason = "", origin = "transport-stale") {
+    this.releaseStalePeerImmediately(peerId, forceNotify, reason, origin);
   }
   observeDataChannel(peerId, channel) {
     if (!channel || typeof channel !== "object" && typeof channel !== "function") return;
@@ -519,7 +519,7 @@ var FreeRTCClientAdapter = class {
     channel.addEventListener?.("close", () => {
       const current = this.client?.mesh?.connections?.get?.(peerId);
       if (this.intentionallyDisconnected || current?.channel !== channel) return;
-      this.markPeerTransportStale(peerId);
+      this.markPeerTransportStale(peerId, false, "", "channel-closed");
     }, { once: true });
   }
   activateOpenDataChannel(peerId, channel) {
@@ -530,7 +530,18 @@ var FreeRTCClientAdapter = class {
     this.connectedPeers.add(peerId);
     this.emitter.emit("rtc:connected", { peerId });
   }
-  releaseStalePeerImmediately(peerId, forceNotify = false, reason = "") {
+  // A refusal on a transport that is still connecting, or whose channel is
+  // open or opening, is a race with the open, not proof the edge is gone.
+  // Releasing on it dropped every peer the instant it connected.
+  transportStillOpening(peerId) {
+    const entry = this.client?.mesh?.connections?.get?.(peerId);
+    if (!entry) return false;
+    const channelState = entry.channel?.readyState;
+    if (channelState === "open" || channelState === "connecting") return true;
+    const connectionState = entry.connection?.connectionState;
+    return connectionState === "connecting" || connectionState === "new" || connectionState === "connected";
+  }
+  releaseStalePeerImmediately(peerId, forceNotify = false, reason = "", origin = "") {
     if (this.intentionallyDisconnected) return;
     if (this.recoveringPeerIds.has(peerId) && !forceNotify) return;
     this.clearTransientDisconnectTimer(peerId);
@@ -549,7 +560,7 @@ var FreeRTCClientAdapter = class {
     } catch {
     }
     this.emitter.emit("signaling:log", {
-      message: `[webrtc] stale transport to ${peerId} released immediately; redialing`
+      message: `[webrtc] stale transport to ${peerId} released immediately (${origin || "unspecified"}${reason ? `: ${reason}` : ""}); redialing`
     });
     this.nudgeSignaling();
     this.emitter.emit("rtc:disconnected", reason ? { peerId, reason } : { peerId });
@@ -560,7 +571,7 @@ var FreeRTCClientAdapter = class {
     const entry = this.client?.mesh?.connections?.get?.(peerId);
     const failed = !entry || entry?.connection?.connectionState === "failed" || entry?.connection?.connectionState === "closed";
     if (failed) {
-      this.releaseStalePeerImmediately(peerId);
+      this.releaseStalePeerImmediately(peerId, false, "", "wait-open-failed");
       return;
     }
     if (!entry.channel) return;

@@ -378,12 +378,12 @@ export class FreeRTCClientAdapter {
       const channelState = String(entry?.channel?.readyState ?? '').toLowerCase();
 
       if (!entry || channelState !== 'open' || connectionState === 'failed' || connectionState === 'closed' || connectionState === 'dead') {
-        this.releaseStalePeerImmediately(peerId);
+        this.releaseStalePeerImmediately(peerId, false, '', 'resume-channel-not-open');
         continue;
       }
 
       if (connectionState === 'disconnected' || connectionState === 'recovering') {
-        this.releaseStalePeerImmediately(peerId);
+        this.releaseStalePeerImmediately(peerId, false, '', 'resume-disconnected');
       }
     }
 
@@ -431,8 +431,8 @@ export class FreeRTCClientAdapter {
       // or riding out an ICE blip as transient — the edge recovers on its
       // own, and releasing it here turned every blip into a redial flap.
       // Only a terminal refusal proves the edge is gone.
-      if (!(error as { transient?: boolean })?.transient) {
-        this.releaseStalePeerImmediately(this.normalizePeerId(peerId));
+      if (!(error as { transient?: boolean })?.transient && !this.transportStillOpening(this.normalizePeerId(peerId))) {
+        this.releaseStalePeerImmediately(this.normalizePeerId(peerId), false, String((error as Error)?.message ?? ''), 'send-refused');
       }
       throw error;
     }
@@ -446,8 +446,8 @@ export class FreeRTCClientAdapter {
         // A terminal send failure is proof this edge is not usable; a
         // transient one is a connection mid-recovery that must be left
         // alone — gossip anti-entropy re-covers whatever this send missed.
-        if (!(error as { transient?: boolean })?.transient) {
-          this.releaseStalePeerImmediately(peerId);
+        if (!(error as { transient?: boolean })?.transient && !this.transportStillOpening(peerId)) {
+          this.releaseStalePeerImmediately(peerId, false, String((error as Error)?.message ?? ''), 'broadcast-refused');
         }
       }
     }
@@ -572,7 +572,7 @@ export class FreeRTCClientAdapter {
       // Keep the close reason: FreeRTC's `bye` frame carries it end-to-end,
       // and PartialMesh must see 'local_close'/'capacity_shed' to know an
       // intentional topology change from a transport failure.
-      this.markPeerTransportStale(peerId, Boolean(data?.reason), String(data?.reason ?? ''));
+      this.markPeerTransportStale(peerId, Boolean(data?.reason), String(data?.reason ?? ''), `connection-${state}`);
     }
   }
 
@@ -585,7 +585,7 @@ export class FreeRTCClientAdapter {
       const connectionState = String(entry?.connection?.connectionState ?? entry?.state ?? '').toLowerCase();
       const channelOpen = entry?.channel?.readyState === 'open';
       if (channelOpen || connectionState === 'connected' || connectionState === 'connecting') return;
-      this.markPeerTransportStale(peerId);
+      this.markPeerTransportStale(peerId, false, '', 'transient-disconnect-timeout');
     }, TRANSIENT_DISCONNECT_GRACE_MS);
     (timer as { unref?: () => void }).unref?.();
     this.transientDisconnectTimers.set(peerId, timer);
@@ -626,11 +626,11 @@ export class FreeRTCClientAdapter {
     // negotiation. Release that dead generation immediately so PartialMesh can
     // remove its pending dial and use a fresh discovery candidate instead of
     // waiting for a browser-specific connection-state event or the 45s guard.
-    this.releaseStalePeerImmediately(peerId, true);
+    this.releaseStalePeerImmediately(peerId, true, reason, 'negotiation-failed');
   }
 
-  private markPeerTransportStale(peerId: string, forceNotify = false, reason = ''): void {
-    this.releaseStalePeerImmediately(peerId, forceNotify, reason);
+  private markPeerTransportStale(peerId: string, forceNotify = false, reason = '', origin = 'transport-stale'): void {
+    this.releaseStalePeerImmediately(peerId, forceNotify, reason, origin);
   }
 
   private observeDataChannel(peerId: string, channel: any): void {
@@ -645,7 +645,7 @@ export class FreeRTCClientAdapter {
     channel.addEventListener?.('close', () => {
       const current = this.client?.mesh?.connections?.get?.(peerId);
       if (this.intentionallyDisconnected || current?.channel !== channel) return;
-      this.markPeerTransportStale(peerId);
+      this.markPeerTransportStale(peerId, false, '', 'channel-closed');
     }, { once: true });
   }
 
@@ -658,7 +658,19 @@ export class FreeRTCClientAdapter {
     this.emitter.emit('rtc:connected', { peerId });
   }
 
-  private releaseStalePeerImmediately(peerId: string, forceNotify = false, reason = ''): void {
+  // A refusal on a transport that is still connecting, or whose channel is
+  // open or opening, is a race with the open, not proof the edge is gone.
+  // Releasing on it dropped every peer the instant it connected.
+  private transportStillOpening(peerId: string): boolean {
+    const entry = this.client?.mesh?.connections?.get?.(peerId);
+    if (!entry) return false;
+    const channelState = entry.channel?.readyState;
+    if (channelState === 'open' || channelState === 'connecting') return true;
+    const connectionState = entry.connection?.connectionState;
+    return connectionState === 'connecting' || connectionState === 'new' || connectionState === 'connected';
+  }
+
+  private releaseStalePeerImmediately(peerId: string, forceNotify = false, reason = '', origin = ''): void {
     if (this.intentionallyDisconnected) return;
     if (this.recoveringPeerIds.has(peerId) && !forceNotify) return;
     this.clearTransientDisconnectTimer(peerId);
@@ -673,7 +685,7 @@ export class FreeRTCClientAdapter {
     try { entry?.connection?.close?.(); } catch { /* best effort */ }
 
     this.emitter.emit('signaling:log', {
-      message: `[webrtc] stale transport to ${peerId} released immediately; redialing`,
+      message: `[webrtc] stale transport to ${peerId} released immediately (${origin || 'unspecified'}${reason ? `: ${reason}` : ''}); redialing`,
     });
     this.nudgeSignaling();
     this.emitter.emit('rtc:disconnected', reason ? { peerId, reason } : { peerId });
@@ -687,7 +699,7 @@ export class FreeRTCClientAdapter {
       || entry?.connection?.connectionState === 'failed'
       || entry?.connection?.connectionState === 'closed';
     if (failed) {
-      this.releaseStalePeerImmediately(peerId);
+      this.releaseStalePeerImmediately(peerId, false, '', 'wait-open-failed');
       return;
     }
     if (!entry.channel) return;
