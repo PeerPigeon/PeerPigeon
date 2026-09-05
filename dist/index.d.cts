@@ -300,6 +300,7 @@ declare class GossipProtocol {
     private extendRoutePath;
     private compactRoutePeerId;
     private static readonly INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS;
+    private static readonly MAX_REPLAYS_PER_PEER;
     private initialSpreadRepairAtMs;
     private scheduleInitialSpreadRepair;
     private validSpreadEnvelope;

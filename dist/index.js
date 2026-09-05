@@ -1083,7 +1083,13 @@ var _GossipProtocol = class _GossipProtocol {
    */
   handleIncomingMessage(message, fromPeerId) {
     const receivedAt = Date.now();
-    if (receivedAt > this.initialSpreadDeadlineAt(message)) return;
+    if (receivedAt > this.initialSpreadDeadlineAt(message)) {
+      if (!this.messageLog.has(message.id)) {
+        this.messageLog.set(message.id, { timestamp: receivedAt, sender: message.sender, hops: message.hops });
+        if (this.messageLog.size > this.maxTrackedMessages) this.pruneTracking();
+      }
+      return;
+    }
     const alreadySeen = this.messageLog.has(message.id);
     this.retainGossipMessage(message);
     if (message.delivery) {
@@ -1254,7 +1260,7 @@ var _GossipProtocol = class _GossipProtocol {
       message.messageIds.filter((messageId) => typeof messageId === "string" && messageId.length <= 512).slice(0, limit)
     ));
     if (message.mode === "summary") {
-      const missing = messageIds.filter((messageId) => !this.retainedMessages.has(messageId)).slice(0, this.antiEntropyRequestSize);
+      const missing = messageIds.filter((messageId) => !this.retainedMessages.has(messageId) && !this.messageLog.has(messageId)).slice(0, this.antiEntropyRequestSize);
       if (missing.length === 0) return;
       const request = {
         id: this.generateMessageId(this.mesh.getClientId()),
@@ -1276,6 +1282,10 @@ var _GossipProtocol = class _GossipProtocol {
       const retained = this.retainedMessages.get(messageId);
       if (!retained) continue;
       if (this.initialSpreadComplete(retained.message) || !this.canContinueInitialSpread(retained.message, fromPeerId)) continue;
+      const replays = retained.replayedTo ?? (retained.replayedTo = /* @__PURE__ */ new Map());
+      const replayed = replays.get(fromPeerId) ?? 0;
+      if (replayed >= _GossipProtocol.MAX_REPLAYS_PER_PEER) continue;
+      replays.set(fromPeerId, replayed + 1);
       const deliveryState = this.deliveryStates.get(messageId);
       const repaired = {
         ...retained.message,
@@ -2411,6 +2421,7 @@ var _GossipProtocol = class _GossipProtocol {
 // round per half second carries the same information; the two-second sync
 // loop still runs behind it.
 _GossipProtocol.INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS = 500;
+_GossipProtocol.MAX_REPLAYS_PER_PEER = 3;
 var GossipProtocol = _GossipProtocol;
 
 // src/storage.ts

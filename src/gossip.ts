@@ -397,6 +397,7 @@ export class GossipProtocol {
     retainedAt: number;
     viewId: string;
     viewSize: number;
+    replayedTo?: Map<string, number>;
   }> = new Map();
   private dirtyDeliveryReceiptIds: Set<string> = new Set();
   private gossipFanoutCursor = 0;
@@ -646,7 +647,18 @@ export class GossipProtocol {
    */
   handleIncomingMessage(message: GossipMessage, fromPeerId: string): void {
     const receivedAt = Date.now();
-    if (receivedAt > this.initialSpreadDeadlineAt(message)) return;
+    if (receivedAt > this.initialSpreadDeadlineAt(message)) {
+      // Past its spread deadline by THIS clock. Dropping it without a trace
+      // meant the next anti-entropy summary listed it as missing again, the
+      // peer replayed it again, and — with the peer's clock a little behind
+      // ours — a half-megabyte record crossed the link thirty times a second
+      // for as long as the peer retained it. Remember the id as seen.
+      if (!this.messageLog.has(message.id)) {
+        this.messageLog.set(message.id, { timestamp: receivedAt, sender: message.sender, hops: message.hops });
+        if (this.messageLog.size > this.maxTrackedMessages) this.pruneTracking();
+      }
+      return;
+    }
     const alreadySeen = this.messageLog.has(message.id);
 
     // Store before the duplicate check. A repeated envelope may restore a
@@ -742,6 +754,7 @@ export class GossipProtocol {
   // round per half second carries the same information; the two-second sync
   // loop still runs behind it.
   private static readonly INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS = 500;
+  private static readonly MAX_REPLAYS_PER_PEER = 3;
   private initialSpreadRepairAtMs = 0;
 
   private scheduleInitialSpreadRepair(_startedAt: number = Date.now()): void {
@@ -897,8 +910,10 @@ export class GossipProtocol {
     ));
 
     if (message.mode === 'summary') {
+      // A message this node has seen — retained, or logged and declined —
+      // is not missing, whatever happened to its payload since.
       const missing = messageIds
-        .filter((messageId) => !this.retainedMessages.has(messageId))
+        .filter((messageId) => !this.retainedMessages.has(messageId) && !this.messageLog.has(messageId))
         .slice(0, this.antiEntropyRequestSize);
       if (missing.length === 0) return;
       const request: GossipAntiEntropyMessage = {
@@ -926,6 +941,13 @@ export class GossipProtocol {
         this.initialSpreadComplete(retained.message)
         || !this.canContinueInitialSpread(retained.message, fromPeerId)
       ) continue;
+      // A peer that keeps asking for the same message is not receiving it
+      // for a reason repetition will not fix (a clock ahead of ours, a
+      // payload it rejects). A few replays per peer are plenty.
+      const replays = retained.replayedTo ??= new Map<string, number>();
+      const replayed = replays.get(fromPeerId) ?? 0;
+      if (replayed >= GossipProtocol.MAX_REPLAYS_PER_PEER) continue;
+      replays.set(fromPeerId, replayed + 1);
       const deliveryState = this.deliveryStates.get(messageId);
       const repaired: GossipMessage = {
         ...retained.message,
