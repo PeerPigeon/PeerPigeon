@@ -784,7 +784,14 @@ export class PartialMesh {
         const channelState = entry.channel?.readyState;
         if (channelState === 'open' || channelState === 'connecting') return true;
         const connectionState = entry.connection?.connectionState;
-        return connectionState === 'connected' || connectionState === 'connecting';
+        if (connectionState === 'connected' || connectionState === 'connecting') return true;
+        // An offer on the wire is progress too. A peer on another relay is
+        // routinely missing from this relay's snapshot while its answer is in
+        // flight; replacing the dial here made every late answer land on a
+        // connection that no longer existed, and the pair redialed forever.
+        // The offer's own retry budget decides when a silent peer is given up.
+        const signalingState = entry.connection?.signalingState;
+        return signalingState === 'have-local-offer' || signalingState === 'have-remote-offer';
       };
       const inactivePendingPeers = Array.from(this.peers.values()).filter((peer) => (
         !peer.connected

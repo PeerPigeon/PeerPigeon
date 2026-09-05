@@ -4159,7 +4159,9 @@ var PartialMesh = class {
         const channelState = entry.channel?.readyState;
         if (channelState === "open" || channelState === "connecting") return true;
         const connectionState = entry.connection?.connectionState;
-        return connectionState === "connected" || connectionState === "connecting";
+        if (connectionState === "connected" || connectionState === "connecting") return true;
+        const signalingState = entry.connection?.signalingState;
+        return signalingState === "have-local-offer" || signalingState === "have-remote-offer";
       };
       const inactivePendingPeers = Array.from(this.peers.values()).filter((peer) => !peer.connected && !this.activeSignalingPeers.has(peer.id) && !transportInProgress(peer.id) && Array.from(this.activeSignalingPeers).some((peerId) => peerId !== peer.id));
       for (const peer of inactivePendingPeers) {
