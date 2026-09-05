@@ -778,6 +778,7 @@ export class GossipProtocol {
     message: GossipMessage,
     targetPeerId?: string,
     now: number = Date.now(),
+    view?: { peers: string[]; hash: string },
   ): boolean {
     if (now > this.initialSpreadDeadlineAt(message)) return false;
     const spread = this.validSpreadEnvelope(message);
@@ -787,8 +788,14 @@ export class GossipProtocol {
     if (!targetPeerId) return true;
     const retained = this.retainedMessages.get(message.id);
     if (!retained) return false;
-    const peers = this.canonicalPeerSet();
-    if (peers.length !== retained.viewSize || this.canonicalSetHash(peers) !== retained.viewId) return false;
+    // The view is the same for every message in a round: the caller computes
+    // it once. Recomputing the sorted peer set and its BigInt hash per
+    // retained message, per target, per round put a watcher holding a few
+    // thousand retained messages at a full CPU core doing nothing else.
+    const peers = view?.peers ?? this.canonicalPeerSet();
+    if (peers.length !== retained.viewSize) return false;
+    const hash = view?.hash ?? this.canonicalSetHash(peers);
+    if (hash !== retained.viewId) return false;
     return peers.includes(targetPeerId);
   }
 
@@ -811,12 +818,21 @@ export class GossipProtocol {
 
   private recentRetainedMessageIds(targetPeerId: string, now: number = Date.now()): string[] {
     const minRetainedAt = now - this.trackingRetentionMs;
-    return Array.from(this.retainedMessages.entries())
-      .filter(([, retained]) => retained.retainedAt >= minRetainedAt
-        && !this.initialSpreadComplete(retained.message)
-        && this.canContinueInitialSpread(retained.message, targetPeerId, now))
-      .slice(-this.antiEntropySummarySize)
-      .map(([messageId]) => messageId);
+    const peers = this.canonicalPeerSet();
+    const view = { peers, hash: this.canonicalSetHash(peers) };
+    const messageIds: string[] = [];
+    for (const [messageId, retained] of this.retainedMessages) {
+      if (retained.retainedAt < minRetainedAt) continue;
+      // A message whose recorded view is a different size than the current
+      // one can never be replayed to this target; skip it before any of the
+      // expensive checks.
+      if (retained.viewSize !== peers.length) continue;
+      if (now > this.initialSpreadDeadlineAt(retained.message)) continue;
+      if (this.initialSpreadComplete(retained.message)) continue;
+      if (!this.canContinueInitialSpread(retained.message, targetPeerId, now, view)) continue;
+      messageIds.push(messageId);
+    }
+    return messageIds.slice(-this.antiEntropySummarySize);
   }
 
   private publishGossipAntiEntropy(targetPeerId?: string): void {

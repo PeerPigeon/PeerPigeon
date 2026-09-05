@@ -1172,15 +1172,17 @@ var GossipProtocol = class {
     if (envelopeDeadlines.length > 0) return Math.min(...envelopeDeadlines);
     return Number(message.timestamp) + this.deliveryTimeoutMs;
   }
-  canContinueInitialSpread(message, targetPeerId, now = Date.now()) {
+  canContinueInitialSpread(message, targetPeerId, now = Date.now(), view) {
     if (now > this.initialSpreadDeadlineAt(message)) return false;
     const spread = this.validSpreadEnvelope(message);
     if (!spread) return targetPeerId == null;
     if (!targetPeerId) return true;
     const retained = this.retainedMessages.get(message.id);
     if (!retained) return false;
-    const peers = this.canonicalPeerSet();
-    if (peers.length !== retained.viewSize || this.canonicalSetHash(peers) !== retained.viewId) return false;
+    const peers = view?.peers ?? this.canonicalPeerSet();
+    if (peers.length !== retained.viewSize) return false;
+    const hash = view?.hash ?? this.canonicalSetHash(peers);
+    if (hash !== retained.viewId) return false;
     return peers.includes(targetPeerId);
   }
   initialSpreadComplete(message) {
@@ -1199,7 +1201,18 @@ var GossipProtocol = class {
   }
   recentRetainedMessageIds(targetPeerId, now = Date.now()) {
     const minRetainedAt = now - this.trackingRetentionMs;
-    return Array.from(this.retainedMessages.entries()).filter(([, retained]) => retained.retainedAt >= minRetainedAt && !this.initialSpreadComplete(retained.message) && this.canContinueInitialSpread(retained.message, targetPeerId, now)).slice(-this.antiEntropySummarySize).map(([messageId]) => messageId);
+    const peers = this.canonicalPeerSet();
+    const view = { peers, hash: this.canonicalSetHash(peers) };
+    const messageIds = [];
+    for (const [messageId, retained] of this.retainedMessages) {
+      if (retained.retainedAt < minRetainedAt) continue;
+      if (retained.viewSize !== peers.length) continue;
+      if (now > this.initialSpreadDeadlineAt(retained.message)) continue;
+      if (this.initialSpreadComplete(retained.message)) continue;
+      if (!this.canContinueInitialSpread(retained.message, targetPeerId, now, view)) continue;
+      messageIds.push(messageId);
+    }
+    return messageIds.slice(-this.antiEntropySummarySize);
   }
   publishGossipAntiEntropy(targetPeerId) {
     const self = this.mesh.getClientId();
