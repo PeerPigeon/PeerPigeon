@@ -888,7 +888,7 @@ var MAX_REPAIR_ATTEMPTS_PER_TARGET = 3;
 var DEFAULT_ANTI_ENTROPY_SUMMARY_SIZE = 256;
 var DEFAULT_ANTI_ENTROPY_REQUEST_SIZE = 64;
 var MAX_ROUTE_TRACE_PEERS = 32;
-var GossipProtocol = class {
+var _GossipProtocol = class _GossipProtocol {
   constructor(mesh, options = {}) {
     this.messageLog = /* @__PURE__ */ new Map();
     this.maxTrackedMessages = 12e3;
@@ -911,6 +911,7 @@ var GossipProtocol = class {
     this.destroyed = false;
     this.callbacks = {};
     this.peers = /* @__PURE__ */ new Map();
+    this.initialSpreadRepairAtMs = 0;
     this.mesh = mesh;
     this.maxHops = options.maxHops ?? 5;
     this.maxDirectHops = options.maxDirectHops ?? CECR_ID_WIDTH_BITS;
@@ -1191,12 +1192,20 @@ var GossipProtocol = class {
   scheduleInitialSpreadRepair(_startedAt = Date.now()) {
     if (this.initialSpreadRepairQueued || this.destroyed) return;
     this.initialSpreadRepairQueued = true;
-    queueMicrotask(() => {
+    const elapsed = Date.now() - this.initialSpreadRepairAtMs;
+    const run = () => {
       this.initialSpreadRepairQueued = false;
       if (this.destroyed) return;
+      this.initialSpreadRepairAtMs = Date.now();
       this.publishGossipAntiEntropy();
       this.maintainTrackedDeliveries();
-    });
+    };
+    if (elapsed >= _GossipProtocol.INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS) {
+      queueMicrotask(run);
+    } else {
+      const timer = setTimeout(run, _GossipProtocol.INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS - elapsed);
+      timer.unref?.();
+    }
   }
   validSpreadEnvelope(message) {
     const spread = message.spread;
@@ -2435,6 +2444,12 @@ var GossipProtocol = class {
     }
   }
 };
+// A repair round per retained message was a summary to every fan-out peer
+// for every message that arrived: twenty-five a second on a busy link. One
+// round per half second carries the same information; the two-second sync
+// loop still runs behind it.
+_GossipProtocol.INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS = 500;
+var GossipProtocol = _GossipProtocol;
 
 // src/storage.ts
 var MemoryStorageDriver = class {
@@ -3782,6 +3797,7 @@ var DIAL_FAILURE_MEMORY_MS = 6e4;
 var CHRONIC_DIAL_FAILURES = 5;
 var CHRONIC_DIAL_QUARANTINE_MS = 5 * 6e4;
 var NEGOTIATION_TOTAL_BUDGET_MS = 3e4;
+var MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1e3;
 function canonicalSignalingUrl(value) {
   try {
     const url = new URL(String(value || "").trim());
@@ -3921,6 +3937,15 @@ var PartialMesh = class {
     this.peerTopologyById = /* @__PURE__ */ new Map();
     this.localCapacityUpdatedAtMs = Date.now();
     this.localTopologyUpdatedAtMs = Date.now();
+    // Membership is re-broadcast whenever a received one changes the view,
+    // and every record carries a fresh timestamp, so two peers could answer
+    // each other at wire speed: a probe measured eighty membership frames a
+    // second on one link, each chunked because the payload runs past the
+    // frame limit, and both watchers spent a core on nothing else. At most
+    // one broadcast per interval; a change inside the window is sent when
+    // the window closes, so nothing is lost, only coalesced.
+    this.membershipBroadcastAtMs = 0;
+    this.membershipBroadcastTimer = null;
     const automaticSignalingServer = config.automaticSignalingServer ?? !config.signalingServer;
     const bootstrapServer = String(config.signalingServer || DEFAULT_SIGNALING_SERVERS[0]).trim();
     const configuredSignalingServers = Array.from(new Set((config.signalingServers != null ? [bootstrapServer, ...config.signalingServers] : automaticSignalingServer ? DEFAULT_SIGNALING_SERVERS : [bootstrapServer]).map((url) => String(url || "").trim()).filter(Boolean)));
@@ -5654,6 +5679,19 @@ var PartialMesh = class {
     }
   }
   broadcastMembership(exceptPeerId) {
+    const now = Date.now();
+    const elapsed = now - this.membershipBroadcastAtMs;
+    if (elapsed < MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS) {
+      if (!this.membershipBroadcastTimer) {
+        this.membershipBroadcastTimer = setTimeout(() => {
+          this.membershipBroadcastTimer = null;
+          this.broadcastMembership();
+        }, MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS - elapsed);
+        this.membershipBroadcastTimer.unref?.();
+      }
+      return;
+    }
+    this.membershipBroadcastAtMs = now;
     for (const peerId of this.getConnectedPeers()) {
       if (peerId !== exceptPeerId) this.sendMembership(peerId);
     }

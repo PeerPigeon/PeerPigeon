@@ -737,15 +737,30 @@ export class GossipProtocol {
     return /^[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : sha1Hex(value);
   }
 
+  // A repair round per retained message was a summary to every fan-out peer
+  // for every message that arrived: twenty-five a second on a busy link. One
+  // round per half second carries the same information; the two-second sync
+  // loop still runs behind it.
+  private static readonly INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS = 500;
+  private initialSpreadRepairAtMs = 0;
+
   private scheduleInitialSpreadRepair(_startedAt: number = Date.now()): void {
     if (this.initialSpreadRepairQueued || this.destroyed) return;
     this.initialSpreadRepairQueued = true;
-    queueMicrotask(() => {
+    const elapsed = Date.now() - this.initialSpreadRepairAtMs;
+    const run = () => {
       this.initialSpreadRepairQueued = false;
       if (this.destroyed) return;
+      this.initialSpreadRepairAtMs = Date.now();
       this.publishGossipAntiEntropy();
       this.maintainTrackedDeliveries();
-    });
+    };
+    if (elapsed >= GossipProtocol.INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS) {
+      queueMicrotask(run);
+    } else {
+      const timer = setTimeout(run, GossipProtocol.INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS - elapsed);
+      (timer as { unref?: () => void }).unref?.();
+    }
   }
 
   private validSpreadEnvelope(message: GossipMessage): GossipSpreadEnvelope | null {

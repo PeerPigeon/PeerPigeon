@@ -299,6 +299,8 @@ declare class GossipProtocol {
     private retainGossipMessage;
     private extendRoutePath;
     private compactRoutePeerId;
+    private static readonly INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS;
+    private initialSpreadRepairAtMs;
     private scheduleInitialSpreadRepair;
     private validSpreadEnvelope;
     private initialSpreadDeadlineAt;
@@ -1130,6 +1132,8 @@ declare class PartialMesh {
     private pruneMembershipRecords;
     private membershipRecordsForWire;
     private sendMembership;
+    private membershipBroadcastAtMs;
+    private membershipBroadcastTimer;
     private broadcastMembership;
     private tryParseMembership;
     private mergeMembership;

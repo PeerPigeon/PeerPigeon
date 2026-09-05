@@ -61,6 +61,8 @@ const CHRONIC_DIAL_QUARANTINE_MS = 5 * 60_000;
 // connected → SCTP/data channel opening) deserves a fresh window per phase,
 // but no negotiation may extend itself indefinitely by oscillating.
 const NEGOTIATION_TOTAL_BUDGET_MS = 30_000;
+// Membership broadcasts are coalesced to one per interval per node.
+const MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1_000;
 
 function canonicalSignalingUrl(value: string): string | null {
   try {
@@ -2727,7 +2729,30 @@ export class PartialMesh {
       }
     }
 
+    // Membership is re-broadcast whenever a received one changes the view,
+    // and every record carries a fresh timestamp, so two peers could answer
+    // each other at wire speed: a probe measured eighty membership frames a
+    // second on one link, each chunked because the payload runs past the
+    // frame limit, and both watchers spent a core on nothing else. At most
+    // one broadcast per interval; a change inside the window is sent when
+    // the window closes, so nothing is lost, only coalesced.
+    private membershipBroadcastAtMs = 0;
+    private membershipBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+
     private broadcastMembership(exceptPeerId?: string): void {
+      const now = Date.now();
+      const elapsed = now - this.membershipBroadcastAtMs;
+      if (elapsed < MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS) {
+        if (!this.membershipBroadcastTimer) {
+          this.membershipBroadcastTimer = setTimeout(() => {
+            this.membershipBroadcastTimer = null;
+            this.broadcastMembership();
+          }, MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS - elapsed);
+          (this.membershipBroadcastTimer as { unref?: () => void }).unref?.();
+        }
+        return;
+      }
+      this.membershipBroadcastAtMs = now;
       for (const peerId of this.getConnectedPeers()) {
         if (peerId !== exceptPeerId) this.sendMembership(peerId);
       }
