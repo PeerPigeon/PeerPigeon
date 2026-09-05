@@ -4837,6 +4837,7 @@ var PartialMesh = class {
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
     const ownerTimeoutMs = Math.max(4e3, this.config.connectionTimeoutMs);
     const activeIceTimeoutMs = Math.max(6e3, this.config.connectionTimeoutMs);
+    const offerTimeoutMs = Math.max(2e4, this.config.connectionTimeoutMs);
     for (const peer of this.peers.values()) {
       if (peer.connected) {
         this.negotiationPhaseByPeerId.delete(peer.id);
@@ -4857,7 +4858,7 @@ var PartialMesh = class {
       const connectedWithoutChannel = signalingState === "stable" && dataState !== "open" && connectionState === "connected";
       const activeIce = signalingState === "stable" && dataState !== "open" && (connectionState === "new" || connectionState === "connecting");
       const repeatedlyFailing = (this.dialFailureCount.get(peer.id) ?? 0) >= 2;
-      const timeoutMs = activeIce || connectedWithoutChannel ? activeIceTimeoutMs : ownerTimeoutMs;
+      const timeoutMs = activeIce || connectedWithoutChannel ? activeIceTimeoutMs : deadTransport ? ownerTimeoutMs : offerTimeoutMs;
       const phase = deadTransport ? "dead" : connectedWithoutChannel ? "sctp" : activeIce ? "ice" : stalledOffer ? "offer" : noRtcProgress ? "pending" : "idle";
       const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
       const tracked = this.negotiationPhaseByPeerId.get(peer.id);

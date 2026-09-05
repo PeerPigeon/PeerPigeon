@@ -1646,6 +1646,12 @@ export class PartialMesh {
     // retaining it for 30 seconds (and multiplying it across browser tabs).
     const ownerTimeoutMs = Math.max(4_000, this.config.connectionTimeoutMs);
     const activeIceTimeoutMs = Math.max(6_000, this.config.connectionTimeoutMs);
+    // An offer on the wire is FreeRTC's to give up on: its retry budget runs
+    // sixteen seconds now, because a busy watcher answers late. Executing the
+    // dial here at four seconds threw away every answer that arrived after
+    // it ("queued answer (no connection yet)") and redialed into the same
+    // wait; only a dead transport still gets the short deadline.
+    const offerTimeoutMs = Math.max(20_000, this.config.connectionTimeoutMs);
 
     for (const peer of this.peers.values()) {
       if (peer.connected) {
@@ -1683,7 +1689,9 @@ export class PartialMesh {
       // hit on nearly every attempt. Both live transport phases get the
       // longer deadline; only a stalled offer or a dead transport gets the
       // short one.
-      const timeoutMs = (activeIce || connectedWithoutChannel) ? activeIceTimeoutMs : ownerTimeoutMs;
+      const timeoutMs = (activeIce || connectedWithoutChannel)
+        ? activeIceTimeoutMs
+        : deadTransport ? ownerTimeoutMs : offerTimeoutMs;
 
       // Age the negotiation per phase: every observable step forward (offer
       // answered → ICE running → peer connection connected) restarts the
