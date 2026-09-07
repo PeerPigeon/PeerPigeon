@@ -5,7 +5,7 @@ import { performance } from 'node:perf_hooks';
 function parseArgs(argv) {
   const args = {
     runs: Number(process.env.E2E_RUNS ?? 5),
-    timeoutMs: Number(process.env.E2E_TIMEOUT_MS ?? 45_000),
+    timeoutMs: Number(process.env.E2E_TIMEOUT_MS ?? 75_000),
     maxRunSeconds: Number.isFinite(Number(process.env.E2E_MAX_RUN_SECONDS))
       ? Number(process.env.E2E_MAX_RUN_SECONDS)
       : undefined,

@@ -1,6 +1,9 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
 
-const rtcPeerModulePath = '/@fs/Users/danraeder/Documents/GitHub/gossip-protocol/src/rtc-peer.ts';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const rtcPeerModulePath = `/@fs${path.resolve(__dirname, '../src/rtc-peer.ts')}`;
 
 test.describe('RtcPeer semantics', () => {
   test('connect waits for data channel open and ignores disconnected wobble', async ({ page, baseURL }) => {

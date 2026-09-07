@@ -3,6 +3,10 @@ import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+if (process.env.SKIP_FREERTC_SYNC) {
+  process.exit(0);
+}
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(scriptDir, '..');
 const packageRoots = [projectRoot, path.join(projectRoot, 'examples/vue3')];

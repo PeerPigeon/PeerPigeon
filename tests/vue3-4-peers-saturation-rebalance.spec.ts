@@ -37,6 +37,8 @@ test('4-peer saturation rebalance: a late joiner gets admitted when maxPeers=2',
   try {
     for (let i = 0; i < 3; i++) {
       const page = await context.newPage();
+      page.on('console', (msg) => console.log(`[p${i}] ${msg.type()}: ${msg.text()}`));
+      page.on('pageerror', (err) => console.log(`[p${i}] pageerror: ${err.message}`));
       await page.goto(url);
       pages.push(page);
     }
