@@ -1,4 +1,4 @@
-import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair } from 'unsea';
+import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair, signMessage, verifyMessage } from 'unsea';
 import type { DirectMessage, GossipBroadcastOptions, GossipMessage } from './gossip.js';
 
 export const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
@@ -40,6 +40,7 @@ export type EncryptedDirectPayload = {
   to: string;
   cipher: unknown;
   timestamp: number;
+  sig?: string;
 };
 
 export type PeerPigeonCryptoOptions = {
@@ -102,6 +103,7 @@ type CryptoPublicInfoPayload = {
   pub: string;
   epub: string;
   timestamp: number;
+  sig?: string;
 };
 
 type CryptoPublicRequestPayload = {
@@ -116,6 +118,7 @@ export class PeerPigeonCryptoProtocol {
   private readonly gossip: CryptoGossipLike;
   private readonly options: Required<Omit<PeerPigeonCryptoOptions, 'keyPair'>> & { keyPair?: PeerPigeonKeyPair };
   private keyPair: PeerPigeonKeyPair | null = null;
+  private localKeySig: string | null = null;
   private readonly publicKeys = new Map<string, PeerPublicKey>();
   private readonly callbacks: Partial<Record<keyof PeerPigeonCryptoEvents, Set<Function>>> = {};
   private announceTimer: ReturnType<typeof setInterval> | null = null;
@@ -132,8 +135,10 @@ export class PeerPigeonCryptoProtocol {
     if (!this.publicKeys.has(peerId)) this.requestPeerKey(peerId);
   };
   private readonly onSignalingConnectedBound = (): void => {
-    this.registerLocalKey();
-    this.announcePublicKey();
+    this.refreshLocalSignature().then(() => {
+      this.registerLocalKey();
+      this.announcePublicKey();
+    });
   };
 
   constructor(mesh: CryptoMeshLike, gossip: CryptoGossipLike, options: PeerPigeonCryptoOptions) {
@@ -152,11 +157,22 @@ export class PeerPigeonCryptoProtocol {
     };
   }
 
+  private async refreshLocalSignature(): Promise<void> {
+    const peerId = String(this.mesh.getClientId() ?? '').trim();
+    if (!peerId || !this.keyPair) return;
+    try {
+      this.localKeySig = await signMessage(`pp-key:${peerId}:${this.keyPair.pub}:${this.keyPair.epub}`, this.keyPair.priv);
+    } catch {
+      this.localKeySig = null;
+    }
+  }
+
   async init(): Promise<void> {
     if (this.initialized) return;
     this.keyPair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await generateRandomPair();
     this.validateKeyPair(this.keyPair);
     this.persistKeyPair(this.keyPair);
+    await this.refreshLocalSignature();
     this.initialized = true;
     this.gossip.on('messageReceived', this.onGossipMessageBound);
     this.gossip.on('directMessageReceived', this.onDirectMessageBound);
@@ -262,12 +278,22 @@ export class PeerPigeonCryptoProtocol {
     if (!this.keyPair) throw new Error('Crypto protocol has not been initialized');
     const target = String(peerId ?? '').trim();
     const recipient = this.getPublicKey(target) ?? await this.waitForPeerKey(target, timeoutMs);
+    const from = String(this.mesh.getClientId() ?? '').trim();
+    const timestamp = Date.now();
+    const cipher = await encryptMessageWithMeta(String(plaintext), { epub: recipient.epub });
+    let sig: string | undefined;
+    try {
+      sig = await signMessage(`pp-direct:${from}:${target}:${timestamp}:${JSON.stringify(cipher)}`, this.keyPair.priv);
+    } catch {
+      sig = undefined;
+    }
     return {
       __ppType: ENCRYPTED_DIRECT_TYPE,
-      from: String(this.mesh.getClientId() ?? '').trim(),
+      from,
       to: target,
-      cipher: await encryptMessageWithMeta(String(plaintext), { epub: recipient.epub }),
-      timestamp: Date.now(),
+      cipher,
+      timestamp,
+      sig,
     };
   }
 
@@ -372,6 +398,7 @@ export class PeerPigeonCryptoProtocol {
       pub: this.keyPair.pub,
       epub: this.keyPair.epub,
       timestamp: Date.now(),
+      sig: this.localKeySig ?? undefined,
     };
   }
 
@@ -380,11 +407,21 @@ export class PeerPigeonCryptoProtocol {
     this.gossip.sendDirect(peerId, payload);
   }
 
-  private upsertPublicKey(peerId: string, payload: CryptoPublicInfoPayload): void {
+  private async upsertPublicKey(peerId: string, payload: CryptoPublicInfoPayload): Promise<void> {
     const id = String(peerId ?? '').trim();
     if (!id || typeof payload.pub !== 'string' || typeof payload.epub !== 'string') return;
     const existing = this.publicKeys.get(id);
     if (existing && existing.updatedAt > payload.timestamp) return;
+
+    if (payload.sig && id !== this.mesh.getClientId()) {
+      const msg = `pp-key:${id}:${payload.pub}:${payload.epub}`;
+      const valid = await verifyMessage(msg, payload.sig, payload.pub).catch(() => false);
+      if (!valid) {
+        this.emitError(new Error(`Public key announcement signature verification failed for peer ${id}`));
+        return;
+      }
+    }
+
     const value: PeerPublicKey = {
       peerId: id,
       pub: payload.pub,
@@ -422,7 +459,7 @@ export class PeerPigeonCryptoProtocol {
   private async handleGossipMessage(data: { message: GossipMessage; local: boolean; fromPeer?: string; receivedAt?: number }): Promise<void> {
     const payload = data.message.data;
     if (this.isPublicInfo(payload)) {
-      if (data.local || !data.message.sender || payload.from === data.message.sender) this.upsertPublicKey(payload.from, payload);
+      if (data.local || !data.message.sender || payload.from === data.message.sender) await this.upsertPublicKey(payload.from, payload);
       return;
     }
     if (this.isPublicRequest(payload)) {
@@ -440,7 +477,7 @@ export class PeerPigeonCryptoProtocol {
   private async handleDirectMessage(message: DirectMessage): Promise<void> {
     const payload = message.data;
     if (this.isPublicInfo(payload)) {
-      if (payload.from === message.from) this.upsertPublicKey(payload.from, payload);
+      if (payload.from === message.from) await this.upsertPublicKey(payload.from, payload);
       return;
     }
     if (this.isPublicRequest(payload)) {
@@ -448,6 +485,18 @@ export class PeerPigeonCryptoProtocol {
       return;
     }
     if (!this.isEncryptedDirect(payload) || payload.to !== this.mesh.getClientId() || payload.from !== message.from) return;
+
+    // Verify digital signature if present and sender public key is known
+    const senderKey = this.getPublicKey(payload.from);
+    if (payload.sig && senderKey) {
+      const sigMsg = `pp-direct:${payload.from}:${payload.to}:${payload.timestamp}:${JSON.stringify(payload.cipher)}`;
+      const valid = await verifyMessage(sigMsg, payload.sig, senderKey.pub).catch(() => false);
+      if (!valid) {
+        this.emitError(new Error(`Direct message signature verification failed from peer ${payload.from}`));
+        return;
+      }
+    }
+
     const plaintext = await this.decryptEncryptedDirect(payload);
     this.emit('encryptedDirectReceived', { plaintext, payload, message });
   }
@@ -457,11 +506,28 @@ export class PeerPigeonCryptoProtocol {
     const roomScope = this.options.roomSecret
       ? `${this.options.roomId}:${this.options.roomSecret}`
       : this.options.roomId;
-    const seed = new TextEncoder().encode(
-      `peerpigeon:room-broadcast:v1:${roomScope}`
+    const enc = new TextEncoder();
+    const ikm = await cryptoApi.subtle.importKey(
+      'raw',
+      enc.encode(roomScope),
+      { name: 'HKDF' },
+      false,
+      ['deriveKey']
     );
-    const hash = await cryptoApi.subtle.digest('SHA-256', seed);
-    return await cryptoApi.subtle.importKey('raw', hash, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const salt = enc.encode(`peerpigeon:room-salt:v1:${this.options.roomId}`);
+    const info = enc.encode('peerpigeon:room-broadcast:v1');
+    return await cryptoApi.subtle.deriveKey(
+      {
+        name: 'HKDF',
+        hash: 'SHA-256',
+        salt,
+        info,
+      },
+      ikm,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
   }
 
   private cryptoApi(): Crypto {

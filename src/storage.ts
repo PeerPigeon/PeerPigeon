@@ -1192,12 +1192,6 @@ export class PeerPigeonStorage {
       if (existing.ownerId === actorId) return true;
       // Allow write if owner is being explicitly migrated via override
       if (ownerOverride && String(ownerOverride).trim()) return true;
-      // Auto-allow migration from old peer ID format to new epub format:
-      // if existing owner is 64-char hex (peer ID) and current actor is not hex format (epub),
-      // allow the write as an implicit identity migration.
-      if (this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
-        return true;
-      }
       return false;
     }
     if (space === 'frozen') {
@@ -1346,11 +1340,24 @@ export class PeerPigeonStorage {
       throw new Error('WebCrypto subtle API is required for encrypted storage sync');
     }
 
-    const seedBytes = new TextEncoder().encode(seed);
-    const digest = await globalThis.crypto.subtle.digest('SHA-256', seedBytes);
-    return await globalThis.crypto.subtle.importKey(
+    const enc = new TextEncoder();
+    const ikm = await globalThis.crypto.subtle.importKey(
       'raw',
-      digest,
+      enc.encode(seed),
+      { name: 'HKDF' },
+      false,
+      ['deriveKey']
+    );
+    const salt = enc.encode(`peerpigeon:storage-salt:v1:${this.sessionId}`);
+    const info = enc.encode('peerpigeon:storage-aes-gcm:v1');
+    return await globalThis.crypto.subtle.deriveKey(
+      {
+        name: 'HKDF',
+        hash: 'SHA-256',
+        salt,
+        info,
+      },
+      ikm,
       { name: 'AES-GCM', length: 256 },
       false,
       ['encrypt', 'decrypt']

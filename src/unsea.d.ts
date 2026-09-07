@@ -12,4 +12,7 @@ declare module 'unsea' {
     recipient: { epub: string }
   ): Promise<unknown>;
   export function decryptMessageWithMeta(cipher: unknown, epriv: string): Promise<string>;
+  export function signMessage(msg: string, privB64: string): Promise<string>;
+  export function verifyMessage(msg: string, sigB64: string, pubJwk: string): Promise<boolean>;
 }
+

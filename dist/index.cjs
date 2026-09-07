@@ -3302,9 +3302,6 @@ var PeerPigeonStorage = class {
       if (!existing) return true;
       if (existing.ownerId === actorId) return true;
       if (ownerOverride && String(ownerOverride).trim()) return true;
-      if (this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
-        return true;
-      }
       return false;
     }
     if (space === "frozen") {
@@ -3397,11 +3394,24 @@ var PeerPigeonStorage = class {
     if (!globalThis.crypto?.subtle) {
       throw new Error("WebCrypto subtle API is required for encrypted storage sync");
     }
-    const seedBytes = new TextEncoder().encode(seed);
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", seedBytes);
-    return await globalThis.crypto.subtle.importKey(
+    const enc = new TextEncoder();
+    const ikm = await globalThis.crypto.subtle.importKey(
       "raw",
-      digest,
+      enc.encode(seed),
+      { name: "HKDF" },
+      false,
+      ["deriveKey"]
+    );
+    const salt = enc.encode(`peerpigeon:storage-salt:v1:${this.sessionId}`);
+    const info = enc.encode("peerpigeon:storage-aes-gcm:v1");
+    return await globalThis.crypto.subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt,
+        info
+      },
+      ikm,
       { name: "AES-GCM", length: 256 },
       false,
       ["encrypt", "decrypt"]
@@ -3472,6 +3482,7 @@ var ENCRYPTED_DIRECT_TYPE = "pp-encrypted-direct-v1";
 var PeerPigeonCryptoProtocol = class {
   constructor(mesh, gossip, options) {
     this.keyPair = null;
+    this.localKeySig = null;
     this.publicKeys = /* @__PURE__ */ new Map();
     this.callbacks = {};
     this.announceTimer = null;
@@ -3487,8 +3498,10 @@ var PeerPigeonCryptoProtocol = class {
       if (!this.publicKeys.has(peerId)) this.requestPeerKey(peerId);
     };
     this.onSignalingConnectedBound = () => {
-      this.registerLocalKey();
-      this.announcePublicKey();
+      this.refreshLocalSignature().then(() => {
+        this.registerLocalKey();
+        this.announcePublicKey();
+      });
     };
     const roomId = String(options.roomId ?? "").trim();
     if (!roomId) throw new Error("PeerPigeonCryptoProtocol requires a non-empty roomId");
@@ -3504,11 +3517,21 @@ var PeerPigeonCryptoProtocol = class {
       keyDiscoveryTimeoutMs: options.keyDiscoveryTimeoutMs ?? 8e3
     };
   }
+  async refreshLocalSignature() {
+    const peerId = String(this.mesh.getClientId() ?? "").trim();
+    if (!peerId || !this.keyPair) return;
+    try {
+      this.localKeySig = await (0, import_unsea.signMessage)(`pp-key:${peerId}:${this.keyPair.pub}:${this.keyPair.epub}`, this.keyPair.priv);
+    } catch {
+      this.localKeySig = null;
+    }
+  }
   async init() {
     if (this.initialized) return;
     this.keyPair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await (0, import_unsea.generateRandomPair)();
     this.validateKeyPair(this.keyPair);
     this.persistKeyPair(this.keyPair);
+    await this.refreshLocalSignature();
     this.initialized = true;
     this.gossip.on("messageReceived", this.onGossipMessageBound);
     this.gossip.on("directMessageReceived", this.onDirectMessageBound);
@@ -3602,12 +3625,22 @@ var PeerPigeonCryptoProtocol = class {
     if (!this.keyPair) throw new Error("Crypto protocol has not been initialized");
     const target = String(peerId ?? "").trim();
     const recipient = this.getPublicKey(target) ?? await this.waitForPeerKey(target, timeoutMs);
+    const from = String(this.mesh.getClientId() ?? "").trim();
+    const timestamp = Date.now();
+    const cipher = await (0, import_unsea.encryptMessageWithMeta)(String(plaintext), { epub: recipient.epub });
+    let sig;
+    try {
+      sig = await (0, import_unsea.signMessage)(`pp-direct:${from}:${target}:${timestamp}:${JSON.stringify(cipher)}`, this.keyPair.priv);
+    } catch {
+      sig = void 0;
+    }
     return {
       __ppType: ENCRYPTED_DIRECT_TYPE,
-      from: String(this.mesh.getClientId() ?? "").trim(),
+      from,
       to: target,
-      cipher: await (0, import_unsea.encryptMessageWithMeta)(String(plaintext), { epub: recipient.epub }),
-      timestamp: Date.now()
+      cipher,
+      timestamp,
+      sig
     };
   }
   async broadcastEncrypted(plaintext, metadata = {}, options = {}) {
@@ -3690,18 +3723,27 @@ var PeerPigeonCryptoProtocol = class {
       from: peerId,
       pub: this.keyPair.pub,
       epub: this.keyPair.epub,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      sig: this.localKeySig ?? void 0
     };
   }
   sendPublicInfoDirect(peerId, payload = this.localPublicInfoPayload()) {
     if (!payload || !peerId || peerId === payload.from) return;
     this.gossip.sendDirect(peerId, payload);
   }
-  upsertPublicKey(peerId, payload) {
+  async upsertPublicKey(peerId, payload) {
     const id = String(peerId ?? "").trim();
     if (!id || typeof payload.pub !== "string" || typeof payload.epub !== "string") return;
     const existing = this.publicKeys.get(id);
     if (existing && existing.updatedAt > payload.timestamp) return;
+    if (payload.sig && id !== this.mesh.getClientId()) {
+      const msg = `pp-key:${id}:${payload.pub}:${payload.epub}`;
+      const valid = await (0, import_unsea.verifyMessage)(msg, payload.sig, payload.pub).catch(() => false);
+      if (!valid) {
+        this.emitError(new Error(`Public key announcement signature verification failed for peer ${id}`));
+        return;
+      }
+    }
     const value = {
       peerId: id,
       pub: payload.pub,
@@ -3731,7 +3773,7 @@ var PeerPigeonCryptoProtocol = class {
   async handleGossipMessage(data) {
     const payload = data.message.data;
     if (this.isPublicInfo(payload)) {
-      if (data.local || !data.message.sender || payload.from === data.message.sender) this.upsertPublicKey(payload.from, payload);
+      if (data.local || !data.message.sender || payload.from === data.message.sender) await this.upsertPublicKey(payload.from, payload);
       return;
     }
     if (this.isPublicRequest(payload)) {
@@ -3746,7 +3788,7 @@ var PeerPigeonCryptoProtocol = class {
   async handleDirectMessage(message) {
     const payload = message.data;
     if (this.isPublicInfo(payload)) {
-      if (payload.from === message.from) this.upsertPublicKey(payload.from, payload);
+      if (payload.from === message.from) await this.upsertPublicKey(payload.from, payload);
       return;
     }
     if (this.isPublicRequest(payload)) {
@@ -3754,17 +3796,43 @@ var PeerPigeonCryptoProtocol = class {
       return;
     }
     if (!this.isEncryptedDirect(payload) || payload.to !== this.mesh.getClientId() || payload.from !== message.from) return;
+    const senderKey = this.getPublicKey(payload.from);
+    if (payload.sig && senderKey) {
+      const sigMsg = `pp-direct:${payload.from}:${payload.to}:${payload.timestamp}:${JSON.stringify(payload.cipher)}`;
+      const valid = await (0, import_unsea.verifyMessage)(sigMsg, payload.sig, senderKey.pub).catch(() => false);
+      if (!valid) {
+        this.emitError(new Error(`Direct message signature verification failed from peer ${payload.from}`));
+        return;
+      }
+    }
     const plaintext = await this.decryptEncryptedDirect(payload);
     this.emit("encryptedDirectReceived", { plaintext, payload, message });
   }
   async deriveRoomKey() {
     const cryptoApi = this.cryptoApi();
     const roomScope = this.options.roomSecret ? `${this.options.roomId}:${this.options.roomSecret}` : this.options.roomId;
-    const seed = new TextEncoder().encode(
-      `peerpigeon:room-broadcast:v1:${roomScope}`
+    const enc = new TextEncoder();
+    const ikm = await cryptoApi.subtle.importKey(
+      "raw",
+      enc.encode(roomScope),
+      { name: "HKDF" },
+      false,
+      ["deriveKey"]
     );
-    const hash = await cryptoApi.subtle.digest("SHA-256", seed);
-    return await cryptoApi.subtle.importKey("raw", hash, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    const salt = enc.encode(`peerpigeon:room-salt:v1:${this.options.roomId}`);
+    const info = enc.encode("peerpigeon:room-broadcast:v1");
+    return await cryptoApi.subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt,
+        info
+      },
+      ikm,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
   }
   cryptoApi() {
     if (!globalThis.crypto?.subtle) throw new Error("WebCrypto is unavailable");
