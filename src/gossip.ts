@@ -392,9 +392,11 @@ export class GossipProtocol {
   private seenDirectIds: Map<string, number> = new Map();
   private deliveryStates: Map<string, GossipDeliveryState> = new Map();
   private aggregateStates: Map<string, GossipAggregateState> = new Map();
+  private lastPruneTrackingAt = 0;
   private retainedMessages: Map<string, {
     message: GossipMessage;
     retainedAt: number;
+    deadlineAt?: number;
     viewId: string;
     viewSize: number;
     replayedTo?: Map<string, number>;
@@ -709,9 +711,11 @@ export class GossipProtocol {
     try {
       const snapshot = JSON.parse(JSON.stringify(message)) as GossipMessage;
       const peers = this.canonicalPeerSet();
+      const deadlineAt = this.initialSpreadDeadlineAt(snapshot);
       this.retainedMessages.set(message.id, {
         message: snapshot,
         retainedAt,
+        deadlineAt,
         viewId: this.canonicalSetHash(peers),
         viewSize: peers.length,
       });
@@ -721,10 +725,13 @@ export class GossipProtocol {
       return;
     }
 
-    while (this.retainedMessages.size > this.maxTrackedMessages) {
-      const oldest = this.retainedMessages.keys().next().value;
-      if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+    if (this.retainedMessages.size > this.maxTrackedMessages) {
+      const target = Math.max(0, this.maxTrackedMessages - Math.min(100, Math.floor(this.maxTrackedMessages * 0.05)));
+      while (this.retainedMessages.size > target) {
+        const oldest = this.retainedMessages.keys().next().value;
+        if (!oldest) break;
+        this.retainedMessages.delete(oldest);
+      }
     }
   }
 
@@ -808,13 +815,14 @@ export class GossipProtocol {
     now: number = Date.now(),
     view?: { peers: string[]; hash: string },
   ): boolean {
-    if (now > this.initialSpreadDeadlineAt(message)) return false;
+    const retained = this.retainedMessages.get(message.id);
+    const deadline = retained?.deadlineAt ?? this.initialSpreadDeadlineAt(message);
+    if (now > deadline) return false;
     const spread = this.validSpreadEnvelope(message);
     // Legacy envelopes may finish their already-active fan-out, but are never
     // eligible for later anti-entropy replay because they have no view proof.
     if (!spread) return targetPeerId == null;
     if (!targetPeerId) return true;
-    const retained = this.retainedMessages.get(message.id);
     if (!retained) return false;
     // The view is the same for every message in a round: the caller computes
     // it once. Recomputing the sorted peer set and its BigInt hash per
@@ -2139,23 +2147,33 @@ export class GossipProtocol {
       this.messageLog.delete(id);
       this.retainedMessages.delete(id);
     }
-    while (this.messageLog.size > this.maxTrackedMessages) {
-      const oldest = this.messageLog.keys().next().value;
-      if (!oldest) break;
-      this.messageLog.delete(oldest);
-      this.retainedMessages.delete(oldest);
+    if (this.messageLog.size > this.maxTrackedMessages) {
+      const target = Math.max(0, this.maxTrackedMessages - Math.min(100, Math.floor(this.maxTrackedMessages * 0.05)));
+      while (this.messageLog.size > target) {
+        const oldest = this.messageLog.keys().next().value;
+        if (!oldest) break;
+        this.messageLog.delete(oldest);
+        this.retainedMessages.delete(oldest);
+      }
     }
 
-    for (const [id, retained] of this.retainedMessages.entries()) {
-      if (
-        retained.retainedAt < minTimestamp
-        || now > this.initialSpreadDeadlineAt(retained.message)
-      ) this.retainedMessages.delete(id);
+    if (now - this.lastPruneTrackingAt >= 2_000) {
+      this.lastPruneTrackingAt = now;
+      for (const [id, retained] of this.retainedMessages.entries()) {
+        const deadline = retained.deadlineAt ?? (retained.deadlineAt = this.initialSpreadDeadlineAt(retained.message));
+        if (retained.retainedAt < minTimestamp || now > deadline) {
+          this.retainedMessages.delete(id);
+        }
+      }
     }
-    while (this.retainedMessages.size > this.maxTrackedMessages) {
-      const oldest = this.retainedMessages.keys().next().value;
-      if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+
+    if (this.retainedMessages.size > this.maxTrackedMessages) {
+      const target = Math.max(0, this.maxTrackedMessages - Math.min(100, Math.floor(this.maxTrackedMessages * 0.05)));
+      while (this.retainedMessages.size > target) {
+        const oldest = this.retainedMessages.keys().next().value;
+        if (!oldest) break;
+        this.retainedMessages.delete(oldest);
+      }
     }
 
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
@@ -2164,10 +2182,13 @@ export class GossipProtocol {
       }
       this.seenDirectIds.delete(id);
     }
-    while (this.seenDirectIds.size > this.maxTrackedDirectIds) {
-      const oldest = this.seenDirectIds.keys().next().value;
-      if (!oldest) break;
-      this.seenDirectIds.delete(oldest);
+    if (this.seenDirectIds.size > this.maxTrackedDirectIds) {
+      const target = Math.max(0, this.maxTrackedDirectIds - Math.min(100, Math.floor(this.maxTrackedDirectIds * 0.05)));
+      while (this.seenDirectIds.size > target) {
+        const oldest = this.seenDirectIds.keys().next().value;
+        if (!oldest) break;
+        this.seenDirectIds.delete(oldest);
+      }
     }
 
     for (const [id, state] of this.deliveryStates.entries()) {

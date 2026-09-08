@@ -864,6 +864,7 @@ var _GossipProtocol = class _GossipProtocol {
     this.seenDirectIds = /* @__PURE__ */ new Map();
     this.deliveryStates = /* @__PURE__ */ new Map();
     this.aggregateStates = /* @__PURE__ */ new Map();
+    this.lastPruneTrackingAt = 0;
     this.retainedMessages = /* @__PURE__ */ new Map();
     this.dirtyDeliveryReceiptIds = /* @__PURE__ */ new Set();
     this.gossipFanoutCursor = 0;
@@ -1127,9 +1128,11 @@ var _GossipProtocol = class _GossipProtocol {
     try {
       const snapshot = JSON.parse(JSON.stringify(message));
       const peers = this.canonicalPeerSet();
+      const deadlineAt = this.initialSpreadDeadlineAt(snapshot);
       this.retainedMessages.set(message.id, {
         message: snapshot,
         retainedAt,
+        deadlineAt,
         viewId: this.canonicalSetHash(peers),
         viewSize: peers.length
       });
@@ -1137,10 +1140,13 @@ var _GossipProtocol = class _GossipProtocol {
     } catch {
       return;
     }
-    while (this.retainedMessages.size > this.maxTrackedMessages) {
-      const oldest = this.retainedMessages.keys().next().value;
-      if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+    if (this.retainedMessages.size > this.maxTrackedMessages) {
+      const target = Math.max(0, this.maxTrackedMessages - Math.min(100, Math.floor(this.maxTrackedMessages * 0.05)));
+      while (this.retainedMessages.size > target) {
+        const oldest = this.retainedMessages.keys().next().value;
+        if (!oldest) break;
+        this.retainedMessages.delete(oldest);
+      }
     }
   }
   extendRoutePath(path, ...peerIds) {
@@ -1188,11 +1194,12 @@ var _GossipProtocol = class _GossipProtocol {
     return Number(message.timestamp) + this.deliveryTimeoutMs;
   }
   canContinueInitialSpread(message, targetPeerId, now = Date.now(), view) {
-    if (now > this.initialSpreadDeadlineAt(message)) return false;
+    const retained = this.retainedMessages.get(message.id);
+    const deadline = retained?.deadlineAt ?? this.initialSpreadDeadlineAt(message);
+    if (now > deadline) return false;
     const spread = this.validSpreadEnvelope(message);
     if (!spread) return targetPeerId == null;
     if (!targetPeerId) return true;
-    const retained = this.retainedMessages.get(message.id);
     if (!retained) return false;
     const peers = view?.peers ?? this.canonicalPeerSet();
     if (peers.length !== retained.viewSize) return false;
@@ -2276,19 +2283,31 @@ var _GossipProtocol = class _GossipProtocol {
       this.messageLog.delete(id);
       this.retainedMessages.delete(id);
     }
-    while (this.messageLog.size > this.maxTrackedMessages) {
-      const oldest = this.messageLog.keys().next().value;
-      if (!oldest) break;
-      this.messageLog.delete(oldest);
-      this.retainedMessages.delete(oldest);
+    if (this.messageLog.size > this.maxTrackedMessages) {
+      const target = Math.max(0, this.maxTrackedMessages - Math.min(100, Math.floor(this.maxTrackedMessages * 0.05)));
+      while (this.messageLog.size > target) {
+        const oldest = this.messageLog.keys().next().value;
+        if (!oldest) break;
+        this.messageLog.delete(oldest);
+        this.retainedMessages.delete(oldest);
+      }
     }
-    for (const [id, retained] of this.retainedMessages.entries()) {
-      if (retained.retainedAt < minTimestamp || now > this.initialSpreadDeadlineAt(retained.message)) this.retainedMessages.delete(id);
+    if (now - this.lastPruneTrackingAt >= 2e3) {
+      this.lastPruneTrackingAt = now;
+      for (const [id, retained] of this.retainedMessages.entries()) {
+        const deadline = retained.deadlineAt ?? (retained.deadlineAt = this.initialSpreadDeadlineAt(retained.message));
+        if (retained.retainedAt < minTimestamp || now > deadline) {
+          this.retainedMessages.delete(id);
+        }
+      }
     }
-    while (this.retainedMessages.size > this.maxTrackedMessages) {
-      const oldest = this.retainedMessages.keys().next().value;
-      if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+    if (this.retainedMessages.size > this.maxTrackedMessages) {
+      const target = Math.max(0, this.maxTrackedMessages - Math.min(100, Math.floor(this.maxTrackedMessages * 0.05)));
+      while (this.retainedMessages.size > target) {
+        const oldest = this.retainedMessages.keys().next().value;
+        if (!oldest) break;
+        this.retainedMessages.delete(oldest);
+      }
     }
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
       if (timestamp >= minTimestamp) {
@@ -2296,10 +2315,13 @@ var _GossipProtocol = class _GossipProtocol {
       }
       this.seenDirectIds.delete(id);
     }
-    while (this.seenDirectIds.size > this.maxTrackedDirectIds) {
-      const oldest = this.seenDirectIds.keys().next().value;
-      if (!oldest) break;
-      this.seenDirectIds.delete(oldest);
+    if (this.seenDirectIds.size > this.maxTrackedDirectIds) {
+      const target = Math.max(0, this.maxTrackedDirectIds - Math.min(100, Math.floor(this.maxTrackedDirectIds * 0.05)));
+      while (this.seenDirectIds.size > target) {
+        const oldest = this.seenDirectIds.keys().next().value;
+        if (!oldest) break;
+        this.seenDirectIds.delete(oldest);
+      }
     }
     for (const [id, state] of this.deliveryStates.entries()) {
       const terminalAt = state.completedAt ?? (state.timedOut ? state.deadlineAt : null);
@@ -3987,10 +4009,15 @@ var PartialMesh = class {
     // the window closes, so nothing is lost, only coalesced.
     this.membershipBroadcastAtMs = 0;
     this.membershipBroadcastTimer = null;
-    const automaticSignalingServer = config.automaticSignalingServer ?? !config.signalingServer;
-    const bootstrapServer = String(config.signalingServer || DEFAULT_SIGNALING_SERVERS[0]).trim();
-    const configuredSignalingServers = Array.from(new Set((config.signalingServers != null ? [bootstrapServer, ...config.signalingServers] : automaticSignalingServer ? DEFAULT_SIGNALING_SERVERS : [bootstrapServer]).map((url) => String(url || "").trim()).filter(Boolean)));
-    const signalingServers = configuredSignalingServers.length > 0 ? configuredSignalingServers : [...DEFAULT_SIGNALING_SERVERS];
+    const env = globalThis.process?.env;
+    const envSignaling = (env?.PEERPIGEON_SIGNALING_SERVER || env?.GIT_PIGEON_SIGNAL)?.trim();
+    const defaultRelays = envSignaling && /^wss?:\/\//i.test(envSignaling) ? [envSignaling] : DEFAULT_SIGNALING_SERVERS;
+    const explicitSignalingServer = config.signalingServer ? String(config.signalingServer).trim() : "";
+    const explicitSignalingServers = config.signalingServers?.map((url) => String(url || "").trim()).filter(Boolean);
+    const bootstrapServer = explicitSignalingServer || explicitSignalingServers?.[0] || defaultRelays[0];
+    const automaticSignalingServer = config.automaticSignalingServer ?? !(explicitSignalingServer || explicitSignalingServers || envSignaling);
+    const configuredSignalingServers = Array.from(new Set((explicitSignalingServers ? explicitSignalingServer ? [explicitSignalingServer, ...explicitSignalingServers] : explicitSignalingServers : automaticSignalingServer ? defaultRelays : [bootstrapServer]).map((url) => String(url || "").trim()).filter(Boolean)));
+    const signalingServers = configuredSignalingServers.length > 0 ? configuredSignalingServers : [...defaultRelays];
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
