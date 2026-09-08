@@ -262,6 +262,7 @@ declare class GossipProtocol {
     private seenDirectIds;
     private deliveryStates;
     private aggregateStates;
+    private lastPruneTrackingAt;
     private retainedMessages;
     private dirtyDeliveryReceiptIds;
     private gossipFanoutCursor;
@@ -598,6 +599,7 @@ type EncryptedDirectPayload = {
     to: string;
     cipher: unknown;
     timestamp: number;
+    sig?: string;
 };
 type PeerPigeonCryptoOptions = {
     /** Room scope mixed into the AES-GCM room key. */
@@ -672,6 +674,7 @@ declare class PeerPigeonCryptoProtocol {
     private readonly gossip;
     private readonly options;
     private keyPair;
+    private localKeySig;
     private readonly publicKeys;
     private readonly callbacks;
     private announceTimer;
@@ -681,6 +684,7 @@ declare class PeerPigeonCryptoProtocol {
     private readonly onPeerConnectedBound;
     private readonly onSignalingConnectedBound;
     constructor(mesh: CryptoMeshLike, gossip: CryptoGossipLike, options: PeerPigeonCryptoOptions);
+    private refreshLocalSignature;
     init(): Promise<void>;
     getKeyPair(): Readonly<PeerPigeonKeyPair>;
     getPublicKey(peerId: string): PeerPublicKey | null;

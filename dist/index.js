@@ -864,6 +864,7 @@ var _GossipProtocol = class _GossipProtocol {
     this.seenDirectIds = /* @__PURE__ */ new Map();
     this.deliveryStates = /* @__PURE__ */ new Map();
     this.aggregateStates = /* @__PURE__ */ new Map();
+    this.lastPruneTrackingAt = 0;
     this.retainedMessages = /* @__PURE__ */ new Map();
     this.dirtyDeliveryReceiptIds = /* @__PURE__ */ new Set();
     this.gossipFanoutCursor = 0;
@@ -1127,9 +1128,11 @@ var _GossipProtocol = class _GossipProtocol {
     try {
       const snapshot = JSON.parse(JSON.stringify(message));
       const peers = this.canonicalPeerSet();
+      const deadlineAt = this.initialSpreadDeadlineAt(snapshot);
       this.retainedMessages.set(message.id, {
         message: snapshot,
         retainedAt,
+        deadlineAt,
         viewId: this.canonicalSetHash(peers),
         viewSize: peers.length
       });
@@ -1137,10 +1140,13 @@ var _GossipProtocol = class _GossipProtocol {
     } catch {
       return;
     }
-    while (this.retainedMessages.size > this.maxTrackedMessages) {
-      const oldest = this.retainedMessages.keys().next().value;
-      if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+    if (this.retainedMessages.size > this.maxTrackedMessages) {
+      const target = Math.max(0, this.maxTrackedMessages - Math.min(100, Math.floor(this.maxTrackedMessages * 0.05)));
+      while (this.retainedMessages.size > target) {
+        const oldest = this.retainedMessages.keys().next().value;
+        if (!oldest) break;
+        this.retainedMessages.delete(oldest);
+      }
     }
   }
   extendRoutePath(path, ...peerIds) {
@@ -1188,11 +1194,12 @@ var _GossipProtocol = class _GossipProtocol {
     return Number(message.timestamp) + this.deliveryTimeoutMs;
   }
   canContinueInitialSpread(message, targetPeerId, now = Date.now(), view) {
-    if (now > this.initialSpreadDeadlineAt(message)) return false;
+    const retained = this.retainedMessages.get(message.id);
+    const deadline = retained?.deadlineAt ?? this.initialSpreadDeadlineAt(message);
+    if (now > deadline) return false;
     const spread = this.validSpreadEnvelope(message);
     if (!spread) return targetPeerId == null;
     if (!targetPeerId) return true;
-    const retained = this.retainedMessages.get(message.id);
     if (!retained) return false;
     const peers = view?.peers ?? this.canonicalPeerSet();
     if (peers.length !== retained.viewSize) return false;
@@ -2276,19 +2283,31 @@ var _GossipProtocol = class _GossipProtocol {
       this.messageLog.delete(id);
       this.retainedMessages.delete(id);
     }
-    while (this.messageLog.size > this.maxTrackedMessages) {
-      const oldest = this.messageLog.keys().next().value;
-      if (!oldest) break;
-      this.messageLog.delete(oldest);
-      this.retainedMessages.delete(oldest);
+    if (this.messageLog.size > this.maxTrackedMessages) {
+      const target = Math.max(0, this.maxTrackedMessages - Math.min(100, Math.floor(this.maxTrackedMessages * 0.05)));
+      while (this.messageLog.size > target) {
+        const oldest = this.messageLog.keys().next().value;
+        if (!oldest) break;
+        this.messageLog.delete(oldest);
+        this.retainedMessages.delete(oldest);
+      }
     }
-    for (const [id, retained] of this.retainedMessages.entries()) {
-      if (retained.retainedAt < minTimestamp || now > this.initialSpreadDeadlineAt(retained.message)) this.retainedMessages.delete(id);
+    if (now - this.lastPruneTrackingAt >= 2e3) {
+      this.lastPruneTrackingAt = now;
+      for (const [id, retained] of this.retainedMessages.entries()) {
+        const deadline = retained.deadlineAt ?? (retained.deadlineAt = this.initialSpreadDeadlineAt(retained.message));
+        if (retained.retainedAt < minTimestamp || now > deadline) {
+          this.retainedMessages.delete(id);
+        }
+      }
     }
-    while (this.retainedMessages.size > this.maxTrackedMessages) {
-      const oldest = this.retainedMessages.keys().next().value;
-      if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+    if (this.retainedMessages.size > this.maxTrackedMessages) {
+      const target = Math.max(0, this.maxTrackedMessages - Math.min(100, Math.floor(this.maxTrackedMessages * 0.05)));
+      while (this.retainedMessages.size > target) {
+        const oldest = this.retainedMessages.keys().next().value;
+        if (!oldest) break;
+        this.retainedMessages.delete(oldest);
+      }
     }
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
       if (timestamp >= minTimestamp) {
@@ -2296,10 +2315,13 @@ var _GossipProtocol = class _GossipProtocol {
       }
       this.seenDirectIds.delete(id);
     }
-    while (this.seenDirectIds.size > this.maxTrackedDirectIds) {
-      const oldest = this.seenDirectIds.keys().next().value;
-      if (!oldest) break;
-      this.seenDirectIds.delete(oldest);
+    if (this.seenDirectIds.size > this.maxTrackedDirectIds) {
+      const target = Math.max(0, this.maxTrackedDirectIds - Math.min(100, Math.floor(this.maxTrackedDirectIds * 0.05)));
+      while (this.seenDirectIds.size > target) {
+        const oldest = this.seenDirectIds.keys().next().value;
+        if (!oldest) break;
+        this.seenDirectIds.delete(oldest);
+      }
     }
     for (const [id, state] of this.deliveryStates.entries()) {
       const terminalAt = state.completedAt ?? (state.timedOut ? state.deadlineAt : null);
@@ -3264,9 +3286,6 @@ var PeerPigeonStorage = class {
       if (!existing) return true;
       if (existing.ownerId === actorId) return true;
       if (ownerOverride && String(ownerOverride).trim()) return true;
-      if (this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
-        return true;
-      }
       return false;
     }
     if (space === "frozen") {
@@ -3359,11 +3378,24 @@ var PeerPigeonStorage = class {
     if (!globalThis.crypto?.subtle) {
       throw new Error("WebCrypto subtle API is required for encrypted storage sync");
     }
-    const seedBytes = new TextEncoder().encode(seed);
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", seedBytes);
-    return await globalThis.crypto.subtle.importKey(
+    const enc = new TextEncoder();
+    const ikm = await globalThis.crypto.subtle.importKey(
       "raw",
-      digest,
+      enc.encode(seed),
+      { name: "HKDF" },
+      false,
+      ["deriveKey"]
+    );
+    const salt = enc.encode(`peerpigeon:storage-salt:v1:${this.sessionId}`);
+    const info = enc.encode("peerpigeon:storage-aes-gcm:v1");
+    return await globalThis.crypto.subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt,
+        info
+      },
+      ikm,
       { name: "AES-GCM", length: 256 },
       false,
       ["encrypt", "decrypt"]
@@ -3426,7 +3458,7 @@ var PeerPigeonStorage = class {
 };
 
 // src/crypto.ts
-import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair } from "unsea";
+import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair, signMessage, verifyMessage } from "unsea";
 var CRYPTO_PUBLIC_INFO_TYPE = "pp-crypto-public-info-v1";
 var CRYPTO_PUBLIC_REQUEST_TYPE = "pp-crypto-public-request-v1";
 var ENCRYPTED_BROADCAST_TYPE = "pp-encrypted-broadcast-v1";
@@ -3434,6 +3466,7 @@ var ENCRYPTED_DIRECT_TYPE = "pp-encrypted-direct-v1";
 var PeerPigeonCryptoProtocol = class {
   constructor(mesh, gossip, options) {
     this.keyPair = null;
+    this.localKeySig = null;
     this.publicKeys = /* @__PURE__ */ new Map();
     this.callbacks = {};
     this.announceTimer = null;
@@ -3449,8 +3482,10 @@ var PeerPigeonCryptoProtocol = class {
       if (!this.publicKeys.has(peerId)) this.requestPeerKey(peerId);
     };
     this.onSignalingConnectedBound = () => {
-      this.registerLocalKey();
-      this.announcePublicKey();
+      this.refreshLocalSignature().then(() => {
+        this.registerLocalKey();
+        this.announcePublicKey();
+      });
     };
     const roomId = String(options.roomId ?? "").trim();
     if (!roomId) throw new Error("PeerPigeonCryptoProtocol requires a non-empty roomId");
@@ -3466,11 +3501,21 @@ var PeerPigeonCryptoProtocol = class {
       keyDiscoveryTimeoutMs: options.keyDiscoveryTimeoutMs ?? 8e3
     };
   }
+  async refreshLocalSignature() {
+    const peerId = String(this.mesh.getClientId() ?? "").trim();
+    if (!peerId || !this.keyPair) return;
+    try {
+      this.localKeySig = await signMessage(`pp-key:${peerId}:${this.keyPair.pub}:${this.keyPair.epub}`, this.keyPair.priv);
+    } catch {
+      this.localKeySig = null;
+    }
+  }
   async init() {
     if (this.initialized) return;
     this.keyPair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await generateRandomPair();
     this.validateKeyPair(this.keyPair);
     this.persistKeyPair(this.keyPair);
+    await this.refreshLocalSignature();
     this.initialized = true;
     this.gossip.on("messageReceived", this.onGossipMessageBound);
     this.gossip.on("directMessageReceived", this.onDirectMessageBound);
@@ -3564,12 +3609,22 @@ var PeerPigeonCryptoProtocol = class {
     if (!this.keyPair) throw new Error("Crypto protocol has not been initialized");
     const target = String(peerId ?? "").trim();
     const recipient = this.getPublicKey(target) ?? await this.waitForPeerKey(target, timeoutMs);
+    const from = String(this.mesh.getClientId() ?? "").trim();
+    const timestamp = Date.now();
+    const cipher = await encryptMessageWithMeta(String(plaintext), { epub: recipient.epub });
+    let sig;
+    try {
+      sig = await signMessage(`pp-direct:${from}:${target}:${timestamp}:${JSON.stringify(cipher)}`, this.keyPair.priv);
+    } catch {
+      sig = void 0;
+    }
     return {
       __ppType: ENCRYPTED_DIRECT_TYPE,
-      from: String(this.mesh.getClientId() ?? "").trim(),
+      from,
       to: target,
-      cipher: await encryptMessageWithMeta(String(plaintext), { epub: recipient.epub }),
-      timestamp: Date.now()
+      cipher,
+      timestamp,
+      sig
     };
   }
   async broadcastEncrypted(plaintext, metadata = {}, options = {}) {
@@ -3652,18 +3707,27 @@ var PeerPigeonCryptoProtocol = class {
       from: peerId,
       pub: this.keyPair.pub,
       epub: this.keyPair.epub,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      sig: this.localKeySig ?? void 0
     };
   }
   sendPublicInfoDirect(peerId, payload = this.localPublicInfoPayload()) {
     if (!payload || !peerId || peerId === payload.from) return;
     this.gossip.sendDirect(peerId, payload);
   }
-  upsertPublicKey(peerId, payload) {
+  async upsertPublicKey(peerId, payload) {
     const id = String(peerId ?? "").trim();
     if (!id || typeof payload.pub !== "string" || typeof payload.epub !== "string") return;
     const existing = this.publicKeys.get(id);
     if (existing && existing.updatedAt > payload.timestamp) return;
+    if (payload.sig && id !== this.mesh.getClientId()) {
+      const msg = `pp-key:${id}:${payload.pub}:${payload.epub}`;
+      const valid = await verifyMessage(msg, payload.sig, payload.pub).catch(() => false);
+      if (!valid) {
+        this.emitError(new Error(`Public key announcement signature verification failed for peer ${id}`));
+        return;
+      }
+    }
     const value = {
       peerId: id,
       pub: payload.pub,
@@ -3693,7 +3757,7 @@ var PeerPigeonCryptoProtocol = class {
   async handleGossipMessage(data) {
     const payload = data.message.data;
     if (this.isPublicInfo(payload)) {
-      if (data.local || !data.message.sender || payload.from === data.message.sender) this.upsertPublicKey(payload.from, payload);
+      if (data.local || !data.message.sender || payload.from === data.message.sender) await this.upsertPublicKey(payload.from, payload);
       return;
     }
     if (this.isPublicRequest(payload)) {
@@ -3708,7 +3772,7 @@ var PeerPigeonCryptoProtocol = class {
   async handleDirectMessage(message) {
     const payload = message.data;
     if (this.isPublicInfo(payload)) {
-      if (payload.from === message.from) this.upsertPublicKey(payload.from, payload);
+      if (payload.from === message.from) await this.upsertPublicKey(payload.from, payload);
       return;
     }
     if (this.isPublicRequest(payload)) {
@@ -3716,17 +3780,43 @@ var PeerPigeonCryptoProtocol = class {
       return;
     }
     if (!this.isEncryptedDirect(payload) || payload.to !== this.mesh.getClientId() || payload.from !== message.from) return;
+    const senderKey = this.getPublicKey(payload.from);
+    if (payload.sig && senderKey) {
+      const sigMsg = `pp-direct:${payload.from}:${payload.to}:${payload.timestamp}:${JSON.stringify(payload.cipher)}`;
+      const valid = await verifyMessage(sigMsg, payload.sig, senderKey.pub).catch(() => false);
+      if (!valid) {
+        this.emitError(new Error(`Direct message signature verification failed from peer ${payload.from}`));
+        return;
+      }
+    }
     const plaintext = await this.decryptEncryptedDirect(payload);
     this.emit("encryptedDirectReceived", { plaintext, payload, message });
   }
   async deriveRoomKey() {
     const cryptoApi = this.cryptoApi();
     const roomScope = this.options.roomSecret ? `${this.options.roomId}:${this.options.roomSecret}` : this.options.roomId;
-    const seed = new TextEncoder().encode(
-      `peerpigeon:room-broadcast:v1:${roomScope}`
+    const enc = new TextEncoder();
+    const ikm = await cryptoApi.subtle.importKey(
+      "raw",
+      enc.encode(roomScope),
+      { name: "HKDF" },
+      false,
+      ["deriveKey"]
     );
-    const hash = await cryptoApi.subtle.digest("SHA-256", seed);
-    return await cryptoApi.subtle.importKey("raw", hash, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    const salt = enc.encode(`peerpigeon:room-salt:v1:${this.options.roomId}`);
+    const info = enc.encode("peerpigeon:room-broadcast:v1");
+    return await cryptoApi.subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt,
+        info
+      },
+      ikm,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"]
+    );
   }
   cryptoApi() {
     if (!globalThis.crypto?.subtle) throw new Error("WebCrypto is unavailable");
@@ -3919,10 +4009,15 @@ var PartialMesh = class {
     // the window closes, so nothing is lost, only coalesced.
     this.membershipBroadcastAtMs = 0;
     this.membershipBroadcastTimer = null;
-    const automaticSignalingServer = config.automaticSignalingServer ?? !config.signalingServer;
-    const bootstrapServer = String(config.signalingServer || DEFAULT_SIGNALING_SERVERS[0]).trim();
-    const configuredSignalingServers = Array.from(new Set((config.signalingServers != null ? [bootstrapServer, ...config.signalingServers] : automaticSignalingServer ? DEFAULT_SIGNALING_SERVERS : [bootstrapServer]).map((url) => String(url || "").trim()).filter(Boolean)));
-    const signalingServers = configuredSignalingServers.length > 0 ? configuredSignalingServers : [...DEFAULT_SIGNALING_SERVERS];
+    const env = globalThis.process?.env;
+    const envSignaling = (env?.PEERPIGEON_SIGNALING_SERVER || env?.GIT_PIGEON_SIGNAL)?.trim();
+    const defaultRelays = envSignaling && /^wss?:\/\//i.test(envSignaling) ? [envSignaling] : DEFAULT_SIGNALING_SERVERS;
+    const explicitSignalingServer = config.signalingServer ? String(config.signalingServer).trim() : "";
+    const explicitSignalingServers = config.signalingServers?.map((url) => String(url || "").trim()).filter(Boolean);
+    const bootstrapServer = explicitSignalingServer || explicitSignalingServers?.[0] || defaultRelays[0];
+    const automaticSignalingServer = config.automaticSignalingServer ?? !(explicitSignalingServer || explicitSignalingServers || envSignaling);
+    const configuredSignalingServers = Array.from(new Set((explicitSignalingServers ? explicitSignalingServer ? [explicitSignalingServer, ...explicitSignalingServers] : explicitSignalingServers : automaticSignalingServer ? defaultRelays : [bootstrapServer]).map((url) => String(url || "").trim()).filter(Boolean)));
+    const signalingServers = configuredSignalingServers.length > 0 ? configuredSignalingServers : [...defaultRelays];
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,

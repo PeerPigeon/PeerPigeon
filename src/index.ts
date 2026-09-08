@@ -452,16 +452,25 @@ export class PartialMesh {
   private localTopologyUpdatedAtMs: number = Date.now();
 
   constructor(config: PartialMeshConfig = {}) {
-    const automaticSignalingServer = config.automaticSignalingServer ?? !config.signalingServer;
-    const bootstrapServer = String(config.signalingServer || DEFAULT_SIGNALING_SERVERS[0]).trim();
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    const envSignaling = (env?.PEERPIGEON_SIGNALING_SERVER || env?.GIT_PIGEON_SIGNAL)?.trim();
+    const defaultRelays = (envSignaling && /^wss?:\/\//i.test(envSignaling))
+      ? [envSignaling]
+      : DEFAULT_SIGNALING_SERVERS;
+    const explicitSignalingServer = config.signalingServer ? String(config.signalingServer).trim() : '';
+    const explicitSignalingServers = config.signalingServers?.map((url) => String(url || '').trim()).filter(Boolean);
+    const bootstrapServer = explicitSignalingServer
+      || explicitSignalingServers?.[0]
+      || defaultRelays[0];
+    const automaticSignalingServer = config.automaticSignalingServer ?? !(explicitSignalingServer || explicitSignalingServers || envSignaling);
     const configuredSignalingServers = Array.from(new Set((
-      config.signalingServers != null
-        ? [bootstrapServer, ...config.signalingServers]
-        : (automaticSignalingServer ? DEFAULT_SIGNALING_SERVERS : [bootstrapServer])
+      explicitSignalingServers
+        ? (explicitSignalingServer ? [explicitSignalingServer, ...explicitSignalingServers] : explicitSignalingServers)
+        : (automaticSignalingServer ? defaultRelays : [bootstrapServer])
     ).map((url) => String(url || '').trim()).filter(Boolean)));
     const signalingServers = configuredSignalingServers.length > 0
       ? configuredSignalingServers
-      : [...DEFAULT_SIGNALING_SERVERS];
+      : [...defaultRelays];
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,

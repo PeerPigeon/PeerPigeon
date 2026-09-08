@@ -1079,30 +1079,6 @@ export default {
     window.addEventListener('online', this.pageLifecycleResumeHandler);
     window.addEventListener('pagehide', this.pageLifecyclePageHideHandler);
   },
-  updated() {
-    // HMR preserves data from tabs opened with the former explicit peer.ooo
-    // default. Migrate that live state too, not only fresh page loads.
-    if (this.usesAutomaticSignalingServer(this.signalingServer) && this.signalingServer !== 'auto') {
-      this.signalingServer = 'auto';
-      this.updateUrlState();
-      if (import.meta.env.DEV && this.isRunning) {
-        this.restartUnexpectedlyStoppedMesh('automatic relay migration');
-        return;
-      }
-    }
-    // Older HMR cleanup destroyed window.__mesh while Vue retained this
-    // component and its `isRunning` state. Repair that impossible half-state
-    // automatically instead of leaving a dev tab stuck at Connected 0.
-    if (
-      import.meta.env.DEV
-      && this.isRunning
-      && this.mesh
-      && !this.mesh.signalingClient
-    ) {
-      this.restartUnexpectedlyStoppedMesh('hot update');
-    }
-    this.scheduleNetworkGraphBadgePinUpdate();
-  },
   computed: {
     gossipBadgeSnapshot() {
       return gossipBadgeState({

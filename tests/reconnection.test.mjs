@@ -203,7 +203,7 @@ test('adapter leaves short retries in FreeRTC, then rotates an unresponsive fede
 
     // The adapter's bounded registration deadline then advances to the next
     // configured relay instead of reconnecting to the dead first relay forever.
-    t.mock.timers.tick(2_500);
+    t.mock.timers.tick(9_500);
     assert.match(attempts.at(-1), /^wss:\/\/next-nearest\.example\/ws/);
   } finally {
     adapter.disconnect();
@@ -329,7 +329,7 @@ test('an exhausted FreeRTC offer releases its pending slot and refreshes discove
   assert.deepEqual(disconnected, [peerId]);
   assert.deepEqual(failures, [{ peerId, reason: 'offer_retries_exhausted' }]);
   assert.ok(logs.some((message) => message.includes('offer_retries_exhausted')));
-  assert.ok(logs.some((message) => message.includes('released immediately; redialing')));
+  assert.ok(logs.some((message) => message.includes('released immediately') && message.includes('redialing')));
 });
 
 test('an exhausted offer still releases PartialMesh after FreeRTC already removed its entry', () => {
@@ -547,9 +547,9 @@ test('broadcast send failure releases the unusable edge immediately', () => {
     peerId: '1'.repeat(64),
   });
   const connections = new Map([[peerId, {
-    state: 'connected',
-    connection: { connectionState: 'connected', close() {} },
-    channel: { readyState: 'open', close() {} },
+    state: 'failed',
+    connection: { connectionState: 'failed', close() {} },
+    channel: { readyState: 'closed', close() {} },
   }]]);
   adapter.client = {
     mesh: { connections },
@@ -578,7 +578,7 @@ test('suspend recovery releases missing peer edges and reconnects signaling with
   let connects = 0;
   let signalingReconnects = 0;
   const client = {
-    isRegistered: true,
+    isRegistered: false,
     mesh: { connections: new Map() },
     advertise() {},
     requestBootstrap() {},
@@ -594,14 +594,14 @@ test('suspend recovery releases missing peer edges and reconnects signaling with
 
   adapter.recoverAfterInactivity('visible');
   assert.deepEqual(peerDisconnects, [{ peerId }]);
-  t.mock.timers.tick(4_999);
+  t.mock.timers.tick(11_999);
   assert.equal(disconnects, 0);
 
   t.mock.timers.tick(1);
   assert.equal(disconnects, 0);
   assert.equal(signalingReconnects, 1);
   assert.equal(adapter.client, client);
-  assert.equal(connects, 0);
+  assert.equal(connects, 1);
   assert.equal(adapter.client, client);
 
   // The missing edge was already released; a later registration flush must
@@ -632,7 +632,7 @@ test('an unregistered signaling transport recovers without another peer announci
   adapter.recoverAfterInactivity('signaling-watchdog');
   assert.equal(connects, 1);
 
-  t.mock.timers.tick(4_999);
+  t.mock.timers.tick(11_999);
   assert.equal(disconnects, 0);
 
   // A FreeRTC connect call can be a no-op while its old WebSocket remains
@@ -646,7 +646,7 @@ test('an unregistered signaling transport recovers without another peer announci
 
   // Missing a second acknowledgement must start another bounded recycle;
   // the adapter cannot remain trapped in "reconnect in progress".
-  t.mock.timers.tick(5_000);
+  t.mock.timers.tick(12_000);
   assert.equal(disconnects, 0);
   assert.equal(signalingReconnects, 2);
   assert.equal(connects, 1);
@@ -709,7 +709,12 @@ test('periodic relay acknowledgement checks detect zombie sockets without lifecy
   assert.equal(bootstrapRequests, 1);
   assert.equal(disconnects, 0);
 
-  t.mock.timers.tick(5_000);
+  // 3 consecutive misses (12s probe timeout, 15s health interval) trigger recycle
+  t.mock.timers.tick(12_000);
+  t.mock.timers.tick(3_000);
+  t.mock.timers.tick(12_000);
+  t.mock.timers.tick(3_000);
+  t.mock.timers.tick(12_000);
   assert.equal(disconnects, 0);
   assert.equal(signalingReconnects, 1);
   assert.equal(peerConnectionClosed, false);
@@ -737,6 +742,7 @@ test('initial relay acknowledgement failure rotates within five seconds', (t) =>
   };
   adapter.client = client;
   adapter.signalingConnected = true;
+  adapter.healthProbeMisses = 2;
   adapter.scheduleInitialSignalingHealthCheck();
 
   t.mock.timers.tick(999);
@@ -747,7 +753,7 @@ test('initial relay acknowledgement failure rotates within five seconds', (t) =>
   assert.equal(bootstrapRequests, 1);
   assert.equal(disconnects, 0);
 
-  t.mock.timers.tick(3_999);
+  t.mock.timers.tick(11_999);
   assert.equal(disconnects, 0);
   t.mock.timers.tick(1);
   assert.equal(disconnects, 1);

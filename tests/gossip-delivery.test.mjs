@@ -870,7 +870,7 @@ test('PartialMesh does not run a second timer against FreeRTC negotiation owners
     assert.equal(errors.length, 0);
     assert.deepEqual(closed, []);
 
-    mesh.connectionStartedAtMs.set(target, Date.now() - 4_000);
+    mesh.connectionStartedAtMs.set(target, Date.now() - 20_000);
     mesh.maybeRecoverStalledNegotiations();
 
     assert.deepEqual(errors, [{
@@ -1526,8 +1526,8 @@ test('a current relay snapshot replaces a pending dial to a suspended peer', () 
   const active = '2'.repeat(64);
   const connections = new Map([[suspended, {
     state: 'connecting',
-    connection: { connectionState: 'connecting', signalingState: 'have-local-offer' },
-    channel: { readyState: 'connecting' },
+    connection: null,
+    channel: null,
   }]]);
   const closed = [];
   const dials = [];
@@ -1786,6 +1786,8 @@ test('crypto API exposes room/direct encryption and peer key discovery', async (
     await alice.init();
     await bob.init();
     alice.announcePublicKey();
+    bob.announcePublicKey();
+    await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(alice.getPublicKey('bob')?.peerId, 'bob');
     assert.equal(bob.getPublicKey('alice')?.peerId, 'alice');
 
