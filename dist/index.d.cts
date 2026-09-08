@@ -262,6 +262,7 @@ declare class GossipProtocol {
     private seenDirectIds;
     private deliveryStates;
     private aggregateStates;
+    private lastPruneTrackingAt;
     private retainedMessages;
     private dirtyDeliveryReceiptIds;
     private gossipFanoutCursor;
