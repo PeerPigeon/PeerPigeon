@@ -1938,6 +1938,23 @@ export class GossipProtocol {
    * Send a direct message to a specific peer, routed through the mesh via XOR distance.
    * Delivers even if there is no direct connection to the target.
    */
+  /**
+   * Whether a direct frame for this peer has somewhere to go right now: the
+   * peer is a connected neighbour, or it is in the live membership and at
+   * least one neighbour makes XOR progress toward it. Signaling asks this
+   * before choosing the mesh over a relay for a negotiation frame.
+   */
+  canRouteDirect(targetPeerId: string): boolean {
+    const self = this.mesh.getClientId();
+    const target = String(targetPeerId ?? '').trim();
+    if (!self || !target || target === self) return false;
+    const connected = this.mesh.getConnectedPeers();
+    if (connected.includes(target)) return true;
+    if (connected.length === 0) return false;
+    if (!this.canonicalPeerSet().includes(target)) return false;
+    return this.orderedRouteCandidates(target, undefined, this.cecrConfigId()).length > 0;
+  }
+
   sendDirect(targetPeerId: string, data: unknown): string | null {
     const from = this.mesh.getClientId();
     if (!from) return null;

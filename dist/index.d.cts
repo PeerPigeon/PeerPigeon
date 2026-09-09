@@ -1,3 +1,14 @@
+/**
+ * A path for signaling frames that does not go through the relay: the
+ * mesh itself. `canRoute` says whether a frame for that peer has somewhere
+ * to go; `send` hands the complete PSP envelope to the mesh and reports
+ * whether it was taken. Any frame the mesh declines falls back to the relay.
+ */
+interface MeshSignaling {
+    canRoute(peerId: string): boolean;
+    send(envelope: Record<string, unknown>): boolean;
+}
+
 type GossipProtocolOptions = {
     /** Maximum number of re-propagation hops for a message. */
     maxHops?: number;
@@ -359,6 +370,13 @@ declare class GossipProtocol {
      * Send a direct message to a specific peer, routed through the mesh via XOR distance.
      * Delivers even if there is no direct connection to the target.
      */
+    /**
+     * Whether a direct frame for this peer has somewhere to go right now: the
+     * peer is a connected neighbour, or it is in the live membership and at
+     * least one neighbour makes XOR progress toward it. Signaling asks this
+     * before choosing the mesh over a relay for a negotiation frame.
+     */
+    canRouteDirect(targetPeerId: string): boolean;
     sendDirect(targetPeerId: string, data: unknown): string | null;
     private routeDirect;
     private handleIncomingDirect;
@@ -724,6 +742,13 @@ declare class PeerPigeonCryptoProtocol {
 /** Deterministic SHA-1 hex for compact, non-routing public display IDs. */
 declare function sha1Hex(value: unknown): string;
 
+/** Payload type of a signaling envelope carried inside a gossip direct frame. */
+declare const MESH_SIGNAL_PAYLOAD_TYPE = "pp-signal-v1";
+declare function isMeshSignalPayload(value: unknown): value is {
+    __ppType: typeof MESH_SIGNAL_PAYLOAD_TYPE;
+    envelope: Record<string, unknown>;
+};
+
 declare const DEFAULT_SIGNALING_SERVERS: readonly string[];
 declare const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
 /** Order relays by SHA-256(hostname) XOR distance to the peer ID. */
@@ -937,6 +962,7 @@ declare class PartialMesh {
     private discoveredAtMs;
     /** Peers present in the relay's latest un-graced discovery snapshot. */
     private activeSignalingPeers;
+    private meshSignaling;
     /** Whether the relay has supplied an authoritative active snapshot yet. */
     private hasActiveSignalingSnapshot;
     private maintenanceTimer;
@@ -975,6 +1001,20 @@ declare class PartialMesh {
     private loadOrCreateBrowserPeerId;
     private rememberBrowserPeerSignalUrls;
     private retirePeerId;
+    /**
+     * Give the mesh a way to carry signaling frames itself. Once set, a peer
+     * the mesh can route to is dialed through connected neighbours, a relay
+     * snapshot that omits it cannot cancel that dial, and it counts as a dial
+     * candidate whether or not this relay ever lists it.
+     */
+    setMeshSignaling(provider: MeshSignaling | null): void;
+    private meshCanSignal;
+    /**
+     * A signaling envelope that arrived inside a gossip direct frame. The
+     * frame's origin must be the envelope's sender: a neighbour can carry a
+     * peer's offer, never author one on its behalf.
+     */
+    receiveMeshSignal(fromPeerId: string, envelope: Record<string, unknown>): boolean;
     private reconcileSignalingPeers;
     private handleSignalingPeerLeft;
     private trackRtcNegotiation;
@@ -1234,4 +1274,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, rankSignalingServersByDistance, selectClosestSignalingServer, sha1Hex };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MESH_SIGNAL_PAYLOAD_TYPE, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, isMeshSignalPayload, rankSignalingServersByDistance, selectClosestSignalingServer, sha1Hex };

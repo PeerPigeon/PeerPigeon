@@ -1,4 +1,14 @@
-import FreeRTCClientAdapter from './freertc-client-adapter.js';
+import FreeRTCClientAdapter, { type MeshSignaling } from './freertc-client-adapter.js';
+
+/** Payload type of a signaling envelope carried inside a gossip direct frame. */
+export const MESH_SIGNAL_PAYLOAD_TYPE = 'pp-signal-v1';
+
+export function isMeshSignalPayload(value: unknown): value is { __ppType: typeof MESH_SIGNAL_PAYLOAD_TYPE; envelope: Record<string, unknown> } {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as { __ppType?: unknown; envelope?: unknown };
+  return candidate.__ppType === MESH_SIGNAL_PAYLOAD_TYPE
+    && !!candidate.envelope && typeof candidate.envelope === 'object';
+}
 import { GossipProtocol } from './gossip.js';
 import type {
   CecrConfigSnapshot,
@@ -422,6 +432,7 @@ export class PartialMesh {
   private discoveredAtMs: Map<string, number> = new Map();
   /** Peers present in the relay's latest un-graced discovery snapshot. */
   private activeSignalingPeers: Set<string> = new Set();
+  private meshSignaling: MeshSignaling | null = null;
   /** Whether the relay has supplied an authoritative active snapshot yet. */
   private hasActiveSignalingSnapshot: boolean = false;
   private maintenanceTimer: ReturnType<typeof setInterval> | null = null;
@@ -728,6 +739,43 @@ export class PartialMesh {
     return changed;
   }
 
+  /**
+   * Give the mesh a way to carry signaling frames itself. Once set, a peer
+   * the mesh can route to is dialed through connected neighbours, a relay
+   * snapshot that omits it cannot cancel that dial, and it counts as a dial
+   * candidate whether or not this relay ever lists it.
+   */
+  setMeshSignaling(provider: MeshSignaling | null): void {
+    this.meshSignaling = provider;
+  }
+
+  private meshCanSignal(peerId: string): boolean {
+    const id = this.normalizePeerId(peerId);
+    if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) return false;
+    try {
+      return this.meshSignaling?.canRoute(id) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * A signaling envelope that arrived inside a gossip direct frame. The
+   * frame's origin must be the envelope's sender: a neighbour can carry a
+   * peer's offer, never author one on its behalf.
+   */
+  receiveMeshSignal(fromPeerId: string, envelope: Record<string, unknown>): boolean {
+    const from = this.normalizePeerId(fromPeerId);
+    if (!from || !envelope || typeof envelope !== 'object') return false;
+    if (this.normalizePeerId(String(envelope.from ?? '')) !== from) return false;
+    if (this.isSelfAlias(from) || this.retiredPeerIds.has(from)) return false;
+    const accepted = this.signalingClient?.injectSignal?.(envelope) === true;
+    if (accepted && (envelope.type === 'offer' || envelope.type === 'answer')) {
+      this.emit('signaling:log', { message: `[signal] ${String(envelope.type)} from ${from.slice(0, 12)} arrived over the mesh` });
+    }
+    return accepted;
+  }
+
   private reconcileSignalingPeers(rawPeerIds: string[], rawActivePeerIds?: string[]): void {
     const previousActiveSignalingPeers = new Set(this.activeSignalingPeers);
     const nextPeers = new Set(
@@ -799,6 +847,8 @@ export class PartialMesh {
         !peer.connected
         && !this.activeSignalingPeers.has(peer.id)
         && !transportInProgress(peer.id)
+        // A dial signaled over the mesh owes nothing to this relay's view.
+        && !this.meshCanSignal(peer.id)
         && Array.from(this.activeSignalingPeers).some((peerId) => peerId !== peer.id)
       ));
       for (const peer of inactivePendingPeers) {
@@ -1263,7 +1313,17 @@ export class PartialMesh {
       previousPeerSignalUrls,
       retiredPeerIds,
       iceServers: this.config.iceServers,
-      trickleIce: this.config.trickleIce
+      trickleIce: this.config.trickleIce,
+      meshSignaling: {
+        canRoute: (peerId: string) => this.meshCanSignal(peerId),
+        send: (envelope: Record<string, unknown>) => {
+          try {
+            return this.meshSignaling?.send(envelope) === true;
+          } catch {
+            return false;
+          }
+        },
+      },
     });
 
     // Set up signaling event handlers
@@ -2004,6 +2064,11 @@ export class PartialMesh {
     const candidates = new Set<string>(
       this.hasActiveSignalingSnapshot ? activeDiscoveredPeers : this.discoveredPeers
     );
+    // A member the mesh can already signal is dialable regardless of what
+    // this relay lists: the offer travels over connected neighbours.
+    for (const peerId of this.getGlobalPeers()) {
+      if (this.meshCanSignal(peerId)) candidates.add(peerId);
+    }
     if (includeLiveMembership && activeDiscoveredPeers.length === 0) {
       for (const peerId of this.getGlobalPeers()) {
         // Discovery grace can retain an expired peer after the authoritative
@@ -2098,7 +2163,7 @@ export class PartialMesh {
     const emergencyIsolated = this.getConnectedPeerCount() === 0
       && this.dialCandidatePeerIds(true).length > 0;
 
-    if (!signalingConnected) {
+    if (!signalingConnected && !this.meshCanSignal(peerId)) {
       try {
         this.signalingClient?.connect?.();
       } catch {
@@ -3023,6 +3088,17 @@ export class PeerPigeonNode {
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
     this.storageOptions = storage;
+    // Signaling prefers the mesh: a negotiation frame for any peer the
+    // gossip layer can route to rides a direct frame through neighbours, and
+    // only frames with no mesh route fall back to a relay.
+    this.mesh.setMeshSignaling({
+      canRoute: (peerId) => this.gossip.canRouteDirect(peerId),
+      send: (envelope) => {
+        const to = String(envelope?.to ?? '').trim();
+        if (!to || !this.gossip.canRouteDirect(to)) return false;
+        return this.gossip.sendDirect(to, { __ppType: MESH_SIGNAL_PAYLOAD_TYPE, envelope }) !== null;
+      },
+    });
 
     if (crypto === false) {
       this.crypto = null;
@@ -3232,6 +3308,10 @@ export class PeerPigeonNode {
       });
     });
     this.gossip.on('directMessageReceived', ({ message }) => {
+      if (isMeshSignalPayload(message.data)) {
+        this.mesh.receiveMeshSignal(message.from, message.data.envelope);
+        return;
+      }
       if (this.isReservedPayload(message.data)) return;
       this.emit('message', {
         kind: 'direct',
@@ -3283,7 +3363,7 @@ export class PeerPigeonNode {
     if (PeerPigeonCryptoProtocol.isProtocolPayload(data)) return true;
     if (!data || typeof data !== 'object') return false;
     const type = (data as { __ppType?: unknown }).__ppType;
-    return typeof type === 'string' && type.startsWith('pp-storage-');
+    return typeof type === 'string' && (type.startsWith('pp-storage-') || type.startsWith('pp-signal-'));
   }
 
   private emitError(error: unknown): void {

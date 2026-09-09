@@ -2,6 +2,17 @@ import { createSignalingClient, withdrawSignalingIdentity } from 'freertc/client
 
 type Handler = (...args: any[]) => void;
 
+/**
+ * A path for signaling frames that does not go through the relay: the
+ * mesh itself. `canRoute` says whether a frame for that peer has somewhere
+ * to go; `send` hands the complete PSP envelope to the mesh and reports
+ * whether it was taken. Any frame the mesh declines falls back to the relay.
+ */
+export interface MeshSignaling {
+  canRoute(peerId: string): boolean;
+  send(envelope: Record<string, unknown>): boolean;
+}
+
 const RECOVERY_PROBE_TIMEOUT_MS = 12_000;
 // A slow discovery reply is not a dead relay. Switching relays on every
 // missed probe re-registered the watcher elsewhere every fifteen seconds,
@@ -64,6 +75,7 @@ export class FreeRTCClientAdapter {
   private readonly previousPeerSignalUrls: readonly string[];
   private readonly defaultIceServers: RTCIceServer[] | null;
   private readonly trickleIce: boolean;
+  private readonly meshSignaling: MeshSignaling | null;
   private readonly emitter = new Emitter();
   private readonly knownPeers = new Set<string>();
   private readonly knownPeerLastSeenAtMs = new Map<string, number>();
@@ -118,6 +130,7 @@ export class FreeRTCClientAdapter {
     retiredPeerIds?: string[];
     iceServers?: RTCIceServer[] | null;
     trickleIce?: boolean;
+    meshSignaling?: MeshSignaling | null;
   }) {
     const normalizedSignalUrls = Array.from(new Set(
       (Array.isArray(signalUrls) ? signalUrls : [signalUrls])
@@ -144,6 +157,7 @@ export class FreeRTCClientAdapter {
     ));
     this.defaultIceServers = options?.iceServers ?? null;
     this.trickleIce = options?.trickleIce ?? true;
+    this.meshSignaling = options?.meshSignaling ?? null;
     this.addSelfAlias(this.requestedPeerId);
     this.addSelfAlias(this.previousPeerId);
     for (const peerId of this.retiredPeerIds) this.addSelfAlias(peerId);
@@ -231,6 +245,16 @@ export class FreeRTCClientAdapter {
       iceServers: this.defaultIceServers ?? undefined,
       trickleIce: this.trickleIce,
       autoConnect: false,
+      // The mesh is asked first for every addressed frame; the relay only
+      // carries what the mesh cannot route.
+      signalTransport: (envelope: Record<string, unknown>) => {
+        if (!isCurrentClient()) return false;
+        try {
+          return this.meshSignaling?.send(envelope) === true;
+        } catch {
+          return false;
+        }
+      },
       // FreeRTC detected a suspend by the clock (a Node peer has no lifecycle
       // events) and already rebuilt its transports; clear our own expired
       // recovery state the same way a browser's thaw does.
@@ -340,10 +364,32 @@ export class FreeRTCClientAdapter {
     if (!id || this.isSelfAlias(id)) {
       throw new Error('Cannot connect to a current or retired local peer ID');
     }
-    if (!this.client?.isRegistered) {
+    // A peer the mesh can reach is dialable before, or without, a relay
+    // registration: its offer travels over connected neighbours.
+    if (!this.client || (!this.client.isRegistered && !this.canSignalViaMesh(id))) {
       throw new Error('Not connected');
     }
     await this.client.initiateConnection(id, iceServers ?? this.defaultIceServers ?? undefined);
+  }
+
+  canSignalViaMesh(peerId: string): boolean {
+    const id = this.normalizePeerId(peerId);
+    if (!id || this.isSelfAlias(id)) return false;
+    try {
+      return this.meshSignaling?.canRoute(id) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** A signaling frame that arrived over the mesh rather than the relay. */
+  injectSignal(envelope: Record<string, unknown>): boolean {
+    if (!this.client) return false;
+    try {
+      return this.client.injectSignal?.(envelope) === true;
+    } catch {
+      return false;
+    }
   }
 
   nudgeSignaling(): void {
