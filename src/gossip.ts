@@ -1974,11 +1974,13 @@ export class GossipProtocol {
     };
 
     this.markDirectSeen(message.id, message.timestamp);
-    this.routeDirect(message, null);
-    return message.id;
+    // A frame nobody took is not sent. Signaling relies on this: a mesh
+    // send that reports success without a neighbour holding the frame would
+    // suppress the relay copy and lose the offer.
+    return this.routeDirect(message, null) ? message.id : null;
   }
 
-  private routeDirect(message: DirectMessage, fromPeerId: string | null): void {
+  private routeDirect(message: DirectMessage, fromPeerId: string | null): boolean {
     const self = this.mesh.getClientId();
 
     // We are the destination
@@ -1995,17 +1997,17 @@ export class GossipProtocol {
             + Math.max(1, Math.floor(Number(message.hops) || 0)),
           path: repairPath,
         }, fromPeerId ?? message.from);
-        return;
+        return true;
       }
       this.emit('directMessageReceived', { message });
-      return;
+      return true;
     }
 
     // Cached or merely discovered identifiers are not routable after their
     // membership lease leaves the local live view.
-    if (!this.canonicalPeerSet().includes(message.to)) return;
+    if (!this.canonicalPeerSet().includes(message.to)) return false;
 
-    if (message.hops >= message.maxHops) return;
+    if (message.hops >= message.maxHops) return false;
 
     // Is target directly connected? Short-circuit.
     const connected = this.mesh.getConnectedPeers();
@@ -2016,8 +2018,10 @@ export class GossipProtocol {
           hops: message.hops + 1,
           path: this.extendRoutePath(message.path, message.to),
         }));
-      } catch { /* best-effort */ }
-      return;
+        return true;
+      } catch {
+        // The direct edge refused it; a neighbour may still make progress.
+      }
     }
 
     // Try the deterministic CECR ordering. Every candidate is a measurable
@@ -2033,11 +2037,12 @@ export class GossipProtocol {
           hops: message.hops + 1,
           path: this.extendRoutePath(message.path, next),
         }));
-        return;
+        return true;
       } catch {
         // try the next eligible progress candidate
       }
     }
+    return false;
   }
 
   private handleIncomingDirect(message: DirectMessage, fromPeerId: string): void {

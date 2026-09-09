@@ -2201,8 +2201,7 @@ var _GossipProtocol = class _GossipProtocol {
       originViewId: this.canonicalSetHash(this.canonicalPeerSet())
     };
     this.markDirectSeen(message.id, message.timestamp);
-    this.routeDirect(message, null);
-    return message.id;
+    return this.routeDirect(message, null) ? message.id : null;
   }
   routeDirect(message, fromPeerId) {
     const self = this.mesh.getClientId();
@@ -2218,13 +2217,13 @@ var _GossipProtocol = class _GossipProtocol {
           hops: Math.max(0, Math.floor(Number(repairedMessage.hops) || 0)) + Math.max(1, Math.floor(Number(message.hops) || 0)),
           path: repairPath
         }, fromPeerId ?? message.from);
-        return;
+        return true;
       }
       this.emit("directMessageReceived", { message });
-      return;
+      return true;
     }
-    if (!this.canonicalPeerSet().includes(message.to)) return;
-    if (message.hops >= message.maxHops) return;
+    if (!this.canonicalPeerSet().includes(message.to)) return false;
+    if (message.hops >= message.maxHops) return false;
     const connected = this.mesh.getConnectedPeers();
     if (connected.includes(message.to)) {
       try {
@@ -2233,9 +2232,9 @@ var _GossipProtocol = class _GossipProtocol {
           hops: message.hops + 1,
           path: this.extendRoutePath(message.path, message.to)
         }));
+        return true;
       } catch {
       }
-      return;
     }
     for (const next of this.orderedRouteCandidates(
       message.to,
@@ -2248,10 +2247,11 @@ var _GossipProtocol = class _GossipProtocol {
           hops: message.hops + 1,
           path: this.extendRoutePath(message.path, next)
         }));
-        return;
+        return true;
       } catch {
       }
     }
+    return false;
   }
   handleIncomingDirect(message, fromPeerId) {
     if (this.seenDirectIds.has(message.id)) return;

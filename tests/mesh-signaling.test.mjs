@@ -178,3 +178,23 @@ test('the adapter dials over the mesh before any relay registration and applies 
     globalThis.RTCPeerConnection = originalRTCPeerConnection;
   }
 });
+
+test('a direct frame no neighbour takes reports as not sent, so signaling falls back to the relay', () => {
+  const sendCalls = [];
+  const refusing = {
+    on() {},
+    getClientId: () => SELF,
+    getConnectedPeers: () => [NEAR_FAR],
+    getDiscoveredPeers: () => [],
+    getGlobalPeers: () => [NEAR_FAR, FAR],
+    send: (peerId) => { sendCalls.push(peerId); throw new Error('send buffer full'); },
+  };
+  const gossip = new GossipProtocol(refusing);
+  try {
+    assert.equal(gossip.canRouteDirect(FAR), true, 'a route exists on paper');
+    assert.equal(gossip.sendDirect(FAR, { hello: 1 }), null, 'but nobody took the frame');
+    assert.ok(sendCalls.length >= 1);
+  } finally {
+    gossip.destroy();
+  }
+});
