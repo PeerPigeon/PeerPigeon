@@ -254,6 +254,9 @@ declare class GossipProtocol {
     private messageLog;
     private readonly maxTrackedMessages;
     private readonly maxTrackedDirectIds;
+    private readonly maxRetainedBytes;
+    private readonly maxRetainedMessageBytes;
+    private retainedBytes;
     private readonly trackingRetentionMs;
     private antiEntropySummarySize;
     private antiEntropyRequestSize;
@@ -308,6 +311,9 @@ declare class GossipProtocol {
      */
     handleIncomingMessage(message: GossipMessage, fromPeerId: string): void;
     private retainGossipMessage;
+    private dropRetained;
+    /** Bytes of message copies currently held for repair. */
+    getRetainedBytes(): number;
     private extendRoutePath;
     private compactRoutePeerId;
     private static readonly INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS;

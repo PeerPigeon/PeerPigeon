@@ -924,6 +924,14 @@ var _GossipProtocol = class _GossipProtocol {
     this.messageLog = /* @__PURE__ */ new Map();
     this.maxTrackedMessages = 12e3;
     this.maxTrackedDirectIds = 12e3;
+    // Retained copies exist so a late peer can be repaired. A count bound alone
+    // let a node that publishes large records every few seconds hold hundreds
+    // of megabytes of payload copies inside the retention window. Retention is
+    // bounded in bytes, and a payload past the per-message bound is not
+    // retained at all: the storage layer repairs records itself.
+    this.maxRetainedBytes = 24 * 1024 * 1024;
+    this.maxRetainedMessageBytes = 256 * 1024;
+    this.retainedBytes = 0;
     this.trackingRetentionMs = 10 * 6e4;
     this.cecrViewChangedAtMs = Date.now();
     this.cecrCurrentExtrema = null;
@@ -1194,23 +1202,37 @@ var _GossipProtocol = class _GossipProtocol {
   retainGossipMessage(message, retainedAt = Date.now()) {
     if (this.retainedMessages.has(message.id)) return;
     try {
-      const snapshot = JSON.parse(JSON.stringify(message));
+      const serialized = JSON.stringify(message);
+      if (serialized.length > this.maxRetainedMessageBytes) return;
+      const snapshot = JSON.parse(serialized);
       const peers = this.canonicalPeerSet();
       this.retainedMessages.set(message.id, {
         message: snapshot,
         retainedAt,
         viewId: this.canonicalSetHash(peers),
-        viewSize: peers.length
+        viewSize: peers.length,
+        bytes: serialized.length
       });
+      this.retainedBytes += serialized.length;
       this.scheduleInitialSpreadRepair(retainedAt);
     } catch {
       return;
     }
-    while (this.retainedMessages.size > this.maxTrackedMessages) {
+    while (this.retainedMessages.size > this.maxTrackedMessages || this.retainedBytes > this.maxRetainedBytes) {
       const oldest = this.retainedMessages.keys().next().value;
       if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+      this.dropRetained(oldest);
     }
+  }
+  dropRetained(messageId) {
+    const retained = this.retainedMessages.get(messageId);
+    if (!retained) return;
+    this.retainedMessages.delete(messageId);
+    this.retainedBytes = Math.max(0, this.retainedBytes - (retained.bytes ?? 0));
+  }
+  /** Bytes of message copies currently held for repair. */
+  getRetainedBytes() {
+    return this.retainedBytes;
   }
   extendRoutePath(path, ...peerIds) {
     const normalized = Array.isArray(path) ? path.filter((peerId) => typeof peerId === "string" && peerId.length > 0 && peerId.length <= 512).map((peerId) => this.compactRoutePeerId(peerId)).slice(-MAX_ROUTE_TRACE_PEERS) : [];
@@ -2337,7 +2359,7 @@ var _GossipProtocol = class _GossipProtocol {
     for (const [id, info] of this.messageLog.entries()) {
       if (now - info.timestamp > maxAgeMs) {
         this.messageLog.delete(id);
-        this.retainedMessages.delete(id);
+        this.dropRetained(id);
       }
     }
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
@@ -2359,21 +2381,21 @@ var _GossipProtocol = class _GossipProtocol {
         break;
       }
       this.messageLog.delete(id);
-      this.retainedMessages.delete(id);
+      this.dropRetained(id);
     }
     while (this.messageLog.size > this.maxTrackedMessages) {
       const oldest = this.messageLog.keys().next().value;
       if (!oldest) break;
       this.messageLog.delete(oldest);
-      this.retainedMessages.delete(oldest);
+      this.dropRetained(oldest);
     }
     for (const [id, retained] of this.retainedMessages.entries()) {
-      if (retained.retainedAt < minTimestamp || now > this.initialSpreadDeadlineAt(retained.message)) this.retainedMessages.delete(id);
+      if (retained.retainedAt < minTimestamp || now > this.initialSpreadDeadlineAt(retained.message)) this.dropRetained(id);
     }
     while (this.retainedMessages.size > this.maxTrackedMessages) {
       const oldest = this.retainedMessages.keys().next().value;
       if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+      this.dropRetained(oldest);
     }
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
       if (timestamp >= minTimestamp) {
@@ -2419,6 +2441,7 @@ var _GossipProtocol = class _GossipProtocol {
     this.deliveryStates.clear();
     this.aggregateStates.clear();
     this.retainedMessages.clear();
+    this.retainedBytes = 0;
     this.initialSpreadRepairQueued = false;
     this.dirtyDeliveryReceiptIds.clear();
     this.cecrRemoteStates.clear();

@@ -373,6 +373,14 @@ export class GossipProtocol {
   private messageLog: Map<string, { timestamp: number; sender: string | null; hops: number }> = new Map();
   private readonly maxTrackedMessages = 12_000;
   private readonly maxTrackedDirectIds = 12_000;
+  // Retained copies exist so a late peer can be repaired. A count bound alone
+  // let a node that publishes large records every few seconds hold hundreds
+  // of megabytes of payload copies inside the retention window. Retention is
+  // bounded in bytes, and a payload past the per-message bound is not
+  // retained at all: the storage layer repairs records itself.
+  private readonly maxRetainedBytes = 24 * 1024 * 1024;
+  private readonly maxRetainedMessageBytes = 256 * 1024;
+  private retainedBytes = 0;
   private readonly trackingRetentionMs = 10 * 60_000;
   private antiEntropySummarySize: number;
   private antiEntropyRequestSize: number;
@@ -398,6 +406,7 @@ export class GossipProtocol {
     viewId: string;
     viewSize: number;
     replayedTo?: Map<string, number>;
+    bytes?: number;
   }> = new Map();
   private dirtyDeliveryReceiptIds: Set<string> = new Set();
   private gossipFanoutCursor = 0;
@@ -707,25 +716,41 @@ export class GossipProtocol {
   private retainGossipMessage(message: GossipMessage, retainedAt: number = Date.now()): void {
     if (this.retainedMessages.has(message.id)) return;
     try {
-      const snapshot = JSON.parse(JSON.stringify(message)) as GossipMessage;
+      const serialized = JSON.stringify(message);
+      if (serialized.length > this.maxRetainedMessageBytes) return;
+      const snapshot = JSON.parse(serialized) as GossipMessage;
       const peers = this.canonicalPeerSet();
       this.retainedMessages.set(message.id, {
         message: snapshot,
         retainedAt,
         viewId: this.canonicalSetHash(peers),
         viewSize: peers.length,
+        bytes: serialized.length,
       });
+      this.retainedBytes += serialized.length;
       this.scheduleInitialSpreadRepair(retainedAt);
     } catch {
       // A payload that cannot cross the JSON mesh boundary cannot be repaired.
       return;
     }
 
-    while (this.retainedMessages.size > this.maxTrackedMessages) {
+    while (this.retainedMessages.size > this.maxTrackedMessages || this.retainedBytes > this.maxRetainedBytes) {
       const oldest = this.retainedMessages.keys().next().value;
       if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+      this.dropRetained(oldest);
     }
+  }
+
+  private dropRetained(messageId: string): void {
+    const retained = this.retainedMessages.get(messageId);
+    if (!retained) return;
+    this.retainedMessages.delete(messageId);
+    this.retainedBytes = Math.max(0, this.retainedBytes - (retained.bytes ?? 0));
+  }
+
+  /** Bytes of message copies currently held for repair. */
+  getRetainedBytes(): number {
+    return this.retainedBytes;
   }
 
   private extendRoutePath(path: unknown, ...peerIds: string[]): string[] {
@@ -2134,7 +2159,7 @@ export class GossipProtocol {
     for (const [id, info] of this.messageLog.entries()) {
       if (now - info.timestamp > maxAgeMs) {
         this.messageLog.delete(id);
-        this.retainedMessages.delete(id);
+        this.dropRetained(id);
       }
     }
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
@@ -2159,25 +2184,25 @@ export class GossipProtocol {
         break;
       }
       this.messageLog.delete(id);
-      this.retainedMessages.delete(id);
+      this.dropRetained(id);
     }
     while (this.messageLog.size > this.maxTrackedMessages) {
       const oldest = this.messageLog.keys().next().value;
       if (!oldest) break;
       this.messageLog.delete(oldest);
-      this.retainedMessages.delete(oldest);
+      this.dropRetained(oldest);
     }
 
     for (const [id, retained] of this.retainedMessages.entries()) {
       if (
         retained.retainedAt < minTimestamp
         || now > this.initialSpreadDeadlineAt(retained.message)
-      ) this.retainedMessages.delete(id);
+      ) this.dropRetained(id);
     }
     while (this.retainedMessages.size > this.maxTrackedMessages) {
       const oldest = this.retainedMessages.keys().next().value;
       if (!oldest) break;
-      this.retainedMessages.delete(oldest);
+      this.dropRetained(oldest);
     }
 
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
@@ -2230,6 +2255,7 @@ export class GossipProtocol {
     this.deliveryStates.clear();
     this.aggregateStates.clear();
     this.retainedMessages.clear();
+    this.retainedBytes = 0;
     this.initialSpreadRepairQueued = false;
     this.dirtyDeliveryReceiptIds.clear();
     this.cecrRemoteStates.clear();

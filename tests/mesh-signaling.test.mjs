@@ -198,3 +198,20 @@ test('a direct frame no neighbour takes reports as not sent, so signaling falls 
     gossip.destroy();
   }
 });
+
+test('message copies kept for repair are bounded in bytes, and an oversized payload is never kept', () => {
+  const mesh = fakeMesh({ connected: [NEIGHBOR], global: [NEIGHBOR] });
+  const gossip = new GossipProtocol(mesh);
+  try {
+    const big = 'x'.repeat(200 * 1024);
+    for (let i = 0; i < 300; i += 1) gossip.broadcast({ i, big });
+    const retained = gossip.getRetainedBytes();
+    assert.ok(retained > 0, 'copies are kept');
+    assert.ok(retained <= 24 * 1024 * 1024, `bounded at 24 MB, held ${retained}`);
+    const before = gossip.getRetainedBytes();
+    gossip.broadcast({ huge: 'y'.repeat(300 * 1024) });
+    assert.equal(gossip.getRetainedBytes(), before, 'a payload past the per-message bound is not retained');
+  } finally {
+    gossip.destroy();
+  }
+});
