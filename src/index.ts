@@ -2064,11 +2064,10 @@ export class PartialMesh {
     const candidates = new Set<string>(
       this.hasActiveSignalingSnapshot ? activeDiscoveredPeers : this.discoveredPeers
     );
-    // A member the mesh can already signal is dialable regardless of what
-    // this relay lists: the offer travels over connected neighbours.
-    for (const peerId of this.getGlobalPeers()) {
-      if (this.meshCanSignal(peerId)) candidates.add(peerId);
-    }
+    // Mesh reachability decides how a dial is signaled, never who is dialed.
+    // Treating every mesh-reachable member as a candidate made each node
+    // dial the whole federation, overflow its degree, rebalance, drop edges
+    // and redial them: a permanent storm of offers and ICE restarts.
     if (includeLiveMembership && activeDiscoveredPeers.length === 0) {
       for (const peerId of this.getGlobalPeers()) {
         // Discovery grace can retain an expired peer after the authoritative

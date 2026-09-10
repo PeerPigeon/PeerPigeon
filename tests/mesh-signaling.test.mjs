@@ -49,7 +49,7 @@ test('a signaling envelope inside a direct frame is recognised and never surface
   assert.equal(isMeshSignalPayload('offer'), false);
 });
 
-test('a member the mesh can signal is a dial candidate whether or not the relay lists it', () => {
+test('mesh reachability never widens the dial set: a member the relay has not listed is not dialed for it', () => {
   const routable = '1'.repeat(64);
   const unroutable = '2'.repeat(64);
   const mesh = new PartialMesh({ minPeers: 1, maxPeers: 20, autoDiscover: false, autoConnect: false });
@@ -59,8 +59,8 @@ test('a member the mesh can signal is a dial candidate whether or not the relay 
     mesh.mergeMembership([routable, unroutable], [], { [routable]: [20, 1, now], [unroutable]: [20, 1, now] }, 'relay');
 
     const candidates = mesh.dialCandidatePeerIds(false);
-    assert.ok(candidates.includes(routable), 'the mesh-reachable member is dialable');
-    assert.ok(!candidates.includes(unroutable), 'a member only the relay could reach still waits for the relay');
+    assert.ok(!candidates.includes(routable), 'reachability alone does not make a member a dial candidate');
+    assert.ok(!candidates.includes(unroutable));
   } finally {
     mesh.destroy();
   }

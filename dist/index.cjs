@@ -5234,9 +5234,6 @@ var PartialMesh = class {
     const candidates = new Set(
       this.hasActiveSignalingSnapshot ? activeDiscoveredPeers : this.discoveredPeers
     );
-    for (const peerId of this.getGlobalPeers()) {
-      if (this.meshCanSignal(peerId)) candidates.add(peerId);
-    }
     if (includeLiveMembership && activeDiscoveredPeers.length === 0) {
       for (const peerId of this.getGlobalPeers()) {
         if (this.hasActiveSignalingSnapshot && this.discoveredPeers.has(peerId) && !this.activeSignalingPeers.has(peerId)) continue;
