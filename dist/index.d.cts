@@ -471,6 +471,7 @@ type StorageEvents = {
 type StorageUnsubscribe = () => void;
 interface GossipLike {
     broadcast(data: unknown, metadata?: Record<string, unknown>): string;
+    sendDirect?(targetPeerId: string, data: unknown): string | null;
     on(event: 'messageReceived', callback: (data: {
         message: {
             data: unknown;
@@ -550,6 +551,7 @@ declare class PeerPigeonStorage {
     private applyCrossTabNotice;
     private trimSeenNoticeIds;
     private broadcastMutation;
+    private syncEnvelope;
     private broadcastSyncPayload;
     private handleRetrieveRequest;
     private handleRetrieveResponse;

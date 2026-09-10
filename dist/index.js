@@ -2720,7 +2720,8 @@ var PeerPigeonStorage = class {
       space,
       key: normalizedKey,
       actorId: this.userId,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      ...this.peerId ? { origin: this.peerId } : {}
     };
     const timeoutMs = Math.max(100, Math.floor(Number(options.timeoutMs ?? 2e3)));
     return await new Promise(async (resolve) => {
@@ -3144,16 +3145,18 @@ var PeerPigeonStorage = class {
   async broadcastMutation(mutation) {
     await this.broadcastSyncPayload(mutation);
   }
-  async broadcastSyncPayload(payload) {
-    if (!this.gossip) return;
+  async syncEnvelope(payload) {
     const cipher = await this.encryptSyncPayload(payload);
-    const envelope = {
+    return {
       __ppType: "pp-storage-sync-v1",
       from: this.userId,
       timestamp: Date.now(),
       cipher
     };
-    this.gossip.broadcast(envelope);
+  }
+  async broadcastSyncPayload(payload) {
+    if (!this.gossip) return;
+    this.gossip.broadcast(await this.syncEnvelope(payload));
   }
   async handleRetrieveRequest(request) {
     if (request.actorId === this.userId) return;
@@ -3171,6 +3174,10 @@ var PeerPigeonStorage = class {
       timestamp: Date.now(),
       record: existing
     };
+    if (typeof request.origin === "string" && request.origin && this.gossip?.sendDirect) {
+      const envelope = await this.syncEnvelope(response);
+      if (this.gossip.sendDirect(request.origin, envelope)) return;
+    }
     await this.broadcastSyncPayload(response);
   }
   async handleRetrieveResponse(response) {

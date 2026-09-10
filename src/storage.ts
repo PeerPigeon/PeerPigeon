@@ -79,6 +79,7 @@ export type StorageUnsubscribe = () => void;
 
 interface GossipLike {
   broadcast(data: unknown, metadata?: Record<string, unknown>): string;
+  sendDirect?(targetPeerId: string, data: unknown): string | null;
   on(event: 'messageReceived', callback: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void): void;
   off(event: 'messageReceived', callback: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void): void;
 }
@@ -114,6 +115,8 @@ type StorageRetrieveRequest = {
   key: string;
   actorId: string;
   timestamp: number;
+  /** The requester's mesh peer id, so a holder can answer it directly. */
+  origin?: string;
 };
 
 type StorageRetrieveResponse = {
@@ -438,6 +441,7 @@ export class PeerPigeonStorage {
       key: normalizedKey,
       actorId: this.userId,
       timestamp: Date.now(),
+      ...(this.peerId ? { origin: this.peerId } : {}),
     };
 
     const timeoutMs = Math.max(100, Math.floor(Number(options.timeoutMs ?? 2000)));
@@ -946,17 +950,19 @@ export class PeerPigeonStorage {
     await this.broadcastSyncPayload(mutation);
   }
 
-  private async broadcastSyncPayload(payload: StorageSyncPayload): Promise<void> {
-    if (!this.gossip) return;
+  private async syncEnvelope(payload: StorageSyncPayload): Promise<SyncEnvelope> {
     const cipher = await this.encryptSyncPayload(payload);
-    const envelope: SyncEnvelope = {
+    return {
       __ppType: 'pp-storage-sync-v1',
       from: this.userId,
       timestamp: Date.now(),
       cipher,
     };
+  }
 
-    this.gossip.broadcast(envelope);
+  private async broadcastSyncPayload(payload: StorageSyncPayload): Promise<void> {
+    if (!this.gossip) return;
+    this.gossip.broadcast(await this.syncEnvelope(payload));
   }
 
   private async handleRetrieveRequest(request: StorageRetrieveRequest): Promise<void> {
@@ -978,6 +984,16 @@ export class PeerPigeonStorage {
       record: existing,
     };
 
+    // Answer the requester, not the room. A broadcast reply went to every
+    // peer and was re-forwarded by each of them, so one browser asking for
+    // one snapshot record cost every holder a fan-out of hundreds of
+    // kilobytes — with a few browsers refreshing, a permanent multi-megabyte
+    // storm on every watcher. Broadcast remains the fallback when the
+    // requester cannot be routed to.
+    if (typeof request.origin === 'string' && request.origin && this.gossip?.sendDirect) {
+      const envelope = await this.syncEnvelope(response);
+      if (this.gossip.sendDirect(request.origin, envelope)) return;
+    }
     await this.broadcastSyncPayload(response);
   }
 
