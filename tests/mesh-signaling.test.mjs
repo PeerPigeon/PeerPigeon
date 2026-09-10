@@ -215,3 +215,25 @@ test('message copies kept for repair are bounded in bytes, and an oversized payl
     gossip.destroy();
   }
 });
+
+test('a send exception on a connection that still reports connected does not release the peer', () => {
+  const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', { networkId: 'n', roomId: 'r', peerId: '8'.repeat(64) });
+  const peer = '9'.repeat(64);
+  const released = [];
+  adapter.releaseStalePeerImmediately = (id, _force, _reason, origin) => released.push(`${id.slice(0, 4)}:${origin}`);
+  adapter.client = {
+    isRegistered: true,
+    mesh: { connections: new Map([[peer, { state: 'connected', connection: { connectionState: 'connected' }, channel: { readyState: 'open' } }]]) },
+    sendData() { throw new Error('Error sending string through RTCDataChannel.'); },
+  };
+  adapter.connectedPeers.add(peer);
+  assert.throws(() => adapter.send(peer, 'x'), /RTCDataChannel/);
+  adapter.broadcast('y');
+  assert.deepEqual(released, [], 'the edge is left to the pong proof');
+
+  adapter.client.mesh.connections.get(peer).state = 'failed';
+  adapter.client.mesh.connections.get(peer).connection.connectionState = 'failed';
+  adapter.client.mesh.connections.get(peer).channel.readyState = 'closed';
+  assert.throws(() => adapter.send(peer, 'x'));
+  assert.deepEqual(released, [`${peer.slice(0, 4)}:send-refused`], 'a failed transport is released');
+});

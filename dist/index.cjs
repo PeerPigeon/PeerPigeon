@@ -428,7 +428,7 @@ var FreeRTCClientAdapter = class {
     try {
       this.client?.sendData(data, peerId);
     } catch (error) {
-      if (!error?.transient && !this.transportStillOpening(this.normalizePeerId(peerId))) {
+      if (this.sendFailureIsTerminal(this.normalizePeerId(peerId), error)) {
         this.releaseStalePeerImmediately(this.normalizePeerId(peerId), false, String(error?.message ?? ""), "send-refused");
       }
       throw error;
@@ -439,11 +439,24 @@ var FreeRTCClientAdapter = class {
       try {
         this.client?.sendData(data, peerId);
       } catch (error) {
-        if (!error?.transient && !this.transportStillOpening(peerId)) {
+        if (this.sendFailureIsTerminal(peerId, error)) {
           this.releaseStalePeerImmediately(peerId, false, String(error?.message ?? ""), "broadcast-refused");
         }
       }
     }
+  }
+  // A send failure releases an edge only when the transport itself says it
+  // is gone. A refusal marked transient, a channel still opening, or a
+  // connection that still reports connected is left to the pong proof and
+  // the connection-state events; releasing on the exception alone made a
+  // browser's first frame over a fresh channel tear the pair down.
+  sendFailureIsTerminal(peerId, error) {
+    if (error?.transient) return false;
+    if (this.transportStillOpening(peerId)) return false;
+    const entry = this.client?.mesh?.connections?.get?.(peerId);
+    if (!entry) return true;
+    const state = String(entry.state ?? entry.connection?.connectionState ?? "").toLowerCase();
+    return state === "failed" || state === "closed" || state === "dead";
   }
   normalizePeerId(peerId) {
     return String(peerId ?? "").trim();

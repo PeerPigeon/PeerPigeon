@@ -477,7 +477,7 @@ export class FreeRTCClientAdapter {
       // or riding out an ICE blip as transient — the edge recovers on its
       // own, and releasing it here turned every blip into a redial flap.
       // Only a terminal refusal proves the edge is gone.
-      if (!(error as { transient?: boolean })?.transient && !this.transportStillOpening(this.normalizePeerId(peerId))) {
+      if (this.sendFailureIsTerminal(this.normalizePeerId(peerId), error)) {
         this.releaseStalePeerImmediately(this.normalizePeerId(peerId), false, String((error as Error)?.message ?? ''), 'send-refused');
       }
       throw error;
@@ -492,11 +492,25 @@ export class FreeRTCClientAdapter {
         // A terminal send failure is proof this edge is not usable; a
         // transient one is a connection mid-recovery that must be left
         // alone — gossip anti-entropy re-covers whatever this send missed.
-        if (!(error as { transient?: boolean })?.transient && !this.transportStillOpening(peerId)) {
+        if (this.sendFailureIsTerminal(peerId, error)) {
           this.releaseStalePeerImmediately(peerId, false, String((error as Error)?.message ?? ''), 'broadcast-refused');
         }
       }
     }
+  }
+
+  // A send failure releases an edge only when the transport itself says it
+  // is gone. A refusal marked transient, a channel still opening, or a
+  // connection that still reports connected is left to the pong proof and
+  // the connection-state events; releasing on the exception alone made a
+  // browser's first frame over a fresh channel tear the pair down.
+  private sendFailureIsTerminal(peerId: string, error: unknown): boolean {
+    if ((error as { transient?: boolean })?.transient) return false;
+    if (this.transportStillOpening(peerId)) return false;
+    const entry = this.client?.mesh?.connections?.get?.(peerId);
+    if (!entry) return true;
+    const state = String(entry.state ?? entry.connection?.connectionState ?? '').toLowerCase();
+    return state === 'failed' || state === 'closed' || state === 'dead';
   }
 
   private normalizePeerId(peerId: string | null | undefined): string {
