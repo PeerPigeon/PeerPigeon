@@ -1303,15 +1303,20 @@ var _GossipProtocol = class _GossipProtocol {
     if (targets.length === 0) return;
     const now = Date.now();
     for (const peerId of targets) {
-      const messageIds = this.recentRetainedMessageIds(peerId, now);
-      if (messageIds.length === 0) {
+      const retainedIds = this.recentRetainedMessageIds(peerId, now);
+      if (retainedIds.length === 0) {
         this.lastSummaryByPeer.delete(peerId);
         continue;
       }
-      const signature = `${messageIds.length}:${sha1Hex(messageIds.join("\n"))}`;
       const last = this.lastSummaryByPeer.get(peerId);
-      if (!targetPeerId && last && last.signature === signature && now - last.at < _GossipProtocol.ANTI_ENTROPY_RESEND_MS) continue;
-      this.lastSummaryByPeer.set(peerId, { signature, at: now });
+      const full = !last || targetPeerId != null || now - last.fullAt >= _GossipProtocol.ANTI_ENTROPY_RESEND_MS;
+      const messageIds = full ? retainedIds : retainedIds.filter((messageId) => !last.told.has(messageId));
+      if (messageIds.length === 0) continue;
+      if (full) {
+        this.lastSummaryByPeer.set(peerId, { told: new Set(retainedIds), fullAt: now });
+      } else {
+        for (const messageId of messageIds) last.told.add(messageId);
+      }
       const message = {
         id: this.generateMessageId(self),
         type: "gossip-ae",
@@ -2513,10 +2518,11 @@ var _GossipProtocol = class _GossipProtocol {
 // loop still runs behind it.
 _GossipProtocol.INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS = 500;
 _GossipProtocol.MAX_REPLAYS_PER_PEER = 3;
-// A summary is sent when the retained set a peer should hold has changed
-// since the last summary it got, else at most once per resend interval.
-// Identical fifteen-kilobyte id lists every two seconds on every link
-// were most of an idle watcher's traffic.
+// A summary lists only the retained ids a peer has not been told about
+// since its last full summary; the full list goes at most once per resend
+// interval. Re-listing every id in flight on every change — a hundred and
+// eighty ids, twenty kilobytes, three frames, a few times a second per
+// link on a busy fleet — was the largest flow on every link.
 _GossipProtocol.ANTI_ENTROPY_RESEND_MS = 3e4;
 var GossipProtocol = _GossipProtocol;
 

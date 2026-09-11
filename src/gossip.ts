@@ -781,12 +781,13 @@ export class GossipProtocol {
   // loop still runs behind it.
   private static readonly INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS = 500;
   private static readonly MAX_REPLAYS_PER_PEER = 3;
-  // A summary is sent when the retained set a peer should hold has changed
-  // since the last summary it got, else at most once per resend interval.
-  // Identical fifteen-kilobyte id lists every two seconds on every link
-  // were most of an idle watcher's traffic.
+  // A summary lists only the retained ids a peer has not been told about
+  // since its last full summary; the full list goes at most once per resend
+  // interval. Re-listing every id in flight on every change — a hundred and
+  // eighty ids, twenty kilobytes, three frames, a few times a second per
+  // link on a busy fleet — was the largest flow on every link.
   private static readonly ANTI_ENTROPY_RESEND_MS = 30_000;
-  private readonly lastSummaryByPeer = new Map<string, { signature: string; at: number }>();
+  private readonly lastSummaryByPeer = new Map<string, { told: Set<string>; fullAt: number }>();
   private initialSpreadRepairAtMs = 0;
 
   private scheduleInitialSpreadRepair(_startedAt: number = Date.now()): void {
@@ -906,16 +907,20 @@ export class GossipProtocol {
 
     const now = Date.now();
     for (const peerId of targets) {
-      const messageIds = this.recentRetainedMessageIds(peerId, now);
-      if (messageIds.length === 0) {
+      const retainedIds = this.recentRetainedMessageIds(peerId, now);
+      if (retainedIds.length === 0) {
         this.lastSummaryByPeer.delete(peerId);
         continue;
       }
-      const signature = `${messageIds.length}:${sha1Hex(messageIds.join('\n'))}`;
       const last = this.lastSummaryByPeer.get(peerId);
-      if (!targetPeerId && last && last.signature === signature
-        && now - last.at < GossipProtocol.ANTI_ENTROPY_RESEND_MS) continue;
-      this.lastSummaryByPeer.set(peerId, { signature, at: now });
+      const full = !last || targetPeerId != null || now - last.fullAt >= GossipProtocol.ANTI_ENTROPY_RESEND_MS;
+      const messageIds = full ? retainedIds : retainedIds.filter((messageId) => !last.told.has(messageId));
+      if (messageIds.length === 0) continue;
+      if (full) {
+        this.lastSummaryByPeer.set(peerId, { told: new Set(retainedIds), fullAt: now });
+      } else {
+        for (const messageId of messageIds) last.told.add(messageId);
+      }
       const message: GossipAntiEntropyMessage = {
         id: this.generateMessageId(self),
         type: 'gossip-ae',
