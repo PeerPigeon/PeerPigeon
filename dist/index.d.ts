@@ -712,6 +712,7 @@ declare class PeerPigeonCryptoProtocol {
     getPublicKey(peerId: string): PeerPublicKey | null;
     getKnownPeerKeys(): PeerPublicKey[];
     announcePublicKey(): void;
+    private readonly keyRequestedAt;
     requestPeerKey(peerId: string): void;
     waitForPeerKey(peerId: string, timeoutMs?: number): Promise<PeerPublicKey>;
     encryptRoom(plaintext: string): Promise<RoomCipher>;

@@ -3,6 +3,7 @@ import type { DirectMessage, GossipBroadcastOptions, GossipMessage } from './gos
 
 export const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
 export const CRYPTO_PUBLIC_REQUEST_TYPE = 'pp-crypto-public-request-v1';
+const KEY_REQUEST_MIN_INTERVAL_MS = 5_000;
 export const ENCRYPTED_BROADCAST_TYPE = 'pp-encrypted-broadcast-v1';
 export const ENCRYPTED_DIRECT_TYPE = 'pp-encrypted-direct-v1';
 
@@ -192,10 +193,21 @@ export class PeerPigeonCryptoProtocol {
     for (const peerId of this.mesh.getConnectedPeers()) this.sendPublicInfoDirect(peerId, payload);
   }
 
+  private readonly keyRequestedAt = new Map<string, number>();
+
   requestPeerKey(peerId: string): void {
     const self = String(this.mesh.getClientId() ?? '').trim();
     const target = String(peerId ?? '').trim();
     if (!self || !target || target === self) return;
+    // One ask per peer per few seconds. Every encrypted send to a peer whose
+    // key is still unknown asked again — direct and broadcast — so a peer
+    // that never answered (gone, or its announcement lost) drew a request
+    // per message from every node that tried to reach it, and each request
+    // was a broadcast the whole room decrypted.
+    const now = Date.now();
+    if (now - (this.keyRequestedAt.get(target) ?? 0) < KEY_REQUEST_MIN_INTERVAL_MS) return;
+    this.keyRequestedAt.set(target, now);
+    if (this.keyRequestedAt.size > 512) this.keyRequestedAt.delete(this.keyRequestedAt.keys().next().value as string);
     const payload: CryptoPublicRequestPayload = {
       __ppType: CRYPTO_PUBLIC_REQUEST_TYPE,
       from: self,

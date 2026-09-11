@@ -3517,6 +3517,7 @@ var PeerPigeonStorage = class {
 import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair } from "unsea";
 var CRYPTO_PUBLIC_INFO_TYPE = "pp-crypto-public-info-v1";
 var CRYPTO_PUBLIC_REQUEST_TYPE = "pp-crypto-public-request-v1";
+var KEY_REQUEST_MIN_INTERVAL_MS = 5e3;
 var ENCRYPTED_BROADCAST_TYPE = "pp-encrypted-broadcast-v1";
 var ENCRYPTED_DIRECT_TYPE = "pp-encrypted-direct-v1";
 var PeerPigeonCryptoProtocol = class {
@@ -3540,6 +3541,7 @@ var PeerPigeonCryptoProtocol = class {
       this.registerLocalKey();
       this.announcePublicKey();
     };
+    this.keyRequestedAt = /* @__PURE__ */ new Map();
     const roomId = String(options.roomId ?? "").trim();
     if (!roomId) throw new Error("PeerPigeonCryptoProtocol requires a non-empty roomId");
     this.mesh = mesh;
@@ -3591,6 +3593,10 @@ var PeerPigeonCryptoProtocol = class {
     const self = String(this.mesh.getClientId() ?? "").trim();
     const target = String(peerId ?? "").trim();
     if (!self || !target || target === self) return;
+    const now = Date.now();
+    if (now - (this.keyRequestedAt.get(target) ?? 0) < KEY_REQUEST_MIN_INTERVAL_MS) return;
+    this.keyRequestedAt.set(target, now);
+    if (this.keyRequestedAt.size > 512) this.keyRequestedAt.delete(this.keyRequestedAt.keys().next().value);
     const payload = {
       __ppType: CRYPTO_PUBLIC_REQUEST_TYPE,
       from: self,
