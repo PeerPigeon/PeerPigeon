@@ -472,6 +472,7 @@ export class GossipProtocol {
     this.mesh.on('peer:disconnected', (peerId) => {
       this.peers.delete(peerId);
       this.cecrRemoteStates.delete(peerId);
+      this.lastSummaryByPeer.delete(peerId);
       this.publishCecrState();
       this.emit('peerDisconnected', { peerId });
     });
@@ -780,6 +781,12 @@ export class GossipProtocol {
   // loop still runs behind it.
   private static readonly INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS = 500;
   private static readonly MAX_REPLAYS_PER_PEER = 3;
+  // A summary is sent when the retained set a peer should hold has changed
+  // since the last summary it got, else at most once per resend interval.
+  // Identical fifteen-kilobyte id lists every two seconds on every link
+  // were most of an idle watcher's traffic.
+  private static readonly ANTI_ENTROPY_RESEND_MS = 30_000;
+  private readonly lastSummaryByPeer = new Map<string, { signature: string; at: number }>();
   private initialSpreadRepairAtMs = 0;
 
   private scheduleInitialSpreadRepair(_startedAt: number = Date.now()): void {
@@ -897,9 +904,18 @@ export class GossipProtocol {
       : this.selectFanoutPeers(new Set(), 'anti-entropy');
     if (targets.length === 0) return;
 
+    const now = Date.now();
     for (const peerId of targets) {
-      const messageIds = this.recentRetainedMessageIds(peerId);
-      if (messageIds.length === 0) continue;
+      const messageIds = this.recentRetainedMessageIds(peerId, now);
+      if (messageIds.length === 0) {
+        this.lastSummaryByPeer.delete(peerId);
+        continue;
+      }
+      const signature = `${messageIds.length}:${sha1Hex(messageIds.join('\n'))}`;
+      const last = this.lastSummaryByPeer.get(peerId);
+      if (!targetPeerId && last && last.signature === signature
+        && now - last.at < GossipProtocol.ANTI_ENTROPY_RESEND_MS) continue;
+      this.lastSummaryByPeer.set(peerId, { signature, at: now });
       const message: GossipAntiEntropyMessage = {
         id: this.generateMessageId(self),
         type: 'gossip-ae',

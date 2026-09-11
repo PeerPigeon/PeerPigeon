@@ -318,6 +318,8 @@ declare class GossipProtocol {
     private compactRoutePeerId;
     private static readonly INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS;
     private static readonly MAX_REPLAYS_PER_PEER;
+    private static readonly ANTI_ENTROPY_RESEND_MS;
+    private readonly lastSummaryByPeer;
     private initialSpreadRepairAtMs;
     private scheduleInitialSpreadRepair;
     private validSpreadEnvelope;
@@ -469,23 +471,31 @@ type StorageEvents = {
     }) => void;
 };
 type StorageUnsubscribe = () => void;
+type GossipMessageListener = (data: {
+    message: {
+        data: unknown;
+    };
+    local: boolean;
+    fromPeer?: string;
+}) => void;
+type GossipDirectListener = (data: {
+    message: {
+        data: unknown;
+        from?: string;
+    };
+}) => void;
+type GossipPeerListener = (data: {
+    peerId: string;
+}) => void;
 interface GossipLike {
     broadcast(data: unknown, metadata?: Record<string, unknown>): string;
     sendDirect?(targetPeerId: string, data: unknown): string | null;
-    on(event: 'messageReceived', callback: (data: {
-        message: {
-            data: unknown;
-        };
-        local: boolean;
-        fromPeer?: string;
-    }) => void): void;
-    off(event: 'messageReceived', callback: (data: {
-        message: {
-            data: unknown;
-        };
-        local: boolean;
-        fromPeer?: string;
-    }) => void): void;
+    on(event: 'messageReceived', callback: GossipMessageListener): void;
+    on(event: 'directMessageReceived', callback: GossipDirectListener): void;
+    on(event: 'peerConnected', callback: GossipPeerListener): void;
+    off(event: 'messageReceived', callback: GossipMessageListener): void;
+    off(event: 'directMessageReceived', callback: GossipDirectListener): void;
+    off(event: 'peerConnected', callback: GossipPeerListener): void;
 }
 declare class PeerPigeonStorage {
     private readonly userId;
@@ -499,6 +509,9 @@ declare class PeerPigeonStorage {
     private driver;
     private readonly listeners;
     private readonly subscribedKeys;
+    private readonly subscribedEntries;
+    private readonly onDirectMessageBound;
+    private readonly onPeerConnectedBound;
     private readonly retrieveAnsweredAt;
     private readonly pendingRetrieveRequests;
     private closed;
@@ -572,6 +585,19 @@ declare class PeerPigeonStorage {
     private isStorageMutation;
     private isStorageRetrieveRequest;
     private isStorageRetrieveResponse;
+    private isStorageDigest;
+    /**
+     * Tell a neighbour that just linked up which mutable records this node
+     * subscribes to and which version of each it holds. Frozen records are
+     * content-addressed and fetched on demand, so they stay out of it.
+     */
+    private sendDigest;
+    /**
+     * Answer a neighbour's digest: push every record this node holds newer
+     * than the version listed, and ask directly for every subscribed record
+     * the neighbour holds newer than ours.
+     */
+    private handleDigest;
     private isCrossTabNotice;
     private isCipherPayload;
     private encryptSyncPayload;

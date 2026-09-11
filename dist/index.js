@@ -923,6 +923,7 @@ var _GossipProtocol = class _GossipProtocol {
     this.destroyed = false;
     this.callbacks = {};
     this.peers = /* @__PURE__ */ new Map();
+    this.lastSummaryByPeer = /* @__PURE__ */ new Map();
     this.initialSpreadRepairAtMs = 0;
     this.mesh = mesh;
     this.maxHops = options.maxHops ?? 5;
@@ -975,6 +976,7 @@ var _GossipProtocol = class _GossipProtocol {
     this.mesh.on("peer:disconnected", (peerId) => {
       this.peers.delete(peerId);
       this.cecrRemoteStates.delete(peerId);
+      this.lastSummaryByPeer.delete(peerId);
       this.publishCecrState();
       this.emit("peerDisconnected", { peerId });
     });
@@ -1299,9 +1301,17 @@ var _GossipProtocol = class _GossipProtocol {
     const connected = new Set(this.mesh.getConnectedPeers());
     const targets = targetPeerId && connected.has(targetPeerId) ? [targetPeerId] : this.selectFanoutPeers(/* @__PURE__ */ new Set(), "anti-entropy");
     if (targets.length === 0) return;
+    const now = Date.now();
     for (const peerId of targets) {
-      const messageIds = this.recentRetainedMessageIds(peerId);
-      if (messageIds.length === 0) continue;
+      const messageIds = this.recentRetainedMessageIds(peerId, now);
+      if (messageIds.length === 0) {
+        this.lastSummaryByPeer.delete(peerId);
+        continue;
+      }
+      const signature = `${messageIds.length}:${sha1Hex(messageIds.join("\n"))}`;
+      const last = this.lastSummaryByPeer.get(peerId);
+      if (!targetPeerId && last && last.signature === signature && now - last.at < _GossipProtocol.ANTI_ENTROPY_RESEND_MS) continue;
+      this.lastSummaryByPeer.set(peerId, { signature, at: now });
       const message = {
         id: this.generateMessageId(self),
         type: "gossip-ae",
@@ -2503,6 +2513,11 @@ var _GossipProtocol = class _GossipProtocol {
 // loop still runs behind it.
 _GossipProtocol.INITIAL_SPREAD_REPAIR_MIN_INTERVAL_MS = 500;
 _GossipProtocol.MAX_REPLAYS_PER_PEER = 3;
+// A summary is sent when the retained set a peer should hold has changed
+// since the last summary it got, else at most once per resend interval.
+// Identical fifteen-kilobyte id lists every two seconds on every link
+// were most of an idle watcher's traffic.
+_GossipProtocol.ANTI_ENTROPY_RESEND_MS = 3e4;
 var GossipProtocol = _GossipProtocol;
 
 // src/storage.ts
@@ -2591,12 +2606,15 @@ var IndexedDbStorageDriver = class _IndexedDbStorageDriver {
   }
 };
 var RETRIEVE_ANSWER_MIN_INTERVAL_MS = 1e4;
+var DIGEST_MAX_ENTRIES = 4e3;
+var DIGEST_MAX_PUSHES = 1e3;
 var PeerPigeonStorage = class {
   constructor(options) {
     this.storeName = "records";
     this.driver = null;
     this.listeners = /* @__PURE__ */ new Set();
     this.subscribedKeys = /* @__PURE__ */ new Set();
+    this.subscribedEntries = /* @__PURE__ */ new Map();
     this.retrieveAnsweredAt = /* @__PURE__ */ new Map();
     this.pendingRetrieveRequests = /* @__PURE__ */ new Map();
     this.closed = false;
@@ -2618,6 +2636,20 @@ var PeerPigeonStorage = class {
       this.handleGossipMessage(data).catch(() => {
       });
     };
+    this.onDirectMessageBound = (data) => {
+      const message = data?.message;
+      if (!message || typeof message !== "object") return;
+      this.handleGossipMessage({
+        message: { data: message.data },
+        local: false,
+        ...typeof message.from === "string" ? { fromPeer: message.from } : {}
+      }).catch(() => {
+      });
+    };
+    this.onPeerConnectedBound = ({ peerId }) => {
+      this.sendDigest(peerId).catch(() => {
+      });
+    };
     this.crossTabStorageEventBound = (event) => {
       this.handleCrossTabStorageEvent(event);
     };
@@ -2634,6 +2666,8 @@ var PeerPigeonStorage = class {
     this.setupCrossTabSync();
     if (this.gossip) {
       this.gossip.on("messageReceived", this.onGossipMessageBound);
+      this.gossip.on("directMessageReceived", this.onDirectMessageBound);
+      this.gossip.on("peerConnected", this.onPeerConnectedBound);
     }
   }
   on(event, listener) {
@@ -2651,12 +2685,15 @@ var PeerPigeonStorage = class {
     const normalizedKey = this.normalizeKey(key);
     const subscriptionKey = this.makePk(space, normalizedKey);
     this.subscribedKeys.add(subscriptionKey);
+    this.subscribedEntries.set(subscriptionKey, { space, key: normalizedKey });
     return () => this.unsubscribeKey(space, normalizedKey);
   }
   /** Stop accepting remote updates for one exact storage-space/key pair. */
   unsubscribeKey(space, key) {
     const normalizedKey = this.normalizeKey(key);
-    this.subscribedKeys.delete(this.makePk(space, normalizedKey));
+    const subscriptionKey = this.makePk(space, normalizedKey);
+    this.subscribedKeys.delete(subscriptionKey);
+    this.subscribedEntries.delete(subscriptionKey);
   }
   /** Return whether this instance accepts remote updates for a key. */
   isSubscribed(space, key) {
@@ -2787,12 +2824,15 @@ var PeerPigeonStorage = class {
     this.closed = true;
     if (this.gossip) {
       this.gossip.off("messageReceived", this.onGossipMessageBound);
+      this.gossip.off("directMessageReceived", this.onDirectMessageBound);
+      this.gossip.off("peerConnected", this.onPeerConnectedBound);
     }
     this.driver?.close();
     this.driver = null;
     this.teardownCrossTabSync();
     this.listeners.clear();
     this.subscribedKeys.clear();
+    this.subscribedEntries.clear();
     for (const pending of this.pendingRetrieveRequests.values()) {
       clearTimeout(pending.timeout);
       pending.resolve(null);
@@ -2919,6 +2959,10 @@ var PeerPigeonStorage = class {
         return;
       }
       await this.applyRemoteMutation(decrypted);
+      return;
+    }
+    if (this.isStorageDigest(decrypted)) {
+      await this.handleDigest(decrypted, data.fromPeer);
       return;
     }
     if (this.isStorageRetrieveRequest(decrypted)) {
@@ -3425,6 +3469,97 @@ var PeerPigeonStorage = class {
   isStorageRetrieveResponse(value) {
     const maybe = value;
     return !!maybe && maybe.__ppType === "pp-storage-res-v1" && typeof maybe.reqId === "string" && (maybe.space === "public" || maybe.space === "user" || maybe.space === "frozen" || maybe.space === "private" || maybe.space === "epublic") && typeof maybe.key === "string" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number" && (maybe.record === null || typeof maybe.record === "object");
+  }
+  isStorageDigest(value) {
+    const maybe = value;
+    return !!maybe && maybe.__ppType === "pp-storage-digest-v1" && typeof maybe.actorId === "string" && typeof maybe.timestamp === "number" && Array.isArray(maybe.entries);
+  }
+  /**
+   * Tell a neighbour that just linked up which mutable records this node
+   * subscribes to and which version of each it holds. Frozen records are
+   * content-addressed and fetched on demand, so they stay out of it.
+   */
+  async sendDigest(targetPeerId) {
+    if (this.closed || !this.driver || !this.gossip?.sendDirect) return;
+    const target = String(targetPeerId ?? "").trim();
+    if (!target) return;
+    const entries = [];
+    for (const [pk, { space, key }] of this.subscribedEntries) {
+      if (space === "private" || space === "frozen") continue;
+      const existing = await this.driver.get(pk);
+      entries.push([space, key, existing?.version ?? null]);
+      if (entries.length >= DIGEST_MAX_ENTRIES) break;
+    }
+    if (entries.length === 0 || this.closed) return;
+    const digest = {
+      __ppType: "pp-storage-digest-v1",
+      actorId: this.userId,
+      timestamp: Date.now(),
+      ...this.peerId ? { origin: this.peerId } : {},
+      entries
+    };
+    try {
+      this.gossip.sendDirect(target, await this.syncEnvelope(digest));
+    } catch {
+    }
+  }
+  /**
+   * Answer a neighbour's digest: push every record this node holds newer
+   * than the version listed, and ask directly for every subscribed record
+   * the neighbour holds newer than ours.
+   */
+  async handleDigest(digest, fromPeerId) {
+    if (digest.actorId === this.userId) return;
+    const target = typeof digest.origin === "string" && digest.origin.trim() || String(fromPeerId ?? "").trim();
+    if (!target || !this.gossip?.sendDirect) return;
+    const driver = this.requireDriver();
+    let pushed = 0;
+    for (const entry of digest.entries.slice(0, DIGEST_MAX_ENTRIES)) {
+      if (this.closed) return;
+      if (!Array.isArray(entry) || entry.length < 3) continue;
+      const [space, rawKey, rawVersion] = entry;
+      if (space !== "public" && space !== "user" && space !== "epublic") continue;
+      if (typeof rawKey !== "string") continue;
+      const key = rawKey.trim();
+      if (!key || key.length > 2048) continue;
+      const theirVersion = typeof rawVersion === "string" || typeof rawVersion === "number" ? rawVersion : null;
+      const existing = await driver.get(this.makePk(space, key));
+      if (existing) {
+        const cmp = theirVersion == null ? 1 : this.compareStorageVersions(existing.version, theirVersion);
+        if (cmp > 0 && pushed < DIGEST_MAX_PUSHES) {
+          pushed += 1;
+          const mutation = {
+            __ppType: "pp-storage-op-v1",
+            opId: `digest-${this.makeMutationId(this.userId)}`,
+            op: "upsert",
+            space,
+            key,
+            actorId: this.userId,
+            timestamp: existing.updatedAt,
+            record: existing
+          };
+          try {
+            this.gossip.sendDirect(target, await this.syncEnvelope(mutation));
+          } catch {
+          }
+        }
+        if (cmp >= 0) continue;
+      }
+      if (theirVersion == null || !this.isSubscribed(space, key)) continue;
+      const request = {
+        __ppType: "pp-storage-req-v1",
+        reqId: `${this.makeMutationId(this.userId)}-req`,
+        space,
+        key,
+        actorId: this.userId,
+        timestamp: Date.now(),
+        ...this.peerId ? { origin: this.peerId } : {}
+      };
+      try {
+        this.gossip.sendDirect(target, await this.syncEnvelope(request));
+      } catch {
+      }
+    }
   }
   isCrossTabNotice(value) {
     const maybe = value;
@@ -5848,6 +5983,7 @@ var PartialMesh = class {
     let membershipChanged = false;
     let capacityChanged = false;
     let topologyChanged = false;
+    let departureMerged = false;
     const now = Date.now();
     for (const [rawPeerId, rawRecord] of Object.entries(records || {})) {
       const peerId = this.normalizePeerId(rawPeerId);
@@ -5860,7 +5996,10 @@ var PartialMesh = class {
         issuedAt: Math.floor(Number(rawRecord[3])),
         validUntil: rawRecord[4] === null ? null : Math.floor(Number(rawRecord[4]))
       };
-      if (this.mergeMembershipRecord(record, now)) membershipChanged = true;
+      if (this.mergeMembershipRecord(record, now)) {
+        membershipChanged = true;
+        if (record.state === "left") departureMerged = true;
+      }
     }
     const normalizedFromPeerId = this.normalizePeerId(fromPeerId);
     if (retired.some((raw) => this.normalizePeerId(raw) === normalizedFromPeerId) && normalizedFromPeerId) {
@@ -5873,7 +6012,10 @@ var PartialMesh = class {
         issuedAt: now,
         validUntil: null
       };
-      if (this.mergeMembershipRecord(left, now)) membershipChanged = true;
+      if (this.mergeMembershipRecord(left, now)) {
+        membershipChanged = true;
+        departureMerged = true;
+      }
     }
     for (const raw of incoming) {
       const id = this.normalizePeerId(raw);
@@ -5889,7 +6031,8 @@ var PartialMesh = class {
         validUntil: now + this.config.membershipLeaseMs
       }, now)) membershipChanged = true;
     }
-    if (this.rebuildGlobalMembership(false)) membershipChanged = true;
+    const viewChanged = this.rebuildGlobalMembership(false);
+    if (viewChanged) membershipChanged = true;
     for (const [rawPeerId, rawState] of Object.entries(capacities || {})) {
       const peerId = this.normalizePeerId(rawPeerId);
       if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
@@ -5921,7 +6064,7 @@ var PartialMesh = class {
       this.emit("mesh:membership", Array.from(this.globalPeers));
       if (capacityChanged) this.emit("mesh:capacity", this.getPeerCapacities());
       if (membershipChanged || topologyChanged) this.emit("mesh:graph", this.getGraphSnapshot());
-      this.broadcastMembership(fromPeerId);
+      if (viewChanged || departureMerged) this.broadcastMembership(fromPeerId);
       if (this.config.autoConnect) {
         this.maintainPeerConnections();
       }

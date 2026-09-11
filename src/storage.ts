@@ -77,11 +77,19 @@ export type StorageEvents = {
 
 export type StorageUnsubscribe = () => void;
 
+type GossipMessageListener = (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void;
+type GossipDirectListener = (data: { message: { data: unknown; from?: string } }) => void;
+type GossipPeerListener = (data: { peerId: string }) => void;
+
 interface GossipLike {
   broadcast(data: unknown, metadata?: Record<string, unknown>): string;
   sendDirect?(targetPeerId: string, data: unknown): string | null;
-  on(event: 'messageReceived', callback: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void): void;
-  off(event: 'messageReceived', callback: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void): void;
+  on(event: 'messageReceived', callback: GossipMessageListener): void;
+  on(event: 'directMessageReceived', callback: GossipDirectListener): void;
+  on(event: 'peerConnected', callback: GossipPeerListener): void;
+  off(event: 'messageReceived', callback: GossipMessageListener): void;
+  off(event: 'directMessageReceived', callback: GossipDirectListener): void;
+  off(event: 'peerConnected', callback: GossipPeerListener): void;
 }
 
 type PersistedRecord = {
@@ -129,7 +137,25 @@ type StorageRetrieveResponse = {
   record: PersistedRecord | null;
 };
 
-type StorageSyncPayload = StorageMutation | StorageRetrieveRequest | StorageRetrieveResponse;
+type StorageDigestEntry = [StorageSpace, string, StorageVersion | null];
+
+/**
+ * What one node holds of every mutable key it subscribes to, sent to a
+ * neighbour the moment the link comes up. The neighbour pushes what it
+ * holds newer and asks for what it lacks: one exchange per link, after
+ * which subscriptions carry every change. Timers that re-pulled every
+ * record "in case gossip missed one" are what this replaces.
+ */
+type StorageDigest = {
+  __ppType: 'pp-storage-digest-v1';
+  actorId: string;
+  timestamp: number;
+  /** The sender's mesh peer id, so the answers go straight back to it. */
+  origin?: string;
+  entries: StorageDigestEntry[];
+};
+
+type StorageSyncPayload = StorageMutation | StorageRetrieveRequest | StorageRetrieveResponse | StorageDigest;
 
 type StorageCrossTabNotice = {
   __ppType: 'pp-storage-cross-tab-v1';
@@ -277,6 +303,9 @@ class IndexedDbStorageDriver implements StorageDriver {
  */
 // A holder answers the same asker about the same key at most this often.
 const RETRIEVE_ANSWER_MIN_INTERVAL_MS = 10_000;
+// Bounds on a connect-time digest and on what one digest may push back.
+const DIGEST_MAX_ENTRIES = 4_000;
+const DIGEST_MAX_PUSHES = 1_000;
 
 export class PeerPigeonStorage {
   private readonly userId: string;
@@ -290,6 +319,9 @@ export class PeerPigeonStorage {
   private driver: StorageDriver | null = null;
   private readonly listeners = new Set<ChangeListener>();
   private readonly subscribedKeys = new Set<string>();
+  private readonly subscribedEntries = new Map<string, { space: StorageSpace; key: string }>();
+  private readonly onDirectMessageBound: GossipDirectListener;
+  private readonly onPeerConnectedBound: GossipPeerListener;
   private readonly retrieveAnsweredAt = new Map<string, number>();
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
@@ -318,6 +350,26 @@ export class PeerPigeonStorage {
         // ignore malformed or undecryptable sync messages
       });
     };
+    // A retrieve answer, a digest, and whatever a digest pushes back all
+    // travel as direct frames. Gossip surfaces those on a separate event,
+    // and nothing here listened to it: every directly addressed answer was
+    // dropped on arrival and the asker waited out its timeout.
+    this.onDirectMessageBound = (data) => {
+      const message = data?.message;
+      if (!message || typeof message !== 'object') return;
+      this.handleGossipMessage({
+        message: { data: message.data },
+        local: false,
+        ...(typeof message.from === 'string' ? { fromPeer: message.from } : {}),
+      }).catch(() => {
+        // ignore malformed or undecryptable sync messages
+      });
+    };
+    this.onPeerConnectedBound = ({ peerId }) => {
+      this.sendDigest(peerId).catch(() => {
+        // best effort; the peer's own digest still reaches us
+      });
+    };
     this.crossTabStorageEventBound = (event: StorageEvent) => {
       this.handleCrossTabStorageEvent(event);
     };
@@ -337,6 +389,8 @@ export class PeerPigeonStorage {
 
     if (this.gossip) {
       this.gossip.on('messageReceived', this.onGossipMessageBound);
+      this.gossip.on('directMessageReceived', this.onDirectMessageBound);
+      this.gossip.on('peerConnected', this.onPeerConnectedBound);
     }
   }
 
@@ -357,13 +411,16 @@ export class PeerPigeonStorage {
     const normalizedKey = this.normalizeKey(key);
     const subscriptionKey = this.makePk(space, normalizedKey);
     this.subscribedKeys.add(subscriptionKey);
+    this.subscribedEntries.set(subscriptionKey, { space, key: normalizedKey });
     return () => this.unsubscribeKey(space, normalizedKey);
   }
 
   /** Stop accepting remote updates for one exact storage-space/key pair. */
   unsubscribeKey(space: StorageSpace, key: string): void {
     const normalizedKey = this.normalizeKey(key);
-    this.subscribedKeys.delete(this.makePk(space, normalizedKey));
+    const subscriptionKey = this.makePk(space, normalizedKey);
+    this.subscribedKeys.delete(subscriptionKey);
+    this.subscribedEntries.delete(subscriptionKey);
   }
 
   /** Return whether this instance accepts remote updates for a key. */
@@ -525,6 +582,8 @@ export class PeerPigeonStorage {
 
     if (this.gossip) {
       this.gossip.off('messageReceived', this.onGossipMessageBound);
+      this.gossip.off('directMessageReceived', this.onDirectMessageBound);
+      this.gossip.off('peerConnected', this.onPeerConnectedBound);
     }
 
     this.driver?.close();
@@ -532,6 +591,7 @@ export class PeerPigeonStorage {
     this.teardownCrossTabSync();
     this.listeners.clear();
     this.subscribedKeys.clear();
+    this.subscribedEntries.clear();
     for (const pending of this.pendingRetrieveRequests.values()) {
       clearTimeout(pending.timeout);
       pending.resolve(null);
@@ -679,6 +739,11 @@ export class PeerPigeonStorage {
       // Treat every arrived mutation as a candidate update and resolve conflicts
       // at apply-time (newer version/timestamp wins).
       await this.applyRemoteMutation(decrypted);
+      return;
+    }
+
+    if (this.isStorageDigest(decrypted)) {
+      await this.handleDigest(decrypted, data.fromPeer);
       return;
     }
 
@@ -1327,6 +1392,107 @@ export class PeerPigeonStorage {
       (maybe.record === null || typeof maybe.record === 'object');
   }
 
+
+  private isStorageDigest(value: unknown): value is StorageDigest {
+    const maybe = value as Partial<StorageDigest> | null;
+    return !!maybe &&
+      maybe.__ppType === 'pp-storage-digest-v1' &&
+      typeof maybe.actorId === 'string' &&
+      typeof maybe.timestamp === 'number' &&
+      Array.isArray(maybe.entries);
+  }
+
+  /**
+   * Tell a neighbour that just linked up which mutable records this node
+   * subscribes to and which version of each it holds. Frozen records are
+   * content-addressed and fetched on demand, so they stay out of it.
+   */
+  private async sendDigest(targetPeerId: string): Promise<void> {
+    if (this.closed || !this.driver || !this.gossip?.sendDirect) return;
+    const target = String(targetPeerId ?? '').trim();
+    if (!target) return;
+    const entries: StorageDigestEntry[] = [];
+    for (const [pk, { space, key }] of this.subscribedEntries) {
+      if (space === 'private' || space === 'frozen') continue;
+      const existing = await this.driver.get(pk);
+      entries.push([space, key, existing?.version ?? null]);
+      if (entries.length >= DIGEST_MAX_ENTRIES) break;
+    }
+    if (entries.length === 0 || this.closed) return;
+    const digest: StorageDigest = {
+      __ppType: 'pp-storage-digest-v1',
+      actorId: this.userId,
+      timestamp: Date.now(),
+      ...(this.peerId ? { origin: this.peerId } : {}),
+      entries,
+    };
+    try {
+      this.gossip.sendDirect(target, await this.syncEnvelope(digest));
+    } catch {
+      // no route yet; the peer's own digest still reaches us
+    }
+  }
+
+  /**
+   * Answer a neighbour's digest: push every record this node holds newer
+   * than the version listed, and ask directly for every subscribed record
+   * the neighbour holds newer than ours.
+   */
+  private async handleDigest(digest: StorageDigest, fromPeerId?: string): Promise<void> {
+    if (digest.actorId === this.userId) return;
+    const target = (typeof digest.origin === 'string' && digest.origin.trim()) || String(fromPeerId ?? '').trim();
+    if (!target || !this.gossip?.sendDirect) return;
+    const driver = this.requireDriver();
+    let pushed = 0;
+    for (const entry of digest.entries.slice(0, DIGEST_MAX_ENTRIES)) {
+      if (this.closed) return;
+      if (!Array.isArray(entry) || entry.length < 3) continue;
+      const [space, rawKey, rawVersion] = entry as [unknown, unknown, unknown];
+      if (space !== 'public' && space !== 'user' && space !== 'epublic') continue;
+      if (typeof rawKey !== 'string') continue;
+      const key = rawKey.trim();
+      if (!key || key.length > 2048) continue;
+      const theirVersion = (typeof rawVersion === 'string' || typeof rawVersion === 'number') ? rawVersion as StorageVersion : null;
+      const existing = await driver.get(this.makePk(space, key));
+      if (existing) {
+        const cmp = theirVersion == null ? 1 : this.compareStorageVersions(existing.version, theirVersion);
+        if (cmp > 0 && pushed < DIGEST_MAX_PUSHES) {
+          pushed += 1;
+          const mutation: StorageMutation = {
+            __ppType: 'pp-storage-op-v1',
+            opId: `digest-${this.makeMutationId(this.userId)}`,
+            op: 'upsert',
+            space,
+            key,
+            actorId: this.userId,
+            timestamp: existing.updatedAt,
+            record: existing,
+          };
+          try {
+            this.gossip.sendDirect(target, await this.syncEnvelope(mutation));
+          } catch {
+            // best effort; the record still reaches them through gossip
+          }
+        }
+        if (cmp >= 0) continue;
+      }
+      if (theirVersion == null || !this.isSubscribed(space, key)) continue;
+      const request: StorageRetrieveRequest = {
+        __ppType: 'pp-storage-req-v1',
+        reqId: `${this.makeMutationId(this.userId)}-req`,
+        space,
+        key,
+        actorId: this.userId,
+        timestamp: Date.now(),
+        ...(this.peerId ? { origin: this.peerId } : {}),
+      };
+      try {
+        this.gossip.sendDirect(target, await this.syncEnvelope(request));
+      } catch {
+        // best effort
+      }
+    }
+  }
 
   private isCrossTabNotice(value: unknown): value is StorageCrossTabNotice {
     const maybe = value as Partial<StorageCrossTabNotice> | null;

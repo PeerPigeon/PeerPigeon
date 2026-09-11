@@ -2873,6 +2873,7 @@ export class PartialMesh {
       let membershipChanged = false;
       let capacityChanged = false;
       let topologyChanged = false;
+      let departureMerged = false;
       const now = Date.now();
       for (const [rawPeerId, rawRecord] of Object.entries(records || {})) {
         const peerId = this.normalizePeerId(rawPeerId);
@@ -2885,7 +2886,10 @@ export class PartialMesh {
           issuedAt: Math.floor(Number(rawRecord[3])),
           validUntil: rawRecord[4] === null ? null : Math.floor(Number(rawRecord[4])),
         };
-        if (this.mergeMembershipRecord(record, now)) membershipChanged = true;
+        if (this.mergeMembershipRecord(record, now)) {
+          membershipChanged = true;
+          if (record.state === 'left') departureMerged = true;
+        }
       }
       // A transport-authenticated peer may retire itself. Third-party legacy
       // retirement claims are ignored; CECR v1 left records carry versions.
@@ -2900,7 +2904,10 @@ export class PartialMesh {
           issuedAt: now,
           validUntil: null,
         };
-        if (this.mergeMembershipRecord(left, now)) membershipChanged = true;
+        if (this.mergeMembershipRecord(left, now)) {
+          membershipChanged = true;
+          departureMerged = true;
+        }
       }
       for (const raw of incoming) {
         const id = this.normalizePeerId(raw);
@@ -2918,7 +2925,8 @@ export class PartialMesh {
           validUntil: now + this.config.membershipLeaseMs,
         }, now)) membershipChanged = true;
       }
-      if (this.rebuildGlobalMembership(false)) membershipChanged = true;
+      const viewChanged = this.rebuildGlobalMembership(false);
+      if (viewChanged) membershipChanged = true;
       for (const [rawPeerId, rawState] of Object.entries(capacities || {})) {
         const peerId = this.normalizePeerId(rawPeerId);
         if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
@@ -2960,7 +2968,12 @@ export class PartialMesh {
         this.emit('mesh:membership', Array.from(this.globalPeers));
         if (capacityChanged) this.emit('mesh:capacity', this.getPeerCapacities());
         if (membershipChanged || topologyChanged) this.emit('mesh:graph', this.getGraphSnapshot());
-        this.broadcastMembership(fromPeerId);
+        // Forward at once only what changes the view: a peer joining or
+        // leaving. Renewed leases, degrees and adjacency ride every node's
+        // own membership round a few seconds later; re-broadcasting each
+        // one as it arrived had every link carrying a membership frame a
+        // second with nothing new in it.
+        if (viewChanged || departureMerged) this.broadcastMembership(fromPeerId);
         if (this.config.autoConnect) {
           this.maintainPeerConnections();
         }
