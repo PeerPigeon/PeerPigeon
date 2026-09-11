@@ -421,6 +421,14 @@ interface StoragePutOptions {
      * Override owner for first write in user-space records.
      */
     ownerId?: string;
+    /**
+     * Store the record and serve it on request, but announce nothing: no
+     * mutation is gossiped to the room. For content-addressed records that
+     * nobody subscribes to in advance — a watcher re-seeding every chunk of
+     * every snapshot at start gossiped each one to every peer in the room,
+     * hundreds of megabytes that no peer had asked for.
+     */
+    silent?: boolean;
 }
 interface StorageSyncOptions {
     /**

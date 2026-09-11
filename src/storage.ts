@@ -20,6 +20,14 @@ export interface StoragePutOptions {
    * Override owner for first write in user-space records.
    */
   ownerId?: string;
+  /**
+   * Store the record and serve it on request, but announce nothing: no
+   * mutation is gossiped to the room. For content-addressed records that
+   * nobody subscribes to in advance — a watcher re-seeding every chunk of
+   * every snapshot at start gossiped each one to every peer in the room,
+   * hundreds of megabytes that no peer had asked for.
+   */
+  silent?: boolean;
 }
 
 export interface StorageSyncOptions {
@@ -441,7 +449,7 @@ export class PeerPigeonStorage {
 
   async put<T = unknown>(space: StorageSpace, key: string, value: T, options: StoragePutOptions = {}): Promise<StorageRecord<T>> {
     const mutation = await this.applyLocalUpsert(space, key, value, options, false);
-    if (space !== 'private') {
+    if (space !== 'private' && !options.silent) {
       await this.broadcastMutation(mutation);
     }
     return (await this.get(space, key)) as StorageRecord<T>;

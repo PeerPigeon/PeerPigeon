@@ -2756,7 +2756,7 @@ var PeerPigeonStorage = class {
   }
   async put(space, key, value, options = {}) {
     const mutation = await this.applyLocalUpsert(space, key, value, options, false);
-    if (space !== "private") {
+    if (space !== "private" && !options.silent) {
       await this.broadcastMutation(mutation);
     }
     return await this.get(space, key);

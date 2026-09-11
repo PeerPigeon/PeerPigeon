@@ -112,3 +112,21 @@ test('a digest lists only subscribed mutable keys and pushes nothing the neighbo
     await close();
   }
 });
+
+test('a silent put is stored and served on request but gossips no mutation', async () => {
+  const { a, storageA, storageB, close } = await pair();
+  try {
+    const broadcasts = [];
+    const originalBroadcast = a.broadcast;
+    a.broadcast = (data) => { broadcasts.push(data); return originalBroadcast(data); };
+    storageB.subscribeKey('frozen', 'chunk-1');
+    await storageA.put('frozen', 'chunk-1', { data: 'abc' }, { silent: true });
+    await settle();
+    assert.equal(broadcasts.length, 0, 'nothing was gossiped');
+    assert.equal(await storageB.get('frozen', 'chunk-1'), null, 'B was not pushed the record');
+    const fetched = await storageB.retrieve('frozen', 'chunk-1', { timeoutMs: 2_000 });
+    assert.equal(fetched?.value?.data, 'abc', 'B gets it on request');
+  } finally {
+    await close();
+  }
+});
