@@ -275,6 +275,9 @@ class IndexedDbStorageDriver implements StorageDriver {
  * - Enforces five built-in ACL spaces: public, user, frozen, private, epublic
  * - epublic is internal-only and can only be mutated through putSystem/deleteSystem
  */
+// Retrieve answers up to this size are gossiped to the room rather than routed.
+const SMALL_RESPONSE_BROADCAST_BYTES = 24 * 1024;
+
 export class PeerPigeonStorage {
   private readonly userId: string;
   private peerId: string;
@@ -990,8 +993,14 @@ export class PeerPigeonStorage {
     // kilobytes — with a few browsers refreshing, a permanent multi-megabyte
     // storm on every watcher. Broadcast remains the fallback when the
     // requester cannot be routed to.
-    if (typeof request.origin === 'string' && request.origin && this.gossip?.sendDirect) {
-      const envelope = await this.syncEnvelope(response);
+    // A small answer (a heartbeat, a head, a presence record) goes to the
+    // room: a multi-hop direct send can report a neighbour took it and still
+    // never arrive, and a browser that never sees the fresh record shows a
+    // live machine as offline. Small answers are cheap to gossip; the
+    // fan-out cost that mattered was large records, which stay direct.
+    const envelope = await this.syncEnvelope(response);
+    const small = JSON.stringify(envelope).length <= SMALL_RESPONSE_BROADCAST_BYTES;
+    if (!small && typeof request.origin === 'string' && request.origin && this.gossip?.sendDirect) {
       if (this.gossip.sendDirect(request.origin, envelope)) return;
     }
     await this.broadcastSyncPayload(response);

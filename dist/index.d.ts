@@ -487,14 +487,6 @@ interface GossipLike {
         fromPeer?: string;
     }) => void): void;
 }
-/**
- * PeerPigeonStorage
- *
- * - Persists records in IndexedDB (fallback: in-memory)
- * - Syncs subscribed non-private keys over encrypted gossip envelopes
- * - Enforces five built-in ACL spaces: public, user, frozen, private, epublic
- * - epublic is internal-only and can only be mutated through putSystem/deleteSystem
- */
 declare class PeerPigeonStorage {
     private readonly userId;
     private peerId;
