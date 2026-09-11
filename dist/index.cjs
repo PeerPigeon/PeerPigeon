@@ -2630,13 +2630,14 @@ var IndexedDbStorageDriver = class _IndexedDbStorageDriver {
     });
   }
 };
-var SMALL_RESPONSE_BROADCAST_BYTES = 24 * 1024;
+var RETRIEVE_ANSWER_MIN_INTERVAL_MS = 1e4;
 var PeerPigeonStorage = class {
   constructor(options) {
     this.storeName = "records";
     this.driver = null;
     this.listeners = /* @__PURE__ */ new Set();
     this.subscribedKeys = /* @__PURE__ */ new Set();
+    this.retrieveAnsweredAt = /* @__PURE__ */ new Map();
     this.pendingRetrieveRequests = /* @__PURE__ */ new Map();
     this.closed = false;
     this.instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
@@ -3215,9 +3216,17 @@ var PeerPigeonStorage = class {
       timestamp: Date.now(),
       record: existing
     };
-    const envelope = await this.syncEnvelope(response);
-    const small = JSON.stringify(envelope).length <= SMALL_RESPONSE_BROADCAST_BYTES;
-    if (!small && typeof request.origin === "string" && request.origin && this.gossip?.sendDirect) {
+    const answerKey = `${request.origin ?? request.actorId}:${request.space}:${request.key}`;
+    const answeredAt = this.retrieveAnsweredAt.get(answerKey) ?? 0;
+    if (Date.now() - answeredAt < RETRIEVE_ANSWER_MIN_INTERVAL_MS) return;
+    this.retrieveAnsweredAt.set(answerKey, Date.now());
+    if (this.retrieveAnsweredAt.size > 2048) {
+      for (const [key, at] of this.retrieveAnsweredAt) {
+        if (Date.now() - at > RETRIEVE_ANSWER_MIN_INTERVAL_MS) this.retrieveAnsweredAt.delete(key);
+      }
+    }
+    if (typeof request.origin === "string" && request.origin && this.gossip?.sendDirect) {
+      const envelope = await this.syncEnvelope(response);
       if (this.gossip.sendDirect(request.origin, envelope)) return;
     }
     await this.broadcastSyncPayload(response);

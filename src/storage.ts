@@ -275,8 +275,8 @@ class IndexedDbStorageDriver implements StorageDriver {
  * - Enforces five built-in ACL spaces: public, user, frozen, private, epublic
  * - epublic is internal-only and can only be mutated through putSystem/deleteSystem
  */
-// Retrieve answers up to this size are gossiped to the room rather than routed.
-const SMALL_RESPONSE_BROADCAST_BYTES = 24 * 1024;
+// A holder answers the same asker about the same key at most this often.
+const RETRIEVE_ANSWER_MIN_INTERVAL_MS = 10_000;
 
 export class PeerPigeonStorage {
   private readonly userId: string;
@@ -290,6 +290,7 @@ export class PeerPigeonStorage {
   private driver: StorageDriver | null = null;
   private readonly listeners = new Set<ChangeListener>();
   private readonly subscribedKeys = new Set<string>();
+  private readonly retrieveAnsweredAt = new Map<string, number>();
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
   private readonly onGossipMessageBound: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void;
@@ -993,14 +994,21 @@ export class PeerPigeonStorage {
     // kilobytes — with a few browsers refreshing, a permanent multi-megabyte
     // storm on every watcher. Broadcast remains the fallback when the
     // requester cannot be routed to.
-    // A small answer (a heartbeat, a head, a presence record) goes to the
-    // room: a multi-hop direct send can report a neighbour took it and still
-    // never arrive, and a browser that never sees the fresh record shows a
-    // live machine as offline. Small answers are cheap to gossip; the
-    // fan-out cost that mattered was large records, which stay direct.
-    const envelope = await this.syncEnvelope(response);
-    const small = JSON.stringify(envelope).length <= SMALL_RESPONSE_BROADCAST_BYTES;
-    if (!small && typeof request.origin === 'string' && request.origin && this.gossip?.sendDirect) {
+    // One answer per asker per key per few seconds, from this holder. Every
+    // holder answering every ask — and by broadcast — was 1,500 answers in
+    // thirty seconds for one record; the room does not need to hear an
+    // answer meant for one peer, and one peer does not need it twice.
+    const answerKey = `${request.origin ?? request.actorId}:${request.space}:${request.key}`;
+    const answeredAt = this.retrieveAnsweredAt.get(answerKey) ?? 0;
+    if (Date.now() - answeredAt < RETRIEVE_ANSWER_MIN_INTERVAL_MS) return;
+    this.retrieveAnsweredAt.set(answerKey, Date.now());
+    if (this.retrieveAnsweredAt.size > 2048) {
+      for (const [key, at] of this.retrieveAnsweredAt) {
+        if (Date.now() - at > RETRIEVE_ANSWER_MIN_INTERVAL_MS) this.retrieveAnsweredAt.delete(key);
+      }
+    }
+    if (typeof request.origin === 'string' && request.origin && this.gossip?.sendDirect) {
+      const envelope = await this.syncEnvelope(response);
       if (this.gossip.sendDirect(request.origin, envelope)) return;
     }
     await this.broadcastSyncPayload(response);

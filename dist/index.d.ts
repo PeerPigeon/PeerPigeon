@@ -499,6 +499,7 @@ declare class PeerPigeonStorage {
     private driver;
     private readonly listeners;
     private readonly subscribedKeys;
+    private readonly retrieveAnsweredAt;
     private readonly pendingRetrieveRequests;
     private closed;
     private readonly onGossipMessageBound;
