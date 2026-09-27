@@ -569,6 +569,27 @@ declare class PeerPigeonStorage {
     private broadcastSyncPayload;
     private handleRetrieveRequest;
     private handleRetrieveResponse;
+    /** The configured filter's verdict, or null when there is no filter. */
+    private syncFilterAccepts;
+    /**
+     * Whether an arriving mutation, response or request concerns this node.
+     *
+     * A syncFilter names the namespace this node replicates, and it used to be
+     * consulted only AFTER a check that the exact key was already subscribed —
+     * so it could never bring anything in, only keep things out. A node that
+     * had subscribed to nothing dropped every mutation for its own namespace:
+     * it heard the room say a record had changed and threw the words away.
+     *
+     * That made a subscription the only way to learn anything, and a peer with
+     * none was unreachable by the room. It sent an empty digest, so nothing was
+     * pushed to it, and every mutation it heard was discarded — silence that
+     * looked exactly like an empty room. A watcher publishing every ten seconds
+     * was invisible to a peer sitting next to it.
+     *
+     * So a node that declares a namespace replicates it. A node that declares
+     * none keeps the old rule and takes only what it subscribed to, which is
+     * what stops a filterless node from accepting the whole room.
+     */
     private shouldAcceptRemoteSync;
     private createDriver;
     private emitChange;

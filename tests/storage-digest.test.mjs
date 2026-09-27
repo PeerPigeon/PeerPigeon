@@ -113,6 +113,66 @@ test('a digest lists only subscribed mutable keys and pushes nothing the neighbo
   }
 });
 
+test('a node that declares a namespace is pushed its records without subscribing to each key', async () => {
+  const a = makeGossip('peer-a');
+  const b = makeGossip('peer-b');
+  a.other = b; b.other = a;
+  const options = { sessionId: 'namespace-test', syncSecret: 'namespace-test-secret' };
+  const storageA = new PeerPigeonStorage({ ...options, userId: 'user-a', peerId: 'peer-a', gossip: a });
+  // B replicates one namespace and subscribes to nothing inside it, which is
+  // every fresh replica: a browser that has just opened, a watcher that has
+  // just restarted. It used to drop every mutation it heard for its own
+  // namespace, so the room was silent to it and asking was the only way to
+  // learn anything at all.
+  const storageB = new PeerPigeonStorage({
+    ...options,
+    userId: 'user-b',
+    peerId: 'peer-b',
+    gossip: b,
+    syncFilter: (_space, key) => String(key).startsWith('fleet/'),
+  });
+  await storageA.init();
+  await storageB.init();
+  try {
+    await storageA.put('public', 'fleet/publisher/one', { beat: 1 });
+    await settle();
+    assert.equal((await storageB.get('public', 'fleet/publisher/one'))?.value?.beat, 1,
+      'the write arrived without B ever asking for it');
+
+    // And it keeps arriving: this is a heartbeat, not a one-off.
+    await storageA.put('public', 'fleet/publisher/one', { beat: 2 });
+    await settle();
+    assert.equal((await storageB.get('public', 'fleet/publisher/one'))?.value?.beat, 2);
+
+    // What the namespace excludes is still refused, so declaring one narrows
+    // what a node takes rather than opening it to the whole room.
+    await storageA.put('public', 'elsewhere/publisher/two', { beat: 1 });
+    await settle();
+    assert.equal(await storageB.get('public', 'elsewhere/publisher/two'), null,
+      'a key outside the declared namespace is not accepted');
+  } finally {
+    await storageA.close();
+    await storageB.close();
+  }
+});
+
+test('a node that declares no namespace still takes only what it subscribed to', async () => {
+  const { storageA, storageB, close } = await pair();
+  try {
+    await storageA.put('public', 'unsubscribed-key', { n: 1 });
+    await settle();
+    assert.equal(await storageB.get('public', 'unsubscribed-key'), null,
+      'without a declared namespace, a subscription is still the only way in');
+
+    storageB.subscribeKey('public', 'subscribed-key');
+    await storageA.put('public', 'subscribed-key', { n: 2 });
+    await settle();
+    assert.equal((await storageB.get('public', 'subscribed-key'))?.value?.n, 2);
+  } finally {
+    await close();
+  }
+});
+
 test('a silent put is stored and served on request but gossips no mutation', async () => {
   const { a, storageA, storageB, close } = await pair();
   try {
