@@ -750,6 +750,8 @@ declare class PeerPigeonCryptoProtocol {
     private readonly callbacks;
     private announceTimer;
     private initialized;
+    /** Broadcasts seen for other rooms, counted rather than reported as errors. */
+    private foreignBroadcasts;
     private readonly onGossipMessageBound;
     private readonly onDirectMessageBound;
     private readonly onPeerConnectedBound;
@@ -758,6 +760,8 @@ declare class PeerPigeonCryptoProtocol {
     init(): Promise<void>;
     getKeyPair(): Readonly<PeerPigeonKeyPair>;
     getPublicKey(peerId: string): PeerPublicKey | null;
+    /** How many broadcasts this node has seen for rooms it is not in. */
+    getForeignBroadcastCount(): number;
     getKnownPeerKeys(): PeerPublicKey[];
     announcePublicKey(): void;
     private readonly keyRequestedAt;

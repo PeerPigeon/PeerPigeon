@@ -121,6 +121,8 @@ export class PeerPigeonCryptoProtocol {
   private readonly callbacks: Partial<Record<keyof PeerPigeonCryptoEvents, Set<Function>>> = {};
   private announceTimer: ReturnType<typeof setInterval> | null = null;
   private initialized = false;
+  /** Broadcasts seen for other rooms, counted rather than reported as errors. */
+  private foreignBroadcasts = 0;
 
   private readonly onGossipMessageBound = (data: { message: GossipMessage; local: boolean; fromPeer?: string; receivedAt?: number }): void => {
     this.handleGossipMessage(data).catch((error) => this.emitError(error));
@@ -178,6 +180,11 @@ export class PeerPigeonCryptoProtocol {
   getPublicKey(peerId: string): PeerPublicKey | null {
     const value = this.publicKeys.get(String(peerId ?? '').trim());
     return value ? { ...value } : null;
+  }
+
+  /** How many broadcasts this node has seen for rooms it is not in. */
+  getForeignBroadcastCount(): number {
+    return this.foreignBroadcasts;
   }
 
   getKnownPeerKeys(): PeerPublicKey[] {
@@ -442,7 +449,19 @@ export class PeerPigeonCryptoProtocol {
       return;
     }
     if (!this.isEncryptedBroadcast(payload)) return;
-    const plaintext = await this.decryptEncryptedBroadcast(payload);
+    let plaintext: string;
+    try {
+      plaintext = await this.decryptEncryptedBroadcast(payload);
+    } catch {
+      // Not ours. A gossip broadcast floods the whole mesh, so a node sees
+      // every room's traffic and can open only its own; a frame addressed to
+      // a room this node is not in is an ordinary fact of the transport, not
+      // a failure. Reporting each one as a node error buried every real
+      // message under tens of thousands of identical lines, and said nothing
+      // about who sent it or which room it was for.
+      this.foreignBroadcasts += 1;
+      return;
+    }
     const receivedAt = Number.isFinite(data.receivedAt) && Number(data.receivedAt) > 0
       ? Number(data.receivedAt)
       : Date.now();

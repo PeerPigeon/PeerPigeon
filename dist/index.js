@@ -3702,6 +3702,8 @@ var PeerPigeonCryptoProtocol = class {
     this.callbacks = {};
     this.announceTimer = null;
     this.initialized = false;
+    /** Broadcasts seen for other rooms, counted rather than reported as errors. */
+    this.foreignBroadcasts = 0;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch((error) => this.emitError(error));
     };
@@ -3754,6 +3756,10 @@ var PeerPigeonCryptoProtocol = class {
   getPublicKey(peerId) {
     const value = this.publicKeys.get(String(peerId ?? "").trim());
     return value ? { ...value } : null;
+  }
+  /** How many broadcasts this node has seen for rooms it is not in. */
+  getForeignBroadcastCount() {
+    return this.foreignBroadcasts;
   }
   getKnownPeerKeys() {
     return Array.from(this.publicKeys.values()).map((value) => ({ ...value })).sort((a, b) => a.peerId.localeCompare(b.peerId));
@@ -3970,7 +3976,13 @@ var PeerPigeonCryptoProtocol = class {
       return;
     }
     if (!this.isEncryptedBroadcast(payload)) return;
-    const plaintext = await this.decryptEncryptedBroadcast(payload);
+    let plaintext;
+    try {
+      plaintext = await this.decryptEncryptedBroadcast(payload);
+    } catch {
+      this.foreignBroadcasts += 1;
+      return;
+    }
     const receivedAt = Number.isFinite(data.receivedAt) && Number(data.receivedAt) > 0 ? Number(data.receivedAt) : Date.now();
     this.emit("encryptedBroadcastReceived", { plaintext, payload, ...data, receivedAt });
   }
