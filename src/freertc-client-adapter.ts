@@ -76,6 +76,7 @@ export class FreeRTCClientAdapter {
   private readonly defaultIceServers: RTCIceServer[] | null;
   private readonly trickleIce: boolean;
   private readonly meshSignaling: MeshSignaling | null;
+  private readonly relayOnDemand: boolean;
   private readonly emitter = new Emitter();
   private readonly knownPeers = new Set<string>();
   private readonly knownPeerLastSeenAtMs = new Map<string, number>();
@@ -131,6 +132,8 @@ export class FreeRTCClientAdapter {
     iceServers?: RTCIceServer[] | null;
     trickleIce?: boolean;
     meshSignaling?: MeshSignaling | null;
+    /** Let go of the relay while the mesh is healthy. Default: on whenever mesh signaling is wired. */
+    relayOnDemand?: boolean;
   }) {
     const normalizedSignalUrls = Array.from(new Set(
       (Array.isArray(signalUrls) ? signalUrls : [signalUrls])
@@ -158,6 +161,8 @@ export class FreeRTCClientAdapter {
     this.defaultIceServers = options?.iceServers ?? null;
     this.trickleIce = options?.trickleIce ?? true;
     this.meshSignaling = options?.meshSignaling ?? null;
+    // A released relay is only safe when negotiation can travel by mesh.
+    this.relayOnDemand = (options?.relayOnDemand ?? true) && this.meshSignaling !== null;
     this.addSelfAlias(this.requestedPeerId);
     this.addSelfAlias(this.previousPeerId);
     for (const peerId of this.retiredPeerIds) this.addSelfAlias(peerId);
@@ -221,7 +226,7 @@ export class FreeRTCClientAdapter {
     this.startSignalingHealthLoop();
     this.withdrawPreviousIdentity();
     if (this.client) {
-      if (this.client.isRegistered) {
+      if (this.client.isRegistered || this.client.relayIdle === true) {
         this.emitConnectedIfNeeded();
         this.nudgeSignaling();
         return;
@@ -245,6 +250,11 @@ export class FreeRTCClientAdapter {
       iceServers: this.defaultIceServers ?? undefined,
       trickleIce: this.trickleIce,
       autoConnect: false,
+      relay: this.relayOnDemand ? { mode: 'on-demand' } : {},
+      onRelayStateChange: ({ state }: { state?: string } = {}) => {
+        if (!isCurrentClient()) return;
+        this.emitter.emit('signaling:log', { message: `[signal] relay ${String(state)} on ${signalUrl}` });
+      },
       // The mesh is asked first for every addressed frame; the relay only
       // carries what the mesh cannot route.
       signalTransport: (envelope: Record<string, unknown>) => {
@@ -348,7 +358,7 @@ export class FreeRTCClientAdapter {
   }
 
   isConnected(): boolean {
-    return Boolean(this.client?.isRegistered);
+    return Boolean(this.client?.isRegistered || this.client?.relayIdle === true);
   }
 
   joinSession(sessionId: string): void {
@@ -366,7 +376,7 @@ export class FreeRTCClientAdapter {
     }
     // A peer the mesh can reach is dialable before, or without, a relay
     // registration: its offer travels over connected neighbours.
-    if (!this.client || (!this.client.isRegistered && !this.canSignalViaMesh(id))) {
+    if (!this.client || (!this.client.isRegistered && this.client.relayIdle !== true && !this.canSignalViaMesh(id))) {
       throw new Error('Not connected');
     }
     await this.client.initiateConnection(id, iceServers ?? this.defaultIceServers ?? undefined);
@@ -788,6 +798,8 @@ export class FreeRTCClientAdapter {
       this.recoveryProbeTimer = null;
       if (this.intentionallyDisconnected) return;
       if (typeof document !== 'undefined' && document.hidden) return;
+      // The relay was released on purpose while this probe waited: nothing is missing.
+      if (this.client?.relayIdle === true) return;
       if (recycleOnTimeout) {
         this.healthProbeMisses += 1;
         if (this.healthProbeMisses < HEALTH_PROBE_MISSES_BEFORE_RECYCLE && this.client?.isRegistered) {
@@ -813,6 +825,8 @@ export class FreeRTCClientAdapter {
     this.signalingHealthTimer = setInterval(() => {
       if (this.intentionallyDisconnected || this.recyclingSignalingTransport || this.recoveryProbeTimer) return;
       if (typeof document !== 'undefined' && document.hidden) return;
+      // A relay released on purpose has no acknowledgement to wait for; the client wakes it itself.
+      if (this.client?.relayIdle === true) return;
       if (!this.client?.isRegistered) {
         this.ensureRegistrationRecoveryProbe('health check');
         this.client?.connect?.();
@@ -833,6 +847,7 @@ export class FreeRTCClientAdapter {
       this.initialSignalingHealthTimer = null;
       if (this.intentionallyDisconnected || this.recyclingSignalingTransport || this.recoveryProbeTimer) return;
       if (typeof document !== 'undefined' && document.hidden) return;
+      if (this.client?.relayIdle === true) return;
       if (!this.client?.isRegistered) {
         this.ensureRegistrationRecoveryProbe('initial health check');
         this.client?.connect?.();

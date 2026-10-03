@@ -50,6 +50,27 @@ const DATA_CHUNK_STALE_MS = 30000
 // verdicts so a tab that never returns still gets cleaned up.
 const DATA_DORMANT_FRAME = '~dormant'
 const DATA_DORMANT_MAX_MS = 30 * 60000
+// Relay on demand. A peer with a healthy mesh does not need a relay socket: the relay is for
+// meeting the mesh, and once met, negotiation and liveness travel over the data channels. A few
+// peers per room, the anchors, stay registered so a newcomer still finds a way in; the rest
+// release their socket and wake it only when they need it. Anchors are the peers whose id is
+// closest to the room key, and neighbours tell each other which ids they can vouch for with this
+// frame. Opt-in: see the `relay` option.
+const RELAY_ANCHOR_FRAME = '~anchors'
+const RELAY_DEFAULTS = {
+  // Live data-channel neighbours needed before the relay socket can be released.
+  minMeshPeers: 2,
+  // Peers per room that stay registered with the relay.
+  anchors: 3,
+  // How long a peer must have been releasable before it lets go, so a flap does not flap the relay.
+  settleMs: 30_000,
+  // How long the relay stays up once something woke it.
+  lingerMs: 60_000,
+  // How often the peer re-evaluates whether it needs the relay.
+  evalMs: 5_000,
+  // How long a neighbour's word that a peer is closest to the room is believed.
+  gossipTtlMs: 20_000,
+}
 // A send into a transport that is not positively connected does not throw in
 // WebKit — it logs an uncatchable 'Error sending string through
 // RTCDataChannel' console error per attempt. EVERY channel send must pass
@@ -217,6 +238,12 @@ export function createSignalingClient(options = {}) {
     // the relay is not used for that frame. Anything else falls back to the
     // relay socket exactly as before.
     signalTransport = null,
+    // Relay on demand (opt-in). { mode: 'on-demand', minMeshPeers, anchors, settleMs, lingerMs,
+    // evalMs, gossipTtlMs }. Takes effect only when the host also supplies signalTransport,
+    // because a released relay is only safe when the host can carry signaling over the mesh.
+    relay: relayOptions = {},
+    // Called with { state: 'up' | 'idle' | 'waking', ts } as the relay socket is released and woken.
+    onRelayStateChange,
   } = options
 
   const roomId = configuredRoomId || legacyRoomId || networkId
@@ -275,6 +302,26 @@ export function createSignalingClient(options = {}) {
   let stoppedByUser = false
   let onConnectionStateChangeCb = onConnectionStateChange
   let lastBootstrapCountLogged = null
+
+  // ── Relay on demand ───────────────────────────────────────────────────────
+  // Off unless the caller asks for it and can carry signaling over the mesh. Everything below
+  // is inert in 'always' mode, which is how the client has always behaved.
+  const relayMode = relayOptions?.mode === 'on-demand' && typeof signalTransport === 'function' ? 'on-demand' : 'always'
+  const relayConfig = { ...RELAY_DEFAULTS }
+  for (const [name, value] of Object.entries(relayOptions ?? {})) {
+    if (name in RELAY_DEFAULTS && Number.isFinite(value) && value >= 0) relayConfig[name] = value
+  }
+  // Zero anchors would leave a room with no way in, and zero neighbours would never be isolated.
+  relayConfig.anchors = Math.max(1, Math.floor(relayConfig.anchors))
+  relayConfig.minMeshPeers = Math.max(1, Math.floor(relayConfig.minMeshPeers))
+  let relayIdle = false
+  let relayWakeUntil = 0
+  let relayReleasableSince = 0
+  let relayWatchTimer = null
+  let relayEvaluating = false
+  let pendingBootstrapPeerIds = null
+  let lastAnchorBroadcast = { key: '', at: 0 }
+  const closenessKeys = new Map()
 
   // ── Wake Lock ─────────────────────────────────────────────────────────────
   // Acquired while we have active peer connections so the browser doesn't
@@ -521,7 +568,11 @@ export function createSignalingClient(options = {}) {
     if (viaMesh && meshCapablePeers.has(toPeerId)) return
 
     if (!registered) {
-      if (!viaMesh) log('[signal] not registered yet')
+      // A frame the mesh could not carry, with the relay released on purpose: wake it. This frame
+      // is not queued, but a negotiation retries its frames until it connects or gives up, so the
+      // retry that follows the registration is the one that goes out.
+      if (relayIdle && !viaMesh) wakeRelay(`${type} for a peer the mesh cannot reach`)
+      else if (!viaMesh) log('[signal] not registered yet')
       return
     }
     if (loudSignalType(type)) {
@@ -630,6 +681,186 @@ export function createSignalingClient(options = {}) {
     }, delayMs)
     reconnectAttempts += 1
     if (delayMs > 0) backoffMs = Math.min(backoffMs * BACKOFF_FACTOR, BACKOFF_MAX_MS)
+  }
+
+  // A channel can keep reporting 'open' while its connection is anything
+  // but 'connected' — connecting during renegotiation, disconnected on an
+  // ICE blip, failed after one. WebKit fails every such send with an
+  // async console error no catch can see, so the gate must be POSITIVE:
+  // send only over a connection that says 'connected' (or one whose
+  // implementation has no connectionState at all).
+  function isChannelLive(entry) {
+    if (entry?.channel?.readyState !== 'open') return false
+    if (entry.dormantAt && Date.now() - entry.dormantAt < DATA_DORMANT_MAX_MS) return false
+    if (!entry.connection) return false
+    const state = entry.connection.connectionState
+    if (state !== undefined && state !== 'connected') return false
+    // SCTP dies one-way: readyState and connectionState both keep
+    // claiming health while every send fails — and in Safari the
+    // failure does not even throw, so no error path ever fires. The
+    // only trusted signal is the pong round trip: a channel is live
+    // once its first pong has landed, and stops being live when a
+    // ping goes unanswered past the pong timeout.
+    const now = Date.now()
+    if (!(entry.lastPongAt > 0) || now - entry.lastPongAt >= DATA_PROOF_FRESH_MS) return false
+    return !(entry.lastPingSentAt > entry.lastPongAt
+      && now - entry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS)
+  }
+
+  // ── Relay on demand: who stays registered, and when the socket is released ─
+  function notifyRelayState(state) {
+    try { onRelayStateChange?.({ state, ts: Date.now() }) } catch { /* a host callback must not break the client */ }
+  }
+
+  // A stable position on a 256-bit ring for a room or a peer. Closeness to the room is what
+  // makes a peer an anchor, so every peer that knows the same ids reaches the same answer.
+  async function closenessKey(text) {
+    let key = closenessKeys.get(text)
+    if (key === undefined) {
+      const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))
+      key = BigInt(`0x${Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join('')}`)
+      if (closenessKeys.size > 2000) closenessKeys.clear()
+      closenessKeys.set(text, key)
+    }
+    return key
+  }
+
+  async function closestToRoom(roomKey, ids, count) {
+    const scored = await Promise.all([...new Set(ids)].map(async (id) => ({ id, distance: (await closenessKey(id)) ^ roomKey })))
+    scored.sort((a, b) => (a.distance < b.distance ? -1 : a.distance > b.distance ? 1 : a.id < b.id ? -1 : 1))
+    return scored.slice(0, count).map((entry) => entry.id)
+  }
+
+  function liveNeighbourIds() {
+    const ids = []
+    for (const [remotePeerId, entry] of mesh.connections.entries()) {
+      if (isChannelLive(entry)) ids.push(remotePeerId)
+    }
+    return ids
+  }
+
+  // What the neighbours have recently said they can vouch for. A neighbour only vouches for
+  // itself and its own live neighbours, so an id that has gone away stops being repeated as soon
+  // as the last peer that was connected to it notices, and no ghost can keep itself alive by
+  // being passed around.
+  function vouchedIds(neighbourIds) {
+    const now = Date.now()
+    const ids = []
+    for (const remotePeerId of neighbourIds) {
+      const gossip = mesh.connections.get(remotePeerId)?.anchorGossip
+      if (gossip && now - gossip.at < relayConfig.gossipTtlMs) ids.push(...gossip.ids)
+    }
+    return ids
+  }
+
+  // Whether this peer needs the relay right now. It does when it is cut off from the mesh, when it
+  // is one of the room's anchors, or when something has just woken it. `direct` is what it can
+  // vouch for itself (the closest among itself and its live neighbours); `anchors` also counts
+  // what the neighbours vouch for, which is how it learns a closer peer is two hops away.
+  async function relayDecision() {
+    const now = Date.now()
+    const neighbours = liveNeighbourIds()
+    const roomKey = await closenessKey(`${networkId}:${roomId}`)
+    const direct = await closestToRoom(roomKey, [peerId, ...neighbours], relayConfig.anchors)
+    const anchors = await closestToRoom(roomKey, [peerId, ...neighbours, ...vouchedIds(neighbours)], relayConfig.anchors)
+    const isolated = neighbours.length < relayConfig.minMeshPeers
+    const isAnchor = anchors.includes(peerId)
+    const awake = relayWakeUntil > now
+    return { neighbours, direct, anchors, isolated, isAnchor, awake, wantRelay: isolated || isAnchor || awake }
+  }
+
+  // Tell each live neighbour which ids this peer can vouch for. Sent when the answer changes and
+  // otherwise often enough that it never goes stale at the other end.
+  function broadcastAnchors(neighbourIds, direct) {
+    const key = direct.join(',')
+    const now = Date.now()
+    if (key === lastAnchorBroadcast.key && now - lastAnchorBroadcast.at < relayConfig.gossipTtlMs / 2) return
+    lastAnchorBroadcast = { key, at: now }
+    const frame = JSON.stringify({ type: RELAY_ANCHOR_FRAME, ids: direct })
+    for (const remotePeerId of neighbourIds) {
+      const entry = mesh.connections.get(remotePeerId)
+      try {
+        if (entry?.channel?.readyState === 'open' && transportReady(entry.connection)) entry.channel.send(frame)
+      } catch { /* a broken channel is for the keepalive to judge */ }
+    }
+  }
+
+  // A negotiation that has not finished may be waiting on an answer that can only arrive by relay.
+  function negotiationInFlight() {
+    const now = Date.now()
+    for (const entry of mesh.connections.values()) {
+      if (entry.state === 'connecting' && now - (entry.lastSeen ?? 0) < NEGOTIATION_TTL_MS * 2) return true
+    }
+    return false
+  }
+
+  function releaseRelay() {
+    if (relayIdle || !ws) return
+    log('[relay] the mesh is healthy and this peer is not an anchor: releasing the relay socket')
+    relayIdle = true
+    relayReleasableSince = 0
+    send(pspEnvelope('withdraw', { body: { reason: 'relay_idle' } }))
+    registered = false
+    stopAdvertiseHeartbeat()
+    stopKeepalive()
+    // Detach first: a deliberate release must not look like a drop, or the host's recovery logic
+    // would reopen the socket it was just meant to leave closed.
+    const releasing = ws
+    ws = null
+    releasing.onopen = null
+    releasing.onmessage = null
+    releasing.onerror = null
+    releasing.onclose = null
+    try { releasing.close(1000, 'relay_idle') } catch { /* already closed */ }
+    setStatus('relay-idle')
+    notifyRelayState('idle')
+  }
+
+  function wakeRelay(reason = 'requested', holdMs = relayConfig.lingerMs) {
+    if (relayMode !== 'on-demand' || stoppedByUser) return false
+    relayWakeUntil = Math.max(relayWakeUntil, Date.now() + holdMs)
+    relayReleasableSince = 0
+    if (!relayIdle) return true
+    log(`[relay] waking the relay socket: ${reason}`)
+    notifyRelayState('waking')
+    resetReconnectBackoff()
+    intentionalClose = false
+    openSocket()
+    return true
+  }
+
+  async function evaluateRelay() {
+    if (relayMode !== 'on-demand' || stoppedByUser || relayEvaluating) return null
+    relayEvaluating = true
+    try {
+      const decision = await relayDecision()
+      broadcastAnchors(decision.neighbours, decision.direct)
+      if (decision.wantRelay) {
+        relayReleasableSince = 0
+        if (relayIdle) wakeRelay(decision.isolated ? 'cut off from the mesh' : 'anchor')
+      } else if (!relayIdle && registered && !negotiationInFlight()) {
+        const now = Date.now()
+        if (!relayReleasableSince) relayReleasableSince = now
+        if (now - relayReleasableSince >= relayConfig.settleMs) releaseRelay()
+      } else {
+        relayReleasableSince = 0
+      }
+      return decision
+    } finally {
+      relayEvaluating = false
+    }
+  }
+
+  function startRelayWatch() {
+    if (relayMode !== 'on-demand') return
+    clearInterval(relayWatchTimer)
+    relayWatchTimer = setInterval(() => { evaluateRelay().catch((error) => log(`[relay] evaluation failed: ${error?.message ?? error}`)) }, relayConfig.evalMs)
+    if (typeof relayWatchTimer?.unref === 'function') relayWatchTimer.unref()
+  }
+
+  function stopRelayWatch() {
+    clearInterval(relayWatchTimer)
+    relayWatchTimer = null
   }
 
   function closeAllPeerConnections() {
@@ -1000,6 +1231,18 @@ export function createSignalingClient(options = {}) {
         const dormantEntry = mesh.connections.get(remotePeerId)
         if (dormantEntry?.connection === pc && dormantEntry.channel === channel) {
           dormantEntry.dormantAt = Date.now()
+        }
+        return
+      }
+
+      // A neighbour's word on which peers it can vouch for as closest to the room. Control
+      // traffic for the relay-on-demand election: never handed to the host as data.
+      if (msg?.type === RELAY_ANCHOR_FRAME) {
+        if (ownsCurrentEntry && Array.isArray(msg.ids)) {
+          currentEntry.anchorGossip = {
+            at: Date.now(),
+            ids: msg.ids.filter((id) => typeof id === 'string' && id.length > 0 && id.length <= 256).slice(0, 16),
+          }
         }
         return
       }
@@ -1823,6 +2066,13 @@ export function createSignalingClient(options = {}) {
       log(`[signal] registered as ${peerId} on network ${networkId} (${source})`)
       startAdvertiseHeartbeat()
       onRegistered?.(registrationMessage)
+      if (relayMode === 'on-demand') notifyRelayState('up')
+      // A discovery asked for while the relay was released goes out now that it is back.
+      if (pendingBootstrapPeerIds) {
+        const exclude = pendingBootstrapPeerIds
+        pendingBootstrapPeerIds = null
+        client.requestBootstrap(exclude)
+      }
     }
 
     switch (msg.type) {
@@ -1884,6 +2134,10 @@ export function createSignalingClient(options = {}) {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
       return
     }
+
+    // Any real open, whoever asked for it (a wake, a resume, a visibility change), ends the idle
+    // state; the next evaluation decides afresh whether the socket is still needed.
+    relayIdle = false
 
     const wsUrl = new URL(signalUrl, typeof location !== 'undefined' ? location.href : undefined)
     if (!wsUrl.searchParams.get('networkId')) {
@@ -2113,11 +2367,18 @@ export function createSignalingClient(options = {}) {
       stoppedByUser = false
       intentionalClose = false
       startSuspendWatch()
+      startRelayWatch()
       openSocket()
     },
 
     requestBootstrap(excludePeerIds = [peerId]) {
       if (!registered) {
+        // Discovery is what the relay is for: wake it, and ask once it has registered.
+        if (relayIdle) {
+          pendingBootstrapPeerIds = excludePeerIds
+          wakeRelay('discovery')
+          return
+        }
         log('[signal] not registered yet')
         return
       }
@@ -2127,6 +2388,12 @@ export function createSignalingClient(options = {}) {
     },
 
     relay: relaySignal,
+
+    // Relay on demand. wakeRelay reopens a released relay socket and keeps it up for the linger
+    // time; evaluateRelay runs the decision now instead of on its timer and returns it. Both do
+    // nothing in the default 'always' mode.
+    wakeRelay: (reason) => wakeRelay(reason),
+    evaluateRelay,
 
     advertise(nextCapabilities) {
       if (!registered) return
@@ -2164,6 +2431,9 @@ export function createSignalingClient(options = {}) {
       stopAdvertiseHeartbeat()
       stopKeepalive()
       stopSuspendWatch()
+      stopRelayWatch()
+      relayIdle = false
+      pendingBootstrapPeerIds = null
       intentionalClose = true
       closeAllPeerConnections()
       mesh.connections.clear()
@@ -2206,31 +2476,10 @@ export function createSignalingClient(options = {}) {
     injectSignal,
 
     sendData(data, preferredPeerId) {
-      // A channel can keep reporting 'open' while its connection is anything
-      // but 'connected' — connecting during renegotiation, disconnected on an
-      // ICE blip, failed after one. WebKit fails every such send with an
-      // async console error no catch can see, so the gate must be POSITIVE:
-      // send only over a connection that says 'connected' (or one whose
-      // implementation has no connectionState at all). Transient states
-      // throw an error marked transient so callers retry without executing
-      // the peer; terminal states throw plain so callers release it.
-      const channelIsLive = (entry) => {
-        if (entry?.channel?.readyState !== 'open') return false
-        if (entry.dormantAt && Date.now() - entry.dormantAt < DATA_DORMANT_MAX_MS) return false
-        if (!entry.connection) return false
-        const state = entry.connection.connectionState
-        if (state !== undefined && state !== 'connected') return false
-        // SCTP dies one-way: readyState and connectionState both keep
-        // claiming health while every send fails — and in Safari the
-        // failure does not even throw, so no error path ever fires. The
-        // only trusted signal is the pong round trip: a channel is live
-        // once its first pong has landed, and stops being live when a
-        // ping goes unanswered past the pong timeout.
-        const now = Date.now()
-        if (!(entry.lastPongAt > 0) || now - entry.lastPongAt >= DATA_PROOF_FRESH_MS) return false
-        return !(entry.lastPingSentAt > entry.lastPongAt
-          && now - entry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS)
-      }
+      // The gate is isChannelLive (above, with its reasoning): transient states
+      // throw an error marked transient so callers retry without executing the
+      // peer; terminal states throw plain so callers release it.
+      const channelIsLive = isChannelLive
 
       let target = null
 
@@ -2341,6 +2590,14 @@ export function createSignalingClient(options = {}) {
     },
     get isRegistered() {
       return registered
+    },
+    // True while the relay socket is released on purpose. A host that watches for a missing relay
+    // acknowledgement must not read this as an outage.
+    get relayIdle() {
+      return relayIdle
+    },
+    get relayMode() {
+      return relayMode
     },
   }
 
