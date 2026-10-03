@@ -15,6 +15,51 @@ const UI_PREFS_KEY = "freertc.ui.prefs.v1";
 const DATA_PING_MS = 3000;
 const DATA_PONG_TIMEOUT_MS = 12000;
 
+// Relay on demand (PSP 19.4 - 19.7). A peer with a healthy mesh lets go of its relay socket;
+// the peers closest to the room stay as anchors so a newcomer can still find a way in.
+const ANNOUNCE_REFRESH_MS = 12000;
+const RELAY_MIN_MESH_PEERS = 2;
+const RELAY_ANCHORS = 3;
+const RELAY_SETTLE_MS = 30000;
+const RELAY_LINGER_MS = 60000;
+const RELAY_EVAL_MS = 5000;
+const RELAY_GOSSIP_TTL_MS = 20000;
+const RELAY_QUEUE_LIMIT = 50;
+const ANCHOR_GOSSIP_MAX_IDS = 16;
+const ANCHOR_GOSSIP_MAX_ID_CHARS = 256;
+const FRAME_SIGNAL = "~signal";
+const FRAME_ANCHORS = "~anchors";
+// Negotiation messages may travel over a data channel instead of the relay.
+const MESH_SIGNAL_TYPES = new Set(["connect_request", "connect_accept", "connect_reject", "offer", "answer", "ice_candidate", "ice_end", "renegotiate", "bye"]);
+
+const closenessKeys = new Map();
+
+/** A stable position on a 256-bit ring for a room or a peer: SHA-256 of the text as an unsigned integer. */
+async function closenessKey(text) {
+  let key = closenessKeys.get(text);
+  if (key === undefined) {
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+    key = BigInt(`0x${Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")}`);
+    if (closenessKeys.size > 2000) {
+      closenessKeys.clear();
+    }
+    closenessKeys.set(text, key);
+  }
+  return key;
+}
+
+/** The `count` ids closest to the room by XOR distance; ties go to the lexicographically smaller id. */
+async function closestToRoom(roomKey, ids, count) {
+  const scored = await Promise.all([...new Set(ids)].map(async (id) => ({ id, distance: (await closenessKey(id)) ^ roomKey })));
+  scored.sort((a, b) => {
+    if (a.distance !== b.distance) {
+      return a.distance < b.distance ? -1 : 1;
+    }
+    return a.id < b.id ? -1 : 1;
+  });
+  return scored.slice(0, count).map((entry) => entry.id);
+}
+
 function newId(prefix = "msg") {
   return `${prefix}-${crypto.randomUUID()}`;
 }
@@ -214,6 +259,21 @@ createApp({
     const failedPeerCooldowns = new Map();
     const byeCooldowns = new Map();
     const meshLinks = new Map();
+
+    // Relay on demand. `relayState` is what the page shows: up, idle (released on purpose) or waking.
+    const relayOnDemand = ref(true);
+    const relayState = ref("up");
+    let relayIdle = false;
+    let relayWakeUntil = 0;
+    let relayReleasableSince = 0;
+    let relayWatchTimer = null;
+    let relayEvaluating = false;
+    let lastAnnounceAt = 0;
+    let lastAnchorBroadcast = { key: "", at: 0 };
+    // Peers that have sent a signaling frame over the mesh: the relay copy to them can stop.
+    const meshCapablePeers = new Set();
+    // Frames that needed the relay while it was released, sent once it is back.
+    let pendingRelayEnvelopes = [];
 
     const logs = ref([]);
 
@@ -780,6 +840,7 @@ createApp({
             network: normalizedNetworkValue(),
             partial_mesh: Boolean(partialMesh.value),
             partial_mesh_max_peers: normalizeMeshLimit(partialMeshMaxPeers.value),
+            relay_on_demand: Boolean(relayOnDemand.value),
             chat_send_mode: chatSendMode.value === "target" ? "target" : "broadcast",
             active_view: activeView.value === "console" ? "console" : "webrtc"
           })
@@ -817,6 +878,10 @@ createApp({
         }
 
         partialMeshMaxPeers.value = normalizeMeshLimit(saved.partial_mesh_max_peers);
+
+        if (typeof saved.relay_on_demand === "boolean") {
+          relayOnDemand.value = saved.relay_on_demand;
+        }
 
         if (saved.chat_send_mode === "target" || saved.chat_send_mode === "broadcast") {
           chatSendMode.value = saved.chat_send_mode;
@@ -974,12 +1039,63 @@ createApp({
       }
     }
 
-    function sendEnvelope(envelope) {
-      if (!socket.value || socket.value.readyState !== WebSocket.OPEN) {
-        pushLog("client:error", "Socket is not connected");
+    // A neighbour: a peer with an open data channel on a connection that has not failed.
+    function isLiveNeighbour(peerId) {
+      const link = meshLinks.get(peerId);
+      if (!link || link.dc?.readyState !== "open") {
         return false;
       }
+      return !["failed", "closed"].includes(link.rtcState);
+    }
 
+    function liveNeighbourIds() {
+      return Array.from(meshLinks.keys()).filter(isLiveNeighbour);
+    }
+
+    // A negotiation frame for a neighbour goes over the data channel (PSP 19.4).
+    function sendViaMesh(outbound) {
+      if (!relayOnDemand.value || !MESH_SIGNAL_TYPES.has(outbound.type) || !outbound.to || !isLiveNeighbour(outbound.to)) {
+        return false;
+      }
+      try {
+        meshLinks.get(outbound.to).dc.send(JSON.stringify({ type: FRAME_SIGNAL, envelope: outbound }));
+      } catch {
+        // A channel that refuses the frame is for the keepalive to judge; the relay carries it instead.
+        return false;
+      }
+      pushLog("mesh:send", outbound);
+      return true;
+    }
+
+    // Broadcast frames replace each other in the queue; a withdraw is never sent late.
+    function queueForRelay(outbound) {
+      if (outbound.type === "withdraw") {
+        return;
+      }
+      const replaces = outbound.type === "announce" || outbound.type === "discover";
+      pendingRelayEnvelopes = pendingRelayEnvelopes.filter((queued) => !(replaces && queued.type === outbound.type));
+      pendingRelayEnvelopes.push(outbound);
+      pendingRelayEnvelopes = pendingRelayEnvelopes.slice(-RELAY_QUEUE_LIMIT);
+    }
+
+    function flushRelayQueue() {
+      const queued = pendingRelayEnvelopes;
+      pendingRelayEnvelopes = [];
+      for (const outbound of queued) {
+        // A frame outlives its own ttl_ms for nobody.
+        if (now() - Number(outbound.timestamp || 0) <= Number(outbound.ttl_ms || 30000)) {
+          sendOnSocket(outbound);
+        }
+      }
+    }
+
+    function sendOnSocket(outbound) {
+      socket.value.send(JSON.stringify(outbound));
+      pushLog("client:send", outbound);
+      return true;
+    }
+
+    function sendEnvelope(envelope) {
       // Keep network token stable even if the editable field has trailing spaces.
       const stableNetwork = normalizedAppliedNetworkValue();
 
@@ -988,9 +1104,26 @@ createApp({
         network: stableNetwork
       };
 
-      socket.value.send(JSON.stringify(outbound));
-      pushLog("client:send", outbound);
-      return true;
+      const viaMesh = sendViaMesh(outbound);
+      const socketOpen = Boolean(socket.value) && socket.value.readyState === WebSocket.OPEN;
+      // Until a peer has answered over the mesh, the relay copy goes too: it may not carry the mesh.
+      if (viaMesh && (meshCapablePeers.has(outbound.to) || !socketOpen)) {
+        return true;
+      }
+      if (socketOpen) {
+        return sendOnSocket(outbound);
+      }
+      if (relayIdle && relayOnDemand.value) {
+        // The mesh could not carry this: wake the relay and send it once it is back.
+        queueForRelay(outbound);
+        wakeRelay(`${outbound.type} needs the relay`);
+        return true;
+      }
+      if (viaMesh) {
+        return true;
+      }
+      pushLog("client:error", "Socket is not connected");
+      return false;
     }
 
     function sendRelayEnvelope(type, body, override = {}) {
@@ -1036,7 +1169,10 @@ createApp({
         socket.value = null;
       }
 
-      status.value = "connecting";
+      // Waking a released relay is not a reconnect: the mesh is still up and the page stays connected.
+      if (!relayIdle) {
+        status.value = "connecting";
+      }
       const resolvedWsUrl = normalizedWsUrlValue();
       if (resolvedWsUrl !== wsUrl.value) {
         wsUrl.value = resolvedWsUrl;
@@ -1046,7 +1182,11 @@ createApp({
       try {
         ws = new WebSocket(resolvedWsUrl);
       } catch (error) {
-        status.value = "disconnected";
+        if (relayIdle) {
+          relayState.value = "idle";
+        } else {
+          status.value = "disconnected";
+        }
         socket.value = null;
         pushLog("socket:error", error?.message || "failed to create websocket");
         return;
@@ -1055,9 +1195,14 @@ createApp({
 
       ws.onopen = () => {
         status.value = "connected";
+        relayIdle = false;
+        relayState.value = "up";
+        relayReleasableSince = 0;
         pushLog("socket", `connected to ${resolvedWsUrl}`);
         // Auto-start handshake on connect
         void beginRtc();
+        flushRelayQueue();
+        startRelayWatch();
       };
 
       ws.onmessage = (event) => {
@@ -1072,14 +1217,24 @@ createApp({
 
       ws.onerror = () => {
         pushLog("socket:error", "WebSocket error");
-        if (ws.readyState !== WebSocket.OPEN) {
+        if (ws.readyState !== WebSocket.OPEN && !relayIdle) {
           status.value = "disconnected";
         }
       };
 
       ws.onclose = () => {
+        // A socket released on purpose, or a wake that did not get through, is not a lost
+        // relay: the mesh does not depend on it, so nothing is torn down and nothing reconnects
+        // until the next time the relay is needed.
+        if (relayIdle) {
+          socket.value = null;
+          relayState.value = "idle";
+          pushLog("socket", "relay idle");
+          return;
+        }
         status.value = "disconnected";
         socket.value = null;
+        stopRelayWatch();
         pendingPingStartedAt = 0;
         pingButtonText.value = "ping";
         pingFlash.value = false;
@@ -1105,6 +1260,7 @@ createApp({
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+      resetRelayState();
 
       if (!socket.value) {
         status.value = "disconnected";
@@ -1122,8 +1278,138 @@ createApp({
       stopRtc();
     }
 
+    // What the neighbours have recently said they can vouch for (PSP 19.7). A neighbour vouches
+    // only for itself and its own live neighbours, so no id outlives the peers connected to it.
+    function vouchedIds(neighbourIds) {
+      const ids = [];
+      for (const peerId of neighbourIds) {
+        const gossip = meshLinks.get(peerId)?.anchorGossip;
+        if (gossip && now() - gossip.at < RELAY_GOSSIP_TTL_MS) {
+          ids.push(...gossip.ids);
+        }
+      }
+      return ids;
+    }
+
+    // Whether this peer needs the relay right now: it is cut off from the mesh, it is one of the
+    // room's anchors, or something has just woken it (PSP 19.5, 19.6).
+    async function relayDecision() {
+      const neighbours = liveNeighbourIds();
+      const roomKey = await closenessKey(`${normalizedAppliedNetworkValue()}:${normalizedAppliedRoomValue()}`);
+      const self = fromPeer.value;
+      const direct = await closestToRoom(roomKey, [self, ...neighbours], RELAY_ANCHORS);
+      const anchors = await closestToRoom(roomKey, [self, ...neighbours, ...vouchedIds(neighbours)], RELAY_ANCHORS);
+      const isolated = neighbours.length < RELAY_MIN_MESH_PEERS;
+      const isAnchor = anchors.includes(self);
+      const awake = relayWakeUntil > now();
+      return { neighbours, direct, isolated, isAnchor, awake, wantRelay: isolated || isAnchor || awake };
+    }
+
+    // Tell each live neighbour who this peer can vouch for: when the answer changes, and often
+    // enough that it never goes stale at the other end.
+    function broadcastAnchors(neighbourIds, direct) {
+      const key = direct.join(",");
+      if (key === lastAnchorBroadcast.key && now() - lastAnchorBroadcast.at < RELAY_GOSSIP_TTL_MS / 2) {
+        return;
+      }
+      lastAnchorBroadcast = { key, at: now() };
+      const frame = JSON.stringify({ type: FRAME_ANCHORS, ids: direct });
+      for (const peerId of neighbourIds) {
+        try {
+          meshLinks.get(peerId).dc.send(frame);
+        } catch {
+          // A channel that refuses the frame is for the keepalive to judge.
+        }
+      }
+    }
+
+    // A negotiation that has not finished may be waiting on an answer that can only come by relay.
+    function negotiationInFlight() {
+      return Array.from(meshLinks.values()).some((link) => isNegotiatingPhase(link.phase) && now() - Number(link.lastSignalAt || 0) < CONNECT_REQUEST_TIMEOUT_MS * 2);
+    }
+
+    function releaseRelay() {
+      const ws = socket.value;
+      if (relayIdle || !ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      pushLog("relay", "the mesh is healthy and this peer is not an anchor: releasing the relay socket");
+      sendWithdraw("relay_idle");
+      relayIdle = true;
+      relayReleasableSince = 0;
+      relayState.value = "idle";
+      ws.close(1000, "relay_idle");
+    }
+
+    function wakeRelay(reason, holdMs = RELAY_LINGER_MS) {
+      if (!relayOnDemand.value || manualDisconnect) {
+        return false;
+      }
+      relayWakeUntil = Math.max(relayWakeUntil, now() + holdMs);
+      relayReleasableSince = 0;
+      if (!relayIdle || relayState.value === "waking") {
+        return true;
+      }
+      pushLog("relay", `waking the relay socket: ${reason}`);
+      relayState.value = "waking";
+      connect();
+      return true;
+    }
+
+    async function evaluateRelay() {
+      if (!relayOnDemand.value || manualDisconnect || relayEvaluating || !isConnected.value) {
+        return;
+      }
+      relayEvaluating = true;
+      try {
+        const decision = await relayDecision();
+        broadcastAnchors(decision.neighbours, decision.direct);
+        if (decision.wantRelay) {
+          relayReleasableSince = 0;
+          if (relayIdle) {
+            wakeRelay(decision.isolated ? "cut off from the mesh" : "anchor");
+          }
+        } else if (!relayIdle && socket.value?.readyState === WebSocket.OPEN && !negotiationInFlight()) {
+          if (!relayReleasableSince) {
+            relayReleasableSince = now();
+          }
+          if (now() - relayReleasableSince >= RELAY_SETTLE_MS) {
+            releaseRelay();
+          }
+        } else {
+          relayReleasableSince = 0;
+        }
+      } finally {
+        relayEvaluating = false;
+      }
+    }
+
+    function startRelayWatch() {
+      clearInterval(relayWatchTimer);
+      relayWatchTimer = setInterval(() => {
+        evaluateRelay().catch((error) => pushLog("relay:error", error?.message || "relay evaluation failed"));
+      }, RELAY_EVAL_MS);
+    }
+
+    function stopRelayWatch() {
+      clearInterval(relayWatchTimer);
+      relayWatchTimer = null;
+    }
+
+    function resetRelayState() {
+      stopRelayWatch();
+      relayIdle = false;
+      relayWakeUntil = 0;
+      relayReleasableSince = 0;
+      relayState.value = "up";
+      pendingRelayEnvelopes = [];
+      meshCapablePeers.clear();
+      lastAnchorBroadcast = { key: "", at: 0 };
+    }
+
     function sendAnnounce(options = {}) {
       const { feedback = true } = options;
+      lastAnnounceAt = now();
       const sent = sendEnvelope({
         psp_version: PSP_VERSION,
         type: "announce",
@@ -1154,7 +1440,7 @@ createApp({
       return sent;
     }
 
-    function sendWithdraw() {
+    function sendWithdraw(reason = "peer_offline") {
       sendEnvelope({
         psp_version: PSP_VERSION,
         type: "withdraw",
@@ -1166,7 +1452,7 @@ createApp({
         timestamp: now(),
         ttl_ms: 30000,
         body: {
-          reason: "peer_offline"
+          reason
         }
       });
     }
@@ -1449,12 +1735,18 @@ createApp({
           meshLinks.delete(peerId);
         }
 
-        // Re-announce every 3s to keep D1 TTL alive. Server suppresses peer_list broadcasts
-        // for heartbeat re-announces, so this is cheap and ensures continuous peer discovery.
-        sendAnnounce({ feedback: false });
+        // A released relay has nothing to renew: the registration was withdrawn on purpose, and
+        // an announce here would reopen the socket that was just let go (PSP 19.5).
+        const relayHeld = !relayIdle && relayState.value !== "waking";
+
+        // Re-announce before the 30s lease ends (PSP 9.1, 26). The relay suppresses peer_list
+        // broadcasts for heartbeat re-announces and leaves a lease with most of its life alone.
+        if (relayHeld && now() - lastAnnounceAt >= ANNOUNCE_REFRESH_MS) {
+          sendAnnounce({ feedback: false });
+        }
 
         // Low-frequency discover keeps peer_list timestamps fresh when heartbeat broadcasts are suppressed.
-        if (autoDiscovery.value && now() - lastDiscoverSyncAt >= DISCOVER_SYNC_INTERVAL_MS) {
+        if (relayHeld && autoDiscovery.value && now() - lastDiscoverSyncAt >= DISCOVER_SYNC_INTERVAL_MS) {
           sendDiscover({ feedback: false });
           lastDiscoverSyncAt = now();
         }
@@ -1695,6 +1987,26 @@ createApp({
       refreshSelectedPeerSnapshot();
     }
 
+    function handlePeerControlFrame(peerId, link, frame) {
+      if (frame.type === FRAME_SIGNAL) {
+        const envelope = frame.envelope;
+        // Without forwarding, a frame on this channel can only come from the peer at the other end.
+        if (!envelope || typeof envelope !== "object" || envelope.from !== peerId || !MESH_SIGNAL_TYPES.has(envelope.type)) {
+          return;
+        }
+        meshCapablePeers.add(peerId);
+        pushLog("mesh:recv", envelope);
+        void onServerEnvelope(envelope);
+        return;
+      }
+      if (frame.type === FRAME_ANCHORS && Array.isArray(frame.ids)) {
+        const ids = frame.ids
+          .filter((id) => typeof id === "string" && id.length > 0 && id.length <= ANCHOR_GOSSIP_MAX_ID_CHARS)
+          .slice(0, ANCHOR_GOSSIP_MAX_IDS);
+        link.anchorGossip = { at: now(), ids };
+      }
+    }
+
     function setupDataChannel(peerId, channel, source) {
       const link = getMeshLink(peerId);
       link.dc = channel;
@@ -1794,6 +2106,11 @@ createApp({
         if (msg?.type === "pong") {
           lastPongAt = Date.now();
           lastPingSentAt = 0;
+          return;
+        }
+        // Frames that start with "~" belong to the protocol, never to the chat (PSP 19.7).
+        if (typeof msg?.type === "string" && msg.type.startsWith("~")) {
+          handlePeerControlFrame(peerId, link, msg);
           return;
         }
         pushChatMessage(event.data, "incoming");
@@ -2622,12 +2939,20 @@ createApp({
     }
 
     watch(
-      [wsUrl, network, partialMesh, partialMeshMaxPeers, chatSendMode, activeView],
+      [wsUrl, network, partialMesh, partialMeshMaxPeers, chatSendMode, activeView, relayOnDemand],
       () => {
         persistUiPrefs();
       },
       { flush: "sync" }
     );
+
+    // Turning it off while the relay is released brings the relay back at once.
+    watch(relayOnDemand, (enabled) => {
+      if (!enabled && relayIdle && relayState.value !== "waking") {
+        relayState.value = "waking";
+        connect();
+      }
+    });
 
     loadUiPrefs();
     initSharedIds();
@@ -2793,6 +3118,8 @@ createApp({
       autoConnect,
       partialMesh,
       partialMeshMaxPeers,
+      relayOnDemand,
+      relayState,
       debugExpanded,
       logsText,
       logCount,
@@ -3052,6 +3379,10 @@ createApp({
                 <span>{{ partialMesh ? 'On' : 'Off' }}</span>
                 <input v-if="partialMesh" type="number" min="1" max="99" :value="partialMeshMaxPeers" @input.stop="partialMeshMaxPeers = Math.max(1, parseInt($event.target.value) || 1)" @click.stop style="width:3em;font-size:0.85em;background:transparent;border:1px solid currentColor;border-radius:4px;padding:0 3px;color:inherit;text-align:center" title="Max peers" />
               </div>
+            </article>
+            <article class="runtime-chip" :class="relayOnDemand ? (relayState === 'idle' ? 'ok' : 'idle') : 'idle'" style="cursor:pointer" @click="relayOnDemand = !relayOnDemand" title="With a healthy mesh, a peer that is not an anchor lets go of its relay socket and signals over the mesh; it reopens the relay when it needs it (PSP 19.5)">
+              <div class="runtime-label">Relay On Demand</div>
+              <div class="runtime-value">{{ relayOnDemand ? 'On · relay ' + relayState : 'Off · relay up' }}</div>
             </article>
             <article class="runtime-chip selected">
               <div class="runtime-label">Send Route</div>

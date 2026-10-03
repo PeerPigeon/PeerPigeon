@@ -135,6 +135,7 @@ var FreeRTCClientAdapter = class {
     this.defaultIceServers = options?.iceServers ?? null;
     this.trickleIce = options?.trickleIce ?? true;
     this.meshSignaling = options?.meshSignaling ?? null;
+    this.relayOnDemand = (options?.relayOnDemand ?? true) && this.meshSignaling !== null;
     this.addSelfAlias(this.requestedPeerId);
     this.addSelfAlias(this.previousPeerId);
     for (const peerId of this.retiredPeerIds) this.addSelfAlias(peerId);
@@ -191,7 +192,7 @@ var FreeRTCClientAdapter = class {
     this.startSignalingHealthLoop();
     this.withdrawPreviousIdentity();
     if (this.client) {
-      if (this.client.isRegistered) {
+      if (this.client.isRegistered || this.client.relayIdle === true) {
         this.emitConnectedIfNeeded();
         this.nudgeSignaling();
         return;
@@ -212,6 +213,11 @@ var FreeRTCClientAdapter = class {
       iceServers: this.defaultIceServers ?? void 0,
       trickleIce: this.trickleIce,
       autoConnect: false,
+      relay: this.relayOnDemand ? { mode: "on-demand" } : {},
+      onRelayStateChange: ({ state } = {}) => {
+        if (!isCurrentClient()) return;
+        this.emitter.emit("signaling:log", { message: `[signal] relay ${String(state)} on ${signalUrl}` });
+      },
       // The mesh is asked first for every addressed frame; the relay only
       // carries what the mesh cannot route.
       signalTransport: (envelope) => {
@@ -316,7 +322,7 @@ var FreeRTCClientAdapter = class {
     this.joinedOnce = false;
   }
   isConnected() {
-    return Boolean(this.client?.isRegistered);
+    return Boolean(this.client?.isRegistered || this.client?.relayIdle === true);
   }
   joinSession(sessionId) {
     if (sessionId && sessionId !== this.roomId) {
@@ -330,7 +336,7 @@ var FreeRTCClientAdapter = class {
     if (!id || this.isSelfAlias(id)) {
       throw new Error("Cannot connect to a current or retired local peer ID");
     }
-    if (!this.client || !this.client.isRegistered && !this.canSignalViaMesh(id)) {
+    if (!this.client || !this.client.isRegistered && this.client.relayIdle !== true && !this.canSignalViaMesh(id)) {
       throw new Error("Not connected");
     }
     await this.client.initiateConnection(id, iceServers ?? this.defaultIceServers ?? void 0);
@@ -678,6 +684,7 @@ var FreeRTCClientAdapter = class {
       this.recoveryProbeTimer = null;
       if (this.intentionallyDisconnected) return;
       if (typeof document !== "undefined" && document.hidden) return;
+      if (this.client?.relayIdle === true) return;
       if (recycleOnTimeout) {
         this.healthProbeMisses += 1;
         if (this.healthProbeMisses < HEALTH_PROBE_MISSES_BEFORE_RECYCLE && this.client?.isRegistered) {
@@ -702,6 +709,7 @@ var FreeRTCClientAdapter = class {
     this.signalingHealthTimer = setInterval(() => {
       if (this.intentionallyDisconnected || this.recyclingSignalingTransport || this.recoveryProbeTimer) return;
       if (typeof document !== "undefined" && document.hidden) return;
+      if (this.client?.relayIdle === true) return;
       if (!this.client?.isRegistered) {
         this.ensureRegistrationRecoveryProbe("health check");
         this.client?.connect?.();
@@ -721,6 +729,7 @@ var FreeRTCClientAdapter = class {
       this.initialSignalingHealthTimer = null;
       if (this.intentionallyDisconnected || this.recyclingSignalingTransport || this.recoveryProbeTimer) return;
       if (typeof document !== "undefined" && document.hidden) return;
+      if (this.client?.relayIdle === true) return;
       if (!this.client?.isRegistered) {
         this.ensureRegistrationRecoveryProbe("initial health check");
         this.client?.connect?.();
