@@ -1583,7 +1583,11 @@ export class GossipProtocol {
   }
 
   private cecrFanout(connectedDegree: number = this.mesh.getConnectedPeers().length): number {
-    const liveN = Math.max(1, this.canonicalPeerSet().length);
+    // A peer this node is connected to is live by definition, whatever the membership view has
+    // converged to yet. Counting only the converged view made a node that had just connected see a
+    // network of one, log2(1) = 0, and a fan-out budget of zero: for the first several seconds after
+    // two peers met, neither gossiped to the other and every broadcast was silently lost.
+    const liveN = Math.max(1, this.canonicalPeerSet().length, Math.max(0, connectedDegree) + 1);
     return Math.min(Math.max(0, connectedDegree), Math.ceil(Math.log2(liveN)));
   }
 
@@ -2001,7 +2005,13 @@ export class GossipProtocol {
     return this.orderedRouteCandidates(target, undefined, this.cecrConfigId()).length > 0;
   }
 
-  sendDirect(targetPeerId: string, data: unknown): string | null {
+  /**
+   * `connectedOnly` addresses a peer this node is connected to right now, whatever the converged
+   * membership view says. The key exchange that runs the moment two peers connect needs it: the
+   * view takes a few membership rounds to include a new neighbour, and refusing the frame
+   * meant encrypted direct messages waited for the next ten-second announce.
+   */
+  sendDirect(targetPeerId: string, data: unknown, options: { connectedOnly?: boolean } = {}): string | null {
     const from = this.mesh.getClientId();
     if (!from) return null;
 
@@ -2023,10 +2033,10 @@ export class GossipProtocol {
     // A frame nobody took is not sent. Signaling relies on this: a mesh
     // send that reports success without a neighbour holding the frame would
     // suppress the relay copy and lose the offer.
-    return this.routeDirect(message, null) ? message.id : null;
+    return this.routeDirect(message, null, options.connectedOnly === true) ? message.id : null;
   }
 
-  private routeDirect(message: DirectMessage, fromPeerId: string | null): boolean {
+  private routeDirect(message: DirectMessage, fromPeerId: string | null, viaNeighbour = false): boolean {
     const self = this.mesh.getClientId();
 
     // We are the destination
@@ -2049,14 +2059,16 @@ export class GossipProtocol {
       return true;
     }
 
+    const connected = this.mesh.getConnectedPeers();
+
     // Cached or merely discovered identifiers are not routable after their
-    // membership lease leaves the local live view.
-    if (!this.canonicalPeerSet().includes(message.to)) return false;
+    // membership lease leaves the local live view. The one exception is a frame the sender
+    // addressed to a neighbour on purpose (see sendDirect's `connectedOnly`).
+    if (!(viaNeighbour && connected.includes(message.to)) && !this.canonicalPeerSet().includes(message.to)) return false;
 
     if (message.hops >= message.maxHops) return false;
 
     // Is target directly connected? Short-circuit.
-    const connected = this.mesh.getConnectedPeers();
     if (connected.includes(message.to)) {
       try {
         this.mesh.send(message.to, JSON.stringify({

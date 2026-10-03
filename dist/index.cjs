@@ -1915,7 +1915,7 @@ var _GossipProtocol = class _GossipProtocol {
     })]);
   }
   cecrFanout(connectedDegree = this.mesh.getConnectedPeers().length) {
-    const liveN = Math.max(1, this.canonicalPeerSet().length);
+    const liveN = Math.max(1, this.canonicalPeerSet().length, Math.max(0, connectedDegree) + 1);
     return Math.min(Math.max(0, connectedDegree), Math.ceil(Math.log2(liveN)));
   }
   selectFanoutPeers(excluded, channel) {
@@ -2243,7 +2243,13 @@ var _GossipProtocol = class _GossipProtocol {
     if (!this.canonicalPeerSet().includes(target)) return false;
     return this.orderedRouteCandidates(target, void 0, this.cecrConfigId()).length > 0;
   }
-  sendDirect(targetPeerId, data) {
+  /**
+   * `connectedOnly` addresses a peer this node is connected to right now, whatever the converged
+   * membership view says. The key exchange that runs the moment two peers connect needs it: the
+   * view takes a few membership rounds to include a new neighbour, and refusing the frame
+   * meant encrypted direct messages waited for the next ten-second announce.
+   */
+  sendDirect(targetPeerId, data, options = {}) {
     const from = this.mesh.getClientId();
     if (!from) return null;
     const message = {
@@ -2260,9 +2266,9 @@ var _GossipProtocol = class _GossipProtocol {
       originViewId: this.canonicalSetHash(this.canonicalPeerSet())
     };
     this.markDirectSeen(message.id, message.timestamp);
-    return this.routeDirect(message, null) ? message.id : null;
+    return this.routeDirect(message, null, options.connectedOnly === true) ? message.id : null;
   }
-  routeDirect(message, fromPeerId) {
+  routeDirect(message, fromPeerId, viaNeighbour = false) {
     const self = this.mesh.getClientId();
     if (message.to === self) {
       const repairedMessage = this.reliableRepairMessage(message.data);
@@ -2281,9 +2287,9 @@ var _GossipProtocol = class _GossipProtocol {
       this.emit("directMessageReceived", { message });
       return true;
     }
-    if (!this.canonicalPeerSet().includes(message.to)) return false;
-    if (message.hops >= message.maxHops) return false;
     const connected = this.mesh.getConnectedPeers();
+    if (!(viaNeighbour && connected.includes(message.to)) && !this.canonicalPeerSet().includes(message.to)) return false;
+    if (message.hops >= message.maxHops) return false;
     if (connected.includes(message.to)) {
       try {
         this.mesh.send(message.to, JSON.stringify({
@@ -3742,6 +3748,7 @@ var import_unsea = require("unsea");
 var CRYPTO_PUBLIC_INFO_TYPE = "pp-crypto-public-info-v1";
 var CRYPTO_PUBLIC_REQUEST_TYPE = "pp-crypto-public-request-v1";
 var KEY_REQUEST_MIN_INTERVAL_MS = 5e3;
+var KEY_EXCHANGE_RETRY_DELAYS_MS = [250, 500, 1e3, 2e3, 4e3];
 var ENCRYPTED_BROADCAST_TYPE = "pp-encrypted-broadcast-v1";
 var ENCRYPTED_DIRECT_TYPE = "pp-encrypted-direct-v1";
 var PeerPigeonCryptoProtocol = class {
@@ -3759,9 +3766,9 @@ var PeerPigeonCryptoProtocol = class {
     this.onDirectMessageBound = (data) => {
       this.handleDirectMessage(data.message).catch((error) => this.emitError(error));
     };
+    this.keyExchangeTimers = /* @__PURE__ */ new Set();
     this.onPeerConnectedBound = (peerId) => {
-      this.sendPublicInfoDirect(peerId);
-      if (!this.publicKeys.has(peerId)) this.requestPeerKey(peerId);
+      this.exchangeKeysWithNeighbour(peerId, 0);
     };
     this.onSignalingConnectedBound = () => {
       this.registerLocalKey();
@@ -3833,7 +3840,7 @@ var PeerPigeonCryptoProtocol = class {
       to: target,
       timestamp: Date.now()
     };
-    this.gossip.sendDirect(target, payload);
+    this.gossip.sendDirect(target, payload, { connectedOnly: true });
     this.gossip.broadcast(payload, { sender: self, timestamp: payload.timestamp, internal: true });
   }
   async waitForPeerKey(peerId, timeoutMs = this.options.keyDiscoveryTimeoutMs) {
@@ -3925,6 +3932,8 @@ var PeerPigeonCryptoProtocol = class {
   destroy() {
     if (this.announceTimer) clearInterval(this.announceTimer);
     this.announceTimer = null;
+    for (const timer of this.keyExchangeTimers) clearTimeout(timer);
+    this.keyExchangeTimers.clear();
     if (this.initialized) {
       this.gossip.off("messageReceived", this.onGossipMessageBound);
       this.gossip.off("directMessageReceived", this.onDirectMessageBound);
@@ -3979,9 +3988,26 @@ var PeerPigeonCryptoProtocol = class {
       timestamp: Date.now()
     };
   }
+  /** True when the neighbour took the frame. A neighbour is addressed whatever the membership view says. */
   sendPublicInfoDirect(peerId, payload = this.localPublicInfoPayload()) {
-    if (!payload || !peerId || peerId === payload.from) return;
-    this.gossip.sendDirect(peerId, payload);
+    if (!payload || !peerId || peerId === payload.from) return true;
+    return this.gossip.sendDirect(peerId, payload, { connectedOnly: true }) !== null;
+  }
+  /**
+   * Swap keys with a peer that has just connected, and keep trying while it is still connected and
+   * either the frame was refused or its key has not arrived. The periodic announce stays as the backstop.
+   */
+  exchangeKeysWithNeighbour(peerId, attempt) {
+    if (!this.initialized) return;
+    const sent = this.sendPublicInfoDirect(peerId);
+    if (!this.publicKeys.has(peerId)) this.requestPeerKey(peerId);
+    const delay = KEY_EXCHANGE_RETRY_DELAYS_MS[attempt];
+    if (delay === void 0 || sent && this.publicKeys.has(peerId)) return;
+    const timer = setTimeout(() => {
+      this.keyExchangeTimers.delete(timer);
+      if (this.mesh.getConnectedPeers().includes(peerId)) this.exchangeKeysWithNeighbour(peerId, attempt + 1);
+    }, delay);
+    this.keyExchangeTimers.add(timer);
   }
   upsertPublicKey(peerId, payload) {
     const id = String(peerId ?? "").trim();

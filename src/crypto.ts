@@ -4,6 +4,10 @@ import type { DirectMessage, GossipBroadcastOptions, GossipMessage } from './gos
 export const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
 export const CRYPTO_PUBLIC_REQUEST_TYPE = 'pp-crypto-public-request-v1';
 const KEY_REQUEST_MIN_INTERVAL_MS = 5_000;
+// A neighbour's first frames can be refused while its channel proves itself (freertc accepts none
+// until the first pong), so the key exchange that runs on connect is tried again at these delays
+// rather than waiting for the next periodic announce.
+const KEY_EXCHANGE_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000];
 export const ENCRYPTED_BROADCAST_TYPE = 'pp-encrypted-broadcast-v1';
 export const ENCRYPTED_DIRECT_TYPE = 'pp-encrypted-direct-v1';
 
@@ -90,7 +94,7 @@ interface CryptoMeshLike {
 interface CryptoGossipLike {
   broadcast(data: unknown, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): string;
   broadcastReliable(data: unknown, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): string;
-  sendDirect(targetPeerId: string, data: unknown): string | null;
+  sendDirect(targetPeerId: string, data: unknown, options?: { connectedOnly?: boolean }): string | null;
   on(event: 'messageReceived', callback: (data: { message: GossipMessage; local: boolean; fromPeer?: string; receivedAt?: number }) => void): void;
   on(event: 'directMessageReceived', callback: (data: { message: DirectMessage }) => void): void;
   off(event: 'messageReceived', callback: (data: { message: GossipMessage; local: boolean; fromPeer?: string; receivedAt?: number }) => void): void;
@@ -130,9 +134,9 @@ export class PeerPigeonCryptoProtocol {
   private readonly onDirectMessageBound = (data: { message: DirectMessage }): void => {
     this.handleDirectMessage(data.message).catch((error) => this.emitError(error));
   };
+  private readonly keyExchangeTimers = new Set<ReturnType<typeof setTimeout>>();
   private readonly onPeerConnectedBound = (peerId: string): void => {
-    this.sendPublicInfoDirect(peerId);
-    if (!this.publicKeys.has(peerId)) this.requestPeerKey(peerId);
+    this.exchangeKeysWithNeighbour(peerId, 0);
   };
   private readonly onSignalingConnectedBound = (): void => {
     this.registerLocalKey();
@@ -221,7 +225,7 @@ export class PeerPigeonCryptoProtocol {
       to: target,
       timestamp: Date.now(),
     };
-    this.gossip.sendDirect(target, payload);
+    this.gossip.sendDirect(target, payload, { connectedOnly: true });
     this.gossip.broadcast(payload, { sender: self, timestamp: payload.timestamp, internal: true });
   }
 
@@ -331,6 +335,8 @@ export class PeerPigeonCryptoProtocol {
   destroy(): void {
     if (this.announceTimer) clearInterval(this.announceTimer);
     this.announceTimer = null;
+    for (const timer of this.keyExchangeTimers) clearTimeout(timer);
+    this.keyExchangeTimers.clear();
     if (this.initialized) {
       this.gossip.off('messageReceived', this.onGossipMessageBound);
       this.gossip.off('directMessageReceived', this.onDirectMessageBound);
@@ -394,9 +400,27 @@ export class PeerPigeonCryptoProtocol {
     };
   }
 
-  private sendPublicInfoDirect(peerId: string, payload: CryptoPublicInfoPayload | null = this.localPublicInfoPayload()): void {
-    if (!payload || !peerId || peerId === payload.from) return;
-    this.gossip.sendDirect(peerId, payload);
+  /** True when the neighbour took the frame. A neighbour is addressed whatever the membership view says. */
+  private sendPublicInfoDirect(peerId: string, payload: CryptoPublicInfoPayload | null = this.localPublicInfoPayload()): boolean {
+    if (!payload || !peerId || peerId === payload.from) return true;
+    return this.gossip.sendDirect(peerId, payload, { connectedOnly: true }) !== null;
+  }
+
+  /**
+   * Swap keys with a peer that has just connected, and keep trying while it is still connected and
+   * either the frame was refused or its key has not arrived. The periodic announce stays as the backstop.
+   */
+  private exchangeKeysWithNeighbour(peerId: string, attempt: number): void {
+    if (!this.initialized) return;
+    const sent = this.sendPublicInfoDirect(peerId);
+    if (!this.publicKeys.has(peerId)) this.requestPeerKey(peerId);
+    const delay = KEY_EXCHANGE_RETRY_DELAYS_MS[attempt];
+    if (delay === undefined || (sent && this.publicKeys.has(peerId))) return;
+    const timer = setTimeout(() => {
+      this.keyExchangeTimers.delete(timer);
+      if (this.mesh.getConnectedPeers().includes(peerId)) this.exchangeKeysWithNeighbour(peerId, attempt + 1);
+    }, delay);
+    this.keyExchangeTimers.add(timer);
   }
 
   private upsertPublicKey(peerId: string, payload: CryptoPublicInfoPayload): void {

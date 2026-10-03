@@ -385,7 +385,15 @@ declare class GossipProtocol {
      * before choosing the mesh over a relay for a negotiation frame.
      */
     canRouteDirect(targetPeerId: string): boolean;
-    sendDirect(targetPeerId: string, data: unknown): string | null;
+    /**
+     * `connectedOnly` addresses a peer this node is connected to right now, whatever the converged
+     * membership view says. The key exchange that runs the moment two peers connect needs it: the
+     * view takes a few membership rounds to include a new neighbour, and refusing the frame
+     * meant encrypted direct messages waited for the next ten-second announce.
+     */
+    sendDirect(targetPeerId: string, data: unknown, options?: {
+        connectedOnly?: boolean;
+    }): string | null;
     private routeDirect;
     private handleIncomingDirect;
     getCecrConfig(): Readonly<CecrConfigSnapshot>;
@@ -721,7 +729,9 @@ interface CryptoMeshLike {
 interface CryptoGossipLike {
     broadcast(data: unknown, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): string;
     broadcastReliable(data: unknown, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): string;
-    sendDirect(targetPeerId: string, data: unknown): string | null;
+    sendDirect(targetPeerId: string, data: unknown, options?: {
+        connectedOnly?: boolean;
+    }): string | null;
     on(event: 'messageReceived', callback: (data: {
         message: GossipMessage;
         local: boolean;
@@ -754,6 +764,7 @@ declare class PeerPigeonCryptoProtocol {
     private foreignBroadcasts;
     private readonly onGossipMessageBound;
     private readonly onDirectMessageBound;
+    private readonly keyExchangeTimers;
     private readonly onPeerConnectedBound;
     private readonly onSignalingConnectedBound;
     constructor(mesh: CryptoMeshLike, gossip: CryptoGossipLike, options: PeerPigeonCryptoOptions);
@@ -784,7 +795,13 @@ declare class PeerPigeonCryptoProtocol {
     private persistKeyPair;
     private registerLocalKey;
     private localPublicInfoPayload;
+    /** True when the neighbour took the frame. A neighbour is addressed whatever the membership view says. */
     private sendPublicInfoDirect;
+    /**
+     * Swap keys with a peer that has just connected, and keep trying while it is still connected and
+     * either the frame was refused or its key has not arrived. The periodic announce stays as the backstop.
+     */
+    private exchangeKeysWithNeighbour;
     private upsertPublicKey;
     private isPublicInfo;
     private isPublicRequest;

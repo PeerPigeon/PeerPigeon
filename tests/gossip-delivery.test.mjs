@@ -248,6 +248,60 @@ test('ordinary broadcast remains untracked', () => {
   }
 });
 
+test('two peers that have just connected gossip to each other before membership has converged', () => {
+  const { network, protocols } = makeProtocols(
+    ['01', '02'],
+    new Map([
+      ['01', ['02']],
+      ['02', ['01']],
+    ]),
+  );
+  try {
+    // Membership gossip has not run yet: each node knows only itself, though the link is up.
+    network.meshes.get('01').global = [];
+    network.meshes.get('02').global = [];
+    const heard = [];
+    protocols.get('02').on('messageReceived', ({ message, local }) => { if (!local) heard.push(message.data); });
+
+    protocols.get('01').broadcast('sent in the first seconds');
+
+    assert.equal(network.frames.some((frame) => frame.type === 'gossip' && frame.from === '01' && frame.to === '02'), true,
+      'the broadcast went out to the connected neighbour');
+    assert.deepEqual(heard, ['sent in the first seconds']);
+  } finally {
+    destroyProtocols(protocols);
+  }
+});
+
+test('a direct message reaches a connected neighbour before membership has converged', () => {
+  const { network, protocols } = makeProtocols(
+    ['01', '02'],
+    new Map([
+      ['01', ['02']],
+      ['02', ['01']],
+    ]),
+  );
+  try {
+    network.meshes.get('01').global = [];
+    network.meshes.get('02').global = [];
+    const received = [];
+    protocols.get('02').on('directMessageReceived', ({ message }) => received.push(message.data));
+
+    // Ordinary routing still follows the live view: nothing is routed to a peer it does not hold.
+    assert.equal(protocols.get('01').sendDirect('02', 'routed'), null);
+    assert.deepEqual(received, []);
+
+    // A frame addressed to a neighbour on purpose, such as the key exchange that runs on connect, is not.
+    const messageId = protocols.get('01').sendDirect('02', 'the key exchange that runs on connect', { connectedOnly: true });
+    assert.ok(messageId, 'a connected neighbour is reachable even though the view has not converged');
+    assert.deepEqual(received, ['the key exchange that runs on connect']);
+    // Connected-only is not a licence to reach anyone: a stranger with no link is refused.
+    assert.equal(protocols.get('01').sendDirect('99', 'x', { connectedOnly: true }), null);
+  } finally {
+    destroyProtocols(protocols);
+  }
+});
+
 test('a late or previously inactive peer recovers a recent ordinary broadcast through epidemic anti-entropy', () => {
   const { network, protocols } = makeProtocols(
     ['01', '02', '03'],
