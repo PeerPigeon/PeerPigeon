@@ -3,16 +3,104 @@ const BACKOFF_BASE_MS = 1000
 const BACKOFF_MAX_MS = 30000
 const BACKOFF_FACTOR = 1.5
 const DATA_PING_MS = 1000
-const DATA_PONG_TIMEOUT_MS = 4000
+// Twenty seconds, not four. A pong can sit behind the peer's own outbound
+// burst — the GitPigeon index sync moves megabytes in both directions the
+// moment two peers meet, and werift's SCTP is slow — and four seconds
+// executed healthy channels on every connection. A dead channel is still
+// caught; it merely takes twenty seconds instead of four.
+const DATA_PONG_TIMEOUT_MS = 20000
+// A ping is re-sent this often while it stays unanswered. One outstanding
+// ping is the rule, but a single lost frame — the arming ping werift hands to
+// a peer whose channel has not flipped to 'open' yet — must not be a death
+// sentence twenty seconds later; the retry keeps the original clock.
+const DATA_PING_RETRY_MS = 5000
+// A send buffer that stops draining is a dead receiver, however the channel
+// reports itself. Beyond this many queued bytes nothing more is handed to
+// the transport: werift keeps every pending send subscribed to its SCTP
+// flush event and re-subscribes each on every flush, so a few thousand
+// sends stuck behind a peer whose window closed cost the whole process
+// (the watcher sat at a full core doing nothing but that bookkeeping).
+// One megabyte: the cost is per pending send, so the cap has to bound the
+// count, and a few hundred pending frames is already visible in a profile.
+const DATA_MAX_BUFFERED_BYTES = 1024 * 1024
+// A backlog that has not shrunk for this long is stalled, not busy.
+const DATA_BACKLOG_STALL_MS = 20000
+// A pong is proof of a working outbound direction — but only a RECENT one.
+// After a machine suspends and resumes, every frozen channel still holds its
+// pre-suspend pong and every state field still claims health, so an
+// expiry on the proof is what stops the resume-time send burst.
+const DATA_PROOF_FRESH_MS = DATA_PING_MS + DATA_PONG_TIMEOUT_MS + 5000
+// SCTP max-message-size is negotiated and small in WebKit: Safari advertises
+// 64 KiB where Chromium advertises 256 KiB, and a send over the remote's
+// limit fails — in Safari silently, as an uncatchable console error, on a
+// perfectly healthy channel. Gossip anti-entropy digests measured 205 KiB in
+// production. Every string payload above the threshold therefore travels as
+// ordered chunk frames and is reassembled on receive; 8 KiB raw slices keep
+// each JSON-escaped frame safely under the proven 16 KiB interop ceiling.
+const DATA_CHUNK_SLICE = 8192
+const DATA_CHUNK_THRESHOLD = 15000
+const DATA_CHUNK_FRAME = '~fc'
+const DATA_CHUNK_MAX_FRAMES = 4096
+const DATA_CHUNK_STALE_MS = 30000
+// A hidden tab cannot answer pings promptly — Safari throttles its JS — so
+// the 4s pong verdict executed every edge to a napping tab, and each thaw
+// redialed and burst into the corpses. A tab that is about to nap says so;
+// peers PARK that edge: no sends, no pings, no execution, until a wake frame
+// or any traffic revives it. A park older than the cap falls back to normal
+// verdicts so a tab that never returns still gets cleaned up.
+const DATA_DORMANT_FRAME = '~dormant'
+const DATA_DORMANT_MAX_MS = 30 * 60000
+// A send into a transport that is not positively connected does not throw in
+// WebKit — it logs an uncatchable 'Error sending string through
+// RTCDataChannel' console error per attempt. EVERY channel send must pass
+// this gate; the transient state either recovers (sends resume) or the
+// stalled-negotiation machinery executes the peer.
+const transportReady = (pc) => pc?.connectionState === undefined || pc.connectionState === 'connected'
+let dataChunkCounter = 0
 const SIGNAL_PING_MS = 1000
-const SIGNAL_PONG_TIMEOUT_MS = 4000
+// Twenty seconds, matching the data-channel deadline. A watcher pushing a
+// multi-megabyte index sync over werift stalls its own event loop for a few
+// seconds; a four-second pong deadline read that as a dead relay, dropped
+// the socket, re-registered, and every peer was released in the process.
+const SIGNAL_PONG_TIMEOUT_MS = 20000
+// A machine that sleeps freezes this process with it. Browsers announce the
+// thaw (pageshow, resume); a Node peer — the GitPigeon watcher — has no such
+// event and used to trust a signaling socket and ICE candidates that died
+// during the freeze until every timeout ground through: 46 seconds to get a
+// link back after waking, both sides stalling dials the whole time. The
+// clock is the tell: a one-second tick that fires many seconds late is a
+// suspend, and thawing runs the very same path a browser's resume does.
+// Node only, and a long gap: browsers have real lifecycle events, and a busy
+// Node event loop (a watcher hashing a publish) can legitimately pause for
+// seconds — that must never read as a suspend, which tears every link down.
+const SUSPEND_TICK_MS = 1000
+const SUSPEND_GAP_MS = 20000
 // A relay-backed offer normally reaches the destination on its next one-second
 // signaling heartbeat. Five total sends over 2.85s cover that delivery window
 // without pinning an isolated peer to one unreachable candidate for 31.85s.
-const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000]
+// Under two seconds used to be the whole budget for an answer. A watcher
+// that has just restarted, or is publishing a bundle, answers late — its
+// answers arrived after the dial had given up, were queued for a connection
+// that no longer existed, and the pair redialed. Sixteen seconds covers it.
+const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000, 8000]
+// A negotiation frame is perishable. An offer is retried within two seconds
+// and its negotiation given up within ten; delivered later, from the relay's
+// offline queue, it is a dead offer the receiver answers into nothing — and a
+// tab waking from a long sleep, or re-registering after a resume, received a
+// backlog of exactly those and stalled on each before it could dial. Ten
+// seconds covers the retry burst and a live handshake; the relay drops the
+// rest unread.
+const NEGOTIATION_TTL_MS = 10000
+const NEGOTIATION_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end', 'renegotiate'])
+// Frames addressed to one peer that can travel over an established mesh
+// instead of the relay: everything a negotiation needs, plus the goodbye.
+const MESH_SIGNAL_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end', 'renegotiate', 'bye'])
 const ANSWER_BURST_COOLDOWN_MS = 3000
 const ANSWER_BURST_DELAYS_MS = [200, 800, 2000]
 const SDP_DEDUP_WINDOW_MS = 15000
+// The ICE ufrag identifies one negotiation across every retry of its offer.
+const iceUfragOf = (sdp) => /a=ice-ufrag:(\S+)/.exec(String(sdp ?? ''))?.[1] ?? null
+const candidateLinesOf = (sdp) => String(sdp ?? '').split(/\r?\n/).filter((line) => /^a=candidate:/.test(line))
 
 /**
  * Remove a previously owned signaling identity without announcing it again.
@@ -116,6 +204,7 @@ export function createSignalingClient(options = {}) {
     auth,
     autoConnect = true,
     onLog,
+    onResume,
     onRegistered,
     onBootstrap,
     onIncomingRelay,
@@ -123,6 +212,11 @@ export function createSignalingClient(options = {}) {
     onConnectionStateChange,
     onStatusChange,
     onDataMessage,
+    // Optional first-choice path for addressed signaling frames. Called with
+    // the complete PSP envelope; returning true means the mesh took it and
+    // the relay is not used for that frame. Anything else falls back to the
+    // relay socket exactly as before.
+    signalTransport = null,
   } = options
 
   const roomId = configuredRoomId || legacyRoomId || networkId
@@ -172,6 +266,9 @@ export function createSignalingClient(options = {}) {
   let reconnectTimer = null
   let advertiseHeartbeatTimer = null
   let keepaliveTimer = null
+  let suspendWatchTimer = null
+  let lastSuspendTick = 0
+  let lastTickHidden = false
   let lastSignalPongAt = Date.now()
   let lastSignalPingSentAt = 0
   let intentionalClose = false
@@ -387,20 +484,68 @@ export function createSignalingClient(options = {}) {
     }
   }
 
-  async function relaySignal(toPeerId, type, body) {
-    if (!registered) {
-      log('[signal] not registered yet')
-      return
-    }
-    if (type === 'offer' || type === 'answer' || type === 'renegotiate') {
-      log(`[signal] sending ${type} to ${toPeerId}`)
-    }
+  const loudSignalType = (type) => type === 'offer' || type === 'answer' || type === 'renegotiate'
 
-    send(pspEnvelope(type, {
+  // Peers that have proven they hear the mesh: one of their frames arrived
+  // through injectSignal. Until a peer is in this set every frame for it
+  // also goes to the relay, so a peer on a build that ignores mesh-carried
+  // signaling still receives the offer, the answer, and the candidates.
+  // After the first mesh frame from it, the relay copy stops.
+  const meshCapablePeers = new Set()
+
+  // The mesh is tried before the relay for every frame addressed to one
+  // peer. A peer already reachable through connected neighbours negotiates
+  // without any relay in the path, so a relay outage, a partial relay view,
+  // or two peers registered on different relays no longer decides whether
+  // they can connect. Registration only gates the relay fallback.
+  function sendViaMesh(toPeerId, type, envelope) {
+    if (!toPeerId || typeof signalTransport !== 'function' || !MESH_SIGNAL_TYPES.has(type)) return false
+    let accepted = false
+    try {
+      accepted = signalTransport(envelope) === true
+    } catch {
+      accepted = false
+    }
+    if (accepted && loudSignalType(type)) log(`[signal] sending ${type} to ${toPeerId} via mesh`)
+    return accepted
+  }
+
+  async function relaySignal(toPeerId, type, body) {
+    const envelope = pspEnvelope(type, {
       to:         toPeerId,
       session_id: getOrCreateSessionId(toPeerId),
       body,
-    }))
+      ...(NEGOTIATION_TYPES.has(type) ? { ttl_ms: NEGOTIATION_TTL_MS } : {}),
+    })
+    const viaMesh = sendViaMesh(toPeerId, type, envelope)
+    if (viaMesh && meshCapablePeers.has(toPeerId)) return
+
+    if (!registered) {
+      if (!viaMesh) log('[signal] not registered yet')
+      return
+    }
+    if (loudSignalType(type)) {
+      log(viaMesh
+        ? `[signal] sending ${type} to ${toPeerId} on the relay as well; it has not answered over the mesh yet`
+        : `[signal] sending ${type} to ${toPeerId}`)
+    }
+
+    send(envelope)
+  }
+
+  // A signaling frame that arrived over the mesh instead of the relay
+  // socket. It is held to the same shape the relay would have delivered:
+  // addressed to this peer, for this network and room, from someone else.
+  function injectSignal(envelope) {
+    if (!envelope || typeof envelope !== 'object') return false
+    if (!MESH_SIGNAL_TYPES.has(envelope.type)) return false
+    if (typeof envelope.from !== 'string' || !envelope.from || envelope.from === peerId) return false
+    if (envelope.to !== peerId) return false
+    if (envelope.network !== networkId) return false
+    if (envelope.session_id !== roomId) return false
+    meshCapablePeers.add(envelope.from)
+    handleMessage(envelope)
+    return true
   }
 
   function stopAdvertiseHeartbeat() {
@@ -425,6 +570,33 @@ export function createSignalingClient(options = {}) {
         body: { instance_id: networkId, capabilities, hints: { wants_peers: true } },
       }))
     }, 12000)
+  }
+
+  function stopSuspendWatch() {
+    clearInterval(suspendWatchTimer)
+    suspendWatchTimer = null
+  }
+
+  function startSuspendWatch() {
+    stopSuspendWatch()
+    if (typeof document !== 'undefined') return
+    lastSuspendTick = Date.now()
+    lastTickHidden = typeof document !== 'undefined' && document.hidden
+    suspendWatchTimer = setInterval(() => {
+      const now = Date.now()
+      const gap = now - lastSuspendTick
+      lastSuspendTick = now
+      // A hidden tab's timers are throttled to a crawl; that gap is not a
+      // suspend, and the tab's own visibility events cover its thaw.
+      const hidden = typeof document !== 'undefined' && document.hidden
+      const wasHidden = lastTickHidden
+      lastTickHidden = hidden
+      if (hidden || wasHidden || stoppedByUser) return
+      if (gap < SUSPEND_GAP_MS) return
+      log(`[signal] clock jumped ${Math.round(gap / 1000)}s — this peer was suspended; resuming`)
+      handleSuspendRestore('clock_jump', gap)
+    }, SUSPEND_TICK_MS)
+    if (typeof suspendWatchTimer?.unref === 'function') suspendWatchTimer.unref()
   }
 
   function startKeepalive() {
@@ -472,19 +644,86 @@ export function createSignalingClient(options = {}) {
     }
   }
 
+  // A rollback withdraws the local offer but not the data channel created
+  // for it: SCTP opens that channel anyway once the remote offer connects,
+  // and the peers end up holding two 'mesh' channels on one connection. The
+  // channel goes with the offer it was created for.
+  function withdrawChannelOfRolledBackOffer(remotePeerId, pc) {
+    const entry = mesh.connections.get(remotePeerId)
+    if (entry?.connection !== pc || !entry.channel) return
+    const abandoned = entry.channel
+    if (abandoned.readyState === 'open') return
+    entry.channel = null
+    try { abandoned.close() } catch {}
+  }
+
   function attachDataChannelHandlers(channel, remotePeerId, pc) {
     let keepaliveTimerId = null
     let lastPongAt    = Date.now()
     let lastPingSentAt = 0   // 0 = no ping in flight
+    let lastInboundAt = Date.now()
+    let lastPingRetryAt = 0
+    // werift delivers a message on a channel it still reports as
+    // 'connecting': the remote's arming ping lands a beat before our 'open'
+    // fires. Its pong is owed, not skipped — it is the only proof the remote
+    // gets that this direction works, and it sends no second ping while the
+    // first is outstanding.
+    let pongOwed = false
+    // A ping cannot be late while it is still sitting in our own send
+    // buffer, and a channel that keeps delivering messages is not dead. The
+    // watcher's index node pushes megabytes of storage the moment a browser
+    // connects; over werift's SCTP that takes longer than the pong deadline,
+    // the ping queued behind it, and the keepalive executed a channel that
+    // was working flat out — on every peer, on every connection.
+    // Backlogged means BUSY, not merely non-empty: the buffer has to be
+    // shrinking. A buffer that holds or grows for the stall window is a
+    // receiver that stopped reading, and the keepalive verdict must run.
+    let lastBufferedAmount = 0
+    let lastBufferedProgressAt = Date.now()
+    const backlogged = () => {
+      const buffered = Number(channel.bufferedAmount ?? 0)
+      const now = Date.now()
+      if (buffered < lastBufferedAmount) lastBufferedProgressAt = now
+      lastBufferedAmount = buffered
+      return buffered > 0 && now - lastBufferedProgressAt < DATA_BACKLOG_STALL_MS
+    }
+    const backlogStalled = () => Number(channel.bufferedAmount ?? 0) > 0
+      && Date.now() - lastBufferedProgressAt >= DATA_BACKLOG_STALL_MS
+    const inboundAlive = () => Date.now() - lastInboundAt < DATA_PONG_TIMEOUT_MS
 
-    // Reset the pong clock the moment the tab becomes visible so the
-    // throttled-timer gap doesn't look like a timeout.
+    // The moment the tab becomes visible, PROBE the channel instead of
+    // assuming it survived: faking a fresh pong here stamped every
+    // suspend-killed channel as healthy, so the resume-time gossip burst
+    // sent straight into corpses. A real ping gives a healthy channel a
+    // fresh pong within one round trip and starts the execution clock on
+    // a dead one.
     function onVisible() {
-      if (typeof document === 'undefined' || document.hidden) return
-      // Any ping that was sent while the tab was hidden can't have been
-      // answered; don't count that gap as a missed pong.
-      lastPingSentAt = 0
-      lastPongAt = Date.now()
+      if (typeof document === 'undefined') return
+      if (document.hidden) {
+        // Going dormant: tell the peer BEFORE the freeze lands so it parks
+        // this edge instead of executing it at the pong timeout.
+        try {
+          if (channel.readyState === 'open' && transportReady(pc)) {
+            channel.send(JSON.stringify({ type: DATA_DORMANT_FRAME }))
+          }
+        } catch { /* the peer's timeout still covers a lost announcement */ }
+        return
+      }
+      lastPongAt = 0
+      const visibleEntry = mesh.connections.get(remotePeerId)
+      const owned = visibleEntry?.connection === pc && visibleEntry.channel === channel
+      try {
+        if (channel.readyState === 'open' && transportReady(pc)) {
+          channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+          lastPingSentAt = Date.now()
+          if (owned) {
+            visibleEntry.lastPongAt = 0
+            visibleEntry.lastPingSentAt = lastPingSentAt
+          }
+        }
+      } catch {
+        closeBrokenChannel('data channel resume probe failed')
+      }
     }
 
     function closeBrokenChannel(reason) {
@@ -499,7 +738,27 @@ export function createSignalingClient(options = {}) {
     }
 
     const entry = mesh.connections.get(remotePeerId)
-    if (entry?.connection === pc) entry.channel = channel
+    if (entry?.connection === pc) {
+      entry.channel = channel
+      // The proof bookkeeping belongs to THIS channel. It used to survive a
+      // channel swap on the entry (glare adoption, a redial on the same
+      // connection), so a fresh channel inherited an unanswered ping from
+      // the dead one, the first send was refused as "failed its pong proof"
+      // — a terminal refusal — and the peer was released the instant it
+      // connected. Start unproven with nothing in flight; an already-open
+      // channel is armed here exactly as onopen would have armed it.
+      entry.lastPongAt = 0
+      entry.lastPingSentAt = 0
+      lastPongAt = 0
+      lastPingSentAt = 0
+      if (channel.readyState === 'open' && transportReady(pc)) {
+        try {
+          channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+          entry.lastPingSentAt = Date.now()
+          lastPingSentAt = entry.lastPingSentAt
+        } catch { /* the keepalive verdict handles it */ }
+      }
+    }
 
     channel.onopen = () => {
       const currentEntry = mesh.connections.get(remotePeerId)
@@ -508,7 +767,10 @@ export function createSignalingClient(options = {}) {
         return
       }
       log(`[webrtc] data channel open to ${remotePeerId}`)
-      lastPongAt = Date.now()
+      // 0, not now: the channel is unproven until its first pong, and the
+      // keepalive's ping-in-flight timeout must be armed from the start so
+      // a channel that never answers dies at the timeout, not never.
+      lastPongAt = 0
       _acquireWakeLock()
 
       if (typeof document !== 'undefined') {
@@ -520,6 +782,38 @@ export function createSignalingClient(options = {}) {
       if (openEntry?.connection === pc) {
         openEntry.channel = channel
         openEntry.lastSeen = Date.now()
+        // Round-trip bookkeeping, mirrored onto the entry so sendData can
+        // refuse a channel whose outbound direction is unproven. SCTP can
+        // die one-way: messages keep ARRIVING while every send fails as
+        // WebKit's async console error — readyState and connectionState
+        // both keep lying, and in Safari the failed send does not even
+        // throw. A returned pong is the only send-side truth, so an
+        // 'open' channel starts UNPROVEN (lastPongAt 0): app sends are
+        // refused until the first pong lands, and a channel whose opening
+        // ping stays unanswered dies by the normal timeout instead of
+        // enjoying a grace window it never earned.
+        openEntry.lastPongAt = 0
+        // Only a ping that actually left counts as outstanding. Recording
+        // one that was skipped (transport not yet 'connected') armed a
+        // phantom four-second timeout that the first inbound message
+        // executed as "outbound timeout" on a channel nobody had pinged.
+        try {
+          if (transportReady(pc)) {
+            channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
+            openEntry.lastPingSentAt = Date.now()
+            lastPingSentAt = openEntry.lastPingSentAt
+          } else {
+            openEntry.lastPingSentAt = 0
+            lastPingSentAt = 0
+          }
+        } catch {
+          openEntry.lastPingSentAt = 0
+          lastPingSentAt = 0
+        }
+      }
+      if (pongOwed) {
+        pongOwed = false
+        try { channel.send(JSON.stringify({ type: 'pong', ts: Date.now() })) } catch { /* the keepalive verdict handles it */ }
       }
       // RTCPeerConnection "connected" may precede data-channel readiness.
       // Emit again at the exact usable boundary so callers can send immediately.
@@ -542,17 +836,33 @@ export function createSignalingClient(options = {}) {
           closeBrokenChannel(`data channel ${channel.readyState}`)
           return
         }
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed'
-          || pc.connectionState === 'disconnected') {
+        if (currentEntry.dormantAt) {
+          if (Date.now() - currentEntry.dormantAt < DATA_DORMANT_MAX_MS) {
+            // Parked: the peer announced a nap. No pings, no verdicts —
+            // pacify the in-flight bookkeeping so nothing ages while parked.
+            lastPingSentAt = 0
+            lastPongAt = Date.now()
+            return
+          }
+          currentEntry.dormantAt = 0
+        }
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
           // The inverse zombie: the channel still reports 'open' but the
           // connection under it is dead, so every send fails as the same
-          // uncatchable async console error. The connection's word beats
-          // the channel's; execute this one on the spot too.
+          // uncatchable async console error. Only TERMINAL states execute
+          // here — 'disconnected' is usually a transient ICE blip that
+          // recovers on its own, and executing it turned every blip into a
+          // teardown-and-redial flap; a blip that persists still dies
+          // through the ping timeout below.
           closeBrokenChannel(`connection ${pc.connectionState}`)
           return
         }
 
         // Browsers throttle timers in hidden tabs — don't falsely time out.
+        // The fake pong here only pacifies THIS timer; the entry mirrors are
+        // left honest so ping-on-receive still proves outbound in hidden
+        // tabs, where a one-way-dead channel used to live forever while
+        // every reactive gossip reply failed.
         if (typeof document !== 'undefined' && document.hidden) {
           lastPingSentAt = 0
           lastPongAt = Date.now()
@@ -561,40 +871,181 @@ export function createSignalingClient(options = {}) {
 
         // Only consider a timeout if we sent a ping that hasn't been answered.
         const pingInFlight = lastPingSentAt > lastPongAt
-        if (pingInFlight && Date.now() - lastPingSentAt >= DATA_PONG_TIMEOUT_MS) {
+        const busy = backlogged()
+        if (!busy && backlogStalled()) {
+          closeBrokenChannel('data channel backlog stalled')
+          return
+        }
+        if (pingInFlight && busy) {
+          // Still in our buffer: the clock on this ping has not started.
+          lastPingSentAt = Date.now()
+          if (currentEntry.lastPingSentAt > currentEntry.lastPongAt) currentEntry.lastPingSentAt = lastPingSentAt
+          return
+        }
+        if (pingInFlight && Date.now() - lastPingSentAt >= DATA_PONG_TIMEOUT_MS && !inboundAlive()) {
           closeBrokenChannel('data channel timeout')
           return
         }
 
         // Keep one outstanding ping. Replacing its timestamp on every tick
-        // made a silent channel impossible to time out.
-        if (pingInFlight) return
+        // made a silent channel impossible to time out — so the clock stays,
+        // but the frame itself is re-sent every few seconds: a lost ping is
+        // recovered within one retry instead of executing a live channel.
+        if (pingInFlight) {
+          const now = Date.now()
+          if (now - lastPingSentAt >= DATA_PING_RETRY_MS && now - lastPingRetryAt >= DATA_PING_RETRY_MS
+            && (pc.connectionState === undefined || pc.connectionState === 'connected')) {
+            lastPingRetryAt = now
+            try { channel.send(JSON.stringify({ type: 'ping', ts: now })) } catch { /* verdict below */ }
+          }
+          return
+        }
+
+        // A transient connection state (connecting, disconnected) refuses
+        // application sends already; a ping into it fails the same way —
+        // WebKit logs an uncatchable async console error per attempt, one
+        // every tick through a whole renegotiation window. Skip the ping:
+        // recovery either restores 'connected' (pings resume) or the stalled
+        // negotiation machinery executes the peer.
+        if (pc.connectionState !== undefined && pc.connectionState !== 'connected') return
 
         try {
           channel.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
           lastPingSentAt = Date.now()
+          if (currentEntry.lastPingSentAt <= currentEntry.lastPongAt) {
+            currentEntry.lastPingSentAt = lastPingSentAt
+          }
         } catch {
           closeBrokenChannel('data channel keepalive send failed')
         }
       }, DATA_PING_MS)
     }
 
-    channel.onmessage = (event) => {
+    // Outbound proof, driven by INCOMING traffic so it works even in hidden
+    // tabs where interval timers are throttled into uselessness: a message
+    // arriving on a channel whose outbound is not recently pong-proven
+    // sends a ping; a ping that stays unanswered past the pong timeout
+    // while messages keep arriving is a one-way-dead channel — execute it.
+    const proveOutbound = () => {
       const currentEntry = mesh.connections.get(remotePeerId)
       if (currentEntry?.connection !== pc || currentEntry.channel !== channel) return
+      if (currentEntry.dormantAt) return
+      const now = Date.now()
+      const pingOutstanding = currentEntry.lastPingSentAt > currentEntry.lastPongAt
+      if (pingOutstanding && backlogged()) {
+        currentEntry.lastPingSentAt = now
+        return
+      }
+      if (pingOutstanding && now - currentEntry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS) {
+        closeBrokenChannel('data channel outbound timeout')
+        return
+      }
+      // Same transient-state gate as the timer ping: WebKit turns every send
+      // into a not-connected transport into an uncatchable console error.
+      if (pc.connectionState !== undefined && pc.connectionState !== 'connected') return
+      if (!pingOutstanding && now - currentEntry.lastPongAt > DATA_PING_MS) {
+        try {
+          channel.send(JSON.stringify({ type: 'ping', ts: now }))
+          currentEntry.lastPingSentAt = now
+        } catch {
+          closeBrokenChannel('data channel keepalive send failed')
+        }
+      }
+    }
+
+    // Reassembly state for chunked payloads on this channel. Bounded: a
+    // stale or oversized transfer is dropped, never grown forever.
+    const chunkTransfers = new Map()
+    const reassembleChunk = (msg) => {
+      const total = Number(msg.n)
+      const seq = Number(msg.s)
+      const id = String(msg.i ?? '')
+      if (!id || !Number.isInteger(total) || !Number.isInteger(seq)
+        || total < 1 || total > DATA_CHUNK_MAX_FRAMES || seq < 0 || seq >= total) return null
+      const now = Date.now()
+      for (const [key, transfer] of chunkTransfers) {
+        if (now - transfer.startedAt > DATA_CHUNK_STALE_MS) chunkTransfers.delete(key)
+      }
+      let transfer = chunkTransfers.get(id)
+      if (!transfer) {
+        transfer = { startedAt: now, total, received: 0, parts: new Array(total) }
+        chunkTransfers.set(id, transfer)
+      }
+      if (transfer.total !== total || transfer.parts[seq] !== undefined) return null
+      transfer.parts[seq] = String(msg.d ?? '')
+      transfer.received++
+      if (transfer.received < transfer.total) return null
+      chunkTransfers.delete(id)
+      return transfer.parts.join('')
+    }
+
+    channel.onmessage = (event) => {
+      lastInboundAt = Date.now()
+      const currentEntry = mesh.connections.get(remotePeerId)
+      const ownsCurrentEntry = currentEntry?.connection === pc && currentEntry.channel === channel
+      if (ownsCurrentEntry && currentEntry.dormantAt && String(event.data).indexOf(DATA_DORMANT_FRAME) === -1) {
+        currentEntry.dormantAt = 0
+      }
       let msg
       try {
         msg = JSON.parse(event.data)
       } catch {
+        if (!ownsCurrentEntry) return
+        proveOutbound()
         onDataMessage?.({ peerId: remotePeerId, data: event.data })
         return
       }
 
+      if (msg?.type === DATA_DORMANT_FRAME) {
+        const dormantEntry = mesh.connections.get(remotePeerId)
+        if (dormantEntry?.connection === pc && dormantEntry.channel === channel) {
+          dormantEntry.dormantAt = Date.now()
+        }
+        return
+      }
+
+      if (msg?.t === DATA_CHUNK_FRAME) {
+        if (!ownsCurrentEntry) return
+        const full = reassembleChunk(msg)
+        if (full !== null) {
+          proveOutbound()
+          onDataMessage?.({ peerId: remotePeerId, data: full })
+        }
+        return
+      }
+
+      // Keepalives must be answered on the channel they arrived on, even when
+      // simultaneous negotiation left two channels on one peer connection and
+      // this one lost the `entry.channel` slot. The remote pings whichever
+      // channel IT owns; refusing to pong a non-owning channel made the remote
+      // time out a perfectly healthy transport within four seconds — an
+      // open/close/redial flap.
       if (msg?.type === 'ping') {
+        // Inbound can outlive outbound: WebKit delivers queued pings on a
+        // transport whose sending side is already dead, and the reply was
+        // the last remaining source of the uncatchable send error. A skipped
+        // pong on a transient state is safe — the remote holds its own pings
+        // during transient states too, and a state that never returns to
+        // 'connected' is executed by the stall machinery on both ends.
+        // A ping arriving here PROVES the remote can reach us on this
+        // channel; the reply is the only proof it gets of the other
+        // direction. Gating the pong on pc.connectionState === 'connected'
+        // dropped it whenever a browser reported 'connecting' with the
+        // channel open — a state Chromium and WebKit both pass through
+        // during (re)negotiation — and the remote read the silence as a
+        // one-way-dead channel and executed a healthy transport four
+        // seconds later ("data channel outbound timeout"). Only the
+        // channel's own state gates the reply; a failed send is caught.
+        if (channel.readyState === 'connecting') { pongOwed = true; return }
+        if (channel.readyState !== 'open') return
         try {
           channel.send(JSON.stringify({ type: 'pong', ts: Date.now() }))
         } catch {
-          closeBrokenChannel('data channel pong send failed')
+          if (ownsCurrentEntry) {
+            closeBrokenChannel('data channel pong send failed')
+          } else {
+            try { channel.close() } catch { /* already closing */ }
+          }
         }
         return
       }
@@ -602,8 +1053,16 @@ export function createSignalingClient(options = {}) {
       if (msg?.type === 'pong') {
         lastPongAt = Date.now()
         lastPingSentAt = 0
+        const pongEntry = mesh.connections.get(remotePeerId)
+        if (pongEntry?.connection === pc && pongEntry.channel === channel) {
+          pongEntry.lastPongAt = lastPongAt
+          pongEntry.lastPingSentAt = 0
+        }
         return
       }
+
+      if (!ownsCurrentEntry) return
+      proveOutbound()
 
       onDataMessage?.({ peerId: remotePeerId, data: event.data })
     }
@@ -750,8 +1209,48 @@ export function createSignalingClient(options = {}) {
     }
 
     pc.ondatachannel = (event) => {
-      if (mesh.connections.get(remotePeerId)?.connection !== pc) {
+      const current = mesh.connections.get(remotePeerId)
+      if (current?.connection !== pc) {
         try { event.channel?.close?.() } catch {}
+        return
+      }
+      // Glare leaves BOTH peers with a channel on this connection: the one
+      // each created for its own offer, and the one the other created. SCTP
+      // opens both once the winning offer connects. The two peers must keep
+      // the SAME channel — keeping "the one that arrived last" made each
+      // side close exactly the channel the other side was using, and the
+      // close was read as transport death: connect, teardown, redial, glare
+      // again, until quarantine. The impolite peer's channel wins on both
+      // sides, matching the offer that won.
+      const local = current.channel
+      // The rule held only while the local channel was still 'connecting'.
+      // On one host SCTP opens both channels within milliseconds, so the
+      // local one was often already OPEN when the remote's arrived; the
+      // rule was skipped, the remote channel simply replaced the entry's,
+      // and each side ended up owning the channel the OTHER side had
+      // created — every app frame then arrived on a non-owning channel and
+      // was dropped, the PeerPigeon handshake never completed, the stalled-
+      // negotiation watchdog executed the peer, and the pair looped. The
+      // rule now applies to any live local channel.
+      if (local && local !== event.channel && local.readyState !== 'closed' && local.readyState !== 'closing') {
+        const polite = String(peerId) > String(remotePeerId)
+        if (!polite) {
+          log(`[webrtc] duplicate data channel from ${remotePeerId} closed; keeping the local one (impolite peer)`)
+          try { event.channel?.close?.() } catch {}
+          return
+        }
+        log(`[webrtc] local data channel to ${remotePeerId} withdrawn for the remote one (polite peer)`)
+        // Adopt first, withdraw second: whoever watches the entry sees the
+        // old channel close while it is no longer the entry's, so the
+        // withdrawal is not read as the transport dying.
+        current.channel = null
+        attachDataChannelHandlers(event.channel, remotePeerId, pc)
+        try { local.close() } catch {}
+        if (event.channel.readyState === 'open') {
+          // Already open: its onopen will never fire again, so state the
+          // usable boundary now for whoever waits on it.
+          onConnectionStateChangeCb?.({ peerId: remotePeerId, state: 'connected', ts: Date.now() })
+        }
         return
       }
       attachDataChannelHandlers(event.channel, remotePeerId, pc)
@@ -771,12 +1270,28 @@ export function createSignalingClient(options = {}) {
     const priorEntry = mesh.connections.get(toPeerId)
     const prior = priorEntry?.connection
 
-    // Don't dial if the data channel is already open.
+    // Don't dial over a connection that is already open OR still being
+    // made. Closing a prior that was mid-negotiation — the remote's offer
+    // answered, ICE checking, channel opening — replaced it with our own
+    // offer, which the remote (already holding that live connection) never
+    // answered; our retries exhausted, marked the peer dead, and tore down
+    // the connection the remote had just completed. Only a prior that is
+    // failed, closed or dead is replaced.
     if (priorEntry?.channel?.readyState === 'open') {
       return prior
     }
-
     if (prior && prior.signalingState !== 'closed') {
+      const progressing = priorEntry?.state !== 'dead'
+        && prior.connectionState !== 'failed'
+        && prior.connectionState !== 'closed'
+        && (prior.connectionState === 'connected'
+          || prior.connectionState === 'connecting'
+          || prior.signalingState === 'have-remote-offer'
+          || Boolean(prior.remoteDescription))
+      if (progressing) {
+        log(`[webrtc] not dialing ${toPeerId}: a connection is already in progress`)
+        return prior
+      }
       try {
         prior.close()
       } catch {}
@@ -881,13 +1396,37 @@ export function createSignalingClient(options = {}) {
 
         const existingEntry = mesh.connections.get(fromPeerId)
 
-        // Already connected — just re-send our cached answer so the remote
-        // peer's retry timer can stop; do NOT tear down the live connection.
+        // Already connected. A retry of the offer we answered just needs that
+        // answer again so the remote's retry timer can stop; the live
+        // connection stays. But an offer with NEW ICE credentials on a channel
+        // that still looks open means the other side has lost its end and is
+        // dialing afresh. Our end is dead too, our keepalive just has not said
+        // so yet; ignoring the offer (or answering it with the cached answer
+        // for a connection that no longer exists over there) left the two
+        // sides deaf to each other for twenty seconds, then redialing — the
+        // churn a watcher sees every time a browser wakes. Replace the
+        // connection and answer the new offer.
         if (existingEntry?.channel?.readyState === 'open') {
-          if (existingEntry.lastLocalAnswer) {
-            sendRelay('answer', existingEntry.lastLocalAnswer)
+          const openRemoteSdp = existingEntry.lastRemoteOfferSdp
+            ?? existingEntry.connection?.remoteDescription?.sdp
+            ?? null
+          const freshUfrag = iceUfragOf(offer?.sdp ?? null)
+          const openUfrag = iceUfragOf(openRemoteSdp)
+          const sameNegotiation = !freshUfrag || !openUfrag || freshUfrag === openUfrag
+          if (sameNegotiation) {
+            if (existingEntry.lastLocalAnswer) {
+              sendRelay('answer', existingEntry.lastLocalAnswer)
+            }
+            return
           }
-          return
+          log(`[webrtc] fresh offer from ${fromPeerId} (ufrag ${openUfrag} → ${freshUfrag}) on an open channel; the remote restarted, replacing the connection`)
+          const openPc = existingEntry.connection
+          if (openPc) clearOfferRetryTimer(openPc)
+          clearAnswerBurst(fromPeerId)
+          pendingCandidates.delete(fromPeerId)
+          pendingAnswers.delete(fromPeerId)
+          mesh.connections.delete(fromPeerId)
+          try { openPc?.close() } catch {}
         }
 
         // If the existing connection is dead/failed (but signalingState not yet
@@ -947,21 +1486,73 @@ export function createSignalingClient(options = {}) {
           return
         }
 
+        // The SAME offer, retried. An offer is re-sent on a short burst, and
+        // each retry carries the local description as it stands — with the
+        // candidates gathered since the last send — so the text differs while
+        // the negotiation is the same one. Treating that as a renewed offer
+        // re-answered it with fresh ICE credentials on this side while the
+        // other side had already applied the first answer: every connectivity
+        // check then carried a username the receiver no longer recognized, and
+        // the handshake died on both sides. Two peers that discover each other
+        // at the same instant hit this on every attempt. The ICE ufrag names
+        // the negotiation: same ufrag, same offer — take its new candidates
+        // and re-send the answer already given.
+        const incomingUfrag = iceUfragOf(incomingOfferSdp)
+        if (
+          incomingOfferSdp &&
+          cachedAnswer &&
+          currentRemoteOfferSdp &&
+          currentRemoteOfferSdp !== incomingOfferSdp &&
+          incomingUfrag &&
+          incomingUfrag === iceUfragOf(currentRemoteOfferSdp)
+        ) {
+          const known = new Set(candidateLinesOf(currentRemoteOfferSdp))
+          for (const line of candidateLinesOf(incomingOfferSdp)) {
+            if (known.has(line)) continue
+            const candidate = line.replace(/^a=/, '')
+            await pc.addIceCandidate({ candidate, sdpMid: '0', sdpMLineIndex: 0 }).catch(() => {})
+          }
+          if (entry) entry.lastRemoteOfferSdp = incomingOfferSdp
+          recentOfferSdp.set(fromPeerId, { sdp: incomingOfferSdp, ts: now })
+          if (Date.now() - (entry?.lastAnswerSentAt ?? 0) > ANSWER_BURST_COOLDOWN_MS) {
+            if (entry) entry.lastAnswerSentAt = Date.now()
+            sendRelay('answer', cachedAnswer)
+          }
+          log(`[webrtc] retried offer from ${fromPeerId} (same ufrag); answered again, no renegotiation`)
+          return
+        }
+
         if (
           incomingOfferSdp &&
           pc.remoteDescription &&
           currentRemoteOfferSdp &&
           currentRemoteOfferSdp !== incomingOfferSdp
         ) {
-          // A new SDP is not proof that the current transport is stale. The
-          // other peer may have retried before this side's data-channel `open`
-          // event, or may be performing a normal ICE renegotiation. Closing a
-          // connected/connecting RTCPeerConnection here made both peers start
-          // over repeatedly. Apply the offer to the stable existing connection;
-          // explicit failed/closed states were already replaced above, and the
-          // RTP-extension error path below still performs a fresh retry when a
-          // browser genuinely cannot reuse this connection.
-          log(`[webrtc] applying renewed offer from ${fromPeerId} to existing connection`)
+          const currentUfrag = iceUfragOf(currentRemoteOfferSdp)
+          const channelOpen = entry?.channel?.readyState === 'open'
+          if (!channelOpen && incomingUfrag && currentUfrag && incomingUfrag !== currentUfrag) {
+            // A different ufrag is a different negotiation: the other peer
+            // gave up on the last one and started over with fresh ICE
+            // credentials. Applying that offer to the unfinished connection
+            // as a "renewal" left this side checking with the old password —
+            // every STUN response then failed its integrity check on both
+            // machines, and two watchers on one LAN sat at 'connecting' for
+            // hours. An unfinished connection is replaced; only a connection
+            // with an open channel is renegotiated in place.
+            log(`[webrtc] new negotiation from ${fromPeerId} (ufrag ${currentUfrag} → ${incomingUfrag}); replacing the unfinished connection`)
+            clearOfferRetryTimer(pc)
+            clearAnswerBurst(fromPeerId)
+            pendingCandidates.delete(fromPeerId)
+            try { pc.close() } catch {}
+            mesh.connections.delete(fromPeerId)
+            pc = createPeerConnection(fromPeerId, resolveIceServers(entry?.iceServers), sendRelay)
+            entry = mesh.connections.get(fromPeerId)
+          } else {
+            // A new SDP with the same credentials, or one arriving on a
+            // connection whose channel is already open, is a normal ICE
+            // renegotiation on the existing connection.
+            log(`[webrtc] applying renewed offer from ${fromPeerId} to existing connection`)
+          }
         }
 
         if (pc.signalingState === 'closed') return
@@ -984,6 +1575,7 @@ export function createSignalingClient(options = {}) {
           pendingAnswers.delete(fromPeerId)
           await pc.setLocalDescription({ type: 'rollback' })
           log(`[webrtc] rolled back local offer for ${fromPeerId} (polite peer)`)
+          withdrawChannelOfRolledBackOffer(fromPeerId, pc)
         }
 
         try {
@@ -1423,10 +2015,12 @@ export function createSignalingClient(options = {}) {
     reconnectAttempts = 0
   }
 
-  function handleSuspendRestore() {
+  function handleSuspendRestore(reason = 'browser_resume', gapMs = 0) {
     if (stoppedByUser) return
 
-    log('[signal] browser resumed — reconnecting immediately')
+    log(reason === 'clock_jump'
+      ? '[signal] resumed after suspend — reconnecting immediately'
+      : '[signal] browser resumed — reconnecting immediately')
     resetReconnectBackoff()
 
     // A socket can remain OPEN/CONNECTING briefly after the browser thaws even
@@ -1451,6 +2045,10 @@ export function createSignalingClient(options = {}) {
     mesh.connections.clear()
     intentionalClose = false
     openSocket()
+    // Consumers hold their own recovery state (backoffs, deadlines, stale
+    // peer sets) that a suspend leaves expired; tell them the same way the
+    // browser lifecycle would.
+    try { onResume?.({ reason, gapMs }) } catch { /* consumer error must not break resume */ }
   }
 
   function reconnectSignalingPreservingPeers(reason = 'signaling_refresh') {
@@ -1514,6 +2112,7 @@ export function createSignalingClient(options = {}) {
     connect() {
       stoppedByUser = false
       intentionalClose = false
+      startSuspendWatch()
       openSocket()
     },
 
@@ -1564,6 +2163,7 @@ export function createSignalingClient(options = {}) {
       reconnectTimer = null
       stopAdvertiseHeartbeat()
       stopKeepalive()
+      stopSuspendWatch()
       intentionalClose = true
       closeAllPeerConnections()
       mesh.connections.clear()
@@ -1603,16 +2203,33 @@ export function createSignalingClient(options = {}) {
       return initiateWebRTCConnection(toPeerId, iceServers)
     },
 
+    injectSignal,
+
     sendData(data, preferredPeerId) {
-      // A channel can keep reporting 'open' after its connection has died —
-      // WebKit then fails the send with an async console error no catch can
-      // see, so a readyState guard alone still sends into corpses. A send is
-      // only attempted over a live connection; a dead one throws, which is
-      // the synchronous signal callers use to release the peer.
+      // A channel can keep reporting 'open' while its connection is anything
+      // but 'connected' — connecting during renegotiation, disconnected on an
+      // ICE blip, failed after one. WebKit fails every such send with an
+      // async console error no catch can see, so the gate must be POSITIVE:
+      // send only over a connection that says 'connected' (or one whose
+      // implementation has no connectionState at all). Transient states
+      // throw an error marked transient so callers retry without executing
+      // the peer; terminal states throw plain so callers release it.
       const channelIsLive = (entry) => {
         if (entry?.channel?.readyState !== 'open') return false
-        const state = entry.connection?.connectionState
-        return state !== 'failed' && state !== 'closed' && state !== 'disconnected'
+        if (entry.dormantAt && Date.now() - entry.dormantAt < DATA_DORMANT_MAX_MS) return false
+        if (!entry.connection) return false
+        const state = entry.connection.connectionState
+        if (state !== undefined && state !== 'connected') return false
+        // SCTP dies one-way: readyState and connectionState both keep
+        // claiming health while every send fails — and in Safari the
+        // failure does not even throw, so no error path ever fires. The
+        // only trusted signal is the pong round trip: a channel is live
+        // once its first pong has landed, and stops being live when a
+        // ping goes unanswered past the pong timeout.
+        const now = Date.now()
+        if (!(entry.lastPongAt > 0) || now - entry.lastPongAt >= DATA_PROOF_FRESH_MS) return false
+        return !(entry.lastPingSentAt > entry.lastPongAt
+          && now - entry.lastPingSentAt >= DATA_PONG_TIMEOUT_MS)
       }
 
       let target = null
@@ -1629,13 +2246,90 @@ export function createSignalingClient(options = {}) {
       }
 
       if (!target?.channel || target.channel.readyState !== 'open') {
-        throw new Error('WebRTC not yet connected')
+        // Not open YET is transient by definition: the channel is still
+        // being negotiated or attached. This refusal carried no flag, so a
+        // send that raced the open was read as terminal and the peer was
+        // released the moment it had connected.
+        const error = new Error('WebRTC not yet connected')
+        error.transient = true
+        throw error
+      }
+      if (target.dormantAt && Date.now() - target.dormantAt < DATA_DORMANT_MAX_MS) {
+        const error = new Error('Peer is dormant (hidden tab)')
+        error.transient = true
+        throw error
+      }
+      if (Number(target.channel.bufferedAmount ?? 0) > DATA_MAX_BUFFERED_BYTES) {
+        // Backpressure. The peer is not reading fast enough (or at all); the
+        // keepalive decides which. Nothing more goes into the transport.
+        const error = new Error('WebRTC channel send buffer is full')
+        error.transient = true
+        throw error
       }
       if (!channelIsLive(target)) {
-        throw new Error(`WebRTC connection is ${target.connection?.connectionState}`)
+        const now = Date.now()
+        const state = target.connection?.connectionState
+        const unproven = !(target.lastPongAt > 0) || now - target.lastPongAt >= DATA_PROOF_FRESH_MS
+        const pingOutstanding = target.lastPingSentAt > (target.lastPongAt ?? 0)
+        const outboundDead = pingOutstanding && now - target.lastPingSentAt >= DATA_PONG_TIMEOUT_MS
+          && !(Number(target.channel?.bufferedAmount ?? 0) > 0)
+        // A refusal for a stale proof arms its own re-proof: a healthy
+        // channel pongs within one round trip and the next send passes; a
+        // dead one lets this ping age into the execution verdict. Without
+        // this, a quiet channel could stay refused forever.
+        if (unproven && !pingOutstanding && target.channel?.readyState === 'open'
+          && (target.connection?.connectionState === undefined || target.connection.connectionState === 'connected')) {
+          try {
+            target.channel.send(JSON.stringify({ type: 'ping', ts: now }))
+            target.lastPingSentAt = now
+          } catch { /* the keepalive verdict handles it */ }
+        }
+        const error = new Error(outboundDead
+          ? 'WebRTC channel failed its pong proof'
+          : unproven
+            ? 'WebRTC channel is awaiting a fresh pong'
+            : `WebRTC connection is ${state}`)
+        // Awaiting-a-pong resolves within one round trip — retry. A failed
+        // proof or a bad connection state is the edge telling the truth
+        // about being gone.
+        error.transient = !outboundDead
+          && (unproven || state === 'connecting' || state === 'disconnected' || state === 'new')
+        throw error
       }
 
-      target.channel.send(data)
+      // A channel that reports 'open' can still throw from send(): Safari and
+      // Chrome both do while SCTP is settling right after the channel opens,
+      // and again while it is closing. The gate above already passed, so
+      // this is not proof the edge is gone; the pong round trip decides that.
+      // Surfacing the throw as terminal released a freshly connected peer on
+      // its first frame, both sides redialed, and the pair churned forever.
+      const sendFrame = (frame) => {
+        try {
+          target.channel.send(frame)
+        } catch (err) {
+          const error = new Error(`WebRTC channel refused a frame: ${err?.message ?? err}`)
+          error.transient = true
+          error.cause = err
+          throw error
+        }
+      }
+
+      if (typeof data === 'string' && data.length > DATA_CHUNK_THRESHOLD) {
+        const id = `${Date.now().toString(36)}-${(dataChunkCounter++).toString(36)}`
+        const total = Math.ceil(data.length / DATA_CHUNK_SLICE)
+        for (let seq = 0; seq < total; seq++) {
+          sendFrame(JSON.stringify({
+            t: DATA_CHUNK_FRAME,
+            i: id,
+            s: seq,
+            n: total,
+            d: data.slice(seq * DATA_CHUNK_SLICE, (seq + 1) * DATA_CHUNK_SLICE),
+          }))
+        }
+        return target
+      }
+
+      sendFrame(data)
       return target
     },
 
