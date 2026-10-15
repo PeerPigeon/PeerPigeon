@@ -59,9 +59,16 @@ const DATA_DORMANT_MAX_MS = 30 * 60000
 const RELAY_ANCHOR_FRAME = '~anchors'
 const RELAY_DEFAULTS = {
   // Live data-channel neighbours needed before the relay socket can be released.
-  minMeshPeers: 2,
-  // Peers per room that stay registered with the relay.
-  anchors: 3,
+  // One is the honest threshold: a peer that can reach a neighbour over a data
+  // channel is not cut off from the mesh, and the pair below still keeps an
+  // anchor registered so a newcomer has a way in.
+  minMeshPeers: 1,
+  // Peers per room that stay registered with the relay. A room needs one way
+  // in, not three: at three, every peer in a room of three or fewer is an
+  // anchor, so no peer ever released its socket and this whole feature did
+  // nothing in the small rooms that need it most. One anchor dropping leaves
+  // the rest isolated, which wakes their relay within evalMs.
+  anchors: 1,
   // How long a peer must have been releasable before it lets go, so a flap does not flap the relay.
   settleMs: 30_000,
   // How long the relay stays up once something woke it.
@@ -78,12 +85,23 @@ const RELAY_DEFAULTS = {
 // stalled-negotiation machinery executes the peer.
 const transportReady = (pc) => pc?.connectionState === undefined || pc.connectionState === 'connected'
 let dataChunkCounter = 0
-const SIGNAL_PING_MS = 1000
-// Twenty seconds, matching the data-channel deadline. A watcher pushing a
-// multi-megabyte index sync over werift stalls its own event loop for a few
-// seconds; a four-second pong deadline read that as a dead relay, dropped
-// the socket, re-registered, and every peer was released in the process.
-const SIGNAL_PONG_TIMEOUT_MS = 20000
+// A relay socket is a Durable Object, and every message a peer sends up it is
+// a billable request. At one ping a second that is 86,400 requests a day per
+// socket to say nothing at all — measured on an idle node, 62% of everything
+// it sent, and by itself more than a Cloudflare free tier allows in a day. A
+// watcher runs several nodes, so one quiet machine spent the daily allowance
+// in about three hours and then the whole fleet stopped.
+//
+// Twenty-five seconds still notices a dead relay inside a minute and a half,
+// which nothing here waits on: a peer's liveness to its fleet is the index
+// heartbeat it publishes, not this socket.
+const SIGNAL_PING_MS = 25000
+// Comfortably more than the ping interval, so one lost pong is not a dead
+// relay. A watcher pushing a multi-megabyte index sync over werift stalls its
+// own event loop for seconds at a time; a tight deadline read that as a dead
+// relay, dropped the socket, re-registered, and released every peer in the
+// process.
+const SIGNAL_PONG_TIMEOUT_MS = 60000
 // A machine that sleeps freezes this process with it. Browsers announce the
 // thaw (pageshow, resume); a Node peer — the GitPigeon watcher — has no such
 // event and used to trust a signaling socket and ICE candidates that died
@@ -112,6 +130,13 @@ const OFFER_RETRY_DELAYS_MS = [100, 250, 500, 1000, 2000, 4000, 8000]
 // seconds covers the retry burst and a live handshake; the relay drops the
 // rest unread.
 const NEGOTIATION_TTL_MS = 10000
+// The relay forgets an announcement once its TTL lapses, so this heartbeat only
+// has to outpace the TTL — and every beat is a billable request against the
+// relay. So it asks for the longest TTL the relay will honour (both the Worker
+// and the self-hosted relay cap at 120s) and refreshes at a third of it, which
+// leaves room for two lost beats before the peer disappears from the registry.
+const ADVERTISE_TTL_MS = 120000
+const ADVERTISE_HEARTBEAT_MS = ADVERTISE_TTL_MS / 3
 const NEGOTIATION_TYPES = new Set(['offer', 'answer', 'ice_candidate', 'ice_end', 'renegotiate'])
 // Frames addressed to one peer that can travel over an established mesh
 // instead of the relay: everything a negotiation needs, plus the goodbye.
@@ -617,10 +642,10 @@ export function createSignalingClient(options = {}) {
       if (!registered) return
       // Re-announce to refresh TTL in the server's peer registry.
       send(pspEnvelope('announce', {
-        ttl_ms: 30000,
+        ttl_ms: ADVERTISE_TTL_MS,
         body: { instance_id: networkId, capabilities, hints: { wants_peers: true } },
       }))
-    }, 12000)
+    }, ADVERTISE_HEARTBEAT_MS)
   }
 
   function stopSuspendWatch() {

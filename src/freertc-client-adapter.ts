@@ -28,6 +28,14 @@ const HEALTH_PROBE_MISSES_BEFORE_RECYCLE = 3;
 const TRANSIENT_DISCONNECT_GRACE_MS = 3_000;
 const INITIAL_SIGNALING_HEALTH_DELAY_MS = 1_000;
 const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
+// The health check proves the relay is listening by asking it who else is in
+// the room, and every such ask is a billable request against the relay. A room
+// that keeps answering with the same peers has nothing left to prove, so the
+// ask slows down to this ceiling. Signaling liveness is not lost by waiting:
+// the socket's own ping/pong still fails fast, and a bootstrap that brings
+// different peers — or a lost registration, or a woken relay — drops the wait
+// straight back to the interval.
+const SIGNALING_HEALTH_MAX_INTERVAL_MS = 5 * 60_000;
 const DISCOVERY_ABSENCE_GRACE_MS = 30_000;
 const DISCOVERY_ACTIVE_MAX_AGE_MS = 18_000;
 
@@ -96,6 +104,8 @@ export class FreeRTCClientAdapter {
   private initialSignalingHealthTimer: ReturnType<typeof setTimeout> | null = null;
   private signalingHealthTimer: ReturnType<typeof setInterval> | null = null;
   private lastBootstrapAtMs = 0;
+  private healthBootstrapWaitMs = SIGNALING_HEALTH_INTERVAL_MS;
+  private lastBootstrapFingerprint: string | null = null;
   private healthProbeMisses = 0;
   private recyclingSignalingTransport = false;
   private waitingForTransportClose = false;
@@ -288,6 +298,7 @@ export class FreeRTCClientAdapter {
         if (!isCurrentClient()) return;
         this.lastBootstrapAtMs = Date.now();
         this.healthProbeMisses = 0;
+        this.noteBootstrapAnswer(candidates);
         this.clearRecoveryProbeTimer();
         this.handleBootstrapCandidates(candidates);
       },
@@ -423,6 +434,7 @@ export class FreeRTCClientAdapter {
     this.waitingForTransportClose = false;
     this.lastBootstrapAtMs = 0;
     this.healthProbeMisses = 0;
+    this.resetHealthBootstrapWait();
     this.client?.resetRecoveryBackoffs?.();
     // Notify PartialMesh so it can reset stale-age baselines. FreeRTC retains
     // ownership of restoration; this event must not trigger immediate redials.
@@ -820,6 +832,30 @@ export class FreeRTCClientAdapter {
     }, RECOVERY_PROBE_TIMEOUT_MS);
   }
 
+  /**
+   * A bootstrap answer that names the same peers as last time told us nothing,
+   * so the next ask waits longer. A different set is news: ask at full speed
+   * again.
+   */
+  private noteBootstrapAnswer(candidates: readonly { peerId?: string | null }[]): void {
+    const peerIds = (Array.isArray(candidates) ? candidates : [])
+      .map((candidate) => this.normalizePeerId(candidate?.peerId))
+      .filter(Boolean);
+    const fingerprint = Array.from(new Set(peerIds)).sort().join(',');
+    if (fingerprint === this.lastBootstrapFingerprint) {
+      this.healthBootstrapWaitMs = Math.min(this.healthBootstrapWaitMs * 2, SIGNALING_HEALTH_MAX_INTERVAL_MS);
+      return;
+    }
+    this.lastBootstrapFingerprint = fingerprint;
+    this.healthBootstrapWaitMs = SIGNALING_HEALTH_INTERVAL_MS;
+  }
+
+  /** Something changed that the relay may know about: ask it now. */
+  private resetHealthBootstrapWait(): void {
+    this.healthBootstrapWaitMs = SIGNALING_HEALTH_INTERVAL_MS;
+    this.lastBootstrapFingerprint = null;
+  }
+
   private startSignalingHealthLoop(): void {
     if (this.signalingHealthTimer) return;
     this.signalingHealthTimer = setInterval(() => {
@@ -832,7 +868,7 @@ export class FreeRTCClientAdapter {
         this.client?.connect?.();
         return;
       }
-      if (Date.now() - this.lastBootstrapAtMs < SIGNALING_HEALTH_INTERVAL_MS) return;
+      if (Date.now() - this.lastBootstrapAtMs < this.healthBootstrapWaitMs) return;
       this.emitter.emit('signaling:log', {
         message: '[signal] health check: awaiting relay acknowledgement',
       });
@@ -875,6 +911,9 @@ export class FreeRTCClientAdapter {
     this.signalingConnected = false;
     this.clearRecoveryProbeTimer();
     this.clearDisconnectGraceTimers();
+    // Whatever the old relay last said about the room does not carry over to
+    // the next one, so the replacement is asked at full speed.
+    this.resetHealthBootstrapWait();
 
     // FreeRTC owns backoff while a selected relay may still recover. Once the
     // adapter's acknowledgement deadline expires, however, an isolated client

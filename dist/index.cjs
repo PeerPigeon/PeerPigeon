@@ -45,6 +45,7 @@ var HEALTH_PROBE_MISSES_BEFORE_RECYCLE = 3;
 var TRANSIENT_DISCONNECT_GRACE_MS = 3e3;
 var INITIAL_SIGNALING_HEALTH_DELAY_MS = 1e3;
 var SIGNALING_HEALTH_INTERVAL_MS = 15e3;
+var SIGNALING_HEALTH_MAX_INTERVAL_MS = 5 * 6e4;
 var DISCOVERY_ABSENCE_GRACE_MS = 3e4;
 var DISCOVERY_ACTIVE_MAX_AGE_MS = 18e3;
 function generateMessageId(bytesLength = 8) {
@@ -94,6 +95,8 @@ var FreeRTCClientAdapter = class {
     this.initialSignalingHealthTimer = null;
     this.signalingHealthTimer = null;
     this.lastBootstrapAtMs = 0;
+    this.healthBootstrapWaitMs = SIGNALING_HEALTH_INTERVAL_MS;
+    this.lastBootstrapFingerprint = null;
     this.healthProbeMisses = 0;
     this.recyclingSignalingTransport = false;
     this.waitingForTransportClose = false;
@@ -249,6 +252,7 @@ var FreeRTCClientAdapter = class {
         if (!isCurrentClient()) return;
         this.lastBootstrapAtMs = Date.now();
         this.healthProbeMisses = 0;
+        this.noteBootstrapAnswer(candidates);
         this.clearRecoveryProbeTimer();
         this.handleBootstrapCandidates(candidates);
       },
@@ -376,6 +380,7 @@ var FreeRTCClientAdapter = class {
     this.waitingForTransportClose = false;
     this.lastBootstrapAtMs = 0;
     this.healthProbeMisses = 0;
+    this.resetHealthBootstrapWait();
     this.client?.resetRecoveryBackoffs?.();
     this.emitter.emit("lifecycle:resume", { reason });
     for (const peerId of Array.from(this.connectedPeers)) {
@@ -704,6 +709,26 @@ var FreeRTCClientAdapter = class {
       this.nudgeSignaling();
     }, RECOVERY_PROBE_TIMEOUT_MS);
   }
+  /**
+   * A bootstrap answer that names the same peers as last time told us nothing,
+   * so the next ask waits longer. A different set is news: ask at full speed
+   * again.
+   */
+  noteBootstrapAnswer(candidates) {
+    const peerIds = (Array.isArray(candidates) ? candidates : []).map((candidate) => this.normalizePeerId(candidate?.peerId)).filter(Boolean);
+    const fingerprint = Array.from(new Set(peerIds)).sort().join(",");
+    if (fingerprint === this.lastBootstrapFingerprint) {
+      this.healthBootstrapWaitMs = Math.min(this.healthBootstrapWaitMs * 2, SIGNALING_HEALTH_MAX_INTERVAL_MS);
+      return;
+    }
+    this.lastBootstrapFingerprint = fingerprint;
+    this.healthBootstrapWaitMs = SIGNALING_HEALTH_INTERVAL_MS;
+  }
+  /** Something changed that the relay may know about: ask it now. */
+  resetHealthBootstrapWait() {
+    this.healthBootstrapWaitMs = SIGNALING_HEALTH_INTERVAL_MS;
+    this.lastBootstrapFingerprint = null;
+  }
   startSignalingHealthLoop() {
     if (this.signalingHealthTimer) return;
     this.signalingHealthTimer = setInterval(() => {
@@ -715,7 +740,7 @@ var FreeRTCClientAdapter = class {
         this.client?.connect?.();
         return;
       }
-      if (Date.now() - this.lastBootstrapAtMs < SIGNALING_HEALTH_INTERVAL_MS) return;
+      if (Date.now() - this.lastBootstrapAtMs < this.healthBootstrapWaitMs) return;
       this.emitter.emit("signaling:log", {
         message: "[signal] health check: awaiting relay acknowledgement"
       });
@@ -755,6 +780,7 @@ var FreeRTCClientAdapter = class {
     this.signalingConnected = false;
     this.clearRecoveryProbeTimer();
     this.clearDisconnectGraceTimers();
+    this.resetHealthBootstrapWait();
     if (this.signalUrls.length > 1 && this.connectedPeers.size === 0) {
       const previousSignalUrl = this.activeSignalUrl;
       const staleClient = this.client;
@@ -4133,6 +4159,8 @@ var CHRONIC_DIAL_FAILURES = 5;
 var CHRONIC_DIAL_QUARANTINE_MS = 5 * 6e4;
 var NEGOTIATION_TOTAL_BUDGET_MS = 3e4;
 var MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1e3;
+var DISCOVERY_REFRESH_MIN_MS = 2e3;
+var DISCOVERY_REFRESH_MAX_MS = 5 * 6e4;
 function canonicalSignalingUrl(value) {
   try {
     const url = new URL(String(value || "").trim());
@@ -4253,6 +4281,7 @@ var PartialMesh = class {
     this.lastHardResetAtMs = 0;
     this.lastUnderConnectedRecoveryAtMs = 0;
     this.lastDiscoveryRefreshAtMs = 0;
+    this.discoveryRefreshWaitMs = DISCOVERY_REFRESH_MIN_MS;
     this.lastSignalingReconnectAtMs = 0;
     this.dialFailureCount = /* @__PURE__ */ new Map();
     this.lastDialFailureAtMs = /* @__PURE__ */ new Map();
@@ -4388,12 +4417,18 @@ var PartialMesh = class {
     if (!id) return false;
     return this.selfAliases.has(id);
   }
+  /** Real news arrived, so ask again at full speed. */
+  noteDiscoveryNews() {
+    this.discoveryRefreshWaitMs = DISCOVERY_REFRESH_MIN_MS;
+    this.lastDiscoveryRefreshAtMs = 0;
+  }
   addDiscoveredPeer(peerId) {
     const id = this.normalizePeerId(peerId);
     if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) return;
     if (this.discoveredPeers.has(id)) return;
     this.discoveredPeers.add(id);
     this.discoveredAtMs.set(id, Date.now());
+    this.noteDiscoveryNews();
     this.emit("peer:discovered", id);
     this.emit("mesh:graph", this.getGraphSnapshot());
   }
@@ -5142,8 +5177,9 @@ var PartialMesh = class {
     const saturatedWithoutSpareCandidates = connected >= this.config.maxPeers && this.discoveredPeers.size <= connected;
     const negotiationNeedsFreshSnapshot = pending > 0;
     if (!underConnected && !hasFewCandidates && !saturatedWithoutSpareCandidates && !negotiationNeedsFreshSnapshot) return;
-    if (now - this.lastDiscoveryRefreshAtMs < 2e3) return;
+    if (now - this.lastDiscoveryRefreshAtMs < this.discoveryRefreshWaitMs) return;
     this.lastDiscoveryRefreshAtMs = now;
+    this.discoveryRefreshWaitMs = Math.min(this.discoveryRefreshWaitMs * 2, DISCOVERY_REFRESH_MAX_MS);
     try {
       this.signalingClient?.joinSession(this.config.sessionId);
     } catch {
@@ -5171,7 +5207,7 @@ var PartialMesh = class {
     this.rebalanceAttemptAtMs.clear();
     this.rebalanceCooldownUntilMs = 0;
     this.lastUnderConnectedRecoveryAtMs = 0;
-    this.lastDiscoveryRefreshAtMs = 0;
+    this.noteDiscoveryNews();
     this.underConnectedSinceMs = null;
     try {
       this.maybeRefreshDiscovery();
@@ -6225,7 +6261,7 @@ var PartialMesh = class {
     this.clientId = null;
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;
-    this.lastDiscoveryRefreshAtMs = 0;
+    this.noteDiscoveryNews();
     this.lastSignalingReconnectAtMs = 0;
     this.rebalanceCooldownUntilMs = 0;
     this.dialFailureCount.clear();

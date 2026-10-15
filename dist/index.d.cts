@@ -1049,6 +1049,7 @@ declare class PartialMesh {
     private lastHardResetAtMs;
     private lastUnderConnectedRecoveryAtMs;
     private lastDiscoveryRefreshAtMs;
+    private discoveryRefreshWaitMs;
     private lastSignalingReconnectAtMs;
     private dialFailureCount;
     private lastDialFailureAtMs;
@@ -1075,6 +1076,8 @@ declare class PartialMesh {
     private normalizeSignalingUrl;
     private addSelfAlias;
     private isSelfAlias;
+    /** Real news arrived, so ask again at full speed. */
+    private noteDiscoveryNews;
     private addDiscoveredPeer;
     private loadOrCreateBrowserPeerId;
     private rememberBrowserPeerSignalUrls;

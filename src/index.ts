@@ -73,6 +73,14 @@ const CHRONIC_DIAL_QUARANTINE_MS = 5 * 60_000;
 const NEGOTIATION_TOTAL_BUDGET_MS = 30_000;
 // Membership broadcasts are coalesced to one per interval per node.
 const MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1_000;
+// Asking the signaling relay "who else is here?" costs a billable request, so a
+// node that keeps hearing nothing slows down rather than asking every two
+// seconds forever. A lone node in a one-machine fleet sits permanently below
+// minPeers and would otherwise never stop. Any real news — a fresh candidate, a
+// peer connecting, a transport returning — drops the wait back to the floor, so
+// the backoff never delays a node that has someone to find.
+const DISCOVERY_REFRESH_MIN_MS = 2_000;
+const DISCOVERY_REFRESH_MAX_MS = 5 * 60_000;
 
 function canonicalSignalingUrl(value: string): string | null {
   try {
@@ -441,6 +449,7 @@ export class PartialMesh {
   private lastHardResetAtMs: number = 0;
   private lastUnderConnectedRecoveryAtMs: number = 0;
   private lastDiscoveryRefreshAtMs: number = 0;
+  private discoveryRefreshWaitMs: number = DISCOVERY_REFRESH_MIN_MS;
   private lastSignalingReconnectAtMs: number = 0;
   private dialFailureCount: Map<string, number> = new Map();
   private lastDialFailureAtMs: Map<string, number> = new Map();
@@ -600,12 +609,19 @@ export class PartialMesh {
     return this.selfAliases.has(id);
   }
 
+  /** Real news arrived, so ask again at full speed. */
+  private noteDiscoveryNews(): void {
+    this.discoveryRefreshWaitMs = DISCOVERY_REFRESH_MIN_MS;
+    this.lastDiscoveryRefreshAtMs = 0;
+  }
+
   private addDiscoveredPeer(peerId: string): void {
     const id = this.normalizePeerId(peerId);
     if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) return;
     if (this.discoveredPeers.has(id)) return;
     this.discoveredPeers.add(id);
     this.discoveredAtMs.set(id, Date.now());
+    this.noteDiscoveryNews();
     this.emit('peer:discovered', id);
     this.emit('mesh:graph', this.getGraphSnapshot());
   }
@@ -1555,9 +1571,10 @@ export class PartialMesh {
     const negotiationNeedsFreshSnapshot = pending > 0;
 
     if (!underConnected && !hasFewCandidates && !saturatedWithoutSpareCandidates && !negotiationNeedsFreshSnapshot) return;
-    if (now - this.lastDiscoveryRefreshAtMs < 2_000) return;
+    if (now - this.lastDiscoveryRefreshAtMs < this.discoveryRefreshWaitMs) return;
 
     this.lastDiscoveryRefreshAtMs = now;
+    this.discoveryRefreshWaitMs = Math.min(this.discoveryRefreshWaitMs * 2, DISCOVERY_REFRESH_MAX_MS);
     try {
       this.signalingClient?.joinSession(this.config.sessionId);
     } catch {
@@ -1597,7 +1614,7 @@ export class PartialMesh {
     this.rebalanceAttemptAtMs.clear();
     this.rebalanceCooldownUntilMs = 0;
     this.lastUnderConnectedRecoveryAtMs = 0;
-    this.lastDiscoveryRefreshAtMs = 0;
+    this.noteDiscoveryNews();
     this.underConnectedSinceMs = null;
 
     try {
@@ -3022,7 +3039,7 @@ export class PartialMesh {
     this.clientId = null;
     this.underConnectedSinceMs = null;
     this.lastHardResetAtMs = 0;
-    this.lastDiscoveryRefreshAtMs = 0;
+    this.noteDiscoveryNews();
     this.lastSignalingReconnectAtMs = 0;
     this.rebalanceCooldownUntilMs = 0;
     this.dialFailureCount.clear();
