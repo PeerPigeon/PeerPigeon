@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { FreeRTCClientAdapter } from '../src/freertc-client-adapter.ts';
+import {
+  FreeRTCClientAdapter,
+  HEALTH_PROBE_MISSES_BEFORE_RECYCLE,
+  INITIAL_SIGNALING_HEALTH_DELAY_MS,
+  RECOVERY_PROBE_TIMEOUT_MS,
+  SIGNALING_HEALTH_INTERVAL_MS,
+} from '../src/freertc-client-adapter.ts';
 
 test('adapter withdraws the previous reload identity before registering its replacement', () => {
   const originalWebSocket = globalThis.WebSocket;
@@ -202,8 +208,11 @@ test('adapter leaves short retries in FreeRTC, then rotates an unresponsive fede
     assert.equal(attempts.some((url) => /^wss:\/\/next-nearest\.example\/ws/.test(url)), false);
 
     // The adapter's bounded registration deadline then advances to the next
-    // configured relay instead of reconnecting to the dead first relay forever.
-    t.mock.timers.tick(2_500);
+    // configured relay instead of reconnecting to the dead first relay
+    // forever. A socket that never registered is moved on the first missed
+    // deadline; the three-miss grace is only for one still claiming
+    // registration.
+    t.mock.timers.tick(RECOVERY_PROBE_TIMEOUT_MS);
     assert.match(attempts.at(-1), /^wss:\/\/next-nearest\.example\/ws/);
   } finally {
     adapter.disconnect();
@@ -329,7 +338,14 @@ test('an exhausted FreeRTC offer releases its pending slot and refreshes discove
   assert.deepEqual(disconnected, [peerId]);
   assert.deepEqual(failures, [{ peerId, reason: 'offer_retries_exhausted' }]);
   assert.ok(logs.some((message) => message.includes('offer_retries_exhausted')));
-  assert.ok(logs.some((message) => message.includes('released immediately; redialing')));
+  // The release log names its caller and the refusal, so a release loop is one
+  // line to read rather than an afternoon.
+  assert.ok(logs.some((message) => (
+    message.includes('released immediately')
+    && message.includes('negotiation-failed')
+    && message.includes('offer_retries_exhausted')
+    && message.includes('redialing')
+  )));
 });
 
 test('an exhausted offer still releases PartialMesh after FreeRTC already removed its entry', () => {
@@ -541,16 +557,18 @@ test('data-channel open is event-driven with no polling delay', () => {
   adapter.disconnect();
 });
 
-test('broadcast send failure releases the unusable edge immediately', () => {
+/**
+ * A refused send is only proof the edge is gone when the transport itself says
+ * so. PeerPigeon's handshake fires the instant a channel reports open and
+ * FreeRTC could still refuse that first send, so reading every refusal as a
+ * dead edge released a working peer on every connection.
+ */
+function broadcastRefusedOn(transport) {
   const peerId = '2'.repeat(64);
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
     peerId: '1'.repeat(64),
   });
-  const connections = new Map([[peerId, {
-    state: 'connected',
-    connection: { connectionState: 'connected', close() {} },
-    channel: { readyState: 'open', close() {} },
-  }]]);
+  const connections = new Map([[peerId, transport]]);
   adapter.client = {
     mesh: { connections },
     sendData() { throw new Error('channel is no longer writable'); },
@@ -562,13 +580,33 @@ test('broadcast send failure releases the unusable edge immediately', () => {
   adapter.on('rtc:disconnected', ({ peerId: disconnectedPeerId }) => disconnected.push(disconnectedPeerId));
 
   adapter.broadcast('payload');
-
-  assert.deepEqual(disconnected, [peerId]);
-  assert.equal(connections.has(peerId), false);
   adapter.disconnect();
+  return { peerId, disconnected, stillHeld: connections.has(peerId) };
+}
+
+test('a broadcast refused by a connected transport leaves the edge alone', () => {
+  const { disconnected, stillHeld } = broadcastRefusedOn({
+    state: 'connected',
+    connection: { connectionState: 'connected', close() {} },
+    channel: { readyState: 'open', close() {} },
+  });
+
+  assert.deepEqual(disconnected, []);
+  assert.equal(stillHeld, true);
 });
 
-test('suspend recovery releases missing peer edges and reconnects signaling without a full client teardown', (t) => {
+test('a broadcast refused by a dead transport releases the unusable edge immediately', () => {
+  const { peerId, disconnected, stillHeld } = broadcastRefusedOn({
+    state: 'failed',
+    connection: { connectionState: 'failed', close() {} },
+    channel: { readyState: 'closed', close() {} },
+  });
+
+  assert.deepEqual(disconnected, [peerId]);
+  assert.equal(stillHeld, false);
+});
+
+test('suspend recovery releases missing peer edges and re-announces on a still-registered socket', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const peerId = '2'.repeat(64);
   const adapter = new FreeRTCClientAdapter('wss://relay.example/ws', {
@@ -577,30 +615,43 @@ test('suspend recovery releases missing peer edges and reconnects signaling with
   let disconnects = 0;
   let connects = 0;
   let signalingReconnects = 0;
+  let reannouncements = 0;
   const client = {
     isRegistered: true,
     mesh: { connections: new Map() },
-    advertise() {},
+    advertise() { reannouncements += 1; },
     requestBootstrap() {},
     disconnect() { disconnects += 1; },
     connect() { connects += 1; },
     reconnectSignaling() { signalingReconnects += 1; },
   };
   const peerDisconnects = [];
+  const logs = [];
   adapter.client = client;
   adapter.signalingConnected = true;
   adapter.connectedPeers.add(peerId);
   adapter.on('rtc:disconnected', (data) => peerDisconnects.push(data));
+  adapter.on('signaling:log', ({ message }) => logs.push(message));
 
   adapter.recoverAfterInactivity('visible');
   assert.deepEqual(peerDisconnects, [{ peerId }]);
-  t.mock.timers.tick(4_999);
+  t.mock.timers.tick(RECOVERY_PROBE_TIMEOUT_MS - 1);
   assert.equal(disconnects, 0);
+  assert.equal(signalingReconnects, 0);
 
+  // One missed deadline on a socket that still claims registration is a slow
+  // reply, not a dead relay: it re-announces and stays put. Only
+  // HEALTH_PROBE_MISSES_BEFORE_RECYCLE consecutive misses move the socket,
+  // which the periodic health check drives.
+  const announcementsBeforeDeadline = reannouncements;
   t.mock.timers.tick(1);
+  assert.ok(reannouncements > announcementsBeforeDeadline);
+  assert.ok(logs.some((message) => (
+    message.includes(`discovery slow (1/${HEALTH_PROBE_MISSES_BEFORE_RECYCLE})`)
+    && message.includes('staying on this relay')
+  )));
+  assert.equal(signalingReconnects, 0);
   assert.equal(disconnects, 0);
-  assert.equal(signalingReconnects, 1);
-  assert.equal(adapter.client, client);
   assert.equal(connects, 0);
   assert.equal(adapter.client, client);
 
@@ -632,11 +683,14 @@ test('an unregistered signaling transport recovers without another peer announci
   adapter.recoverAfterInactivity('signaling-watchdog');
   assert.equal(connects, 1);
 
-  t.mock.timers.tick(4_999);
+  t.mock.timers.tick(RECOVERY_PROBE_TIMEOUT_MS - 1);
   assert.equal(disconnects, 0);
+  assert.equal(signalingReconnects, 0);
 
   // A FreeRTC connect call can be a no-op while its old WebSocket remains
   // OPEN/CONNECTING. The deadline replaces signaling only, not WebRTC peers.
+  // A socket that never registered is replaced on the first missed deadline:
+  // the three-miss grace is for a socket still claiming registration.
   t.mock.timers.tick(1);
   assert.equal(disconnects, 0);
   assert.equal(signalingReconnects, 1);
@@ -646,7 +700,7 @@ test('an unregistered signaling transport recovers without another peer announci
 
   // Missing a second acknowledgement must start another bounded recycle;
   // the adapter cannot remain trapped in "reconnect in progress".
-  t.mock.timers.tick(5_000);
+  t.mock.timers.tick(RECOVERY_PROBE_TIMEOUT_MS);
   assert.equal(disconnects, 0);
   assert.equal(signalingReconnects, 2);
   assert.equal(connects, 1);
@@ -705,11 +759,23 @@ test('periodic relay acknowledgement checks detect zombie sockets without lifecy
   adapter.connectedPeers.add(remotePeerId);
 
   adapter.startSignalingHealthLoop();
-  t.mock.timers.tick(15_000);
+  t.mock.timers.tick(SIGNALING_HEALTH_INTERVAL_MS);
   assert.equal(bootstrapRequests, 1);
   assert.equal(disconnects, 0);
 
-  t.mock.timers.tick(5_000);
+  // A socket that still claims registration gets
+  // HEALTH_PROBE_MISSES_BEFORE_RECYCLE consecutive missed acknowledgements
+  // before it is replaced: each miss re-announces and stays, and the next
+  // health check arms the next deadline. Replacing it on the first miss
+  // re-registered the watcher elsewhere every fifteen seconds and nothing
+  // converged.
+  for (let miss = 1; miss < HEALTH_PROBE_MISSES_BEFORE_RECYCLE; miss += 1) {
+    t.mock.timers.tick(RECOVERY_PROBE_TIMEOUT_MS);
+    assert.equal(signalingReconnects, 0);
+    t.mock.timers.tick(SIGNALING_HEALTH_INTERVAL_MS);
+  }
+  t.mock.timers.tick(RECOVERY_PROBE_TIMEOUT_MS);
+
   assert.equal(disconnects, 0);
   assert.equal(signalingReconnects, 1);
   assert.equal(peerConnectionClosed, false);
@@ -719,7 +785,7 @@ test('periodic relay acknowledgement checks detect zombie sockets without lifecy
   adapter.stopSignalingHealthLoop();
 });
 
-test('initial relay acknowledgement failure rotates within five seconds', (t) => {
+test('the initial health check asks once and leaves a still-registered relay in place', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const adapter = new FreeRTCClientAdapter([
     'wss://stale.example/ws',
@@ -739,7 +805,7 @@ test('initial relay acknowledgement failure rotates within five seconds', (t) =>
   adapter.signalingConnected = true;
   adapter.scheduleInitialSignalingHealthCheck();
 
-  t.mock.timers.tick(999);
+  t.mock.timers.tick(INITIAL_SIGNALING_HEALTH_DELAY_MS - 1);
   assert.equal(bootstrapRequests, 0);
   assert.equal(disconnects, 0);
 
@@ -747,12 +813,15 @@ test('initial relay acknowledgement failure rotates within five seconds', (t) =>
   assert.equal(bootstrapRequests, 1);
   assert.equal(disconnects, 0);
 
-  t.mock.timers.tick(3_999);
+  // Missing that first acknowledgement is a slow reply, not a dead relay: the
+  // socket still claims registration, so it re-announces and keeps its place
+  // in the federated list. Only HEALTH_PROBE_MISSES_BEFORE_RECYCLE consecutive
+  // misses move it, which the periodic health check drives.
+  t.mock.timers.tick(RECOVERY_PROBE_TIMEOUT_MS);
   assert.equal(disconnects, 0);
-  t.mock.timers.tick(1);
-  assert.equal(disconnects, 1);
-  assert.equal(adapter.activeSignalIndex, 1);
+  assert.equal(adapter.activeSignalIndex, 0);
   assert.equal(connects, 0);
+  assert.ok(bootstrapRequests > 1);
 
   adapter.disconnect();
 });

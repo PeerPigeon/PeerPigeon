@@ -71,6 +71,15 @@ const CHRONIC_DIAL_QUARANTINE_MS = 5 * 60_000;
 // connected → SCTP/data channel opening) deserves a fresh window per phase,
 // but no negotiation may extend itself indefinitely by oscillating.
 const NEGOTIATION_TOTAL_BUDGET_MS = 30_000;
+// Floors for the per-phase stalled-negotiation deadlines, exported so the
+// tests assert the deadlines this file actually keeps rather than numbers
+// copied once and left behind. A dead transport is given the shortest window;
+// a live handshake (ICE running, or a peer connection whose data channel is
+// still opening) gets longer; an offer on the wire is FreeRTC's to give up on
+// and gets the longest.
+export const NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS = 4_000;
+export const NEGOTIATION_ACTIVE_ICE_DEADLINE_MS = 6_000;
+export const NEGOTIATION_OFFER_DEADLINE_MS = 20_000;
 // Membership broadcasts are coalesced to one per interval per node.
 const MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1_000;
 // Asking the signaling relay "who else is here?" costs a billable request, so a
@@ -1721,14 +1730,14 @@ export class PartialMesh {
     // Never race FreeRTC's 2.85-second offer retry loop. Six seconds permits a
     // complete retry but bounds stuck ICE/data-channel state instead of
     // retaining it for 30 seconds (and multiplying it across browser tabs).
-    const ownerTimeoutMs = Math.max(4_000, this.config.connectionTimeoutMs);
-    const activeIceTimeoutMs = Math.max(6_000, this.config.connectionTimeoutMs);
+    const ownerTimeoutMs = Math.max(NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, this.config.connectionTimeoutMs);
+    const activeIceTimeoutMs = Math.max(NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, this.config.connectionTimeoutMs);
     // An offer on the wire is FreeRTC's to give up on: its retry budget runs
     // sixteen seconds now, because a busy watcher answers late. Executing the
     // dial here at four seconds threw away every answer that arrived after
     // it ("queued answer (no connection yet)") and redialed into the same
     // wait; only a dead transport still gets the short deadline.
-    const offerTimeoutMs = Math.max(20_000, this.config.connectionTimeoutMs);
+    const offerTimeoutMs = Math.max(NEGOTIATION_OFFER_DEADLINE_MS, this.config.connectionTimeoutMs);
 
     for (const peer of this.peers.values()) {
       if (peer.connected) {

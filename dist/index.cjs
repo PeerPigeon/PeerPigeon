@@ -24,6 +24,9 @@ __export(index_exports, {
   DEFAULT_SIGNALING_SERVERS: () => DEFAULT_SIGNALING_SERVERS,
   GossipProtocol: () => GossipProtocol,
   MESH_SIGNAL_PAYLOAD_TYPE: () => MESH_SIGNAL_PAYLOAD_TYPE,
+  NEGOTIATION_ACTIVE_ICE_DEADLINE_MS: () => NEGOTIATION_ACTIVE_ICE_DEADLINE_MS,
+  NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS: () => NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS,
+  NEGOTIATION_OFFER_DEADLINE_MS: () => NEGOTIATION_OFFER_DEADLINE_MS,
   PartialMesh: () => PartialMesh,
   PeerPigeonCryptoProtocol: () => PeerPigeonCryptoProtocol,
   PeerPigeonNode: () => PeerPigeonNode,
@@ -4158,6 +4161,9 @@ var DIAL_FAILURE_MEMORY_MS = 6e4;
 var CHRONIC_DIAL_FAILURES = 5;
 var CHRONIC_DIAL_QUARANTINE_MS = 5 * 6e4;
 var NEGOTIATION_TOTAL_BUDGET_MS = 3e4;
+var NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS = 4e3;
+var NEGOTIATION_ACTIVE_ICE_DEADLINE_MS = 6e3;
+var NEGOTIATION_OFFER_DEADLINE_MS = 2e4;
 var MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1e3;
 var DISCOVERY_REFRESH_MIN_MS = 2e3;
 var DISCOVERY_REFRESH_MAX_MS = 5 * 6e4;
@@ -5278,9 +5284,9 @@ var PartialMesh = class {
     const now = Date.now();
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
-    const ownerTimeoutMs = Math.max(4e3, this.config.connectionTimeoutMs);
-    const activeIceTimeoutMs = Math.max(6e3, this.config.connectionTimeoutMs);
-    const offerTimeoutMs = Math.max(2e4, this.config.connectionTimeoutMs);
+    const ownerTimeoutMs = Math.max(NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, this.config.connectionTimeoutMs);
+    const activeIceTimeoutMs = Math.max(NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, this.config.connectionTimeoutMs);
+    const offerTimeoutMs = Math.max(NEGOTIATION_OFFER_DEADLINE_MS, this.config.connectionTimeoutMs);
     for (const peer of this.peers.values()) {
       if (peer.connected) {
         this.negotiationPhaseByPeerId.delete(peer.id);
@@ -6537,6 +6543,9 @@ var index_default = PartialMesh;
   DEFAULT_SIGNALING_SERVERS,
   GossipProtocol,
   MESH_SIGNAL_PAYLOAD_TYPE,
+  NEGOTIATION_ACTIVE_ICE_DEADLINE_MS,
+  NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS,
+  NEGOTIATION_OFFER_DEADLINE_MS,
   PartialMesh,
   PeerPigeonCryptoProtocol,
   PeerPigeonNode,

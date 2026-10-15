@@ -13,12 +13,16 @@ export interface MeshSignaling {
   send(envelope: Record<string, unknown>): boolean;
 }
 
-const RECOVERY_PROBE_TIMEOUT_MS = 12_000;
+// These four are exported so the tests assert the deadlines the adapter
+// actually keeps. They were tightened once without the tests following, and
+// seven of those tests then spent six weeks asserting a policy this file had
+// deliberately removed.
+export const RECOVERY_PROBE_TIMEOUT_MS = 12_000;
 // A slow discovery reply is not a dead relay. Switching relays on every
 // missed probe re-registered the watcher elsewhere every fifteen seconds,
 // every browser's offers were routed to the relay it had just left, and
 // nothing ever converged. Only this many misses in a row move the socket.
-const HEALTH_PROBE_MISSES_BEFORE_RECYCLE = 3;
+export const HEALTH_PROBE_MISSES_BEFORE_RECYCLE = 3;
 // RTCPeerConnection 'disconnected' is transient by specification: ICE consent
 // jitter routinely self-heals within a couple of seconds while the data
 // channel keeps working. Tearing the transport down on the first
@@ -26,8 +30,8 @@ const HEALTH_PROBE_MISSES_BEFORE_RECYCLE = 3;
 // penalty on both ends). Give the transport this long to recover before the
 // edge is released.
 const TRANSIENT_DISCONNECT_GRACE_MS = 3_000;
-const INITIAL_SIGNALING_HEALTH_DELAY_MS = 1_000;
-const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
+export const INITIAL_SIGNALING_HEALTH_DELAY_MS = 1_000;
+export const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
 // The health check proves the relay is listening by asking it who else is in
 // the room, and every such ask is a billable request against the relay. A room
 // that keeps answering with the same peers has nothing left to prove, so the

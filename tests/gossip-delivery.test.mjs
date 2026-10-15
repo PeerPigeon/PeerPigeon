@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   GossipProtocol,
+  NEGOTIATION_OFFER_DEADLINE_MS,
   PartialMesh,
   PeerPigeonCryptoProtocol,
   PeerPigeonNode,
@@ -924,7 +925,10 @@ test('PartialMesh does not run a second timer against FreeRTC negotiation owners
     assert.equal(errors.length, 0);
     assert.deepEqual(closed, []);
 
-    mesh.connectionStartedAtMs.set(target, Date.now() - 4_000);
+    // A dial with no transport yet is a pending offer, and an offer on the
+    // wire is FreeRTC's to give up on: it gets the longest deadline, not the
+    // four seconds a dead transport gets.
+    mesh.connectionStartedAtMs.set(target, Date.now() - NEGOTIATION_OFFER_DEADLINE_MS);
     mesh.maybeRecoverStalledNegotiations();
 
     assert.deepEqual(errors, [{
@@ -1578,10 +1582,15 @@ test('a current relay snapshot replaces a pending dial to a suspended peer', () 
   const self = '0'.repeat(64);
   const suspended = '1'.repeat(64);
   const active = '2'.repeat(64);
+  // A dial that made no transport progress at all: no ICE running, no offer on
+  // the wire, no channel opening. A peer whose handshake is in any of those
+  // states is mid-negotiation and is deliberately left alone, because
+  // federated relay snapshots are partial and closing those channels made
+  // pairs redial each other for hours.
   const connections = new Map([[suspended, {
-    state: 'connecting',
-    connection: { connectionState: 'connecting', signalingState: 'have-local-offer' },
-    channel: { readyState: 'connecting' },
+    state: 'new',
+    connection: { connectionState: 'new', signalingState: 'stable' },
+    channel: { readyState: 'closed' },
   }]]);
   const closed = [];
   const dials = [];
@@ -1625,6 +1634,56 @@ test('a current relay snapshot replaces a pending dial to a suspended peer', () 
     assert.deepEqual(dials, [active]);
   } finally {
     mesh.destroy();
+  }
+});
+
+test('a relay snapshot that omits a mid-handshake peer leaves its dial alone', () => {
+  const self = '0'.repeat(64);
+  const active = '2'.repeat(64);
+  // Each of these is transport progress on its own, and a federated snapshot
+  // routinely omits a peer registered on another relay while its answer is in
+  // flight. Replacing the dial on that evidence closed handshakes seconds
+  // after they opened and the pair looped.
+  const midHandshake = [
+    { label: 'offer on the wire', connection: { connectionState: 'new', signalingState: 'have-local-offer' }, channel: { readyState: 'closed' } },
+    { label: 'answer on the wire', connection: { connectionState: 'new', signalingState: 'have-remote-offer' }, channel: { readyState: 'closed' } },
+    { label: 'ICE running', connection: { connectionState: 'connecting', signalingState: 'stable' }, channel: { readyState: 'closed' } },
+    { label: 'channel opening', connection: { connectionState: 'new', signalingState: 'stable' }, channel: { readyState: 'connecting' } },
+  ];
+
+  for (const { label, connection, channel } of midHandshake) {
+    const peerId = '1'.repeat(64);
+    const connections = new Map([[peerId, { state: connection.connectionState, connection, channel }]]);
+    const closed = [];
+    const mesh = new PartialMesh({
+      minPeers: 1,
+      maxPeers: 2,
+      tolerantPeers: 1,
+      autoDiscover: false,
+      autoConnect: false,
+    });
+    try {
+      mesh.clientId = self;
+      mesh.selfAliases.add(self);
+      mesh.discoveredPeers.add(peerId);
+      mesh.peers.set(peerId, { id: peerId, connected: false, initiator: true });
+      mesh.connecting.add(peerId);
+      mesh.connectionStartedAtMs.set(peerId, Date.now());
+      mesh.signalingClient = {
+        isConnected: () => true,
+        nudgeSignaling() {},
+        initiateConnection: () => new Promise(() => {}),
+        closeConnection(closedPeerId) { closed.push(closedPeerId); },
+        disconnect() {},
+        client: { mesh: { connections } },
+      };
+
+      mesh.reconcileSignalingPeers([peerId, active], [active]);
+      assert.deepEqual(closed, [], label);
+      assert.equal(mesh.peers.has(peerId), true, label);
+    } finally {
+      mesh.destroy();
+    }
   }
 });
 
