@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Start PeerPigeon browser peers in containers, each container on its own
-# Docker network (its own bridge and NAT). Default: 50 peers across 10
-# networks, 5 per network, all in one PeerPigeon network/room.
+# Start PeerPigeon browser peers in containers on one Docker network, all in
+# one PeerPigeon network and room, and check that they form one partial mesh
+# and that broadcast and direct messages reach every peer.
+# Default: 10 containers x 5 peers = 50 peers.
 #
-#   docker/browser-peers/swarm.sh up      build the image if needed, start the swarm
-#   docker/browser-peers/swarm.sh status  each container's latest status line
+#   docker/browser-peers/swarm.sh up      build the image, start the swarm
+#   docker/browser-peers/swarm.sh status  the mesh: one group or several, links per peer
+#   docker/browser-peers/swarm.sh test    the mesh, then every peer broadcasts once
+#                                         and sends one direct message
 #   docker/browser-peers/swarm.sh logs N  follow container N's log
-#   docker/browser-peers/swarm.sh down    stop and remove the containers and networks
+#   docker/browser-peers/swarm.sh down    stop and remove the containers and the network
 #
 # Settings (environment):
-#   CONTAINERS=10           containers, each on its own Docker network
+#   CONTAINERS=10           containers, all on one Docker network
 #   PEERS_PER_CONTAINER=5   browser peers inside each container (one Chromium, one tab each)
 #   NETWORK=network:test    PeerPigeon network
 #   ROOM=room-vsmtj78m      PeerPigeon room
@@ -17,8 +20,6 @@
 #   MAX_PEERS=10            each peer's connection limit
 #   MB_PER_PEER=220         memory per browser tab, for the resource check
 #   MB_PER_CONTAINER=300    memory per container (Chromium itself + Node), for the check
-#   SEPARATE_ROOMS=1        put each container's peers in their own PeerPigeon
-#                           network instead (NETWORK-1, NETWORK-2, ...)
 #   FORCE=1                 skip the up-front estimate; start containers one at a
 #                           time and stop when the next one would not fit
 #   MAC_RESERVE_MB=4096     with FORCE=1: memory to keep free on the Mac for other things
@@ -38,6 +39,7 @@ MB_PER_PEER=${MB_PER_PEER:-220}
 MB_PER_CONTAINER=${MB_PER_CONTAINER:-300}
 MAC_RESERVE_MB=${MAC_RESERVE_MB:-4096}
 SETTLE_S=${SETTLE_S:-15}
+DOCKER_NET=${PREFIX}-net
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 need_docker() {
@@ -136,13 +138,15 @@ room_for_another() {
   return 0
 }
 
-# Wait until a container's peers have loaded (its first status report) or
-# SETTLE_S seconds pass, whichever is first.
+# Wait until a container's browser has loaded its peer pages (its first
+# status report, whatever the connection count) or SETTLE_S seconds pass.
+# Nothing here waits for peers to connect: the first container has nobody to
+# connect to.
 wait_for_peers() {
   local name=$1 waited=0
   while [ "$waited" -lt "$SETTLE_S" ]; do
-    if docker logs "$name" 2>&1 | grep -q 'connected '; then
-      echo "  ${name}'s peers are up (${waited}s)"
+    if docker logs "$name" 2>&1 | grep -qE '^\[browser-peers\] [0-9]{4}-'; then
+      echo "  ${name}'s browser is up (${waited}s)"
       return
     fi
     if [ "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)" != "running" ]; then
@@ -152,7 +156,7 @@ wait_for_peers() {
     sleep 1
     waited=$((waited + 1))
   done
-  echo "  ${name}'s peers haven't reported after ${SETTLE_S}s; measuring anyway"
+  echo "  ${name}'s browser hasn't loaded after ${SETTLE_S}s; measuring anyway"
 }
 
 up() {
@@ -164,10 +168,9 @@ up() {
   else
     check_resources
   fi
-  if ! docker image inspect "$IMAGE" >/dev/null 2>&1 || [ "${REBUILD:-0}" = "1" ]; then
-    echo "Building $IMAGE (first time takes a few minutes)..."
-    docker build -t "$IMAGE" -f "$REPO_ROOT/docker/browser-peers/Dockerfile" "$REPO_ROOT"
-  fi
+  echo "Building $IMAGE (the first build takes a few minutes; later ones are cached)..."
+  docker build -q -t "$IMAGE" -f "$REPO_ROOT/docker/browser-peers/Dockerfile" "$REPO_ROOT" >/dev/null
+  docker network inspect "$DOCKER_NET" >/dev/null 2>&1 || docker network create "$DOCKER_NET" >/dev/null
   local started=0
   for i in $(seq 1 "$CONTAINERS"); do
     if [ "${FORCE:-0}" = "1" ]; then
@@ -177,35 +180,54 @@ up() {
       room_for_another "$started" "$docker_mb" || break
     fi
     local name="${PREFIX}-${i}"
-    local pp_network="$NETWORK"
-    [ "${SEPARATE_ROOMS:-0}" = "1" ] && pp_network="${NETWORK}-${i}"
-    docker network inspect "${name}-net" >/dev/null 2>&1 || docker network create "${name}-net" >/dev/null
     docker rm -f "$name" >/dev/null 2>&1 || true
-    docker run -d --name "$name" --network "${name}-net" \
+    docker run -d --name "$name" --network "$DOCKER_NET" -e CONTAINER_NAME="$name" \
       --add-host host.docker.internal:host-gateway \
       --shm-size=1g \
-      -e PEERS="$PEERS_PER_CONTAINER" -e NETWORK="$pp_network" -e ROOM="$ROOM" \
+      -e PEERS="$PEERS_PER_CONTAINER" -e NETWORK="$NETWORK" -e ROOM="$ROOM" \
       -e SIGNALING_SERVER="$SIGNALING_SERVER" -e MAX_PEERS="$MAX_PEERS" \
       "$IMAGE" >/dev/null
-    echo "started $name on Docker network ${name}-net: ${PEERS_PER_CONTAINER} peers in ${pp_network} / ${ROOM}"
+    echo "started $name: ${PEERS_PER_CONTAINER} peers in ${NETWORK} / ${ROOM}"
     started=$((started + 1))
   done
   echo
   echo "Running ${started} container(s), $((started * PEERS_PER_CONTAINER)) peers."
   echo
-  echo "Watch them:  $0 status   (or: $0 logs 1)"
+  echo "Check the mesh:  $0 status"
+  echo "Test messages:   $0 test"
   echo "Stop them:   $0 down"
+}
+
+# Run check.mjs in a container on the swarm's network, where it can reach
+# every container's control endpoint by name.
+run_check() {
+  local mode=$1 count
+  count=$(docker ps -q --filter "name=^${PREFIX}-[0-9]+$" | wc -l | tr -d ' ')
+  if [ "$count" -eq 0 ]; then
+    echo "No swarm containers are running. Start them with: $0 up"
+    return
+  fi
+  local highest
+  highest=$(docker ps --filter "name=^${PREFIX}-[0-9]+$" --format '{{.Names}}' | sed "s/^${PREFIX}-//" | sort -n | tail -1)
+  docker run --rm --network "$DOCKER_NET" \
+    -e CONTAINERS="$highest" -e PREFIX="$PREFIX" -e MAX_PEERS="$MAX_PEERS" -e WAIT_S="${WAIT_S:-30}" \
+    "$IMAGE" node docker/browser-peers/check.mjs "$mode"
+  local used docker_mb
+  used=$(swarm_used_mb)
+  docker_mb=$(( $(docker info --format '{{.MemTotal}}') / 1024 / 1024 ))
+  echo "MEMORY  ${count} containers use ${used} MB of Docker's ${docker_mb} MB"
+  echo
 }
 
 status() {
   need_docker
-  for name in $(docker ps -a --filter "name=^${PREFIX}-[0-9]+$" --format '{{.Names}}' | sort -t- -k3 -n); do
-    local state line
-    state=$(docker inspect -f '{{.State.Status}}' "$name")
-    line=$(docker logs --tail 50 "$name" 2>&1 | grep -E 'connected|error|unavailable' | tail -n "$PEERS_PER_CONTAINER" | sed 's/^ *//' | paste -sd ';' -)
-    echo "$name [$state] ${line:-starting...}"
-  done
-  docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}' $(docker ps -q --filter "name=^${PREFIX}-") 2>/dev/null | sort -t- -k3 -n | sed 's/^/  /'
+  run_check status
+}
+
+test_messages() {
+  need_docker
+  echo "Testing: every peer broadcasts once, then sends one direct message (up to ${WAIT_S:-30}s each)..."
+  run_check test
 }
 
 logs() {
@@ -216,6 +238,8 @@ logs() {
 down() {
   need_docker
   docker rm -f $(docker ps -aq --filter "name=^${PREFIX}-[0-9]+$") >/dev/null 2>&1 || true
+  docker network rm "$DOCKER_NET" >/dev/null 2>&1 || true
+  # Networks from the earlier one-network-per-container version.
   docker network rm $(docker network ls -q --filter "name=^${PREFIX}-[0-9]+-net$") >/dev/null 2>&1 || true
   echo "swarm stopped and removed"
 }
@@ -223,7 +247,8 @@ down() {
 case "${1:-up}" in
   up) up ;;
   status) status ;;
+  test) test_messages ;;
   logs) logs "${2:-1}" ;;
   down) down ;;
-  *) echo "usage: $0 up|status|logs N|down" >&2; exit 2 ;;
+  *) echo "usage: $0 up|status|test|logs N|down" >&2; exit 2 ;;
 esac
