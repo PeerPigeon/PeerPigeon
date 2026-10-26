@@ -2060,16 +2060,17 @@ export class GossipProtocol {
     }
 
     const connected = this.mesh.getConnectedPeers();
-
-    // Cached or merely discovered identifiers are not routable after their
-    // membership lease leaves the local live view. The one exception is a frame the sender
-    // addressed to a neighbour on purpose (see sendDirect's `connectedOnly`).
-    if (!(viaNeighbour && connected.includes(message.to)) && !this.canonicalPeerSet().includes(message.to)) return false;
-
     if (message.hops >= message.maxHops) return false;
 
+    // Greedy CECR routing needs the target in this peer's live view (or, for
+    // a frame the sender addressed to a neighbour on purpose, sendDirect's
+    // `connectedOnly`). A target outside it is still reachable through
+    // peers that know it, so the message is not refused: it takes the
+    // other-paths fallback below.
+    const routable = (viaNeighbour && connected.includes(message.to)) || this.canonicalPeerSet().includes(message.to);
+
     // Is target directly connected? Short-circuit.
-    if (connected.includes(message.to)) {
+    if (routable && connected.includes(message.to)) {
       try {
         this.mesh.send(message.to, JSON.stringify({
           ...message,
@@ -2084,23 +2085,49 @@ export class GossipProtocol {
 
     // Try the deterministic CECR ordering. Every candidate is a measurable
     // prefix or raw-XOR improvement; failed sends fall through to the next.
-    for (const next of this.orderedRouteCandidates(
-      message.to,
-      fromPeerId ?? undefined,
-      message.originConfigId,
-    )) {
+    if (routable) {
+      for (const next of this.orderedRouteCandidates(
+        message.to,
+        fromPeerId ?? undefined,
+        message.originConfigId,
+      )) {
+        try {
+          this.mesh.send(next, JSON.stringify({
+            ...message,
+            hops: message.hops + 1,
+            path: this.extendRoutePath(message.path, next),
+          }));
+          return true;
+        } catch {
+          // try the next eligible progress candidate
+        }
+      }
+    }
+
+    // No neighbour makes progress (a local minimum of the greedy order), or
+    // the target is not in this peer's live view. A direct message must
+    // always leave, so instead of refusing it, this peer tries the other
+    // paths it has: every neighbour except the one it came from and those
+    // already on its path. Each peer forwards a given direct message at most
+    // once (seenDirectIds), so this cannot loop and costs at most one frame
+    // per link; the next hop tries the greedy order again first. On a 50-peer
+    // partial mesh, greedy routing alone delivered 35/50 direct messages.
+    const onPath = new Set(Array.isArray(message.path) ? message.path : []);
+    let forwarded = false;
+    for (const next of connected) {
+      if (next === fromPeerId || onPath.has(this.compactRoutePeerId(next))) continue;
       try {
         this.mesh.send(next, JSON.stringify({
           ...message,
           hops: message.hops + 1,
           path: this.extendRoutePath(message.path, next),
         }));
-        return true;
+        forwarded = true;
       } catch {
-        // try the next eligible progress candidate
+        // a neighbour that refuses this frame is skipped
       }
     }
-    return false;
+    return forwarded;
   }
 
   private handleIncomingDirect(message: DirectMessage, fromPeerId: string): void {

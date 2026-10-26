@@ -60,24 +60,29 @@ test('CECR gossip fan-out is min(connected degree, ceil(log2(live N)))', () => {
   }
 });
 
-test('CECR routing never forwards to a non-improving peer', () => {
+// A direct message always leaves: at a local minimum of the greedy order,
+// or for a target outside the live view, the peer tries its other paths
+// (every neighbour not already on the message's path) instead of refusing.
+// Each peer forwards a given message at most once, so this cannot loop.
+test('CECR routing at a local minimum tries the other neighbours instead of refusing', () => {
   const mesh = new CecrTestMesh(id('08'), [id('0f')], [id('00'), id('0f')]);
   const protocol = new GossipProtocol(mesh, { cecrRequireConsensus: false });
   try {
-    protocol.sendDirect(id('00'), 'no-loop');
-    assert.equal(mesh.frames.filter((frame) => frame.envelope.type === 'direct').length, 0);
+    assert.ok(protocol.sendDirect(id('00'), 'other-path'), 'the message left');
+    const directFrames = mesh.frames.filter((frame) => frame.envelope.type === 'direct');
+    assert.deepEqual(directFrames.map((frame) => frame.peerId), [id('0f')]);
   } finally {
     destroy(protocol);
   }
 });
 
-test('CECR routing stops when the target is not in the local live view', () => {
+test('CECR routing still sends a message whose target is not in the local live view', () => {
   const target = id('00');
   const mesh = new CecrTestMesh(id('08'), [target], []);
   const protocol = new GossipProtocol(mesh, { cecrRequireConsensus: false });
   try {
-    protocol.sendDirect(target, 'expired-target');
-    assert.equal(mesh.frames.filter((frame) => frame.envelope.type === 'direct').length, 0);
+    assert.ok(protocol.sendDirect(target, 'expired-target'), 'the message left');
+    assert.equal(mesh.frames.filter((frame) => frame.envelope.type === 'direct').length, 1);
   } finally {
     destroy(protocol);
   }

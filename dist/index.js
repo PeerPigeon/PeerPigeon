@@ -2303,9 +2303,9 @@ var _GossipProtocol = class _GossipProtocol {
       return true;
     }
     const connected = this.mesh.getConnectedPeers();
-    if (!(viaNeighbour && connected.includes(message.to)) && !this.canonicalPeerSet().includes(message.to)) return false;
     if (message.hops >= message.maxHops) return false;
-    if (connected.includes(message.to)) {
+    const routable = viaNeighbour && connected.includes(message.to) || this.canonicalPeerSet().includes(message.to);
+    if (routable && connected.includes(message.to)) {
       try {
         this.mesh.send(message.to, JSON.stringify({
           ...message,
@@ -2316,22 +2316,38 @@ var _GossipProtocol = class _GossipProtocol {
       } catch {
       }
     }
-    for (const next of this.orderedRouteCandidates(
-      message.to,
-      fromPeerId ?? void 0,
-      message.originConfigId
-    )) {
+    if (routable) {
+      for (const next of this.orderedRouteCandidates(
+        message.to,
+        fromPeerId ?? void 0,
+        message.originConfigId
+      )) {
+        try {
+          this.mesh.send(next, JSON.stringify({
+            ...message,
+            hops: message.hops + 1,
+            path: this.extendRoutePath(message.path, next)
+          }));
+          return true;
+        } catch {
+        }
+      }
+    }
+    const onPath = new Set(Array.isArray(message.path) ? message.path : []);
+    let forwarded = false;
+    for (const next of connected) {
+      if (next === fromPeerId || onPath.has(this.compactRoutePeerId(next))) continue;
       try {
         this.mesh.send(next, JSON.stringify({
           ...message,
           hops: message.hops + 1,
           path: this.extendRoutePath(message.path, next)
         }));
-        return true;
+        forwarded = true;
       } catch {
       }
     }
-    return false;
+    return forwarded;
   }
   handleIncomingDirect(message, fromPeerId) {
     if (this.seenDirectIds.has(message.id)) return;
