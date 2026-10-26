@@ -26,7 +26,7 @@ export type GossipProtocolOptions = {
   /** Maximum missing broadcasts requested or served per anti-entropy exchange. Default 64. */
   antiEntropyRequestSize?: number;
   /**
-   * Learn routes from broadcasts (CECR v1.2, Section 8.4): a broadcast that
+   * Learn routes from broadcasts (CECR v1.2, Section 8.5): a broadcast that
    * arrives proves the link it came over leads back to its sender, and a
    * small route ack sent back up the broadcast's path proves the forward
    * links. Direct messages try a fresh learned route before the greedy
@@ -426,7 +426,7 @@ export class GossipProtocol {
   private learnedRoutes: Map<string, { via: string; hops: number; at: number }> = new Map();
   // Per broadcast: the neighbour it first arrived from (where route acks go)
   // and the acks waiting to be sent there in one frame.
-  private routeAckParents: Map<string, { parent: string; at: number }> = new Map();
+  private routeAckParents: Map<string, { parent: string; at: number; forwarded: Set<string> }> = new Map();
   private pendingRouteAcks: Map<string, { parent: string; reached: Map<string, number>; timer: ReturnType<typeof setTimeout> | null }> = new Map();
   private deliveryStates: Map<string, GossipDeliveryState> = new Map();
   private aggregateStates: Map<string, GossipAggregateState> = new Map();
@@ -742,7 +742,7 @@ export class GossipProtocol {
     });
     const self = this.mesh.getClientId();
     if (this.learnRoutes && self && message.sender && message.sender !== self) {
-      this.routeAckParents.set(message.id, { parent: fromPeerId, at: receivedAt });
+      this.routeAckParents.set(message.id, { parent: fromPeerId, at: receivedAt, forwarded: new Set() });
       this.queueRouteAck(message.id, fromPeerId, this.compactRoutePeerId(self), 1);
     }
     if (this.messageLog.size > this.maxTrackedMessages) {
@@ -2127,7 +2127,7 @@ export class GossipProtocol {
       }
     }
 
-    // A learned route (Section 8.4): a recent frame from the target came in
+    // A learned route (Section 8.5): a recent frame from the target came in
     // over this link, so it is a proven path, tried before the greedy order.
     const onPathIds = new Set(Array.isArray(message.path) ? message.path : []);
     const learned = this.learnedRouteFor(message.to);
@@ -2289,7 +2289,10 @@ export class GossipProtocol {
       // leads to it in `hops` hops.
       this.learnCompactRoute(item[0], fromPeerId, hops, now);
       // Not the broadcast's sender: pass the ack on toward it, one hop more.
-      if (parent && parent.parent !== fromPeerId && now - parent.at < this.learnedRouteMaxAgeMs) {
+      // At most once per acked peer per broadcast, so acks cannot loop or repeat.
+      if (parent && parent.parent !== fromPeerId && now - parent.at < this.learnedRouteMaxAgeMs
+        && !parent.forwarded.has(item[0])) {
+        parent.forwarded.add(item[0]);
         this.queueRouteAck(message.id, parent.parent, item[0], hops + 1);
       }
     }

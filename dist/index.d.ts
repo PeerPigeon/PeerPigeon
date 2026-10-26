@@ -35,7 +35,7 @@ type GossipProtocolOptions = {
     /** Maximum missing broadcasts requested or served per anti-entropy exchange. Default 64. */
     antiEntropyRequestSize?: number;
     /**
-     * Learn routes from broadcasts (CECR v1.2, Section 8.4): a broadcast that
+     * Learn routes from broadcasts (CECR v1.2, Section 8.5): a broadcast that
      * arrives proves the link it came over leads back to its sender, and a
      * small route ack sent back up the broadcast's path proves the forward
      * links. Direct messages try a fresh learned route before the greedy

@@ -1287,7 +1287,7 @@ var _GossipProtocol = class _GossipProtocol {
     });
     const self = this.mesh.getClientId();
     if (this.learnRoutes && self && message.sender && message.sender !== self) {
-      this.routeAckParents.set(message.id, { parent: fromPeerId, at: receivedAt });
+      this.routeAckParents.set(message.id, { parent: fromPeerId, at: receivedAt, forwarded: /* @__PURE__ */ new Set() });
       this.queueRouteAck(message.id, fromPeerId, this.compactRoutePeerId(self), 1);
     }
     if (this.messageLog.size > this.maxTrackedMessages) {
@@ -2509,7 +2509,8 @@ var _GossipProtocol = class _GossipProtocol {
       if (!Array.isArray(item) || typeof item[0] !== "string" || !/^[0-9a-f]{40}$/.test(item[0])) continue;
       const hops = Math.max(1, Math.floor(Number(item[1]) || 1));
       this.learnCompactRoute(item[0], fromPeerId, hops, now);
-      if (parent && parent.parent !== fromPeerId && now - parent.at < this.learnedRouteMaxAgeMs) {
+      if (parent && parent.parent !== fromPeerId && now - parent.at < this.learnedRouteMaxAgeMs && !parent.forwarded.has(item[0])) {
+        parent.forwarded.add(item[0]);
         this.queueRouteAck(message.id, parent.parent, item[0], hops + 1);
       }
     }
