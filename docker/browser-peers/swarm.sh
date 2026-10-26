@@ -21,7 +21,7 @@
 #                           network instead (NETWORK-1, NETWORK-2, ...)
 #   FORCE=1                 skip the up-front estimate; start containers one at a
 #                           time and stop when the next one would not fit
-#   MAC_RESERVE_MB=6144     with FORCE=1: memory to keep free on the Mac for other things
+#   MAC_RESERVE_MB=4096     with FORCE=1: memory to keep free on the Mac for other things
 #   SETTLE_S=25             with FORCE=1: seconds to let a container's peers start
 #                           before measuring what it really uses
 set -euo pipefail
@@ -36,7 +36,7 @@ SIGNALING_SERVER=${SIGNALING_SERVER:-auto}
 MAX_PEERS=${MAX_PEERS:-10}
 MB_PER_PEER=${MB_PER_PEER:-220}
 MB_PER_CONTAINER=${MB_PER_CONTAINER:-300}
-MAC_RESERVE_MB=${MAC_RESERVE_MB:-6144}
+MAC_RESERVE_MB=${MAC_RESERVE_MB:-4096}
 SETTLE_S=${SETTLE_S:-25}
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
@@ -47,11 +47,21 @@ need_docker() {
   fi
 }
 
-# Memory macOS could hand out now: free, inactive, speculative and purgeable pages.
+# Memory macOS could hand out now, as macOS itself counts it: the
+# "System-wide memory free percentage" behind Activity Monitor's memory
+# pressure, which includes cache it frees on demand. (Counting only free and
+# inactive pages said 4.4 GB on a 24 GB Mac that had far more to give.)
 mac_available_mb() {
+  local total_mb pct
+  total_mb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 ))
+  pct=$(memory_pressure -Q 2>/dev/null | awk -F: '/free percentage/ { gsub(/[ %]/, "", $2); print $2 }')
+  if [ -n "$pct" ] && [ "$total_mb" -gt 0 ]; then
+    echo $((total_mb * pct / 100))
+    return
+  fi
   vm_stat 2>/dev/null | awk '
     /page size of/ { size = $8 }
-    /Pages free/ || /Pages inactive/ || /Pages speculative/ || /Pages purgeable/ { gsub(/\./, "", $NF); pages += $NF }
+    /Pages free/ || /Pages inactive/ || /Pages speculative/ || /Pages purgeable/ || /File-backed pages/ { gsub(/\./, "", $NF); pages += $NF }
     END { if (size) printf "%d", pages * size / 1048576; else print 0 }'
 }
 
