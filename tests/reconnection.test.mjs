@@ -334,7 +334,9 @@ test('an exhausted FreeRTC offer releases its pending slot and refreshes discove
   assert.equal(connection.closeCalls, 1);
   assert.equal(channel.closeCalls, 1);
   assert.equal(reannouncements, 1);
-  assert.equal(discoveryRequests, 2);
+  // One discover: the re-announce carries it. A second in the same instant
+  // added nothing and doubled the relay traffic of every failed link.
+  assert.equal(discoveryRequests, 1);
   assert.deepEqual(disconnected, [peerId]);
   assert.deepEqual(failures, [{ peerId, reason: 'offer_retries_exhausted' }]);
   assert.ok(logs.some((message) => message.includes('offer_retries_exhausted')));
@@ -372,7 +374,9 @@ test('an exhausted offer still releases PartialMesh after FreeRTC already remove
 
   assert.deepEqual(disconnected, [peerId]);
   assert.equal(reannouncements, 1);
-  assert.equal(discoveryRequests, 2);
+  // One discover: the re-announce carries it. A second in the same instant
+  // added nothing and doubled the relay traffic of every failed link.
+  assert.equal(discoveryRequests, 1);
 });
 
 test('closing a pending transport emits disconnected even before its channel opens', () => {

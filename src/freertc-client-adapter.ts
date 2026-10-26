@@ -30,6 +30,19 @@ export const HEALTH_PROBE_MISSES_BEFORE_RECYCLE = 3;
 // penalty on both ends). Give the transport this long to recover before the
 // edge is released.
 const TRANSIENT_DISCONNECT_GRACE_MS = 3_000;
+// Every dial and every failed or closed link nudged signaling (an announce and
+// a discover) with no limit, and a failed link added a second discover. Peers
+// whose links never formed sent ~32 discovers and ~18 announces a minute each,
+// over 20x a healthy peer, and 50 of them used a public relay's whole daily
+// request limit in an hour. Those nudges now draw on a small budget: a burst
+// of NUDGE_BURST goes out at once, as before, then one per interval, and the
+// interval doubles with each failed link (to the max) until a channel opens.
+// A nudge over budget is not lost: one trailing nudge covers all of them.
+// Explicit recovery (connect, resume, the recovery probe) is not budgeted; it
+// has its own timing.
+const NUDGE_BURST = 4;
+const NUDGE_MIN_INTERVAL_MS = 2_000;
+const NUDGE_MAX_INTERVAL_MS = 60_000;
 export const INITIAL_SIGNALING_HEALTH_DELAY_MS = 1_000;
 export const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
 // The health check proves the relay is listening by asking it who else is in
@@ -101,6 +114,10 @@ export class FreeRTCClientAdapter {
   private readonly transientDisconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly observedDataChannels = new WeakSet<object>();
   private client: any = null;
+  private nudgeTokens = NUDGE_BURST;
+  private nudgeRefilledAtMs = Date.now();
+  private nudgeIntervalMs = NUDGE_MIN_INTERVAL_MS;
+  private nudgeTimer: ReturnType<typeof setTimeout> | null = null;
   private joinedOnce = false;
   private intentionallyDisconnected = false;
   private signalingConnected = false;
@@ -242,7 +259,7 @@ export class FreeRTCClientAdapter {
     if (this.client) {
       if (this.client.isRegistered || this.client.relayIdle === true) {
         this.emitConnectedIfNeeded();
-        this.nudgeSignaling();
+        this.nudgeSignaling(true);
         return;
       }
       this.ensureRegistrationRecoveryProbe('connect');
@@ -355,6 +372,10 @@ export class FreeRTCClientAdapter {
     this.stopSignalingHealthLoop();
     this.clientGeneration += 1;
     this.clearDisconnectGraceTimers();
+    if (this.nudgeTimer) {
+      clearTimeout(this.nudgeTimer);
+      this.nudgeTimer = null;
+    }
     for (const handle of this.previousIdentityWithdrawalHandles) {
       try { handle.close(); } catch { /* best effort */ }
     }
@@ -417,7 +438,24 @@ export class FreeRTCClientAdapter {
     }
   }
 
-  nudgeSignaling(): void {
+  /** Re-announce and refresh discovery. `force` skips the budget, for explicit recovery. */
+  nudgeSignaling(force = false): void {
+    const now = Date.now();
+    this.nudgeTokens = Math.min(NUDGE_BURST, this.nudgeTokens + (now - this.nudgeRefilledAtMs) / this.nudgeIntervalMs);
+    this.nudgeRefilledAtMs = now;
+    if (!force) {
+      if (this.nudgeTokens < 1) {
+        if (!this.nudgeTimer) {
+          const wait = Math.ceil((1 - this.nudgeTokens) * this.nudgeIntervalMs);
+          this.nudgeTimer = setTimeout(() => {
+            this.nudgeTimer = null;
+            if (!this.intentionallyDisconnected) this.nudgeSignaling();
+          }, wait);
+        }
+        return;
+      }
+      this.nudgeTokens -= 1;
+    }
     this.client?.advertise?.({});
     this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
@@ -468,7 +506,7 @@ export class FreeRTCClientAdapter {
 
     this.emitter.emit('signaling:log', { message: `[signal] ${reason} recovery: refreshing discovery` });
     this.startRecoveryProbe(reason, true);
-    this.nudgeSignaling();
+    this.nudgeSignaling(true);
     return true;
   }
 
@@ -741,6 +779,7 @@ export class FreeRTCClientAdapter {
     this.observeDataChannel(peerId, channel);
     if (this.connectedPeers.has(peerId)) return;
     this.connectedPeers.add(peerId);
+    this.nudgeIntervalMs = NUDGE_MIN_INTERVAL_MS;
     this.emitter.emit('rtc:connected', { peerId });
   }
 
@@ -773,9 +812,11 @@ export class FreeRTCClientAdapter {
     this.emitter.emit('signaling:log', {
       message: `[webrtc] stale transport to ${peerId} released immediately (${origin || 'unspecified'}${reason ? `: ${reason}` : ''}); redialing`,
     });
+    // Each failed link backs nudging off further; the nudge's own discover
+    // replaces the extra one this used to send.
+    this.nudgeIntervalMs = Math.min(this.nudgeIntervalMs * 2, NUDGE_MAX_INTERVAL_MS);
     this.nudgeSignaling();
     this.emitter.emit('rtc:disconnected', reason ? { peerId, reason } : { peerId });
-    this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
 
   private waitForOpenDataChannel(peerId: string): void {
@@ -822,7 +863,7 @@ export class FreeRTCClientAdapter {
           this.emitter.emit('signaling:log', {
             message: `[signal] ${reason}: discovery slow (${this.healthProbeMisses}/${HEALTH_PROBE_MISSES_BEFORE_RECYCLE}); staying on this relay and re-announcing`,
           });
-          this.nudgeSignaling();
+          this.nudgeSignaling(true);
           return;
         }
         this.healthProbeMisses = 0;
@@ -832,7 +873,7 @@ export class FreeRTCClientAdapter {
       this.emitter.emit('signaling:log', {
         message: `[signal] ${reason}: discovery stale; re-announcing without replacing FreeRTC`,
       });
-      this.nudgeSignaling();
+      this.nudgeSignaling(true);
     }, RECOVERY_PROBE_TIMEOUT_MS);
   }
 
@@ -966,7 +1007,7 @@ export class FreeRTCClientAdapter {
       this.emitter.emit('signaling:log', {
         message: `[signal] ${reason}: relay acknowledgement missing; preserving healthy peer channels and refreshing discovery`,
       });
-      this.nudgeSignaling();
+      this.nudgeSignaling(true);
       return;
     }
 
