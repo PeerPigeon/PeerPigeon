@@ -19,7 +19,11 @@
 #   MB_PER_CONTAINER=300    memory per container (Chromium itself + Node), for the check
 #   SEPARATE_ROOMS=1        put each container's peers in their own PeerPigeon
 #                           network instead (NETWORK-1, NETWORK-2, ...)
-#   FORCE=1                 start even if the resource check says no
+#   FORCE=1                 skip the up-front estimate; start containers one at a
+#                           time and stop when the next one would not fit
+#   MAC_RESERVE_MB=6144     with FORCE=1: memory to keep free on the Mac for other things
+#   SETTLE_S=25             with FORCE=1: seconds to let a container's peers start
+#                           before measuring what it really uses
 set -euo pipefail
 
 IMAGE=peerpigeon-browser-peers
@@ -32,6 +36,8 @@ SIGNALING_SERVER=${SIGNALING_SERVER:-auto}
 MAX_PEERS=${MAX_PEERS:-10}
 MB_PER_PEER=${MB_PER_PEER:-220}
 MB_PER_CONTAINER=${MB_PER_CONTAINER:-300}
+MAC_RESERVE_MB=${MAC_RESERVE_MB:-6144}
+SETTLE_S=${SETTLE_S:-25}
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 need_docker() {
@@ -80,14 +86,63 @@ check_resources() {
   fi
 }
 
+# Memory the running swarm containers use now, in MB.
+swarm_used_mb() {
+  local ids
+  ids=$(docker ps -q --filter "name=^${PREFIX}-[0-9]+$")
+  [ -z "$ids" ] && { echo 0; return; }
+  # shellcheck disable=SC2086
+  docker stats --no-stream --format '{{.MemUsage}}' $ids | awk '
+    { v = $1; n = v + 0; u = v; sub(/^[0-9.]+/, "", u)
+      if (u == "GiB") n *= 1024; else if (u == "KiB") n /= 1024; else if (u == "B") n /= 1048576
+      total += n }
+    END { printf "%d", total }'
+}
+
+# With FORCE=1: may one more container start? Uses what the running ones
+# really use, keeping Docker under 90% and MAC_RESERVE_MB free on the Mac.
+room_for_another() {
+  local started=$1 docker_mb=$2
+  local used per docker_left mac_left
+  used=$(swarm_used_mb)
+  per=$(( started > 0 ? used / started : PEERS_PER_CONTAINER * MB_PER_PEER + MB_PER_CONTAINER ))
+  [ "$per" -lt 100 ] && per=$((PEERS_PER_CONTAINER * MB_PER_PEER + MB_PER_CONTAINER))
+  docker_left=$(( docker_mb * 90 / 100 - used ))
+  mac_left=$(mac_available_mb)
+  echo "  swarm uses ${used} MB (${per} MB per container); Docker has ${docker_left} MB to spare, the Mac ${mac_left} MB available"
+  if [ "$per" -gt "$docker_left" ]; then
+    echo "  stopping: another container (~${per} MB) would push Docker past 90% of its ${docker_mb} MB"
+    return 1
+  fi
+  if [ "$mac_left" -gt 0 ] && [ $((mac_left - per)) -lt "$MAC_RESERVE_MB" ]; then
+    echo "  stopping: another container would leave the Mac less than ${MAC_RESERVE_MB} MB free"
+    return 1
+  fi
+  return 0
+}
+
 up() {
   need_docker
-  check_resources
+  local docker_mb
+  docker_mb=$(( $(docker info --format '{{.MemTotal}}') / 1024 / 1024 ))
+  if [ "${FORCE:-0}" = "1" ]; then
+    echo "FORCE=1: starting up to ${CONTAINERS} containers of ${PEERS_PER_CONTAINER} peers one at a time, while Docker (${docker_mb} MB) has room and the Mac keeps ${MAC_RESERVE_MB} MB free"
+  else
+    check_resources
+  fi
   if ! docker image inspect "$IMAGE" >/dev/null 2>&1 || [ "${REBUILD:-0}" = "1" ]; then
     echo "Building $IMAGE (first time takes a few minutes)..."
     docker build -t "$IMAGE" -f "$REPO_ROOT/docker/browser-peers/Dockerfile" "$REPO_ROOT"
   fi
+  local started=0
   for i in $(seq 1 "$CONTAINERS"); do
+    if [ "${FORCE:-0}" = "1" ]; then
+      if [ "$started" -gt 0 ]; then
+        echo "  letting ${PREFIX}-$((i - 1)) settle for ${SETTLE_S}s..."
+        sleep "$SETTLE_S"
+      fi
+      room_for_another "$started" "$docker_mb" || break
+    fi
     local name="${PREFIX}-${i}"
     local pp_network="$NETWORK"
     [ "${SEPARATE_ROOMS:-0}" = "1" ] && pp_network="${NETWORK}-${i}"
@@ -100,7 +155,10 @@ up() {
       -e SIGNALING_SERVER="$SIGNALING_SERVER" -e MAX_PEERS="$MAX_PEERS" \
       "$IMAGE" >/dev/null
     echo "started $name on Docker network ${name}-net: ${PEERS_PER_CONTAINER} peers in ${pp_network} / ${ROOM}"
+    started=$((started + 1))
   done
+  echo
+  echo "Running ${started} container(s), $((started * PEERS_PER_CONTAINER)) peers."
   echo
   echo "Watch them:  $0 status   (or: $0 logs 1)"
   echo "Stop them:   $0 down"
