@@ -16,7 +16,12 @@
 #   PEERS_PER_CONTAINER=5   browser peers inside each container (one Chromium, one tab each)
 #   NETWORK=network:test    PeerPigeon network
 #   ROOM=room-vsmtj78m      PeerPigeon room
-#   SIGNALING_SERVER=auto   or wss://decentralize.ooo/ws, or ws://host.docker.internal:8788/ws
+#   SIGNALING_SERVER=ws://host.docker.internal:8788/ws
+#                           the local freertc relay on this Mac (start it first:
+#                           cd ~/GitPigeon/freertc-local && FREERTC_FEDERATION=off node scripts/node-relay.mjs).
+#                           auto or a public relay (wss://decentralize.ooo/ws) needs
+#                           PUBLIC_RELAYS=1: 50 peers once used a public relay's whole
+#                           daily request limit in an hour.
 #   MAX_PEERS=10            each peer's connection limit
 #   MB_PER_PEER=220         memory per browser tab, for the resource check
 #   MB_PER_CONTAINER=300    memory per container (Chromium itself + Node), for the check
@@ -33,7 +38,8 @@ CONTAINERS=${CONTAINERS:-10}
 PEERS_PER_CONTAINER=${PEERS_PER_CONTAINER:-5}
 NETWORK=${NETWORK:-network:test}
 ROOM=${ROOM:-room-vsmtj78m}
-SIGNALING_SERVER=${SIGNALING_SERVER:-auto}
+SIGNALING_SERVER=${SIGNALING_SERVER:-ws://host.docker.internal:8788/ws}
+LOCAL_RELAY_HEALTH=${LOCAL_RELAY_HEALTH:-http://127.0.0.1:8788/health}
 MAX_PEERS=${MAX_PEERS:-10}
 MB_PER_PEER=${MB_PER_PEER:-220}
 MB_PER_CONTAINER=${MB_PER_CONTAINER:-300}
@@ -159,8 +165,29 @@ wait_for_peers() {
   echo "  ${name}'s browser hasn't loaded after ${SETTLE_S}s; measuring anyway"
 }
 
+# The swarm runs against the local relay unless public relays are asked for.
+check_signaling() {
+  case "$SIGNALING_SERVER" in
+    *host.docker.internal*|*127.0.0.1*|*localhost*)
+      if ! curl -s -m 3 -o /dev/null "$LOCAL_RELAY_HEALTH"; then
+        echo "The local relay isn't running ($LOCAL_RELAY_HEALTH doesn't answer). Start it in another terminal:" >&2
+        echo "  cd ~/GitPigeon/freertc-local && FREERTC_FEDERATION=off node scripts/node-relay.mjs" >&2
+        exit 1
+      fi
+      echo "Signaling: local relay ${SIGNALING_SERVER}" ;;
+    *)
+      if [ "${PUBLIC_RELAYS:-0}" != "1" ]; then
+        echo "SIGNALING_SERVER=${SIGNALING_SERVER} is a public relay. $((CONTAINERS * PEERS_PER_CONTAINER)) peers there count against its daily request limit" >&2
+        echo "(50 peers used the free plan's whole 100,000 in an hour). Set PUBLIC_RELAYS=1 to do it anyway." >&2
+        exit 1
+      fi
+      echo "Signaling: PUBLIC relay ${SIGNALING_SERVER} (PUBLIC_RELAYS=1)" ;;
+  esac
+}
+
 up() {
   need_docker
+  check_signaling
   local docker_mb
   docker_mb=$(( $(docker info --format '{{.MemTotal}}') / 1024 / 1024 ))
   if [ "${FORCE:-0}" = "1" ]; then
