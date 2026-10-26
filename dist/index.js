@@ -3,6 +3,9 @@ import { createSignalingClient, withdrawSignalingIdentity } from "freertc/client
 var RECOVERY_PROBE_TIMEOUT_MS = 12e3;
 var HEALTH_PROBE_MISSES_BEFORE_RECYCLE = 3;
 var TRANSIENT_DISCONNECT_GRACE_MS = 3e3;
+var NUDGE_BURST = 4;
+var NUDGE_MIN_INTERVAL_MS = 2e3;
+var NUDGE_MAX_INTERVAL_MS = 6e4;
 var INITIAL_SIGNALING_HEALTH_DELAY_MS = 1e3;
 var SIGNALING_HEALTH_INTERVAL_MS = 15e3;
 var SIGNALING_HEALTH_MAX_INTERVAL_MS = 5 * 6e4;
@@ -48,6 +51,10 @@ var FreeRTCClientAdapter = class {
     this.transientDisconnectTimers = /* @__PURE__ */ new Map();
     this.observedDataChannels = /* @__PURE__ */ new WeakSet();
     this.client = null;
+    this.nudgeTokens = NUDGE_BURST;
+    this.nudgeRefilledAtMs = Date.now();
+    this.nudgeIntervalMs = NUDGE_MIN_INTERVAL_MS;
+    this.nudgeTimer = null;
     this.joinedOnce = false;
     this.intentionallyDisconnected = false;
     this.signalingConnected = false;
@@ -157,7 +164,7 @@ var FreeRTCClientAdapter = class {
     if (this.client) {
       if (this.client.isRegistered || this.client.relayIdle === true) {
         this.emitConnectedIfNeeded();
-        this.nudgeSignaling();
+        this.nudgeSignaling(true);
         return;
       }
       this.ensureRegistrationRecoveryProbe("connect");
@@ -263,6 +270,10 @@ var FreeRTCClientAdapter = class {
     this.stopSignalingHealthLoop();
     this.clientGeneration += 1;
     this.clearDisconnectGraceTimers();
+    if (this.nudgeTimer) {
+      clearTimeout(this.nudgeTimer);
+      this.nudgeTimer = null;
+    }
     for (const handle of this.previousIdentityWithdrawalHandles) {
       try {
         handle.close();
@@ -323,7 +334,24 @@ var FreeRTCClientAdapter = class {
       return false;
     }
   }
-  nudgeSignaling() {
+  /** Re-announce and refresh discovery. `force` skips the budget, for explicit recovery. */
+  nudgeSignaling(force = false) {
+    const now = Date.now();
+    this.nudgeTokens = Math.min(NUDGE_BURST, this.nudgeTokens + (now - this.nudgeRefilledAtMs) / this.nudgeIntervalMs);
+    this.nudgeRefilledAtMs = now;
+    if (!force) {
+      if (this.nudgeTokens < 1) {
+        if (!this.nudgeTimer) {
+          const wait = Math.ceil((1 - this.nudgeTokens) * this.nudgeIntervalMs);
+          this.nudgeTimer = setTimeout(() => {
+            this.nudgeTimer = null;
+            if (!this.intentionallyDisconnected) this.nudgeSignaling();
+          }, wait);
+        }
+        return;
+      }
+      this.nudgeTokens -= 1;
+    }
     this.client?.advertise?.({});
     this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
@@ -363,7 +391,7 @@ var FreeRTCClientAdapter = class {
     }
     this.emitter.emit("signaling:log", { message: `[signal] ${reason} recovery: refreshing discovery` });
     this.startRecoveryProbe(reason, true);
-    this.nudgeSignaling();
+    this.nudgeSignaling(true);
     return true;
   }
   closeConnection(peerId, reason = "local_close") {
@@ -581,6 +609,7 @@ var FreeRTCClientAdapter = class {
     this.observeDataChannel(peerId, channel);
     if (this.connectedPeers.has(peerId)) return;
     this.connectedPeers.add(peerId);
+    this.nudgeIntervalMs = NUDGE_MIN_INTERVAL_MS;
     this.emitter.emit("rtc:connected", { peerId });
   }
   // A refusal on a transport that is still connecting, or whose channel is
@@ -615,9 +644,9 @@ var FreeRTCClientAdapter = class {
     this.emitter.emit("signaling:log", {
       message: `[webrtc] stale transport to ${peerId} released immediately (${origin || "unspecified"}${reason ? `: ${reason}` : ""}); redialing`
     });
+    this.nudgeIntervalMs = Math.min(this.nudgeIntervalMs * 2, NUDGE_MAX_INTERVAL_MS);
     this.nudgeSignaling();
     this.emitter.emit("rtc:disconnected", reason ? { peerId, reason } : { peerId });
-    this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
   waitForOpenDataChannel(peerId) {
     if (this.connectedPeers.has(peerId)) return;
@@ -656,7 +685,7 @@ var FreeRTCClientAdapter = class {
           this.emitter.emit("signaling:log", {
             message: `[signal] ${reason}: discovery slow (${this.healthProbeMisses}/${HEALTH_PROBE_MISSES_BEFORE_RECYCLE}); staying on this relay and re-announcing`
           });
-          this.nudgeSignaling();
+          this.nudgeSignaling(true);
           return;
         }
         this.healthProbeMisses = 0;
@@ -666,7 +695,7 @@ var FreeRTCClientAdapter = class {
       this.emitter.emit("signaling:log", {
         message: `[signal] ${reason}: discovery stale; re-announcing without replacing FreeRTC`
       });
-      this.nudgeSignaling();
+      this.nudgeSignaling(true);
     }, RECOVERY_PROBE_TIMEOUT_MS);
   }
   /**
@@ -780,7 +809,7 @@ var FreeRTCClientAdapter = class {
       this.emitter.emit("signaling:log", {
         message: `[signal] ${reason}: relay acknowledgement missing; preserving healthy peer channels and refreshing discovery`
       });
-      this.nudgeSignaling();
+      this.nudgeSignaling(true);
       return;
     }
     this.waitingForTransportClose = true;
