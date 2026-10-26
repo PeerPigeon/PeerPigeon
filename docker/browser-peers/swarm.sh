@@ -22,8 +22,8 @@
 #   FORCE=1                 skip the up-front estimate; start containers one at a
 #                           time and stop when the next one would not fit
 #   MAC_RESERVE_MB=4096     with FORCE=1: memory to keep free on the Mac for other things
-#   SETTLE_S=25             with FORCE=1: seconds to let a container's peers start
-#                           before measuring what it really uses
+#   SETTLE_S=15             with FORCE=1: longest wait for a container's peers to
+#                           load before measuring it (it moves on as soon as they report)
 set -euo pipefail
 
 IMAGE=peerpigeon-browser-peers
@@ -37,7 +37,7 @@ MAX_PEERS=${MAX_PEERS:-10}
 MB_PER_PEER=${MB_PER_PEER:-220}
 MB_PER_CONTAINER=${MB_PER_CONTAINER:-300}
 MAC_RESERVE_MB=${MAC_RESERVE_MB:-4096}
-SETTLE_S=${SETTLE_S:-25}
+SETTLE_S=${SETTLE_S:-15}
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 need_docker() {
@@ -54,7 +54,7 @@ need_docker() {
 mac_available_mb() {
   local total_mb pct
   total_mb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 ))
-  pct=$(memory_pressure -Q 2>/dev/null | awk -F: '/free percentage/ { gsub(/[ %]/, "", $2); print $2 }')
+  pct=$(memory_pressure 2>/dev/null | awk -F: '/free percentage/ { gsub(/[ %]/, "", $2); print $2 }')
   if [ -n "$pct" ] && [ "$total_mb" -gt 0 ]; then
     echo $((total_mb * pct / 100))
     return
@@ -136,6 +136,25 @@ room_for_another() {
   return 0
 }
 
+# Wait until a container's peers have loaded (its first status report) or
+# SETTLE_S seconds pass, whichever is first.
+wait_for_peers() {
+  local name=$1 waited=0
+  while [ "$waited" -lt "$SETTLE_S" ]; do
+    if docker logs "$name" 2>&1 | grep -q 'connected '; then
+      echo "  ${name}'s peers are up (${waited}s)"
+      return
+    fi
+    if [ "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)" != "running" ]; then
+      echo "  ${name} stopped: $(docker logs --tail 3 "$name" 2>&1 | tr '\n' ' ')"
+      return
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "  ${name}'s peers haven't reported after ${SETTLE_S}s; measuring anyway"
+}
+
 up() {
   need_docker
   local docker_mb
@@ -153,8 +172,7 @@ up() {
   for i in $(seq 1 "$CONTAINERS"); do
     if [ "${FORCE:-0}" = "1" ]; then
       if [ "$started" -gt 0 ]; then
-        echo "  letting ${PREFIX}-$((i - 1)) settle for ${SETTLE_S}s..."
-        sleep "$SETTLE_S"
+        wait_for_peers "${PREFIX}-$((i - 1))"
       fi
       room_for_another "$started" "$docker_mb" || break
     fi
