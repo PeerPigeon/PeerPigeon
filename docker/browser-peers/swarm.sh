@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Start PeerPigeon browser peers in containers, each container on its own
-# Docker network (its own bridge and NAT), all in one PeerPigeon network/room.
+# Docker network (its own bridge and NAT). Default: 50 peers across 10
+# networks, 5 per network, all in one PeerPigeon network/room.
 #
 #   docker/browser-peers/swarm.sh up      build the image if needed, start the swarm
 #   docker/browser-peers/swarm.sh status  each container's latest status line
@@ -9,24 +10,28 @@
 #
 # Settings (environment):
 #   CONTAINERS=10           containers, each on its own Docker network
-#   PEERS_PER_CONTAINER=1   browser peers inside each container
+#   PEERS_PER_CONTAINER=5   browser peers inside each container (one Chromium, one tab each)
 #   NETWORK=network:test    PeerPigeon network
 #   ROOM=room-vsmtj78m      PeerPigeon room
 #   SIGNALING_SERVER=auto   or wss://decentralize.ooo/ws, or ws://host.docker.internal:8788/ws
 #   MAX_PEERS=10            each peer's connection limit
-#   MB_PER_PEER=350         memory budget per browser peer, for the resource check
+#   MB_PER_PEER=220         memory per browser tab, for the resource check
+#   MB_PER_CONTAINER=300    memory per container (Chromium itself + Node), for the check
+#   SEPARATE_ROOMS=1        put each container's peers in their own PeerPigeon
+#                           network instead (NETWORK-1, NETWORK-2, ...)
 #   FORCE=1                 start even if the resource check says no
 set -euo pipefail
 
 IMAGE=peerpigeon-browser-peers
 PREFIX=pp-swarm
 CONTAINERS=${CONTAINERS:-10}
-PEERS_PER_CONTAINER=${PEERS_PER_CONTAINER:-1}
+PEERS_PER_CONTAINER=${PEERS_PER_CONTAINER:-5}
 NETWORK=${NETWORK:-network:test}
 ROOM=${ROOM:-room-vsmtj78m}
 SIGNALING_SERVER=${SIGNALING_SERVER:-auto}
 MAX_PEERS=${MAX_PEERS:-10}
-MB_PER_PEER=${MB_PER_PEER:-350}
+MB_PER_PEER=${MB_PER_PEER:-220}
+MB_PER_CONTAINER=${MB_PER_CONTAINER:-300}
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 need_docker() {
@@ -38,7 +43,7 @@ need_docker() {
 
 check_resources() {
   local total_peers=$((CONTAINERS * PEERS_PER_CONTAINER))
-  local need_mb=$((total_peers * MB_PER_PEER + CONTAINERS * 60))
+  local need_mb=$((total_peers * MB_PER_PEER + CONTAINERS * MB_PER_CONTAINER))
   local docker_mb=$(( $(docker info --format '{{.MemTotal}}') / 1024 / 1024 ))
   local docker_cpus
   docker_cpus=$(docker info --format '{{.NCPU}}')
@@ -46,9 +51,9 @@ check_resources() {
   echo "Swarm: ${CONTAINERS} containers x ${PEERS_PER_CONTAINER} peer(s) = ${total_peers} browser peers"
   echo "Needs about ${need_mb} MB. Docker has ${docker_mb} MB and ${docker_cpus} CPUs (this Mac has ${mac_mb} MB)."
   if [ "$need_mb" -gt $((docker_mb * 85 / 100)) ] && [ "${FORCE:-0}" != "1" ]; then
-    local fits=$(( (docker_mb * 85 / 100) / (MB_PER_PEER + 60 / PEERS_PER_CONTAINER) ))
-    echo "That's more than 85% of Docker's memory. About ${fits} peers fit." >&2
-    echo "Lower CONTAINERS, give Docker more memory (Docker Desktop > Settings > Resources), or set FORCE=1." >&2
+    local fits=$(( (docker_mb * 85 / 100) / (MB_PER_PEER + MB_PER_CONTAINER / PEERS_PER_CONTAINER) ))
+    echo "That's more than 85% of Docker's memory. About ${fits} peers fit at ${PEERS_PER_CONTAINER} per container." >&2
+    echo "Lower CONTAINERS or PEERS_PER_CONTAINER, give Docker more memory (Docker Desktop > Settings > Resources), or set FORCE=1." >&2
     exit 1
   fi
   if [ "$total_peers" -gt $((docker_cpus * 4)) ]; then
@@ -65,15 +70,17 @@ up() {
   fi
   for i in $(seq 1 "$CONTAINERS"); do
     local name="${PREFIX}-${i}"
+    local pp_network="$NETWORK"
+    [ "${SEPARATE_ROOMS:-0}" = "1" ] && pp_network="${NETWORK}-${i}"
     docker network inspect "${name}-net" >/dev/null 2>&1 || docker network create "${name}-net" >/dev/null
     docker rm -f "$name" >/dev/null 2>&1 || true
     docker run -d --name "$name" --network "${name}-net" \
       --add-host host.docker.internal:host-gateway \
-      --shm-size=512m \
-      -e PEERS="$PEERS_PER_CONTAINER" -e NETWORK="$NETWORK" -e ROOM="$ROOM" \
+      --shm-size=1g \
+      -e PEERS="$PEERS_PER_CONTAINER" -e NETWORK="$pp_network" -e ROOM="$ROOM" \
       -e SIGNALING_SERVER="$SIGNALING_SERVER" -e MAX_PEERS="$MAX_PEERS" \
       "$IMAGE" >/dev/null
-    echo "started $name on network ${name}-net"
+    echo "started $name on Docker network ${name}-net: ${PEERS_PER_CONTAINER} peers in ${pp_network} / ${ROOM}"
   done
   echo
   echo "Watch them:  $0 status   (or: $0 logs 1)"
