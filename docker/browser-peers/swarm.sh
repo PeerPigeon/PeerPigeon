@@ -76,7 +76,9 @@ check_resources() {
     if [ "$mac_free_mb" -gt 0 ] && [ $((want_gb * 1024)) -le $((docker_mb + mac_free_mb)) ]; then
       echo "This Mac has room: set Docker Desktop > Settings > Resources > Memory limit to ${want_gb} GB, Apply & restart, then run this again." >&2
     else
-      echo "The Mac doesn't have ${want_gb} GB free for Docker right now. Close apps, or run fewer peers, e.g. CONTAINERS=$(( fits / PEERS_PER_CONTAINER > 0 ? fits / PEERS_PER_CONTAINER : 1 ))." >&2
+      local fit_containers=$((fits / PEERS_PER_CONTAINER))
+      if [ "$fit_containers" -lt 1 ]; then fit_containers=1; fi
+      echo "The Mac doesn't have ${want_gb} GB free for Docker right now. Close apps, or run fewer peers, e.g. CONTAINERS=${fit_containers}." >&2
     fi
     echo "Or set FORCE=1 to start anyway (peers may be killed when Docker runs out)." >&2
     exit 1
@@ -105,8 +107,11 @@ room_for_another() {
   local started=$1 docker_mb=$2
   local used per docker_left mac_left
   used=$(swarm_used_mb)
-  per=$(( started > 0 ? used / started : PEERS_PER_CONTAINER * MB_PER_PEER + MB_PER_CONTAINER ))
-  [ "$per" -lt 100 ] && per=$((PEERS_PER_CONTAINER * MB_PER_PEER + MB_PER_CONTAINER))
+  # (No ?: here: macOS's bash 3.2 evaluates both branches, and used / 0 fails.)
+  per=$((PEERS_PER_CONTAINER * MB_PER_PEER + MB_PER_CONTAINER))
+  if [ "$started" -gt 0 ] && [ $((used / started)) -ge 100 ]; then
+    per=$((used / started))
+  fi
   docker_left=$(( docker_mb * 90 / 100 - used ))
   mac_left=$(mac_available_mb)
   echo "  swarm uses ${used} MB (${per} MB per container); Docker has ${docker_left} MB to spare, the Mac ${mac_left} MB available"
