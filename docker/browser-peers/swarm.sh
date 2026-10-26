@@ -41,6 +41,14 @@ need_docker() {
   fi
 }
 
+# Memory macOS could hand out now: free, inactive, speculative and purgeable pages.
+mac_available_mb() {
+  vm_stat 2>/dev/null | awk '
+    /page size of/ { size = $8 }
+    /Pages free/ || /Pages inactive/ || /Pages speculative/ || /Pages purgeable/ { gsub(/\./, "", $NF); pages += $NF }
+    END { if (size) printf "%d", pages * size / 1048576; else print 0 }'
+}
+
 check_resources() {
   local total_peers=$((CONTAINERS * PEERS_PER_CONTAINER))
   local need_mb=$((total_peers * MB_PER_PEER + CONTAINERS * MB_PER_CONTAINER))
@@ -48,12 +56,23 @@ check_resources() {
   local docker_cpus
   docker_cpus=$(docker info --format '{{.NCPU}}')
   local mac_mb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 ))
-  echo "Swarm: ${CONTAINERS} containers x ${PEERS_PER_CONTAINER} peer(s) = ${total_peers} browser peers"
-  echo "Needs about ${need_mb} MB. Docker has ${docker_mb} MB and ${docker_cpus} CPUs (this Mac has ${mac_mb} MB)."
-  if [ "$need_mb" -gt $((docker_mb * 85 / 100)) ] && [ "${FORCE:-0}" != "1" ]; then
+  local mac_free_mb
+  mac_free_mb=$(mac_available_mb)
+  echo "Swarm: ${CONTAINERS} containers x ${PEERS_PER_CONTAINER} peer(s) = ${total_peers} browser peers, about ${need_mb} MB."
+  echo "This Mac: ${mac_mb} MB total, ${mac_free_mb} MB available now."
+  echo "Docker:   ${docker_mb} MB and ${docker_cpus} CPUs. Containers can't use more than this, whatever the Mac has free."
+  if [ "${FORCE:-0}" = "1" ]; then return; fi
+  if [ "$need_mb" -gt $((docker_mb * 85 / 100)) ]; then
     local fits=$(( (docker_mb * 85 / 100) / (MB_PER_PEER + MB_PER_CONTAINER / PEERS_PER_CONTAINER) ))
-    echo "That's more than 85% of Docker's memory. About ${fits} peers fit at ${PEERS_PER_CONTAINER} per container." >&2
-    echo "Lower CONTAINERS or PEERS_PER_CONTAINER, give Docker more memory (Docker Desktop > Settings > Resources), or set FORCE=1." >&2
+    local want_gb=$(( (need_mb * 100 / 85 + 1023) / 1024 ))
+    echo >&2
+    echo "Docker's ${docker_mb} MB fits about ${fits} of these peers." >&2
+    if [ "$mac_free_mb" -gt 0 ] && [ $((want_gb * 1024)) -le $((docker_mb + mac_free_mb)) ]; then
+      echo "This Mac has room: set Docker Desktop > Settings > Resources > Memory limit to ${want_gb} GB, Apply & restart, then run this again." >&2
+    else
+      echo "The Mac doesn't have ${want_gb} GB free for Docker right now. Close apps, or run fewer peers, e.g. CONTAINERS=$(( fits / PEERS_PER_CONTAINER > 0 ? fits / PEERS_PER_CONTAINER : 1 ))." >&2
+    fi
+    echo "Or set FORCE=1 to start anyway (peers may be killed when Docker runs out)." >&2
     exit 1
   fi
   if [ "$total_peers" -gt $((docker_cpus * 4)) ]; then
