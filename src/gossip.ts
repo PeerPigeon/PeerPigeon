@@ -25,6 +25,16 @@ export type GossipProtocolOptions = {
   antiEntropySummarySize?: number;
   /** Maximum missing broadcasts requested or served per anti-entropy exchange. Default 64. */
   antiEntropyRequestSize?: number;
+  /**
+   * Learn routes from broadcasts (CECR v1.2, Section 8.4): a broadcast that
+   * arrives proves the link it came over leads back to its sender, and a
+   * small route ack sent back up the broadcast's path proves the forward
+   * links. Direct messages try a fresh learned route before the greedy
+   * order. Default true.
+   */
+  learnRoutes?: boolean;
+  /** How long a learned route stays usable. Default 30 seconds. */
+  learnedRouteMaxAgeMs?: number;
 };
 
 export type CecrConfigSnapshot = {
@@ -169,6 +179,13 @@ export type GossipMessage = {
   spread?: GossipSpreadEnvelope;
   delivery?: GossipDeliveryEnvelope;
   aggregate?: GossipAggregateEnvelope;
+};
+
+/** CECR v1.2 route ack: peers that received broadcast `id`, with their hop distance from the receiver of this frame. */
+export type RouteAckMessage = {
+  type: 'route-ack';
+  id: string;
+  reached: Array<[string, number]>;
 };
 
 export type DirectMessage = {
@@ -359,6 +376,10 @@ const MAX_REPAIR_ATTEMPTS_PER_TARGET = 3;
 const DEFAULT_ANTI_ENTROPY_SUMMARY_SIZE = 256;
 const DEFAULT_ANTI_ENTROPY_REQUEST_SIZE = 64;
 const MAX_ROUTE_TRACE_PEERS = 32;
+// Route acks (CECR v1.2): how long a peer gathers acks for one broadcast
+// before sending them up in one frame, and the most peers in one frame.
+const ROUTE_ACK_BATCH_MS = 150;
+const ROUTE_ACK_MAX_PEERS = 128;
 /**
  * GossipProtocol
  *
@@ -398,6 +419,15 @@ export class GossipProtocol {
   private cecrSyncTimer: ReturnType<typeof setInterval> | null = null;
   private trackingCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private seenDirectIds: Map<string, number> = new Map();
+  // CECR v1.2 learned routes: compact target id -> the neighbour a recent
+  // frame from that target arrived through, and how many hops it took.
+  private learnRoutes: boolean;
+  private learnedRouteMaxAgeMs: number;
+  private learnedRoutes: Map<string, { via: string; hops: number; at: number }> = new Map();
+  // Per broadcast: the neighbour it first arrived from (where route acks go)
+  // and the acks waiting to be sent there in one frame.
+  private routeAckParents: Map<string, { parent: string; at: number }> = new Map();
+  private pendingRouteAcks: Map<string, { parent: string; reached: Map<string, number>; timer: ReturnType<typeof setTimeout> | null }> = new Map();
   private deliveryStates: Map<string, GossipDeliveryState> = new Map();
   private aggregateStates: Map<string, GossipAggregateState> = new Map();
   private retainedMessages: Map<string, {
@@ -427,6 +457,8 @@ export class GossipProtocol {
     this.cecrConvergenceRounds = Math.max(1, Math.floor(options.cecrConvergenceRounds ?? 3));
     this.deliveryTimeoutMs = Math.max(2_000, options.deliveryTimeoutMs ?? 30_000);
     this.deliveryRepairIntervalMs = Math.max(1_000, options.deliveryRepairIntervalMs ?? 5_000);
+    this.learnRoutes = options.learnRoutes ?? true;
+    this.learnedRouteMaxAgeMs = Math.max(1_000, options.learnedRouteMaxAgeMs ?? 30_000);
     this.antiEntropySummarySize = Math.max(
       1,
       Math.min(this.maxTrackedMessages, Math.floor(options.antiEntropySummarySize ?? DEFAULT_ANTI_ENTROPY_SUMMARY_SIZE)),
@@ -454,6 +486,8 @@ export class GossipProtocol {
         this.handleIncomingAggregate(parsed as unknown as GossipAggregateMessage, peerId);
       } else if (parsed.type === 'gossip-ae') {
         this.handleGossipAntiEntropy(parsed as unknown as GossipAntiEntropyMessage, peerId);
+      } else if ((parsed as { type: string }).type === 'route-ack') {
+        this.handleIncomingRouteAck(parsed as unknown as RouteAckMessage, peerId);
       } else {
         this.handleIncomingMessage(parsed, peerId);
       }
@@ -473,6 +507,7 @@ export class GossipProtocol {
       this.peers.delete(peerId);
       this.cecrRemoteStates.delete(peerId);
       this.lastSummaryByPeer.delete(peerId);
+      this.forgetRoutesVia(peerId);
       this.publishCecrState();
       this.emit('peerDisconnected', { peerId });
     });
@@ -694,6 +729,10 @@ export class GossipProtocol {
       }
     }
 
+    // Any copy that arrives, first or duplicate, proves fromPeerId leads
+    // back to the sender in message.hops hops.
+    if (message.sender) this.learnRoute(message.sender, fromPeerId, message.hops, receivedAt);
+
     if (alreadySeen) return;
 
     this.messageLog.set(message.id, {
@@ -701,6 +740,11 @@ export class GossipProtocol {
       sender: message.sender,
       hops: message.hops
     });
+    const self = this.mesh.getClientId();
+    if (this.learnRoutes && self && message.sender && message.sender !== self) {
+      this.routeAckParents.set(message.id, { parent: fromPeerId, at: receivedAt });
+      this.queueRouteAck(message.id, fromPeerId, this.compactRoutePeerId(self), 1);
+    }
     if (this.messageLog.size > this.maxTrackedMessages) {
       this.pruneTracking();
     }
@@ -2083,6 +2127,23 @@ export class GossipProtocol {
       }
     }
 
+    // A learned route (Section 8.4): a recent frame from the target came in
+    // over this link, so it is a proven path, tried before the greedy order.
+    const onPathIds = new Set(Array.isArray(message.path) ? message.path : []);
+    const learned = this.learnedRouteFor(message.to);
+    if (learned && learned !== fromPeerId && connected.includes(learned) && !onPathIds.has(this.compactRoutePeerId(learned))) {
+      try {
+        this.mesh.send(learned, JSON.stringify({
+          ...message,
+          hops: message.hops + 1,
+          path: this.extendRoutePath(message.path, learned),
+        }));
+        return true;
+      } catch {
+        this.forgetRoutesVia(learned);
+      }
+    }
+
     // Try the deterministic CECR ordering. Every candidate is a measurable
     // prefix or raw-XOR improvement; failed sends fall through to the next.
     if (routable) {
@@ -2112,10 +2173,9 @@ export class GossipProtocol {
     // once (seenDirectIds), so this cannot loop and costs at most one frame
     // per link; the next hop tries the greedy order again first. On a 50-peer
     // partial mesh, greedy routing alone delivered 35/50 direct messages.
-    const onPath = new Set(Array.isArray(message.path) ? message.path : []);
     let forwarded = false;
     for (const next of connected) {
-      if (next === fromPeerId || onPath.has(this.compactRoutePeerId(next))) continue;
+      if (next === fromPeerId || onPathIds.has(this.compactRoutePeerId(next))) continue;
       try {
         this.mesh.send(next, JSON.stringify({
           ...message,
@@ -2130,7 +2190,113 @@ export class GossipProtocol {
     return forwarded;
   }
 
+  // ─── CECR v1.2 learned routes and route acks ──────────────────────
+
+  private learnRoute(target: string, via: string, hops: number, at: number = Date.now()): void {
+    if (!this.learnRoutes || !target || !via) return;
+    const self = this.mesh.getClientId();
+    if (target === self || via === self) return;
+    this.learnCompactRoute(this.compactRoutePeerId(target), via, hops, at);
+  }
+
+  private learnCompactRoute(compactTarget: string, via: string, hops: number, at: number = Date.now()): void {
+    if (!this.learnRoutes || !compactTarget || !via) return;
+    const self = this.mesh.getClientId();
+    if (self && compactTarget === this.compactRoutePeerId(self)) return;
+    const h = Math.max(1, Math.floor(Number(hops) || 1));
+    const current = this.learnedRoutes.get(compactTarget);
+    const usable = current
+      && at - current.at < this.learnedRouteMaxAgeMs
+      && this.mesh.getConnectedPeers().includes(current.via);
+    // Keep the shorter of two fresh routes; a refresh over the same link,
+    // or any route replacing a stale or disconnected one, always wins.
+    if (!usable || current.via === via || h <= current.hops) {
+      this.learnedRoutes.set(compactTarget, { via, hops: h, at });
+      if (this.learnedRoutes.size > this.maxTrackedDirectIds) {
+        const oldest = this.learnedRoutes.keys().next().value;
+        if (oldest) this.learnedRoutes.delete(oldest);
+      }
+    }
+  }
+
+  private learnedRouteFor(target: string): string | null {
+    if (!this.learnRoutes) return null;
+    const route = this.learnedRoutes.get(this.compactRoutePeerId(target));
+    if (!route) return null;
+    if (Date.now() - route.at >= this.learnedRouteMaxAgeMs) return null;
+    return route.via;
+  }
+
+  private forgetRoutesVia(peerId: string): void {
+    for (const [target, route] of this.learnedRoutes) {
+      if (route.via === peerId) this.learnedRoutes.delete(target);
+    }
+  }
+
+  /** Learned routes, for diagnostics: compact target id -> { via, hops, ageMs }. */
+  getLearnedRoutes(): Array<{ target: string; via: string; hops: number; ageMs: number }> {
+    const now = Date.now();
+    return Array.from(this.learnedRoutes.entries()).map(([target, route]) => ({
+      target, via: route.via, hops: route.hops, ageMs: now - route.at,
+    }));
+  }
+
+  // A route ack goes one hop back up a broadcast's path, toward the
+  // neighbour the broadcast came from. Acks for one broadcast are batched
+  // for ROUTE_ACK_BATCH_MS, so each link carries about one ack frame per
+  // broadcast whatever the number of peers below it.
+  private queueRouteAck(messageId: string, parent: string, compactPeer: string, hops: number): void {
+    let pending = this.pendingRouteAcks.get(messageId);
+    if (!pending) {
+      pending = { parent, reached: new Map(), timer: null };
+      this.pendingRouteAcks.set(messageId, pending);
+    }
+    const known = pending.reached.get(compactPeer);
+    if (known === undefined || hops < known) pending.reached.set(compactPeer, hops);
+    if (!pending.timer && !this.destroyed) {
+      pending.timer = setTimeout(() => this.flushRouteAck(messageId), ROUTE_ACK_BATCH_MS);
+    }
+  }
+
+  private flushRouteAck(messageId: string): void {
+    const pending = this.pendingRouteAcks.get(messageId);
+    this.pendingRouteAcks.delete(messageId);
+    if (!pending || this.destroyed || pending.reached.size === 0) return;
+    const entries = Array.from(pending.reached.entries());
+    for (let i = 0; i < entries.length; i += ROUTE_ACK_MAX_PEERS) {
+      const ack: RouteAckMessage = {
+        type: 'route-ack',
+        id: messageId,
+        reached: entries.slice(i, i + ROUTE_ACK_MAX_PEERS).map(([peer, hops]) => [peer, hops]),
+      };
+      try {
+        this.mesh.send(pending.parent, JSON.stringify(ack));
+      } catch {
+        // The parent link is gone; its own routes are forgotten on disconnect.
+        return;
+      }
+    }
+  }
+
+  private handleIncomingRouteAck(message: RouteAckMessage, fromPeerId: string): void {
+    if (!this.learnRoutes || !Array.isArray(message.reached)) return;
+    const now = Date.now();
+    const parent = this.routeAckParents.get(message.id);
+    for (const item of message.reached.slice(0, ROUTE_ACK_MAX_PEERS)) {
+      if (!Array.isArray(item) || typeof item[0] !== 'string' || !/^[0-9a-f]{40}$/.test(item[0])) continue;
+      const hops = Math.max(1, Math.floor(Number(item[1]) || 1));
+      // The acked peer received the broadcast below fromPeerId: that link
+      // leads to it in `hops` hops.
+      this.learnCompactRoute(item[0], fromPeerId, hops, now);
+      // Not the broadcast's sender: pass the ack on toward it, one hop more.
+      if (parent && parent.parent !== fromPeerId && now - parent.at < this.learnedRouteMaxAgeMs) {
+        this.queueRouteAck(message.id, parent.parent, item[0], hops + 1);
+      }
+    }
+  }
+
   private handleIncomingDirect(message: DirectMessage, fromPeerId: string): void {
+    if (typeof message.from === 'string') this.learnRoute(message.from, fromPeerId, Math.max(1, Number(message.hops) || 1));
     if (this.seenDirectIds.has(message.id)) return;
     this.markDirectSeen(message.id, message.timestamp);
     this.routeDirect(message, fromPeerId);
@@ -2227,6 +2393,16 @@ export class GossipProtocol {
         this.seenDirectIds.delete(id);
       }
     }
+    this.pruneRouteLearning(now);
+  }
+
+  private pruneRouteLearning(now: number = Date.now()): void {
+    for (const [id, parent] of this.routeAckParents) {
+      if (now - parent.at > this.learnedRouteMaxAgeMs) this.routeAckParents.delete(id);
+    }
+    for (const [target, route] of this.learnedRoutes) {
+      if (now - route.at > this.learnedRouteMaxAgeMs) this.learnedRoutes.delete(target);
+    }
   }
 
   private markDirectSeen(id: string, timestamp: number): void {
@@ -2238,6 +2414,7 @@ export class GossipProtocol {
 
   private pruneTracking(now: number = Date.now()): void {
     const minTimestamp = now - this.trackingRetentionMs;
+    this.pruneRouteLearning(now);
 
     for (const [id, info] of this.messageLog.entries()) {
       if (info.timestamp >= minTimestamp) {
@@ -2312,6 +2489,12 @@ export class GossipProtocol {
     this.messageLog.clear();
     this.peers.clear();
     this.seenDirectIds.clear();
+    for (const pending of this.pendingRouteAcks.values()) {
+      if (pending.timer) clearTimeout(pending.timer);
+    }
+    this.pendingRouteAcks.clear();
+    this.routeAckParents.clear();
+    this.learnedRoutes.clear();
     this.deliveryStates.clear();
     this.aggregateStates.clear();
     this.retainedMessages.clear();
@@ -2376,6 +2559,10 @@ export class GossipProtocol {
 
     if (parsed.type === 'gossip') {
       return parsed as GossipMessage;
+    }
+
+    if (parsed.type === 'route-ack' && Array.isArray(parsed.reached)) {
+      return parsed as any;
     }
 
     if (parsed.type === 'direct' && typeof parsed.from === 'string' && typeof parsed.to === 'string') {

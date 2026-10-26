@@ -34,6 +34,16 @@ type GossipProtocolOptions = {
     antiEntropySummarySize?: number;
     /** Maximum missing broadcasts requested or served per anti-entropy exchange. Default 64. */
     antiEntropyRequestSize?: number;
+    /**
+     * Learn routes from broadcasts (CECR v1.2, Section 8.4): a broadcast that
+     * arrives proves the link it came over leads back to its sender, and a
+     * small route ack sent back up the broadcast's path proves the forward
+     * links. Direct messages try a fresh learned route before the greedy
+     * order. Default true.
+     */
+    learnRoutes?: boolean;
+    /** How long a learned route stays usable. Default 30 seconds. */
+    learnedRouteMaxAgeMs?: number;
 };
 type CecrConfigSnapshot = {
     protocol: 'cecr/1';
@@ -274,6 +284,11 @@ declare class GossipProtocol {
     private cecrSyncTimer;
     private trackingCleanupTimer;
     private seenDirectIds;
+    private learnRoutes;
+    private learnedRouteMaxAgeMs;
+    private learnedRoutes;
+    private routeAckParents;
+    private pendingRouteAcks;
     private deliveryStates;
     private aggregateStates;
     private retainedMessages;
@@ -395,11 +410,26 @@ declare class GossipProtocol {
         connectedOnly?: boolean;
     }): string | null;
     private routeDirect;
+    private learnRoute;
+    private learnCompactRoute;
+    private learnedRouteFor;
+    private forgetRoutesVia;
+    /** Learned routes, for diagnostics: compact target id -> { via, hops, ageMs }. */
+    getLearnedRoutes(): Array<{
+        target: string;
+        via: string;
+        hops: number;
+        ageMs: number;
+    }>;
+    private queueRouteAck;
+    private flushRouteAck;
+    private handleIncomingRouteAck;
     private handleIncomingDirect;
     getCecrConfig(): Readonly<CecrConfigSnapshot>;
     getCecrState(): CecrStateSnapshot;
     getStats(): GossipStats;
     cleanup(maxAgeMs?: number): void;
+    private pruneRouteLearning;
     private markDirectSeen;
     private pruneTracking;
     on<K extends keyof GossipEvents>(event: K, callback: GossipEvents[K]): void;

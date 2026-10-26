@@ -262,3 +262,88 @@ test('CECR membership honors versioned left records, reincarnation, and lease ex
     mesh.destroy();
   }
 });
+
+// CECR v1.2 learned routes (Section 8.4). A broadcast that arrives proves
+// the link it came over leads back to its sender; a route ack sent back up
+// the broadcast's path proves the forward links. A direct message tries a
+// fresh learned route before the greedy order.
+const gossipFrom = (sender, hops = 2) => JSON.stringify({
+  id: `learn-${sender}-${hops}`,
+  type: 'gossip',
+  sender,
+  data: 'hello',
+  metadata: {},
+  timestamp: Date.now(),
+  hops,
+  maxHops: 16,
+  path: [],
+});
+const directFrames = (mesh) => mesh.frames.filter((frame) => frame.envelope.type === 'direct');
+
+test('CECR v1.2 a broadcast teaches the route back to its sender, tried before the greedy order', () => {
+  // Greedy toward 00 would pick 08; the sender's broadcast came in over 09.
+  const mesh = new CecrTestMesh(id('0f'), [id('08'), id('09')], [id('00'), id('08'), id('09')]);
+  const protocol = new GossipProtocol(mesh, { cecrRequireConsensus: false });
+  try {
+    mesh.emit('peer:data', { peerId: id('09'), data: gossipFrom(id('00')) });
+    mesh.frames.length = 0;
+    assert.ok(protocol.sendDirect(id('00'), 'learned'));
+    assert.deepEqual(directFrames(mesh).map((frame) => frame.peerId), [id('09')]);
+  } finally {
+    destroy(protocol);
+  }
+});
+
+test('CECR v1.2 a learned route is forgotten when its link closes', () => {
+  const mesh = new CecrTestMesh(id('0f'), [id('08'), id('09')], [id('00'), id('08'), id('09')]);
+  const protocol = new GossipProtocol(mesh, { cecrRequireConsensus: false });
+  try {
+    mesh.emit('peer:data', { peerId: id('09'), data: gossipFrom(id('00')) });
+    mesh.emit('peer:disconnected', id('09'));
+    mesh.connected = [id('08')];
+    mesh.frames.length = 0;
+    protocol.sendDirect(id('00'), 'greedy again');
+    assert.deepEqual(directFrames(mesh).map((frame) => frame.peerId), [id('08')]);
+  } finally {
+    destroy(protocol);
+  }
+});
+
+test('CECR v1.2 a learned route whose send fails falls back to the greedy order', () => {
+  const mesh = new CecrTestMesh(id('0f'), [id('08'), id('09')], [id('00'), id('08'), id('09')]);
+  const protocol = new GossipProtocol(mesh, { cecrRequireConsensus: false });
+  try {
+    mesh.emit('peer:data', { peerId: id('09'), data: gossipFrom(id('00')) });
+    mesh.failFor.add(id('09'));
+    mesh.frames.length = 0;
+    assert.ok(protocol.sendDirect(id('00'), 'fallback'));
+    assert.deepEqual(directFrames(mesh).map((frame) => frame.peerId), [id('09'), id('08')]);
+  } finally {
+    destroy(protocol);
+  }
+});
+
+test('CECR v1.2 a receiver acks a broadcast to the neighbour it came from, and acks travel on toward the sender', async () => {
+  const mesh = new CecrTestMesh(id('0f'), [id('08'), id('09')], [id('00'), id('08'), id('09')]);
+  const protocol = new GossipProtocol(mesh, { cecrRequireConsensus: false });
+  try {
+    mesh.emit('peer:data', { peerId: id('09'), data: gossipFrom(id('00')) });
+    // 08 got the broadcast from us and acks a peer two hops below it.
+    const below = 'ab'.repeat(20);
+    mesh.emit('peer:data', {
+      peerId: id('08'),
+      data: JSON.stringify({ type: 'route-ack', id: `learn-${id('00')}-2`, reached: [[below, 2]] }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const acks = mesh.frames.filter((frame) => frame.envelope.type === 'route-ack');
+    assert.equal(acks.length, 1, 'one batched ack frame');
+    assert.equal(acks[0].peerId, id('09'), 'sent to the neighbour the broadcast came from');
+    const reached = new Map(acks[0].envelope.reached);
+    assert.equal(reached.size, 2, 'this peer and the peer below it');
+    assert.equal(reached.get(below), 3, 'one hop further from the parent');
+    // And the acked peer is now reachable through 08.
+    assert.ok(protocol.getLearnedRoutes().some((route) => route.target === below && route.via === id('08') && route.hops === 2));
+  } finally {
+    destroy(protocol);
+  }
+});

@@ -288,16 +288,22 @@ test('a direct message reaches a connected neighbour before membership has conve
     const received = [];
     protocols.get('02').on('directMessageReceived', ({ message }) => received.push(message.data));
 
-    // Ordinary routing still follows the live view: nothing is routed to a peer it does not hold.
-    assert.equal(protocols.get('01').sendDirect('02', 'routed'), null);
-    assert.deepEqual(received, []);
+    // CECR v1.1: a direct message always leaves. The target is outside the
+    // live view, so greedy routing cannot use it, but the other-paths step
+    // still carries it over the link to the neighbour.
+    assert.ok(protocols.get('01').sendDirect('02', 'routed'), 'the message left');
+    assert.deepEqual(received, ['routed']);
+    received.length = 0;
 
     // A frame addressed to a neighbour on purpose, such as the key exchange that runs on connect, is not.
     const messageId = protocols.get('01').sendDirect('02', 'the key exchange that runs on connect', { connectedOnly: true });
     assert.ok(messageId, 'a connected neighbour is reachable even though the view has not converged');
     assert.deepEqual(received, ['the key exchange that runs on connect']);
-    // Connected-only is not a licence to reach anyone: a stranger with no link is refused.
-    assert.equal(protocols.get('01').sendDirect('99', 'x', { connectedOnly: true }), null);
+    received.length = 0;
+    // A stranger with no link is not delivered to anyone: the message leaves
+    // over the other paths and dies at a peer with nowhere further to go.
+    assert.ok(protocols.get('01').sendDirect('99', 'x', { connectedOnly: true }), 'the message left');
+    assert.deepEqual(received, []);
   } finally {
     destroyProtocols(protocols);
   }
