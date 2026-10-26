@@ -193,3 +193,43 @@ test('local peer identity is ready before automatic relay discovery completes', 
     globalThis.WebSocket = originalWebSocket;
   }
 });
+
+// Phase 1 of the relay plan: one relay ID everywhere. Relays are ranked by
+// their FreeRTC node ID (the same ID the relays' Kademlia overlay uses), not
+// by SHA-256(hostname); a relay behind NAT is ranked by its own node ID, not
+// as its tunnel home.
+const randomHexId = () => Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) => byte.toString(16).padStart(2, '0')).join('');
+
+test('a relay is ranked by the node ID the registry gives it, not its hostname', async () => {
+  const peerId = randomHexId();
+  const near = { url: 'wss://far-by-hostname.example/ws', node_id: peerId };
+  const ranked = await rankSignalingServersByDistance(peerId, [...DEFAULT_SIGNALING_SERVERS, near]);
+  assert.equal(ranked[0], near.url, 'the relay whose node ID equals the peer ID is closest');
+});
+
+test('relays behind one tunnel home are distinct relays, each ranked by its own node ID', async () => {
+  const a = randomHexId();
+  const b = randomHexId();
+  const tunneledA = `wss://peer.ooo/t/${a}/ws`;
+  const tunneledB = `wss://peer.ooo/t/${b}/ws`;
+  const toA = await rankSignalingServersByDistance(a, ['wss://peer.ooo/ws', tunneledB, tunneledA]);
+  assert.equal(toA[0], tunneledA);
+  const toB = await rankSignalingServersByDistance(b, ['wss://peer.ooo/ws', tunneledA, tunneledB]);
+  assert.equal(toB[0], tunneledB);
+  assert.equal(new Set(toA).size, 3, 'the home and both tunneled relays are three relays');
+});
+
+test('discovery ranks registry relays by their node_id, and a URL listed twice keeps the entry that knew it', async () => {
+  const peerId = randomHexId();
+  const relay = 'wss://registry-relay.example/ws';
+  const relays = await discoverClosestSignalingServers({
+    bootstrapServer: 'wss://peer.ooo/ws',
+    peerId,
+    fallbackServers: [...DEFAULT_SIGNALING_SERVERS, relay],
+    fetchImpl: async () => ({
+      ok: true,
+      async json() { return { relays: [{ url: relay }, { url: relay, node_id: peerId }] }; },
+    }),
+  });
+  assert.equal(relays[0], relay);
+});

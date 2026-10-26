@@ -91,7 +91,7 @@ const MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1_000;
 const DISCOVERY_REFRESH_MIN_MS = 2_000;
 const DISCOVERY_REFRESH_MAX_MS = 5 * 60_000;
 
-function canonicalSignalingUrl(value: string): string | null {
+function canonicalSignalingUrl(value: string | null | undefined): string | null {
   try {
     const url = new URL(String(value || '').trim());
     if (url.protocol === 'https:') url.protocol = 'wss:';
@@ -126,22 +126,46 @@ function compareXorDistance(left: Uint8Array, right: Uint8Array, target: Uint8Ar
   return 0;
 }
 
-/** Order relays by SHA-256(hostname) XOR distance to the peer ID. */
+/** A relay to rank: its URL, and its FreeRTC node ID when known. */
+export type SignalingRelayCandidate = string | { url: string; nodeId?: string | null; node_id?: string | null };
+
+const NODE_ID_RE = /^[0-9a-f]{64}$/;
+const TUNNEL_NODE_ID_RE = /^\/t\/([0-9a-f]{64})\/ws$/;
+
+/**
+ * A relay's ID for ranking: its FreeRTC node ID (the SHA-256 of its signing
+ * key, the same ID the relays' Kademlia overlay uses), from the relay list or,
+ * for a relay behind NAT, from its tunnel path /t/<node id>/ws. Only a relay
+ * whose node ID is unknown falls back to SHA-256(hostname).
+ */
+async function relayRankingId(url: string, nodeId: string | null | undefined): Promise<Uint8Array> {
+  const known = String(nodeId ?? '').trim().toLowerCase();
+  const fromPath = TUNNEL_NODE_ID_RE.exec(new URL(url).pathname)?.[1] ?? null;
+  const id = NODE_ID_RE.test(known) ? known : fromPath;
+  if (id) return hexIdBytes(id);
+  const hostname = new URL(url).hostname.toLowerCase();
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(hostname));
+  return new Uint8Array(digest);
+}
+
+/** Order relays by node-ID XOR distance to the peer ID (SHA-256(hostname) when a relay's node ID is unknown). */
 export async function rankSignalingServersByDistance(
   peerId: string,
-  relayUrls: readonly string[]
+  relays: readonly SignalingRelayCandidate[]
 ): Promise<string[]> {
-  const candidates = Array.from(new Set(
-    relayUrls.map((url) => canonicalSignalingUrl(url)).filter((url): url is string => Boolean(url))
-  ));
-  if (candidates.length === 0) return [];
+  const nodeIds = new Map<string, string | null>();
+  for (const relay of relays) {
+    const url = canonicalSignalingUrl(typeof relay === 'string' ? relay : relay?.url);
+    if (!url) continue;
+    const nodeId = typeof relay === 'string' ? null : (relay.nodeId ?? relay.node_id ?? null);
+    // A URL listed twice keeps whichever entry knew its node ID.
+    if (!nodeIds.has(url) || (nodeId && !nodeIds.get(url))) nodeIds.set(url, nodeId);
+  }
+  if (nodeIds.size === 0) return [];
   const target = hexIdBytes(peerId);
-  const encoder = new TextEncoder();
-  const scored = await Promise.all(candidates.map(async (url) => {
-    const hostname = new URL(url).hostname.toLowerCase();
-    const digest = await globalThis.crypto.subtle.digest('SHA-256', encoder.encode(hostname));
-    return { url, nodeId: new Uint8Array(digest) };
-  }));
+  const scored = await Promise.all(Array.from(nodeIds, async ([url, nodeId]) => (
+    { url, nodeId: await relayRankingId(url, nodeId) }
+  )));
   scored.sort((left, right) => (
     compareXorDistance(left.nodeId, right.nodeId, target)
     || left.url.localeCompare(right.url)
@@ -149,10 +173,10 @@ export async function rankSignalingServersByDistance(
   return scored.map(({ url }) => url);
 }
 
-/** Choose exactly one relay by SHA-256(hostname) XOR distance to the peer ID. */
+/** Choose exactly one relay by node-ID XOR distance to the peer ID. */
 export async function selectClosestSignalingServer(
   peerId: string,
-  relayUrls: readonly string[]
+  relayUrls: readonly SignalingRelayCandidate[]
 ): Promise<string> {
   const ranked = await rankSignalingServersByDistance(peerId, relayUrls);
   if (ranked.length === 0) throw new Error('No valid FreeRTC relays are available');
@@ -173,10 +197,10 @@ export async function discoverClosestSignalingServers(options: {
 }): Promise<string[]> {
   const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
   if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);
-  const candidates = new Set<string>([bootstrap]);
+  const candidates = new Map<string, string | null>([[bootstrap, null]]);
   for (const fallback of options.fallbackServers ?? []) {
     const normalized = canonicalSignalingUrl(fallback);
-    if (normalized) candidates.add(normalized);
+    if (normalized && !candidates.has(normalized)) candidates.set(normalized, null);
   }
 
   const registryUrl = new URL(bootstrap);
@@ -197,17 +221,22 @@ export async function discoverClosestSignalingServers(options: {
       new Promise<null>((resolve) => { setTimeout(() => resolve(null), timeoutMs); }),
     ]);
     if (response?.ok) {
-      const body = await response.json() as { relays?: Array<{ url?: string } | string> };
+      const body = await response.json() as { relays?: Array<{ url?: string; node_id?: string } | string> };
       for (const record of Array.isArray(body?.relays) ? body.relays : []) {
         const normalized = canonicalSignalingUrl(typeof record === 'string' ? record : String(record?.url || ''));
-        if (normalized) candidates.add(normalized);
+        if (!normalized) continue;
+        const nodeId = typeof record === 'string' ? null : (record?.node_id ?? null);
+        if (!candidates.has(normalized) || (nodeId && !candidates.get(normalized))) candidates.set(normalized, nodeId);
       }
     }
   } catch {
     // The known bootstrap/fallback set remains usable when registry discovery
     // is temporarily unavailable.
   }
-  const ranked = await rankSignalingServersByDistance(options.peerId, Array.from(candidates));
+  const ranked = await rankSignalingServersByDistance(
+    options.peerId,
+    Array.from(candidates, ([url, nodeId]) => ({ url, nodeId })),
+  );
   const limit = Math.max(1, Math.trunc(options.limit ?? DEFAULT_CLOSE_SIGNALING_RELAY_COUNT));
   return ranked.slice(0, limit);
 }

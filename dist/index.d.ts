@@ -862,10 +862,16 @@ declare const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
 declare const NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS = 4000;
 declare const NEGOTIATION_ACTIVE_ICE_DEADLINE_MS = 6000;
 declare const NEGOTIATION_OFFER_DEADLINE_MS = 20000;
-/** Order relays by SHA-256(hostname) XOR distance to the peer ID. */
-declare function rankSignalingServersByDistance(peerId: string, relayUrls: readonly string[]): Promise<string[]>;
-/** Choose exactly one relay by SHA-256(hostname) XOR distance to the peer ID. */
-declare function selectClosestSignalingServer(peerId: string, relayUrls: readonly string[]): Promise<string>;
+/** A relay to rank: its URL, and its FreeRTC node ID when known. */
+type SignalingRelayCandidate = string | {
+    url: string;
+    nodeId?: string | null;
+    node_id?: string | null;
+};
+/** Order relays by node-ID XOR distance to the peer ID (SHA-256(hostname) when a relay's node ID is unknown). */
+declare function rankSignalingServersByDistance(peerId: string, relays: readonly SignalingRelayCandidate[]): Promise<string[]>;
+/** Choose exactly one relay by node-ID XOR distance to the peer ID. */
+declare function selectClosestSignalingServer(peerId: string, relayUrls: readonly SignalingRelayCandidate[]): Promise<string>;
 /**
  * Read the public relay registry from one bootstrap, then select one relay.
  * The bootstrap request is HTTP-only; only the selected relay gets a WebSocket.
@@ -1388,4 +1394,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, isMeshSignalPayload, rankSignalingServersByDistance, selectClosestSignalingServer, sha1Hex };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, isMeshSignalPayload, rankSignalingServersByDistance, selectClosestSignalingServer, sha1Hex };

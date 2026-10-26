@@ -4344,18 +4344,28 @@ function compareXorDistance(left, right, target) {
   }
   return 0;
 }
-async function rankSignalingServersByDistance(peerId, relayUrls) {
-  const candidates = Array.from(new Set(
-    relayUrls.map((url) => canonicalSignalingUrl(url)).filter((url) => Boolean(url))
-  ));
-  if (candidates.length === 0) return [];
+var NODE_ID_RE = /^[0-9a-f]{64}$/;
+var TUNNEL_NODE_ID_RE = /^\/t\/([0-9a-f]{64})\/ws$/;
+async function relayRankingId(url, nodeId) {
+  const known = String(nodeId ?? "").trim().toLowerCase();
+  const fromPath = TUNNEL_NODE_ID_RE.exec(new URL(url).pathname)?.[1] ?? null;
+  const id = NODE_ID_RE.test(known) ? known : fromPath;
+  if (id) return hexIdBytes(id);
+  const hostname = new URL(url).hostname.toLowerCase();
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(hostname));
+  return new Uint8Array(digest);
+}
+async function rankSignalingServersByDistance(peerId, relays) {
+  const nodeIds = /* @__PURE__ */ new Map();
+  for (const relay of relays) {
+    const url = canonicalSignalingUrl(typeof relay === "string" ? relay : relay?.url);
+    if (!url) continue;
+    const nodeId = typeof relay === "string" ? null : relay.nodeId ?? relay.node_id ?? null;
+    if (!nodeIds.has(url) || nodeId && !nodeIds.get(url)) nodeIds.set(url, nodeId);
+  }
+  if (nodeIds.size === 0) return [];
   const target = hexIdBytes(peerId);
-  const encoder = new TextEncoder();
-  const scored = await Promise.all(candidates.map(async (url) => {
-    const hostname = new URL(url).hostname.toLowerCase();
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", encoder.encode(hostname));
-    return { url, nodeId: new Uint8Array(digest) };
-  }));
+  const scored = await Promise.all(Array.from(nodeIds, async ([url, nodeId]) => ({ url, nodeId: await relayRankingId(url, nodeId) })));
   scored.sort((left, right) => compareXorDistance(left.nodeId, right.nodeId, target) || left.url.localeCompare(right.url));
   return scored.map(({ url }) => url);
 }
@@ -4367,10 +4377,10 @@ async function selectClosestSignalingServer(peerId, relayUrls) {
 async function discoverClosestSignalingServers(options) {
   const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
   if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);
-  const candidates = /* @__PURE__ */ new Set([bootstrap]);
+  const candidates = /* @__PURE__ */ new Map([[bootstrap, null]]);
   for (const fallback of options.fallbackServers ?? []) {
     const normalized = canonicalSignalingUrl(fallback);
-    if (normalized) candidates.add(normalized);
+    if (normalized && !candidates.has(normalized)) candidates.set(normalized, null);
   }
   const registryUrl = new URL(bootstrap);
   registryUrl.protocol = registryUrl.protocol === "wss:" ? "https:" : "http:";
@@ -4391,12 +4401,17 @@ async function discoverClosestSignalingServers(options) {
       const body = await response.json();
       for (const record of Array.isArray(body?.relays) ? body.relays : []) {
         const normalized = canonicalSignalingUrl(typeof record === "string" ? record : String(record?.url || ""));
-        if (normalized) candidates.add(normalized);
+        if (!normalized) continue;
+        const nodeId = typeof record === "string" ? null : record?.node_id ?? null;
+        if (!candidates.has(normalized) || nodeId && !candidates.get(normalized)) candidates.set(normalized, nodeId);
       }
     }
   } catch {
   }
-  const ranked = await rankSignalingServersByDistance(options.peerId, Array.from(candidates));
+  const ranked = await rankSignalingServersByDistance(
+    options.peerId,
+    Array.from(candidates, ([url, nodeId]) => ({ url, nodeId }))
+  );
   const limit = Math.max(1, Math.trunc(options.limit ?? DEFAULT_CLOSE_SIGNALING_RELAY_COUNT));
   return ranked.slice(0, limit);
 }
