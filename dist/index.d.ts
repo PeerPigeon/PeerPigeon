@@ -424,6 +424,16 @@ declare class GossipProtocol {
     private queueRouteAck;
     private flushRouteAck;
     private handleIncomingRouteAck;
+    /**
+     * CECR v1.3: how many paths a direct message for a non-neighbour takes.
+     *   estimatedHops = ceil(log2(estimated network size)) - leading ID bits shared with the target
+     *   paths         = 1 + ceil(log2(1 + estimatedHops)), at least 2, at most `available`
+     * A target sharing a longer prefix sits in a smaller part of the ID space,
+     * so it is fewer hops away and needs fewer paths.
+     */
+    directPathCount(targetPeerId: string, available: number): number;
+    /** Neighbours ordered by raw XOR distance to the target (unknown IDs last). */
+    private neighboursNearest;
     private handleIncomingDirect;
     getCecrConfig(): Readonly<CecrConfigSnapshot>;
     getCecrState(): CecrStateSnapshot;

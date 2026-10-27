@@ -89,13 +89,59 @@ test('CECR routing still sends a message whose target is not in the local live v
 });
 
 test('CECR local-minimum fallback requires and selects strict raw-XOR progress', () => {
-  const mesh = new CecrTestMesh(id('0f'), [id('08'), id('09')], [id('00'), id('08'), id('09')]);
+  const mesh = new CecrTestMesh(id('0f'), [id('08'), id('09'), id('0e')], [id('00'), id('08'), id('09'), id('0e')]);
   const protocol = new GossipProtocol(mesh, { cecrRequireConsensus: false });
   try {
-    protocol.sendDirect(id('00'), 'fallback');
+    // A relay (a frame that arrived from 0e) forwards one copy, to the
+    // strictly better XOR candidate.
+    mesh.emit('peer:data', {
+      peerId: id('0e'),
+      data: JSON.stringify({ id: 'relay-1', type: 'direct', from: id('0e'), to: id('00'), data: 'fallback', hops: 1, maxHops: 16, timestamp: Date.now(), path: [] }),
+    });
     const directFrames = mesh.frames.filter((frame) => frame.envelope.type === 'direct');
     assert.equal(directFrames.length, 1);
     assert.equal(directFrames[0].peerId, id('08'));
+  } finally {
+    destroy(protocol);
+  }
+});
+
+// CECR v1.3 multipath: a sender takes one path to a neighbour, and for any
+// other target at least two, in the routing order, scaling with the estimated
+// distance to the target.
+test('CECR v1.3 a sender takes one path to a neighbour and at least two to anyone else', () => {
+  const mesh = new CecrTestMesh(id('0f'), [id('08'), id('09'), id('0e')], [id('00'), id('08'), id('09'), id('0e')]);
+  const protocol = new GossipProtocol(mesh, { cecrRequireConsensus: false });
+  try {
+    protocol.sendDirect(id('08'), 'neighbour');
+    assert.deepEqual(mesh.frames.filter((frame) => frame.envelope.type === 'direct').map((frame) => frame.peerId), [id('08')]);
+    mesh.frames.length = 0;
+    protocol.sendDirect(id('00'), 'far');
+    const frames = mesh.frames.filter((frame) => frame.envelope.type === 'direct');
+    assert.ok(frames.length >= 2, `at least two paths (got ${frames.length})`);
+    assert.equal(frames[0].peerId, id('08'), 'the best candidate first');
+    assert.equal(new Set(frames.map((frame) => frame.peerId)).size, frames.length, 'each through a different neighbour');
+    assert.equal(new Set(frames.map((frame) => frame.envelope.id)).size, 1, 'copies of one message');
+  } finally {
+    destroy(protocol);
+  }
+});
+
+test('CECR v1.3 the number of paths scales with network size and distance to the target', () => {
+  const live = Array.from({ length: 200 }, (_, index) => (index + 1).toString(16).padStart(64, '0'));
+  const mesh = new CecrTestMesh(live[0], live.slice(1, 9), live.slice(1));
+  const protocol = new GossipProtocol(mesh, { cecrRequireConsensus: false });
+  try {
+    // 200 peers: ceil(log2 200) = 8 hops at most. A target sharing no leading
+    // bits with us is 8 hops out: 1 + ceil(log2 9) = 5 paths.
+    const far = 'f'.repeat(64);
+    assert.equal(protocol.directPathCount(far, 8), 5);
+    // Our ID is ...01 (255 leading zeros); a target sharing 250 leading bits
+    // is still estimated at least 1 hop: 1 + ceil(log2 2) = 2 paths.
+    assert.equal(protocol.directPathCount(live[30], 8), 2);
+    // Never more than the neighbours there are, and at least two while there are.
+    assert.equal(protocol.directPathCount(far, 3), 3);
+    assert.equal(protocol.directPathCount(far, 1), 1);
   } finally {
     destroy(protocol);
   }
@@ -288,7 +334,8 @@ test('CECR v1.2 a broadcast teaches the route back to its sender, tried before t
     mesh.emit('peer:data', { peerId: id('09'), data: gossipFrom(id('00')) });
     mesh.frames.length = 0;
     assert.ok(protocol.sendDirect(id('00'), 'learned'));
-    assert.deepEqual(directFrames(mesh).map((frame) => frame.peerId), [id('09')]);
+    // v1.3: two paths, the learned route first, then the greedy choice.
+    assert.deepEqual(directFrames(mesh).map((frame) => frame.peerId), [id('09'), id('08')]);
   } finally {
     destroy(protocol);
   }

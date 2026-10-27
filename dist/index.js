@@ -2324,7 +2324,7 @@ var _GossipProtocol = class _GossipProtocol {
     const connected = this.mesh.getConnectedPeers();
     if (message.hops >= message.maxHops) return false;
     const routable = viaNeighbour && connected.includes(message.to) || this.canonicalPeerSet().includes(message.to);
-    if (routable && connected.includes(message.to)) {
+    if (connected.includes(message.to)) {
       try {
         this.mesh.send(message.to, JSON.stringify({
           ...message,
@@ -2337,6 +2337,31 @@ var _GossipProtocol = class _GossipProtocol {
     }
     const onPathIds = new Set(Array.isArray(message.path) ? message.path : []);
     const learned = this.learnedRouteFor(message.to);
+    if (fromPeerId === null) {
+      const firstHops = [];
+      const add = (peerId) => {
+        if (peerId && peerId !== self && connected.includes(peerId) && !firstHops.includes(peerId) && !onPathIds.has(this.compactRoutePeerId(peerId))) firstHops.push(peerId);
+      };
+      add(learned);
+      if (routable) for (const next of this.orderedRouteCandidates(message.to, void 0, message.originConfigId)) add(next);
+      for (const next of this.neighboursNearest(message.to, connected)) add(next);
+      const paths = this.directPathCount(message.to, firstHops.length);
+      let sent = 0;
+      for (const next of firstHops) {
+        if (sent >= paths) break;
+        try {
+          this.mesh.send(next, JSON.stringify({
+            ...message,
+            hops: message.hops + 1,
+            path: this.extendRoutePath(message.path, next)
+          }));
+          sent += 1;
+        } catch {
+          if (next === learned) this.forgetRoutesVia(next);
+        }
+      }
+      if (sent > 0) return true;
+    }
     if (learned && learned !== fromPeerId && connected.includes(learned) && !onPathIds.has(this.compactRoutePeerId(learned))) {
       try {
         this.mesh.send(learned, JSON.stringify({
@@ -2472,6 +2497,36 @@ var _GossipProtocol = class _GossipProtocol {
         this.queueRouteAck(message.id, parent.parent, item[0], hops + 1);
       }
     }
+  }
+  /**
+   * CECR v1.3: how many paths a direct message for a non-neighbour takes.
+   *   estimatedHops = ceil(log2(estimated network size)) - leading ID bits shared with the target
+   *   paths         = 1 + ceil(log2(1 + estimatedHops)), at least 2, at most `available`
+   * A target sharing a longer prefix sits in a smaller part of the ID space,
+   * so it is fewer hops away and needs fewer paths.
+   */
+  directPathCount(targetPeerId, available) {
+    if (available <= 0) return 0;
+    const size = Math.max(2, this.cecrNetworkSizeEstimate().size);
+    const self = this.peerIdToNumeric(this.mesh.getClientId() ?? "");
+    const target = this.peerIdToNumeric(targetPeerId);
+    const sharedBits = self != null && target != null ? CECR_ID_WIDTH_BITS - 1 - this.bucketRank(self ^ target) : 0;
+    const estimatedHops = Math.max(1, Math.ceil(Math.log2(size)) - Math.max(0, sharedBits));
+    const paths = 1 + Math.ceil(Math.log2(1 + estimatedHops));
+    return Math.min(available, Math.max(2, paths));
+  }
+  /** Neighbours ordered by raw XOR distance to the target (unknown IDs last). */
+  neighboursNearest(targetPeerId, neighbours) {
+    const target = this.peerIdToNumeric(targetPeerId);
+    if (target == null) return [...neighbours];
+    return [...neighbours].sort((a, b) => {
+      const da = this.peerIdToNumeric(a);
+      const db = this.peerIdToNumeric(b);
+      if (da == null || db == null) return da == null ? 1 : -1;
+      const xa = da ^ target;
+      const xb = db ^ target;
+      return xa < xb ? -1 : xa > xb ? 1 : 0;
+    });
   }
   handleIncomingDirect(message, fromPeerId) {
     if (typeof message.from === "string") this.learnRoute(message.from, fromPeerId, Math.max(1, Number(message.hops) || 1));
