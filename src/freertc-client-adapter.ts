@@ -978,6 +978,7 @@ export class FreeRTCClientAdapter {
       this.emitter.emit('signaling:log', {
         message: `[signal] ${reason}: ${previousSignalUrl} did not acknowledge; trying federated relay ${this.activeSignalUrl}`,
       });
+      this.emitter.emit('relay:failed', { signalUrl: previousSignalUrl, reason });
       this.connect();
       return;
     }

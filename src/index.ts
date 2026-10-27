@@ -10,6 +10,9 @@ export function isMeshSignalPayload(value: unknown): value is { __ppType: typeof
     && !!candidate.envelope && typeof candidate.envelope === 'object';
 }
 import { GossipProtocol } from './gossip.js';
+import { RelayScoreBook, chooseRelays, type RelayInfo, type RelayKind, type RelayMeasurement } from './relay-choice.js';
+export { RelayScoreBook, chooseRelays, roomRoutingKey, relayScore, isHealthy, RELAY_CANDIDATES, RELAY_VIRTUAL_IDS, RELAY_SWITCH_MARGIN, RELAY_SCORE_STORAGE_KEY } from './relay-choice.js';
+export type { RelayInfo, RelayKind, RelayMeasurement, SharedRelayScore } from './relay-choice.js';
 import type {
   CecrConfigSnapshot,
   CecrStateSnapshot,
@@ -183,9 +186,81 @@ export async function selectClosestSignalingServer(
   return ranked[0];
 }
 
+type RegistryRelayRecord = {
+  url?: string;
+  node_id?: string;
+  relay_kind?: string;
+  reach?: Array<{ via?: string; url?: string }>;
+  connections?: number;
+  capacity?: number;
+};
+
 /**
- * Read the public relay registry from one bootstrap, then select one relay.
- * The bootstrap request is HTTP-only; only the selected relay gets a WebSocket.
+ * Every relay a bootstrap's registry (/api/v1/relays) lists, plus the
+ * bootstrap and fallbacks, with what each says about itself: node ID, kind
+ * (a relay behind NAT is local), and whether it can only be reached through
+ * its tunnel. The registry request is HTTP-only.
+ */
+export async function discoverSignalingRelays(options: {
+  bootstrapServer: string;
+  fallbackServers?: readonly string[];
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
+}): Promise<RelayInfo[]> {
+  const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
+  if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);
+  const records = new Map<string, RegistryRelayRecord>([[bootstrap, {}]]);
+  for (const fallback of options.fallbackServers ?? []) {
+    const normalized = canonicalSignalingUrl(fallback);
+    if (normalized && !records.has(normalized)) records.set(normalized, {});
+  }
+  const registryUrl = new URL(bootstrap);
+  registryUrl.protocol = registryUrl.protocol === 'wss:' ? 'https:' : 'http:';
+  registryUrl.pathname = '/api/v1/relays';
+  registryUrl.search = '';
+  registryUrl.hash = '';
+  const timeoutMs = Math.max(250, options.timeoutMs ?? 4_000);
+  try {
+    const response = await Promise.race([
+      (options.fetchImpl ?? globalThis.fetch)(registryUrl.toString(), { headers: { Accept: 'application/json' } }),
+      new Promise<null>((resolve) => { setTimeout(() => resolve(null), timeoutMs); }),
+    ]);
+    if (response?.ok) {
+      const body = await response.json() as { relays?: Array<RegistryRelayRecord | string> };
+      for (const record of Array.isArray(body?.relays) ? body.relays : []) {
+        const normalized = canonicalSignalingUrl(typeof record === 'string' ? record : String(record?.url || ''));
+        if (!normalized) continue;
+        const next = typeof record === 'string' ? {} : record;
+        const known = records.get(normalized);
+        if (!known || (next.node_id && !known.node_id)) records.set(normalized, next);
+      }
+    }
+  } catch {
+    // The bootstrap and fallbacks stay usable when the registry is not.
+  }
+  return Promise.all(Array.from(records, async ([url, record]) => {
+    const pathId = TUNNEL_NODE_ID_RE.exec(new URL(url).pathname)?.[1] ?? null;
+    const nodeId = NODE_ID_RE.test(String(record.node_id ?? '')) ? String(record.node_id) : null;
+    const ranking = await relayRankingId(url, nodeId);
+    const id = Array.from(ranking, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    const reach = Array.isArray(record.reach) ? record.reach : [];
+    const kind: RelayKind = record.relay_kind === 'local' || (!record.relay_kind && pathId) ? 'local' : 'cloud';
+    return {
+      url,
+      nodeId: id,
+      kind,
+      connections: Number(record.connections || 0),
+      capacity: Number(record.capacity || 0),
+      tunnelOnly: Boolean(pathId) && !reach.some((entry) => entry?.via === 'punch'),
+    };
+  }));
+}
+
+/**
+ * Read the public relay registry from one bootstrap, then order the relays.
+ * Given a network and room, relays are chosen for the room (chooseRelays:
+ * the room's relays, healthy local ones first, then by measured score);
+ * otherwise they are ranked by node-ID distance to the peer ID.
  */
 export async function discoverClosestSignalingServers(options: {
   bootstrapServer: string;
@@ -194,7 +269,26 @@ export async function discoverClosestSignalingServers(options: {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   limit?: number;
+  network?: string;
+  room?: string;
+  measurements?: (nodeId: string) => RelayMeasurement | null | undefined;
+  previousUrl?: string | null;
+  onRelays?: (relays: RelayInfo[]) => void;
 }): Promise<string[]> {
+  const limit = Math.max(1, Math.trunc(options.limit ?? DEFAULT_CLOSE_SIGNALING_RELAY_COUNT));
+  if (options.network && options.room) {
+    const relays = await discoverSignalingRelays(options);
+    options.onRelays?.(relays);
+    const ordered = await chooseRelays({
+      peerId: options.peerId,
+      network: options.network,
+      room: options.room,
+      relays,
+      measurements: options.measurements,
+      previousUrl: options.previousUrl ? canonicalSignalingUrl(options.previousUrl) : null,
+    });
+    return ordered.slice(0, limit);
+  }
   const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
   if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);
   const candidates = new Map<string, string | null>([[bootstrap, null]]);
@@ -237,7 +331,6 @@ export async function discoverClosestSignalingServers(options: {
     options.peerId,
     Array.from(candidates, ([url, nodeId]) => ({ url, nodeId })),
   );
-  const limit = Math.max(1, Math.trunc(options.limit ?? DEFAULT_CLOSE_SIGNALING_RELAY_COUNT));
   return ranked.slice(0, limit);
 }
 
@@ -468,6 +561,11 @@ export class PartialMesh {
   private clientId: string | null = null;
   private selfAliases: Set<string> = new Set();
   private retiredPeerIds: Set<string> = new Set();
+  // Relay choice (relay-choice.ts): measured joins per relay node ID, and the
+  // node ID behind each relay URL this peer was offered.
+  private relayScores: RelayScoreBook = new RelayScoreBook();
+  private relayNodeIds: Map<string, string> = new Map();
+  private relayAttemptStartedAt = 0;
   private eventHandlers: Map<keyof PartialMeshEvents, Set<Function>> = new Map();
   private connecting: Set<string> = new Set();
   private connectionStartedAtMs: Map<string, number> = new Map();
@@ -1341,14 +1439,24 @@ export class PartialMesh {
     this.emit('identity:ready', { clientId: requestedPeerId });
     // Query one bootstrap and select the closest relay. That relay owns the
     // client connection; FreeRTC's Kademlia overlay federates discovery.
+    // The relays are chosen for this room: its relays, healthy local ones
+    // first, then by measured score (relay-choice.ts), staying on the last
+    // one unless another is clearly better.
+    const relayNodeIds = new Map<string, string>();
     const signalingUrls = this.config.automaticSignalingServer
       ? await discoverClosestSignalingServers({
         bootstrapServer: this.config.signalingServer,
         peerId: requestedPeerId,
         fallbackServers: signalingCandidates,
         limit: DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
+        network: this.config.networkId,
+        room: this.config.sessionId,
+        measurements: (nodeId) => this.relayScores.measurement(nodeId),
+        previousUrl: previousPeerSignalUrls[0] ?? null,
+        onRelays: (relays) => { for (const relay of relays) relayNodeIds.set(relay.url, relay.nodeId); },
       })
       : [this.normalizeSignalingUrl(this.config.signalingServer)];
+    this.relayNodeIds = relayNodeIds;
     // Only the selected relay receives this identity announcement.
     this.rememberBrowserPeerSignalUrls(signalingUrls.slice(0, 1));
     this.emit('signaling:log', {
@@ -1381,7 +1489,18 @@ export class PartialMesh {
     });
 
     // Set up signaling event handlers
+    this.relayAttemptStartedAt = Date.now();
+    this.signalingClient.on('relay:failed', (data: { signalUrl?: string }) => {
+      const nodeId = this.relayNodeIds.get(String(data?.signalUrl || ''));
+      if (nodeId) this.relayScores.recordJoin(nodeId, { ok: false });
+      this.relayAttemptStartedAt = Date.now();
+    });
     this.signalingClient.on('connected', (data: { clientId: string; requestedClientId?: string; previousClientId?: string; signalUrl?: string }) => {
+      const joinedNodeId = this.relayNodeIds.get(String(data?.signalUrl || signalingUrls[0] || ''));
+      if (joinedNodeId && this.relayAttemptStartedAt) {
+        this.relayScores.recordJoin(joinedNodeId, { ok: true, joinMs: Date.now() - this.relayAttemptStartedAt });
+        this.relayAttemptStartedAt = 0;
+      }
       const rawClientId = data?.clientId;
       const nextClientId = this.normalizePeerId(rawClientId);
       this.clientId = nextClientId;
@@ -2415,6 +2534,11 @@ export class PartialMesh {
   }
 
   /** Return the effective configuration, including constructor defaults. */
+  /** This peer's relay measurements (own and shared), used to choose relays. */
+  public getRelayScores(): RelayScoreBook {
+    return this.relayScores;
+  }
+
   public getConfig(): Readonly<Required<PartialMeshConfig>> {
     return {
       ...this.config,
@@ -3140,6 +3264,9 @@ export type PeerPigeonNodeEvents = {
  * `gossip`, `crypto`, and `storage`, while normal applications need only this
  * facade for topology, messaging, encryption, keys, capacity, and config.
  */
+const RELAY_SCORES_PAYLOAD_TYPE = 'pp-relay-scores';
+const RELAY_SCORE_SHARE_MS = 10 * 60_000;
+
 export class PeerPigeonNode {
   public readonly mesh: PartialMesh;
   public readonly gossip: GossipProtocol;
@@ -3149,6 +3276,7 @@ export class PeerPigeonNode {
   private readonly storageOptions: false | PeerPigeonNodeStorageOptions;
   private readonly callbacks: Partial<Record<keyof PeerPigeonNodeEvents, Set<Function>>> = {};
   private started = false;
+  private relayScoreTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: PeerPigeonNodeOptions = {}) {
     const { gossip = {}, crypto = {}, storage = false, ...meshOptions } = options;
@@ -3342,6 +3470,7 @@ export class PeerPigeonNode {
   }
 
   async destroy(): Promise<void> {
+    if (this.relayScoreTimer) { clearInterval(this.relayScoreTimer); this.relayScoreTimer = null; }
     if (this.storage) await this.storage.close();
     this.storage = null;
     this.crypto?.destroy();
@@ -3374,9 +3503,31 @@ export class PeerPigeonNode {
         message,
       });
     });
+    // Relay scores (relay-choice.ts): each peer hands its own relay
+    // measurements to every new neighbour, and again every RELAY_SCORE_SHARE_MS,
+    // so a peer learns the room's relays from the mesh, not by probing them.
+    // One direct frame per link, never flooded; no relay sees any of it.
+    const shareRelayScores = (peerId: string) => {
+      const scores = this.mesh.getRelayScores().ownScores();
+      if (scores.length === 0) return;
+      try {
+        this.gossip.sendDirect(peerId, { __ppType: RELAY_SCORES_PAYLOAD_TYPE, scores }, { connectedOnly: true });
+      } catch { /* a neighbour that just left */ }
+    };
+    this.mesh.on('peer:connected', (peerId) => shareRelayScores(peerId));
+    this.relayScoreTimer = setInterval(() => {
+      for (const peerId of this.mesh.getConnectedPeers()) shareRelayScores(peerId);
+    }, RELAY_SCORE_SHARE_MS);
+    (this.relayScoreTimer as { unref?: () => void }).unref?.();
+
     this.gossip.on('directMessageReceived', ({ message }) => {
       if (isMeshSignalPayload(message.data)) {
         this.mesh.receiveMeshSignal(message.from, message.data.envelope);
+        return;
+      }
+      const relayScores = message.data as { __ppType?: unknown; scores?: unknown } | null;
+      if (relayScores && typeof relayScores === 'object' && relayScores.__ppType === RELAY_SCORES_PAYLOAD_TYPE) {
+        if (Array.isArray(relayScores.scores)) this.mesh.getRelayScores().mergeShared(message.from, relayScores.scores);
         return;
       }
       if (this.isReservedPayload(message.data)) return;
@@ -3430,7 +3581,7 @@ export class PeerPigeonNode {
     if (PeerPigeonCryptoProtocol.isProtocolPayload(data)) return true;
     if (!data || typeof data !== 'object') return false;
     const type = (data as { __ppType?: unknown }).__ppType;
-    return typeof type === 'string' && (type.startsWith('pp-storage-') || type.startsWith('pp-signal-'));
+    return typeof type === 'string' && (type.startsWith('pp-storage-') || type.startsWith('pp-signal-') || type.startsWith('pp-relay-'));
   }
 
   private emitError(error: unknown): void {

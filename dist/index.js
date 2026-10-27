@@ -785,6 +785,7 @@ var FreeRTCClientAdapter = class {
       this.emitter.emit("signaling:log", {
         message: `[signal] ${reason}: ${previousSignalUrl} did not acknowledge; trying federated relay ${this.activeSignalUrl}`
       });
+      this.emitter.emit("relay:failed", { signalUrl: previousSignalUrl, reason });
       this.connect();
       return;
     }
@@ -2755,6 +2756,255 @@ _GossipProtocol.MAX_REPLAYS_PER_PEER = 3;
 _GossipProtocol.ANTI_ENTROPY_RESEND_MS = 3e4;
 var GossipProtocol = _GossipProtocol;
 
+// src/relay-choice.ts
+var RELAY_CANDIDATES = 5;
+var RELAY_VIRTUAL_IDS = 4;
+var RELAY_SWITCH_MARGIN = 0.3;
+var UNMEASURED_JOIN_MS = 600;
+var TUNNEL_PENALTY_MS = 300;
+var MAX_FAILURE_RATE = 0.05;
+var MAX_LOAD_RATIO = 0.9;
+var SCORE_MAX_AGE_MS = 24 * 60 * 6e4;
+var OWN_WEIGHT = 3;
+var JOIN_EMA = 0.3;
+var MAX_BOOK_ENTRIES = 256;
+var NODE_ID_RE = /^[0-9a-f]{64}$/;
+function hexBytes(hex) {
+  return Uint8Array.from({ length: hex.length / 2 }, (_, i) => Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16));
+}
+async function sha256Bytes(text) {
+  return new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+}
+function compareDistance(a, b, target) {
+  for (let i = 0; i < target.length; i += 1) {
+    const da = a[i] ^ target[i];
+    const db = b[i] ^ target[i];
+    if (da !== db) return da - db;
+  }
+  return 0;
+}
+async function roomRoutingKey(network, room) {
+  return sha256Bytes(JSON.stringify(["freertc-kad", 1, "scope", network, room]));
+}
+async function virtualIds(nodeId, count = RELAY_VIRTUAL_IDS) {
+  const ids = [hexBytes(nodeId)];
+  for (let i = 1; i < count; i += 1) ids.push(await sha256Bytes(`${nodeId}:${i}`));
+  return ids;
+}
+function nearest(ids, target) {
+  return ids.reduce((best, id) => compareDistance(id, best, target) < 0 ? id : best);
+}
+function failureRate(m) {
+  if (!m || m.attempts <= 0) return 0;
+  return Math.min(1, m.failures / m.attempts);
+}
+function loadRatio(relay) {
+  const capacity = Number(relay.capacity || 0);
+  return capacity > 0 ? Math.min(1, Number(relay.connections || 0) / capacity) : 0;
+}
+function isHealthy(relay, m) {
+  if (loadRatio(relay) >= MAX_LOAD_RATIO) return false;
+  if (m && m.attempts >= 2 && failureRate(m) > MAX_FAILURE_RATE) return false;
+  return true;
+}
+function relayScore(relay, m) {
+  const joinMs = m?.joinMs ?? UNMEASURED_JOIN_MS;
+  return joinMs + 2e3 * failureRate(m) + 1e3 * loadRatio(relay) + (relay.tunnelOnly ? TUNNEL_PENALTY_MS : 0);
+}
+async function chooseRelays(options) {
+  const relays = dedupeRelays(options.relays);
+  if (relays.length === 0) return [];
+  const measure = options.measurements ?? (() => null);
+  const roomKey = await roomRoutingKey(options.network, options.room);
+  const peerKey = NODE_ID_RE.test(options.peerId) ? hexBytes(options.peerId) : await sha256Bytes(options.peerId);
+  const placed = await Promise.all(relays.map(async (relay) => {
+    const ids = await virtualIds(relay.nodeId, Math.max(1, options.virtualIds ?? RELAY_VIRTUAL_IDS));
+    return { relay, toRoom: nearest(ids, roomKey), toPeer: nearest(ids, peerKey) };
+  }));
+  const byRoom = [...placed].sort((a, b) => compareDistance(a.toRoom, b.toRoom, roomKey) || a.relay.url.localeCompare(b.relay.url));
+  const candidates = byRoom.slice(0, Math.max(1, options.candidates ?? RELAY_CANDIDATES));
+  const rest = byRoom.slice(candidates.length).sort((a, b) => compareDistance(a.toPeer, b.toPeer, peerKey) || a.relay.url.localeCompare(b.relay.url));
+  const ranked = candidates.map((entry) => {
+    const m = measure(entry.relay.nodeId);
+    const healthy = isHealthy(entry.relay, m);
+    const tier = healthy && entry.relay.kind === "local" ? 0 : healthy ? 1 : 2;
+    return { ...entry, tier, score: relayScore(entry.relay, m) };
+  }).sort((a, b) => a.tier - b.tier || a.score - b.score || compareDistance(a.toPeer, b.toPeer, peerKey));
+  if (options.previousUrl) {
+    const previous = ranked.findIndex((entry) => entry.relay.url === options.previousUrl);
+    if (previous > 0) {
+      const best = ranked[0];
+      const kept = ranked[previous];
+      const clearlyBetter = best.tier < kept.tier || best.score < kept.score * (1 - RELAY_SWITCH_MARGIN);
+      if (!clearlyBetter) {
+        ranked.splice(previous, 1);
+        ranked.unshift(kept);
+      }
+    }
+  }
+  return [...ranked, ...rest].map((entry) => entry.relay.url);
+}
+function dedupeRelays(relays) {
+  const byUrl = /* @__PURE__ */ new Map();
+  for (const relay of relays) {
+    if (!relay?.url || !NODE_ID_RE.test(String(relay.nodeId || ""))) continue;
+    if (!byUrl.has(relay.url)) byUrl.set(relay.url, relay);
+  }
+  return Array.from(byUrl.values());
+}
+var RELAY_SCORE_STORAGE_KEY = "peerpigeon:relay-scores:v1";
+var MAX_SHARED_SOURCES = 16;
+var PERSISTED_SHARED_SOURCES = 4;
+function freshMeasurement(m, now) {
+  const value = m;
+  if (!value || typeof value !== "object") return null;
+  const at = Number(value.at);
+  if (!Number.isFinite(at) || now - at > SCORE_MAX_AGE_MS || at > now + 6e4) return null;
+  const attempts = Math.max(0, Math.min(1e6, Math.floor(Number(value.attempts) || 0)));
+  const failures = Math.max(0, Math.min(attempts, Math.floor(Number(value.failures) || 0)));
+  const joinMs = value.joinMs === null || value.joinMs === void 0 ? null : Number(value.joinMs);
+  return {
+    joinMs: joinMs !== null && Number.isFinite(joinMs) && joinMs >= 0 ? Math.min(6e4, joinMs) : null,
+    attempts,
+    failures,
+    at
+  };
+}
+var RelayScoreBook = class _RelayScoreBook {
+  constructor(options = {}) {
+    this.entries = /* @__PURE__ */ new Map();
+    this.now = options.now ?? (() => Date.now());
+    this.storage = options.storage === void 0 ? _RelayScoreBook.defaultStorage() : options.storage;
+    this.load();
+  }
+  static defaultStorage() {
+    try {
+      const storage = globalThis.localStorage;
+      return storage && typeof storage.getItem === "function" ? storage : null;
+    } catch {
+      return null;
+    }
+  }
+  entry(nodeId) {
+    let entry = this.entries.get(nodeId);
+    if (!entry) {
+      entry = { own: null, shared: /* @__PURE__ */ new Map() };
+      this.entries.set(nodeId, entry);
+      if (this.entries.size > MAX_BOOK_ENTRIES) {
+        const oldest = this.entries.keys().next().value;
+        if (oldest !== void 0 && oldest !== nodeId) this.entries.delete(oldest);
+      }
+    }
+    return entry;
+  }
+  /** Record one of this peer's own joins through a relay. */
+  recordJoin(nodeId, result) {
+    if (!NODE_ID_RE.test(nodeId)) return;
+    const entry = this.entry(nodeId);
+    const own = entry.own ?? { joinMs: null, attempts: 0, failures: 0, at: 0 };
+    own.attempts += 1;
+    if (!result.ok) own.failures += 1;
+    const joinMs = Number(result.joinMs);
+    if (result.ok && Number.isFinite(joinMs) && joinMs >= 0) {
+      own.joinMs = own.joinMs === null ? joinMs : own.joinMs * (1 - JOIN_EMA) + joinMs * JOIN_EMA;
+    }
+    own.at = this.now();
+    entry.own = own;
+    this.save();
+  }
+  /** Merge scores another peer shared. Only its own measurements, one set per source. */
+  mergeShared(sourcePeerId, scores) {
+    if (!sourcePeerId || !Array.isArray(scores)) return;
+    const now = this.now();
+    for (const score of scores.slice(0, 32)) {
+      if (!NODE_ID_RE.test(String(score?.nodeId || ""))) continue;
+      const m = freshMeasurement(score, now);
+      if (!m) continue;
+      const entry = this.entry(score.nodeId);
+      entry.shared.set(sourcePeerId, m);
+      while (entry.shared.size > MAX_SHARED_SOURCES) {
+        const oldest = entry.shared.keys().next().value;
+        if (oldest === void 0) break;
+        entry.shared.delete(oldest);
+      }
+    }
+    this.save();
+  }
+  /** The combined measurement for a relay, own counted OWN_WEIGHT times. */
+  measurement(nodeId) {
+    const entry = this.entries.get(nodeId);
+    if (!entry) return null;
+    const now = this.now();
+    const parts = [];
+    const own = entry.own && freshMeasurement(entry.own, now);
+    if (own) parts.push({ m: own, weight: OWN_WEIGHT });
+    for (const shared of entry.shared.values()) {
+      const m = freshMeasurement(shared, now);
+      if (m) parts.push({ m, weight: 1 });
+    }
+    if (parts.length === 0) return null;
+    let attempts = 0;
+    let failures = 0;
+    let joinSum = 0;
+    let joinWeight = 0;
+    let at = 0;
+    for (const { m, weight } of parts) {
+      attempts += m.attempts * weight;
+      failures += m.failures * weight;
+      if (m.joinMs !== null) {
+        joinSum += m.joinMs * weight;
+        joinWeight += weight;
+      }
+      at = Math.max(at, m.at);
+    }
+    return { joinMs: joinWeight ? joinSum / joinWeight : null, attempts, failures, at };
+  }
+  /** This peer's own measurements, to share with others. */
+  ownScores(limit = 8) {
+    const now = this.now();
+    const out = [];
+    for (const [nodeId, entry] of this.entries) {
+      const own = entry.own && freshMeasurement(entry.own, now);
+      if (own) out.push({ nodeId, ...own });
+    }
+    return out.sort((a, b) => b.at - a.at).slice(0, limit);
+  }
+  load() {
+    if (!this.storage) return;
+    try {
+      const raw = JSON.parse(this.storage.getItem(RELAY_SCORE_STORAGE_KEY) || "{}");
+      const now = this.now();
+      for (const [nodeId, own] of Object.entries(raw?.own ?? {})) {
+        if (!NODE_ID_RE.test(nodeId)) continue;
+        const m = freshMeasurement(own, now);
+        if (m) this.entry(nodeId).own = m;
+      }
+      for (const [nodeId, sources] of Object.entries(raw?.shared ?? {})) {
+        if (!NODE_ID_RE.test(nodeId) || !sources || typeof sources !== "object") continue;
+        for (const [source, shared] of Object.entries(sources).slice(0, PERSISTED_SHARED_SOURCES)) {
+          const m = freshMeasurement(shared, now);
+          if (m) this.entry(nodeId).shared.set(source, m);
+        }
+      }
+    } catch {
+    }
+  }
+  save() {
+    if (!this.storage) return;
+    try {
+      const own = {};
+      const shared = {};
+      for (const [nodeId, entry] of this.entries) {
+        if (entry.own) own[nodeId] = entry.own;
+        const recent = Array.from(entry.shared.entries()).slice(-PERSISTED_SHARED_SOURCES);
+        if (recent.length) shared[nodeId] = Object.fromEntries(recent);
+      }
+      this.storage.setItem(RELAY_SCORE_STORAGE_KEY, JSON.stringify({ own, shared }));
+    } catch {
+    }
+  }
+};
+
 // src/storage.ts
 var MemoryStorageDriver = class {
   constructor() {
@@ -4344,12 +4594,12 @@ function compareXorDistance(left, right, target) {
   }
   return 0;
 }
-var NODE_ID_RE = /^[0-9a-f]{64}$/;
+var NODE_ID_RE2 = /^[0-9a-f]{64}$/;
 var TUNNEL_NODE_ID_RE = /^\/t\/([0-9a-f]{64})\/ws$/;
 async function relayRankingId(url, nodeId) {
   const known = String(nodeId ?? "").trim().toLowerCase();
   const fromPath = TUNNEL_NODE_ID_RE.exec(new URL(url).pathname)?.[1] ?? null;
-  const id = NODE_ID_RE.test(known) ? known : fromPath;
+  const id = NODE_ID_RE2.test(known) ? known : fromPath;
   if (id) return hexIdBytes(id);
   const hostname = new URL(url).hostname.toLowerCase();
   const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(hostname));
@@ -4374,7 +4624,71 @@ async function selectClosestSignalingServer(peerId, relayUrls) {
   if (ranked.length === 0) throw new Error("No valid FreeRTC relays are available");
   return ranked[0];
 }
+async function discoverSignalingRelays(options) {
+  const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
+  if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);
+  const records = /* @__PURE__ */ new Map([[bootstrap, {}]]);
+  for (const fallback of options.fallbackServers ?? []) {
+    const normalized = canonicalSignalingUrl(fallback);
+    if (normalized && !records.has(normalized)) records.set(normalized, {});
+  }
+  const registryUrl = new URL(bootstrap);
+  registryUrl.protocol = registryUrl.protocol === "wss:" ? "https:" : "http:";
+  registryUrl.pathname = "/api/v1/relays";
+  registryUrl.search = "";
+  registryUrl.hash = "";
+  const timeoutMs = Math.max(250, options.timeoutMs ?? 4e3);
+  try {
+    const response = await Promise.race([
+      (options.fetchImpl ?? globalThis.fetch)(registryUrl.toString(), { headers: { Accept: "application/json" } }),
+      new Promise((resolve) => {
+        setTimeout(() => resolve(null), timeoutMs);
+      })
+    ]);
+    if (response?.ok) {
+      const body = await response.json();
+      for (const record of Array.isArray(body?.relays) ? body.relays : []) {
+        const normalized = canonicalSignalingUrl(typeof record === "string" ? record : String(record?.url || ""));
+        if (!normalized) continue;
+        const next = typeof record === "string" ? {} : record;
+        const known = records.get(normalized);
+        if (!known || next.node_id && !known.node_id) records.set(normalized, next);
+      }
+    }
+  } catch {
+  }
+  return Promise.all(Array.from(records, async ([url, record]) => {
+    const pathId = TUNNEL_NODE_ID_RE.exec(new URL(url).pathname)?.[1] ?? null;
+    const nodeId = NODE_ID_RE2.test(String(record.node_id ?? "")) ? String(record.node_id) : null;
+    const ranking = await relayRankingId(url, nodeId);
+    const id = Array.from(ranking, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    const reach = Array.isArray(record.reach) ? record.reach : [];
+    const kind = record.relay_kind === "local" || !record.relay_kind && pathId ? "local" : "cloud";
+    return {
+      url,
+      nodeId: id,
+      kind,
+      connections: Number(record.connections || 0),
+      capacity: Number(record.capacity || 0),
+      tunnelOnly: Boolean(pathId) && !reach.some((entry) => entry?.via === "punch")
+    };
+  }));
+}
 async function discoverClosestSignalingServers(options) {
+  const limit = Math.max(1, Math.trunc(options.limit ?? DEFAULT_CLOSE_SIGNALING_RELAY_COUNT));
+  if (options.network && options.room) {
+    const relays = await discoverSignalingRelays(options);
+    options.onRelays?.(relays);
+    const ordered = await chooseRelays({
+      peerId: options.peerId,
+      network: options.network,
+      room: options.room,
+      relays,
+      measurements: options.measurements,
+      previousUrl: options.previousUrl ? canonicalSignalingUrl(options.previousUrl) : null
+    });
+    return ordered.slice(0, limit);
+  }
   const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
   if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);
   const candidates = /* @__PURE__ */ new Map([[bootstrap, null]]);
@@ -4412,7 +4726,6 @@ async function discoverClosestSignalingServers(options) {
     options.peerId,
     Array.from(candidates, ([url, nodeId]) => ({ url, nodeId }))
   );
-  const limit = Math.max(1, Math.trunc(options.limit ?? DEFAULT_CLOSE_SIGNALING_RELAY_COUNT));
   return ranked.slice(0, limit);
 }
 async function discoverClosestSignalingServer(options) {
@@ -4428,6 +4741,11 @@ var PartialMesh = class {
     this.clientId = null;
     this.selfAliases = /* @__PURE__ */ new Set();
     this.retiredPeerIds = /* @__PURE__ */ new Set();
+    // Relay choice (relay-choice.ts): measured joins per relay node ID, and the
+    // node ID behind each relay URL this peer was offered.
+    this.relayScores = new RelayScoreBook();
+    this.relayNodeIds = /* @__PURE__ */ new Map();
+    this.relayAttemptStartedAt = 0;
     this.eventHandlers = /* @__PURE__ */ new Map();
     this.connecting = /* @__PURE__ */ new Set();
     this.connectionStartedAtMs = /* @__PURE__ */ new Map();
@@ -5119,12 +5437,21 @@ var PartialMesh = class {
     this.clientId = requestedPeerId;
     this.addSelfAlias(requestedPeerId);
     this.emit("identity:ready", { clientId: requestedPeerId });
+    const relayNodeIds = /* @__PURE__ */ new Map();
     const signalingUrls = this.config.automaticSignalingServer ? await discoverClosestSignalingServers({
       bootstrapServer: this.config.signalingServer,
       peerId: requestedPeerId,
       fallbackServers: signalingCandidates,
-      limit: DEFAULT_CLOSE_SIGNALING_RELAY_COUNT
+      limit: DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
+      network: this.config.networkId,
+      room: this.config.sessionId,
+      measurements: (nodeId) => this.relayScores.measurement(nodeId),
+      previousUrl: previousPeerSignalUrls[0] ?? null,
+      onRelays: (relays) => {
+        for (const relay of relays) relayNodeIds.set(relay.url, relay.nodeId);
+      }
     }) : [this.normalizeSignalingUrl(this.config.signalingServer)];
+    this.relayNodeIds = relayNodeIds;
     this.rememberBrowserPeerSignalUrls(signalingUrls.slice(0, 1));
     this.emit("signaling:log", {
       message: `[signal] close federated relays ${signalingUrls.join(" -> ")}`
@@ -5153,7 +5480,18 @@ var PartialMesh = class {
         }
       }
     });
+    this.relayAttemptStartedAt = Date.now();
+    this.signalingClient.on("relay:failed", (data) => {
+      const nodeId = this.relayNodeIds.get(String(data?.signalUrl || ""));
+      if (nodeId) this.relayScores.recordJoin(nodeId, { ok: false });
+      this.relayAttemptStartedAt = Date.now();
+    });
     this.signalingClient.on("connected", (data) => {
+      const joinedNodeId = this.relayNodeIds.get(String(data?.signalUrl || signalingUrls[0] || ""));
+      if (joinedNodeId && this.relayAttemptStartedAt) {
+        this.relayScores.recordJoin(joinedNodeId, { ok: true, joinMs: Date.now() - this.relayAttemptStartedAt });
+        this.relayAttemptStartedAt = 0;
+      }
       const rawClientId = data?.clientId;
       const nextClientId = this.normalizePeerId(rawClientId);
       this.clientId = nextClientId;
@@ -5892,6 +6230,10 @@ var PartialMesh = class {
     });
   }
   /** Return the effective configuration, including constructor defaults. */
+  /** This peer's relay measurements (own and shared), used to choose relays. */
+  getRelayScores() {
+    return this.relayScores;
+  }
   getConfig() {
     return {
       ...this.config,
@@ -6441,11 +6783,14 @@ var PartialMesh = class {
     }
   }
 };
+var RELAY_SCORES_PAYLOAD_TYPE = "pp-relay-scores";
+var RELAY_SCORE_SHARE_MS = 10 * 6e4;
 var PeerPigeonNode = class {
   constructor(options = {}) {
     this.storage = null;
     this.callbacks = {};
     this.started = false;
+    this.relayScoreTimer = null;
     const { gossip = {}, crypto = {}, storage = false, ...meshOptions } = options;
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
@@ -6598,6 +6943,10 @@ var PeerPigeonNode = class {
     this.callbacks[event]?.delete(callback);
   }
   async destroy() {
+    if (this.relayScoreTimer) {
+      clearInterval(this.relayScoreTimer);
+      this.relayScoreTimer = null;
+    }
     if (this.storage) await this.storage.close();
     this.storage = null;
     this.crypto?.destroy();
@@ -6628,9 +6977,27 @@ var PeerPigeonNode = class {
         message
       });
     });
+    const shareRelayScores = (peerId) => {
+      const scores = this.mesh.getRelayScores().ownScores();
+      if (scores.length === 0) return;
+      try {
+        this.gossip.sendDirect(peerId, { __ppType: RELAY_SCORES_PAYLOAD_TYPE, scores }, { connectedOnly: true });
+      } catch {
+      }
+    };
+    this.mesh.on("peer:connected", (peerId) => shareRelayScores(peerId));
+    this.relayScoreTimer = setInterval(() => {
+      for (const peerId of this.mesh.getConnectedPeers()) shareRelayScores(peerId);
+    }, RELAY_SCORE_SHARE_MS);
+    this.relayScoreTimer.unref?.();
     this.gossip.on("directMessageReceived", ({ message }) => {
       if (isMeshSignalPayload(message.data)) {
         this.mesh.receiveMeshSignal(message.from, message.data.envelope);
+        return;
+      }
+      const relayScores = message.data;
+      if (relayScores && typeof relayScores === "object" && relayScores.__ppType === RELAY_SCORES_PAYLOAD_TYPE) {
+        if (Array.isArray(relayScores.scores)) this.mesh.getRelayScores().mergeShared(message.from, relayScores.scores);
         return;
       }
       if (this.isReservedPayload(message.data)) return;
@@ -6682,7 +7049,7 @@ var PeerPigeonNode = class {
     if (PeerPigeonCryptoProtocol.isProtocolPayload(data)) return true;
     if (!data || typeof data !== "object") return false;
     const type = data.__ppType;
-    return typeof type === "string" && (type.startsWith("pp-storage-") || type.startsWith("pp-signal-"));
+    return typeof type === "string" && (type.startsWith("pp-storage-") || type.startsWith("pp-signal-") || type.startsWith("pp-relay-"));
   }
   emitError(error) {
     this.emit("error", error instanceof Error ? error : new Error(String(error)));
@@ -6709,11 +7076,21 @@ export {
   PeerPigeonCryptoProtocol,
   PeerPigeonNode,
   PeerPigeonStorage,
+  RELAY_CANDIDATES,
+  RELAY_SCORE_STORAGE_KEY,
+  RELAY_SWITCH_MARGIN,
+  RELAY_VIRTUAL_IDS,
+  RelayScoreBook,
+  chooseRelays,
   index_default as default,
   discoverClosestSignalingServer,
   discoverClosestSignalingServers,
+  discoverSignalingRelays,
+  isHealthy,
   isMeshSignalPayload,
   rankSignalingServersByDistance,
+  relayScore,
+  roomRoutingKey,
   selectClosestSignalingServer,
   sha1Hex
 };

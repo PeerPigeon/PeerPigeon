@@ -440,6 +440,86 @@ declare class GossipProtocol {
     private generateMessageId;
 }
 
+type RelayKind = 'cloud' | 'local';
+interface RelayInfo {
+    url: string;
+    nodeId: string;
+    kind: RelayKind;
+    connections?: number;
+    capacity?: number;
+    /** True when the relay can only be reached through a tunnel home (no punch). */
+    tunnelOnly?: boolean;
+}
+interface RelayMeasurement {
+    /** Exponential moving average of connect-to-registered time, ms. */
+    joinMs: number | null;
+    attempts: number;
+    failures: number;
+    /** When this was last measured (ms since epoch). */
+    at: number;
+}
+declare const RELAY_CANDIDATES = 5;
+declare const RELAY_VIRTUAL_IDS = 4;
+declare const RELAY_SWITCH_MARGIN = 0.3;
+/** The key FreeRTC relays publish a room under. */
+declare function roomRoutingKey(network: string, room: string): Promise<Uint8Array>;
+declare function isHealthy(relay: RelayInfo, m: RelayMeasurement | null | undefined): boolean;
+declare function relayScore(relay: RelayInfo, m: RelayMeasurement | null | undefined): number;
+interface ChooseRelaysOptions {
+    peerId: string;
+    network: string;
+    room: string;
+    relays: readonly RelayInfo[];
+    measurements?: (nodeId: string) => RelayMeasurement | null | undefined;
+    /** The relay URL this peer used last, if any. */
+    previousUrl?: string | null;
+    candidates?: number;
+    virtualIds?: number;
+}
+/** Relay URLs in the order to try them. */
+declare function chooseRelays(options: ChooseRelaysOptions): Promise<string[]>;
+interface SharedRelayScore {
+    nodeId: string;
+    joinMs: number | null;
+    attempts: number;
+    failures: number;
+    at: number;
+}
+interface StorageLike {
+    getItem(key: string): string | null;
+    setItem(key: string, value: string): void;
+}
+declare const RELAY_SCORE_STORAGE_KEY = "peerpigeon:relay-scores:v1";
+/**
+ * Relay measurements: this peer's own joins, and what other peers share.
+ * Kept in localStorage when there is one, so a returning peer goes straight
+ * to the relay that worked last time.
+ */
+declare class RelayScoreBook {
+    private entries;
+    private storage;
+    private now;
+    constructor(options?: {
+        storage?: StorageLike | null;
+        now?: () => number;
+    });
+    static defaultStorage(): StorageLike | null;
+    private entry;
+    /** Record one of this peer's own joins through a relay. */
+    recordJoin(nodeId: string, result: {
+        ok: boolean;
+        joinMs?: number | null;
+    }): void;
+    /** Merge scores another peer shared. Only its own measurements, one set per source. */
+    mergeShared(sourcePeerId: string, scores: readonly SharedRelayScore[]): void;
+    /** The combined measurement for a relay, own counted OWN_WEIGHT times. */
+    measurement(nodeId: string): RelayMeasurement | null;
+    /** This peer's own measurements, to share with others. */
+    ownScores(limit?: number): SharedRelayScore[];
+    private load;
+    private save;
+}
+
 type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
 type StorageVersion = string | number;
 type StorageChangeOrigin = 'local' | 'remote';
@@ -873,8 +953,22 @@ declare function rankSignalingServersByDistance(peerId: string, relays: readonly
 /** Choose exactly one relay by node-ID XOR distance to the peer ID. */
 declare function selectClosestSignalingServer(peerId: string, relayUrls: readonly SignalingRelayCandidate[]): Promise<string>;
 /**
- * Read the public relay registry from one bootstrap, then select one relay.
- * The bootstrap request is HTTP-only; only the selected relay gets a WebSocket.
+ * Every relay a bootstrap's registry (/api/v1/relays) lists, plus the
+ * bootstrap and fallbacks, with what each says about itself: node ID, kind
+ * (a relay behind NAT is local), and whether it can only be reached through
+ * its tunnel. The registry request is HTTP-only.
+ */
+declare function discoverSignalingRelays(options: {
+    bootstrapServer: string;
+    fallbackServers?: readonly string[];
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+}): Promise<RelayInfo[]>;
+/**
+ * Read the public relay registry from one bootstrap, then order the relays.
+ * Given a network and room, relays are chosen for the room (chooseRelays:
+ * the room's relays, healthy local ones first, then by measured score);
+ * otherwise they are ranked by node-ID distance to the peer ID.
  */
 declare function discoverClosestSignalingServers(options: {
     bootstrapServer: string;
@@ -883,6 +977,11 @@ declare function discoverClosestSignalingServers(options: {
     fetchImpl?: typeof fetch;
     timeoutMs?: number;
     limit?: number;
+    network?: string;
+    room?: string;
+    measurements?: (nodeId: string) => RelayMeasurement | null | undefined;
+    previousUrl?: string | null;
+    onRelays?: (relays: RelayInfo[]) => void;
 }): Promise<string[]>;
 declare function discoverClosestSignalingServer(options: {
     bootstrapServer: string;
@@ -1069,6 +1168,9 @@ declare class PartialMesh {
     private clientId;
     private selfAliases;
     private retiredPeerIds;
+    private relayScores;
+    private relayNodeIds;
+    private relayAttemptStartedAt;
     private eventHandlers;
     private connecting;
     private connectionStartedAtMs;
@@ -1249,6 +1351,8 @@ declare class PartialMesh {
         clockSkewMs: number;
     }>;
     /** Return the effective configuration, including constructor defaults. */
+    /** This peer's relay measurements (own and shared), used to choose relays. */
+    getRelayScores(): RelayScoreBook;
     getConfig(): Readonly<Required<PartialMeshConfig>>;
     /**
      * Update connection-policy knobs without rebuilding the node. Signaling,
@@ -1341,11 +1445,6 @@ type PeerPigeonNodeEvents = {
     cecrStateChanged: (state: CecrStateSnapshot) => void;
     error: (error: Error) => void;
 };
-/**
- * Unified high-level node API. Advanced callers can still access `mesh`,
- * `gossip`, `crypto`, and `storage`, while normal applications need only this
- * facade for topology, messaging, encryption, keys, capacity, and config.
- */
 declare class PeerPigeonNode {
     readonly mesh: PartialMesh;
     readonly gossip: GossipProtocol;
@@ -1354,6 +1453,7 @@ declare class PeerPigeonNode {
     private readonly storageOptions;
     private readonly callbacks;
     private started;
+    private relayScoreTimer;
     constructor(options?: PeerPigeonNodeOptions);
     init(): Promise<void>;
     start(): Promise<void>;
@@ -1394,4 +1494,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, type RoomCipher, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, isMeshSignalPayload, rankSignalingServersByDistance, selectClosestSignalingServer, sha1Hex };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, type SharedRelayScore, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, chooseRelays, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, rankSignalingServersByDistance, relayScore, roomRoutingKey, selectClosestSignalingServer, sha1Hex };
