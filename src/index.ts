@@ -35,6 +35,8 @@ import type {
 
 // A link into a part of the mesh outside our membership is kept this long
 // past maxPeers, so membership can merge across it before trimming.
+// How long a merged membership update waits to be forwarded, so updates arriving together go out as one frame.
+const RENEWAL_FORWARD_MS = 300;
 // How long links stay open after a peer says it is leaving, so that frame goes out first.
 const LEAVE_FLUSH_MS = 250;
 const BRIDGE_GRACE_MS = 8_000;
@@ -3122,6 +3124,42 @@ export class PartialMesh {
     private membershipBroadcastAtMs = 0;
     private membershipBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
 
+    // Lease renewals must cross the whole mesh well inside a lease. Riding
+    // each peer's own five-second round, one hop per round, they did not: on
+    // a ring of forty a renewal took longer to reach the far side than the
+    // lease lasted, live peers dropped out of membership there, and each
+    // dropout was answered with a bridge dial and a shed link, all day. Each
+    // newer record we merge is forwarded to our neighbours as a small update
+    // within RENEWAL_FORWARD_MS. A record is forwarded only when it is newer
+    // than ours, so each version crosses each link at most once.
+    private renewalForwardIds = new Set<string>();
+    private renewalForwardTimer: ReturnType<typeof setTimeout> | null = null;
+
+    private forwardMembershipRecords(peerIds: string[]): void {
+      for (const peerId of peerIds) this.renewalForwardIds.add(peerId);
+      if (this.renewalForwardTimer) return;
+      this.renewalForwardTimer = setTimeout(() => {
+        this.renewalForwardTimer = null;
+        const ids = Array.from(this.renewalForwardIds);
+        this.renewalForwardIds.clear();
+        const all = this.membershipRecordsForWire();
+        const records: Record<string, CecrWireMembershipRecord> = {};
+        for (const peerId of ids) if (all[peerId]) records[peerId] = all[peerId];
+        if (Object.keys(records).length === 0) return;
+        const payload = JSON.stringify({
+          __membership: true, peers: [], retiredPeers: [], records, capacities: {}, topology: {},
+        });
+        for (const peerId of this.getConnectedPeers()) {
+          try {
+            this.signalingClient?.send(peerId, payload);
+          } catch {
+            // best-effort
+          }
+        }
+      }, RENEWAL_FORWARD_MS);
+      (this.renewalForwardTimer as { unref?: () => void }).unref?.();
+    }
+
     private broadcastMembership(exceptPeerId?: string): void {
       const now = Date.now();
       const elapsed = now - this.membershipBroadcastAtMs;
@@ -3186,9 +3224,12 @@ export class PartialMesh {
       let topologyChanged = false;
       let departureMerged = false;
       const now = Date.now();
+      const renewed: string[] = [];
+      const returning: string[] = [];
       for (const [rawPeerId, rawRecord] of Object.entries(records || {})) {
         const peerId = this.normalizePeerId(rawPeerId);
         if (!peerId || !Array.isArray(rawRecord) || rawRecord.length < 5) continue;
+        const wasMember = this.globalPeers.has(peerId);
         const record: CecrMembershipRecord = {
           peerId,
           incarnation: Math.floor(Number(rawRecord[0])),
@@ -3200,6 +3241,10 @@ export class PartialMesh {
         if (this.mergeMembershipRecord(record, now)) {
           membershipChanged = true;
           if (record.state === 'left') departureMerged = true;
+          else {
+            renewed.push(peerId);
+            if (!wasMember) returning.push(peerId);
+          }
         }
       }
       // A transport-authenticated peer may retire itself. Third-party legacy
@@ -3238,6 +3283,18 @@ export class PartialMesh {
       }
       const viewChanged = this.rebuildGlobalMembership(false);
       if (viewChanged) membershipChanged = true;
+      // A peer that is back (asleep in a background tab, or its lease ran out
+      // somewhere on a long ring) is forgiven at once: the dial failures and
+      // the quarantine we gave it belong to the time it was gone. Without
+      // this, a tab that woke up waited out everyone else's five-minute
+      // quarantine and had to force its own way into full peers.
+      for (const peerId of returning) {
+        if (!this.globalPeers.has(peerId)) continue;
+        this.dialFailureCount.delete(peerId);
+        this.lastDialFailureAtMs.delete(peerId);
+        this.dialBackoffUntilMs.delete(peerId);
+      }
+      if (renewed.length > 0) this.forwardMembershipRecords(renewed);
       for (const [rawPeerId, rawState] of Object.entries(capacities || {})) {
         const peerId = this.normalizePeerId(rawPeerId);
         if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
@@ -3351,6 +3408,11 @@ export class PartialMesh {
       this.membershipTimer = null;
     }
 
+    if (this.renewalForwardTimer) {
+      clearTimeout(this.renewalForwardTimer);
+      this.renewalForwardTimer = null;
+    }
+    this.renewalForwardIds.clear();
     const announced = this.announceLeave();
     const closingClient = this.signalingClient;
     const closingPeerIds = Array.from(this.peers.keys());

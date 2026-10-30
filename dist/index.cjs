@@ -4652,6 +4652,7 @@ function isMeshSignalPayload(value) {
   const candidate = value;
   return candidate.__ppType === MESH_SIGNAL_PAYLOAD_TYPE && !!candidate.envelope && typeof candidate.envelope === "object";
 }
+var RENEWAL_FORWARD_MS = 300;
 var LEAVE_FLUSH_MS = 250;
 var BRIDGE_GRACE_MS = 8e3;
 var BRIDGE_DIAL_INTERVAL_MS = 5e3;
@@ -4912,6 +4913,16 @@ var PartialMesh = class {
     // the window closes, so nothing is lost, only coalesced.
     this.membershipBroadcastAtMs = 0;
     this.membershipBroadcastTimer = null;
+    // Lease renewals must cross the whole mesh well inside a lease. Riding
+    // each peer's own five-second round, one hop per round, they did not: on
+    // a ring of forty a renewal took longer to reach the far side than the
+    // lease lasted, live peers dropped out of membership there, and each
+    // dropout was answered with a bridge dial and a shed link, all day. Each
+    // newer record we merge is forwarded to our neighbours as a small update
+    // within RENEWAL_FORWARD_MS. A record is forwarded only when it is newer
+    // than ours, so each version crosses each link at most once.
+    this.renewalForwardIds = /* @__PURE__ */ new Set();
+    this.renewalForwardTimer = null;
     const automaticSignalingServer = config.automaticSignalingServer ?? !config.signalingServer;
     const bootstrapServer = String(config.signalingServer || DEFAULT_SIGNALING_SERVERS[0]).trim();
     const configuredSignalingServers = Array.from(new Set((config.signalingServers != null ? [bootstrapServer, ...config.signalingServers] : automaticSignalingServer ? DEFAULT_SIGNALING_SERVERS : [bootstrapServer]).map((url) => String(url || "").trim()).filter(Boolean)));
@@ -6789,6 +6800,34 @@ var PartialMesh = class {
     } catch {
     }
   }
+  forwardMembershipRecords(peerIds) {
+    for (const peerId of peerIds) this.renewalForwardIds.add(peerId);
+    if (this.renewalForwardTimer) return;
+    this.renewalForwardTimer = setTimeout(() => {
+      this.renewalForwardTimer = null;
+      const ids = Array.from(this.renewalForwardIds);
+      this.renewalForwardIds.clear();
+      const all = this.membershipRecordsForWire();
+      const records = {};
+      for (const peerId of ids) if (all[peerId]) records[peerId] = all[peerId];
+      if (Object.keys(records).length === 0) return;
+      const payload = JSON.stringify({
+        __membership: true,
+        peers: [],
+        retiredPeers: [],
+        records,
+        capacities: {},
+        topology: {}
+      });
+      for (const peerId of this.getConnectedPeers()) {
+        try {
+          this.signalingClient?.send(peerId, payload);
+        } catch {
+        }
+      }
+    }, RENEWAL_FORWARD_MS);
+    this.renewalForwardTimer.unref?.();
+  }
   broadcastMembership(exceptPeerId) {
     const now = Date.now();
     const elapsed = now - this.membershipBroadcastAtMs;
@@ -6831,9 +6870,12 @@ var PartialMesh = class {
     let topologyChanged = false;
     let departureMerged = false;
     const now = Date.now();
+    const renewed = [];
+    const returning = [];
     for (const [rawPeerId, rawRecord] of Object.entries(records || {})) {
       const peerId = this.normalizePeerId(rawPeerId);
       if (!peerId || !Array.isArray(rawRecord) || rawRecord.length < 5) continue;
+      const wasMember = this.globalPeers.has(peerId);
       const record = {
         peerId,
         incarnation: Math.floor(Number(rawRecord[0])),
@@ -6845,6 +6887,10 @@ var PartialMesh = class {
       if (this.mergeMembershipRecord(record, now)) {
         membershipChanged = true;
         if (record.state === "left") departureMerged = true;
+        else {
+          renewed.push(peerId);
+          if (!wasMember) returning.push(peerId);
+        }
       }
     }
     const normalizedFromPeerId = this.normalizePeerId(fromPeerId);
@@ -6879,6 +6925,13 @@ var PartialMesh = class {
     }
     const viewChanged = this.rebuildGlobalMembership(false);
     if (viewChanged) membershipChanged = true;
+    for (const peerId of returning) {
+      if (!this.globalPeers.has(peerId)) continue;
+      this.dialFailureCount.delete(peerId);
+      this.lastDialFailureAtMs.delete(peerId);
+      this.dialBackoffUntilMs.delete(peerId);
+    }
+    if (renewed.length > 0) this.forwardMembershipRecords(renewed);
     for (const [rawPeerId, rawState] of Object.entries(capacities || {})) {
       const peerId = this.normalizePeerId(rawPeerId);
       if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
@@ -6973,6 +7026,11 @@ var PartialMesh = class {
       clearInterval(this.membershipTimer);
       this.membershipTimer = null;
     }
+    if (this.renewalForwardTimer) {
+      clearTimeout(this.renewalForwardTimer);
+      this.renewalForwardTimer = null;
+    }
+    this.renewalForwardIds.clear();
     const announced = this.announceLeave();
     const closingClient = this.signalingClient;
     const closingPeerIds = Array.from(this.peers.keys());

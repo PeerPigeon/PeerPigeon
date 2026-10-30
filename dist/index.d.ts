@@ -1421,6 +1421,9 @@ declare class PartialMesh {
     private sendMembership;
     private membershipBroadcastAtMs;
     private membershipBroadcastTimer;
+    private renewalForwardIds;
+    private renewalForwardTimer;
+    private forwardMembershipRecords;
     private broadcastMembership;
     private tryParseMembership;
     private mergeMembership;
