@@ -973,6 +973,8 @@ declare function discoverSignalingRelays(options: {
     fallbackServers?: readonly string[];
     fetchImpl?: typeof fetch;
     timeoutMs?: number;
+    /** DNS relay directory to read direct relays from (default _relays.peer.ooo); false for none. */
+    directory?: string | false;
 }): Promise<RelayInfo[]>;
 /**
  * Read the public relay registry from one bootstrap, then order the relays.
@@ -992,6 +994,7 @@ declare function discoverClosestSignalingServers(options: {
     measurements?: (nodeId: string) => RelayMeasurement | null | undefined;
     previousUrl?: string | null;
     onRelays?: (relays: RelayInfo[]) => void;
+    directory?: string | false;
 }): Promise<string[]>;
 declare function discoverClosestSignalingServer(options: {
     bootstrapServer: string;
@@ -1021,6 +1024,12 @@ interface PartialMeshConfig {
     signalingServers?: readonly string[];
     /** Resolve one relay closest to the peer ID before opening signaling. */
     automaticSignalingServer?: boolean;
+    /**
+     * DNS relay directory to look direct relays up in (one DNS-over-HTTPS
+     * lookup), with automaticSignalingServer. Default _relays.peer.ooo; false to
+     * use only the bootstrap's registry.
+     */
+    relayDirectory?: string | false;
     /**
      * FreeRTC network/application namespace. Peers must match both networkId and
      * sessionId (room) even when they use different federated relay domains.

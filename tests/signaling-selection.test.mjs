@@ -149,7 +149,7 @@ test('a same-tab reload rotates and retires its previous peer identity', () => {
 test('local peer identity is ready before automatic relay discovery completes', async () => {
   const originalFetch = globalThis.fetch;
   const originalWebSocket = globalThis.WebSocket;
-  let resolveRegistry;
+  const pending = [];
 
   class PendingWebSocket {
     static CONNECTING = 0;
@@ -169,9 +169,13 @@ test('local peer identity is ready before automatic relay discovery completes', 
     send() {}
   }
 
-  globalThis.fetch = () => new Promise((resolve) => {
-    resolveRegistry = resolve;
-  });
+  // Discovery makes several requests at once (the relay registry and the DNS
+  // directory); all of them stay pending until the identity has been checked.
+  let released = false;
+  const failed = { ok: false, json: async () => ({}) };
+  globalThis.fetch = () => (released ? Promise.resolve(failed) : new Promise((resolve) => {
+    pending.push(resolve);
+  }));
   globalThis.WebSocket = PendingWebSocket;
   const mesh = new PartialMesh();
   let identity = '';
@@ -185,7 +189,8 @@ test('local peer identity is ready before automatic relay discovery completes', 
     assert.match(identity, /^[0-9a-f]{64}$/);
     assert.equal(mesh.getClientId(), identity);
 
-    resolveRegistry({ ok: false });
+    released = true;
+    for (const resolve of pending) resolve(failed);
     await initializing;
   } finally {
     mesh.destroy();
@@ -232,4 +237,35 @@ test('discovery ranks registry relays by their node_id, and a URL listed twice k
     }),
   });
   assert.equal(relays[0], relay);
+});
+
+test('direct relays from the DNS directory come first, and a relay listed both ways is kept once', async () => {
+  const { discoverSignalingRelays } = await import('../dist/index.js');
+  const { generateRandomPair } = await import('unsea');
+  const { createRelayIdentity } = await import('../node_modules/freertc/src/relay-identity.js');
+  const { createSignedDirectoryRecord, encodeDirectoryTxt } = await import('../node_modules/freertc/src/direct/record.js');
+  const pair = await generateRandomPair();
+  const identity = await createRelayIdentity(pair.pub, pair.priv);
+  const tunnel = `wss://peer.ooo/t/${identity.nodeId}/ws`;
+  const record = await createSignedDirectoryRecord(identity, {
+    direct: `webrtc-direct://203.0.113.7:9443/sha256/${'a'.repeat(64)}`,
+    tunnel,
+  });
+  const fetchImpl = async (url) => {
+    if (String(url).includes('dns-query') || String(url).includes('/resolve')) {
+      return new Response(JSON.stringify({ Answer: [{ type: 16, data: encodeDirectoryTxt(record) }] }));
+    }
+    return new Response(JSON.stringify({ relays: [
+      { url: tunnel, node_id: identity.nodeId, relay_kind: 'local' },
+      { url: 'wss://decentralize.ooo/ws' },
+    ] }));
+  };
+  const relays = await discoverSignalingRelays({ bootstrapServer: 'wss://peer.ooo/ws', fetchImpl, directory: `_relays.test-${Date.now()}.example` });
+  assert.equal(relays[0].url, `webrtc-direct://203.0.113.7:9443/sha256/${'a'.repeat(64)}?tunnel=${encodeURIComponent(tunnel)}`);
+  assert.equal(relays[0].kind, 'local');
+  assert.equal(relays[0].nodeId, identity.nodeId);
+  assert.equal(relays.filter((relay) => relay.nodeId === identity.nodeId).length, 1, 'kept once, as its direct entry');
+  assert.ok(relays.some((relay) => relay.url === 'wss://decentralize.ooo/ws'));
+  const none = await discoverSignalingRelays({ bootstrapServer: 'wss://peer.ooo/ws', fetchImpl, directory: false });
+  assert.equal(none.some((relay) => relay.url.startsWith('webrtc-direct:')), false, 'directory: false skips the lookup');
 });

@@ -1,3 +1,6 @@
+// src/index.ts
+import { isDirectRelayUrl, lookupDirectRelays, DEFAULT_DIRECTORY_NAME } from "freertc/client";
+
 // src/freertc-client-adapter.ts
 import { createSignalingClient, withdrawSignalingIdentity } from "freertc/client";
 var RECOVERY_PROBE_TIMEOUT_MS = 12e3;
@@ -4622,9 +4625,18 @@ var NEGOTIATION_OFFER_DEADLINE_MS = 2e4;
 var MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1e3;
 var DISCOVERY_REFRESH_MIN_MS = 2e3;
 var DISCOVERY_REFRESH_MAX_MS = 5 * 6e4;
+function canonicalDirectRelayUrl(value) {
+  const [base, query = ""] = value.split("?");
+  if (!isDirectRelayUrl(base)) return null;
+  const tunnel = new URLSearchParams(query).get("tunnel");
+  const canonicalTunnel = tunnel ? canonicalSignalingUrl(tunnel) : null;
+  return canonicalTunnel ? `${base}?tunnel=${encodeURIComponent(canonicalTunnel)}` : base;
+}
 function canonicalSignalingUrl(value) {
+  const text = String(value || "").trim();
+  if (text.startsWith("webrtc-direct://")) return canonicalDirectRelayUrl(text);
   try {
-    const url = new URL(String(value || "").trim());
+    const url = new URL(text);
     if (url.protocol === "https:") url.protocol = "wss:";
     if (url.protocol === "http:") url.protocol = "ws:";
     if (url.protocol !== "wss:" && url.protocol !== "ws:") return null;
@@ -4685,6 +4697,21 @@ async function selectClosestSignalingServer(peerId, relayUrls) {
   return ranked[0];
 }
 async function discoverSignalingRelays(options) {
+  const directLookup = options.directory === false ? Promise.resolve([]) : lookupDirectRelays({ name: options.directory || DEFAULT_DIRECTORY_NAME, fetchImpl: options.fetchImpl }).then((records) => records.map((record) => ({
+    url: canonicalSignalingUrl(record.tunnel ? `${record.direct}?tunnel=${encodeURIComponent(record.tunnel)}` : record.direct),
+    nodeId: record.node_id,
+    kind: "local",
+    connections: 0,
+    capacity: Number(record.capacity || 0),
+    tunnelOnly: false
+  })).filter((relay) => Boolean(relay.url))).catch(() => []);
+  const fromRegistry = await discoverRegistryRelays(options);
+  const direct = await directLookup;
+  if (direct.length === 0) return fromRegistry;
+  const directIds = new Set(direct.map((relay) => relay.nodeId));
+  return [...direct, ...fromRegistry.filter((relay) => !directIds.has(relay.nodeId))];
+}
+async function discoverRegistryRelays(options) {
   const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
   if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);
   const records = /* @__PURE__ */ new Map([[bootstrap, {}]]);
@@ -4881,6 +4908,7 @@ var PartialMesh = class {
       signalingServer: bootstrapServer,
       signalingServers,
       automaticSignalingServer,
+      relayDirectory: config.relayDirectory ?? DEFAULT_DIRECTORY_NAME,
       networkId: config.networkId ?? config.sessionId ?? "peerpigeon",
       sessionId: config.sessionId ?? "default-session",
       autoDiscover: config.autoDiscover ?? true,
@@ -4950,6 +4978,11 @@ var PartialMesh = class {
     return (peerId ?? "").trim();
   }
   normalizeSignalingUrl(rawUrl) {
+    if (String(rawUrl).trim().startsWith("webrtc-direct://")) {
+      const direct = canonicalSignalingUrl(rawUrl);
+      if (!direct) throw new Error(`Invalid direct relay URL: ${rawUrl}`);
+      return direct;
+    }
     const url = new URL(rawUrl);
     const hostname = url.hostname.toLowerCase();
     const isLocalDevelopmentHost = hostname === "localhost" || hostname === "::1" || hostname.endsWith(".local") || /^127\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^169\.254\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
@@ -5565,7 +5598,8 @@ var PartialMesh = class {
       previousUrl: previousPeerSignalUrls[0] ?? null,
       onRelays: (relays) => {
         for (const relay of relays) relayNodeIds.set(relay.url, relay.nodeId);
-      }
+      },
+      directory: this.config.relayDirectory
     }) : [this.normalizeSignalingUrl(this.config.signalingServer)];
     this.relayNodeIds = relayNodeIds;
     this.rememberBrowserPeerSignalUrls(signalingUrls.slice(0, 1));

@@ -1,3 +1,4 @@
+import { isDirectRelayUrl, lookupDirectRelays, DEFAULT_DIRECTORY_NAME } from 'freertc/client';
 import FreeRTCClientAdapter, { type MeshSignaling } from './freertc-client-adapter.js';
 
 /** Payload type of a signaling envelope carried inside a gossip direct frame. */
@@ -104,9 +105,21 @@ const MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1_000;
 const DISCOVERY_REFRESH_MIN_MS = 2_000;
 const DISCOVERY_REFRESH_MAX_MS = 5 * 60_000;
 
+// A direct relay (freertc src/direct): webrtc-direct://<ip>:<port>/sha256/<fp>,
+// optionally ?tunnel=<its tunnel URL> for when the direct path fails.
+function canonicalDirectRelayUrl(value: string): string | null {
+  const [base, query = ''] = value.split('?');
+  if (!isDirectRelayUrl(base)) return null;
+  const tunnel = new URLSearchParams(query).get('tunnel');
+  const canonicalTunnel = tunnel ? canonicalSignalingUrl(tunnel) : null;
+  return canonicalTunnel ? `${base}?tunnel=${encodeURIComponent(canonicalTunnel)}` : base;
+}
+
 function canonicalSignalingUrl(value: string | null | undefined): string | null {
+  const text = String(value || '').trim();
+  if (text.startsWith('webrtc-direct://')) return canonicalDirectRelayUrl(text);
   try {
-    const url = new URL(String(value || '').trim());
+    const url = new URL(text);
     if (url.protocol === 'https:') url.protocol = 'wss:';
     if (url.protocol === 'http:') url.protocol = 'ws:';
     if (url.protocol !== 'wss:' && url.protocol !== 'ws:') return null;
@@ -216,6 +229,37 @@ export async function discoverSignalingRelays(options: {
   fallbackServers?: readonly string[];
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  /** DNS relay directory to read direct relays from (default _relays.peer.ooo); false for none. */
+  directory?: string | false;
+}): Promise<RelayInfo[]> {
+  // Direct relays come from one DNS-over-HTTPS lookup, read alongside the
+  // registry. They are local relays a browser reaches with no cloud relay in
+  // the way; a direct entry also falls back to the relay's tunnel.
+  const directLookup: Promise<RelayInfo[]> = options.directory === false
+    ? Promise.resolve([])
+    : lookupDirectRelays({ name: options.directory || DEFAULT_DIRECTORY_NAME, fetchImpl: options.fetchImpl })
+      .then((records) => records.map((record) => ({
+        url: canonicalSignalingUrl(record.tunnel ? `${record.direct}?tunnel=${encodeURIComponent(record.tunnel)}` : record.direct) as string,
+        nodeId: record.node_id,
+        kind: 'local' as RelayKind,
+        connections: 0,
+        capacity: Number(record.capacity || 0),
+        tunnelOnly: false,
+      })).filter((relay) => Boolean(relay.url)))
+      .catch(() => []);
+  const fromRegistry = await discoverRegistryRelays(options);
+  const direct = await directLookup;
+  if (direct.length === 0) return fromRegistry;
+  // A relay listed both ways is kept once, as its direct entry.
+  const directIds = new Set(direct.map((relay) => relay.nodeId));
+  return [...direct, ...fromRegistry.filter((relay) => !directIds.has(relay.nodeId))];
+}
+
+async function discoverRegistryRelays(options: {
+  bootstrapServer: string;
+  fallbackServers?: readonly string[];
+  fetchImpl?: typeof fetch;
+  timeoutMs?: number;
 }): Promise<RelayInfo[]> {
   const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
   if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);
@@ -284,6 +328,7 @@ export async function discoverClosestSignalingServers(options: {
   measurements?: (nodeId: string) => RelayMeasurement | null | undefined;
   previousUrl?: string | null;
   onRelays?: (relays: RelayInfo[]) => void;
+  directory?: string | false;
 }): Promise<string[]> {
   const limit = Math.max(1, Math.trunc(options.limit ?? DEFAULT_CLOSE_SIGNALING_RELAY_COUNT));
   if (options.network && options.room) {
@@ -382,6 +427,13 @@ export interface PartialMeshConfig {
 
   /** Resolve one relay closest to the peer ID before opening signaling. */
   automaticSignalingServer?: boolean;
+
+  /**
+   * DNS relay directory to look direct relays up in (one DNS-over-HTTPS
+   * lookup), with automaticSignalingServer. Default _relays.peer.ooo; false to
+   * use only the bootstrap's registry.
+   */
+  relayDirectory?: string | false;
 
   /**
    * FreeRTC network/application namespace. Peers must match both networkId and
@@ -640,6 +692,7 @@ export class PartialMesh {
       signalingServer: bootstrapServer,
       signalingServers,
       automaticSignalingServer,
+      relayDirectory: config.relayDirectory ?? DEFAULT_DIRECTORY_NAME,
       networkId: config.networkId ?? config.sessionId ?? 'peerpigeon',
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
@@ -723,6 +776,11 @@ export class PartialMesh {
   }
 
   private normalizeSignalingUrl(rawUrl: string): string {
+    if (String(rawUrl).trim().startsWith('webrtc-direct://')) {
+      const direct = canonicalSignalingUrl(rawUrl);
+      if (!direct) throw new Error(`Invalid direct relay URL: ${rawUrl}`);
+      return direct;
+    }
     const url = new URL(rawUrl);
     const hostname = url.hostname.toLowerCase();
     const isLocalDevelopmentHost = hostname === 'localhost'
@@ -1540,6 +1598,7 @@ export class PartialMesh {
         measurements: (nodeId) => this.relayScores.measurement(nodeId),
         previousUrl: previousPeerSignalUrls[0] ?? null,
         onRelays: (relays) => { for (const relay of relays) relayNodeIds.set(relay.url, relay.nodeId); },
+        directory: this.config.relayDirectory,
       })
       : [this.normalizeSignalingUrl(this.config.signalingServer)];
     this.relayNodeIds = relayNodeIds;
