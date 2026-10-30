@@ -5117,7 +5117,7 @@ export default {
 
 .log-line {
   display: grid;
-  grid-template-columns: 6.5rem 7rem minmax(0, 1fr);
+  grid-template-columns: max-content 8rem minmax(0, 1fr);
   gap: 0.75rem;
   padding: 0.1rem 0.75rem;
 }
@@ -5131,8 +5131,22 @@ export default {
   color: var(--ink-2);
 }
 
+/* Each column keeps to its own width: Safari lets long peer IDs run on into
+   the next column unless the grid items may shrink and clip. */
+.log-line > span {
+  min-width: 0;
+}
+
+.log-time,
+.log-from {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .log-text {
   overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .log-repeat {
@@ -5219,12 +5233,6 @@ export default {
   .wide-only,
   .stage-count {
     display: none;
-  }
-
-  .log-from {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .live {
