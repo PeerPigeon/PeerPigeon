@@ -65,8 +65,8 @@
     "@playwright/test": "^1.55.0",
     "@types/node": "^25.0.3",
     "multicast-dns": "^7.2.5",
-    "tsup": "^8.5.1",
+    "tsup": "^9.0.0",
     "typescript": "^5.9.3",
-    "vite": "^7.3.0"
+    "vite": "^7.3.7"
   }
 }

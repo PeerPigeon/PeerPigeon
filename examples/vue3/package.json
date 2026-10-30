@@ -21,16 +21,10 @@
     "freertc": "github:draeder/freertc#main",
     "peerpigeon": "file:../..",
     "unsea": "^1.1.2",
-    "vue": "^3.3.0"
+    "vue": "^3.5.44"
   },
   "devDependencies": {
-    "@rollup/plugin-inject": "^5.0.5",
-    "@vitejs/plugin-vue": "^5.0.0",
-    "buffer": "^6.0.3",
-    "events": "^3.3.0",
-    "process": "^0.11.10",
-    "stream-browserify": "^3.0.0",
-    "util": "^0.12.5",
-    "vite": "^5.0.0"
+    "@vitejs/plugin-vue": "^6.0.10",
+    "vite": "^7.3.7"
   }
 }
