@@ -355,3 +355,25 @@ test('with no current relay list, peers that left together stop counting at once
   assert.equal(snapshot.coverage, 1);
   assert.equal(graphPeerSummary(graph, { relayListed: [] }).fading, 2);
 });
+
+test('peers that all left at once never count, with no relay list at all', () => {
+  // Two peers that left together still report each other until their leases
+  // end; within the grace they are pending, not counted, and not shown as gone.
+  const graph = {
+    nodes: [{ id: 'me', isSelf: true }, { id: 'a' }, { id: 'x' }, { id: 'y' }],
+    links: [
+      { source: 'me', target: 'a', direct: true },
+      { source: 'a', target: 'me' },
+      { source: 'x', target: 'y' },
+    ],
+  };
+  const options = { cutOffSince: new Map(), cutOffGraceMs: 35000 };
+  const at = (now) => ({ ...options, now });
+  assert.equal(graphCoverageSnapshot(graph, 'me', 0, at(1000)).coverage, 1);
+  const summary = graphPeerSummary(graph, at(20000));
+  assert.equal(summary.total, 2);
+  assert.equal(summary.fading, 0);
+  const left = { ...graph, nodes: graph.nodes.filter((n) => n.id !== 'x' && n.id !== 'y') };
+  assert.equal(graphCoverageSnapshot(left, 'me', 0, at(30000)).coverage, 1);
+  assert.equal(options.cutOffSince.size, 0);
+});

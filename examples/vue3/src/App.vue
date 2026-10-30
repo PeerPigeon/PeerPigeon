@@ -168,13 +168,13 @@
           <div class="stage-top">
             <span
               class="signal"
-              :class="`signal-${connectedPeers === 0 ? 0 : combinedNetworkHealth.bars}`"
+              :class="`signal-${combinedNetworkHealth.bars}`"
               :title="combinedNetworkHealth.title"
               :aria-label="combinedNetworkHealth.title"
               role="img"
               data-testid="network-combined-health"
             >
-              <i v-for="n in 4" :key="n" :class="{ lit: connectedPeers > 0 && n <= combinedNetworkHealth.bars }"></i>
+              <i v-for="n in 4" :key="n" :class="{ lit: n <= combinedNetworkHealth.bars }"></i>
             </span>
             <span
               class="stage-count"
@@ -593,9 +593,13 @@ import {
 } from './graph-coverage.js';
 
 /** How long the gossip badge holds through losing every link before it says Offline. */
-const NO_LINKS_GRACE_MS = 4000;
-/** How long a live peer we cannot reach is left out of gossip coverage (joining peers reach us within this). */
-const CUT_OFF_GRACE_MS = 10000;
+const NO_LINKS_GRACE_MS = 10000;
+/**
+ * How long a part of the network we cannot reach is left out of every count.
+ * Longer than a membership lease (30 s), so peers that left together are gone
+ * from membership before they could count; joining peers reach us well within it.
+ */
+const CUT_OFF_GRACE_MS = 35000;
 
 const APP_ICONS = Object.freeze({
   state: faCircle,
@@ -1013,15 +1017,23 @@ export default {
     },
 
     networkGraphPeerSummary() {
-      return graphPeerSummary(this.networkGraphModel, { relayListed: this.relayListedPeers() });
+      return graphPeerSummary(this.networkGraphModel, this.livenessOptions());
     },
 
     combinedNetworkHealth() {
-      return combinedNetworkGossipHealth(
+      const health = combinedNetworkGossipHealth(
         this.networkGraphPeerSummary,
         this.gossipCoverageSnapshot(this.networkGraphModel),
         this.browserSuspended,
       );
+      // Through a moment with no links (see gossipBadgeSnapshot), show the
+      // last reading rather than an empty signal.
+      if (this.connectedPeersList.length > 0) {
+        this.lastLiveNetworkHealth = health;
+        return health;
+      }
+      if (this.noLinksHeld && this.lastLiveNetworkHealth) return this.lastLiveNetworkHealth;
+      return { ...health, bars: 0 };
     },
 
     effectiveSessionId() {
@@ -3135,7 +3147,7 @@ export default {
           }));
         // Peers still on their lease but with no live links fade out and are
         // left out of every count (see graphLiveness).
-        const { fading } = graphLiveness({ nodes, links }, localSelf, { relayListed: this.relayListedPeers() });
+        const { fading } = graphLiveness({ nodes, links }, localSelf, this.livenessOptions());
         for (const node of nodes) node.isFading = fading.has(node.id);
         return { nodes, links };
       }
@@ -3748,12 +3760,17 @@ export default {
       // Live peers only. The CECR network-size estimate is not used here: it is
       // a high-water mark that keeps counting a departed peer for a while.
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
+      return calculateGraphCoverageSnapshot(graph, self, 0, this.livenessOptions());
+    },
+
+    /** The one liveness rule behind the gossip badge, network strength and the graph's faded peers. */
+    livenessOptions() {
       if (!this.cutOffSince) this.cutOffSince = new Map();
-      return calculateGraphCoverageSnapshot(graph, self, 0, {
+      return {
         relayListed: this.relayListedPeers(),
         cutOffSince: this.cutOffSince,
         cutOffGraceMs: CUT_OFF_GRACE_MS,
-      });
+      };
     },
 
     /**

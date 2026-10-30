@@ -26,7 +26,9 @@ function normalizePeerId(value) {
  * Returns the live peers (self included), the reachable peers (self included),
  * the links gossip can use, and the peers still listed but silent ("fading").
  */
-export function graphLiveness(graph, requestedLocalPeerId = '', { relayListed = null } = {}) {
+export function graphLiveness(graph, requestedLocalPeerId = '', {
+  relayListed = null, cutOffSince = null, cutOffGraceMs = 0, now = Date.now(),
+} = {}) {
   const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
   const links = Array.isArray(graph?.links) ? graph.links : [];
   const peerIds = new Set();
@@ -96,6 +98,7 @@ export function graphLiveness(graph, requestedLocalPeerId = '', { relayListed = 
   }
   const listed = relayListed ? new Set(Array.from(relayListed, normalizePeerId)) : null;
   const placed = new Set();
+  const cutOff = new Set();
   for (const start of mutual.keys()) {
     if (placed.has(start)) continue;
     const part = [start];
@@ -108,11 +111,32 @@ export function graphLiveness(graph, requestedLocalPeerId = '', { relayListed = 
       }
     }
     if (listed && !part.some((peerId) => listed.has(peerId) || reachable.has(peerId))) continue;
-    for (const peerId of part) live.add(peerId);
+    for (const peerId of part) cutOff.add(peerId);
   }
 
-  const fading = new Set(Array.from(peerIds).filter((peerId) => !live.has(peerId)));
-  return { localPeerId, live, reachable, fading, usableLinks };
+  // A cut-off part counts only once it has stayed cut off for cutOffGraceMs
+  // (cutOffSince is a Map the caller keeps between calls). Peers that all
+  // left at once keep reporting each other until their membership leases
+  // run out; with a grace longer than a lease they are gone before they ever
+  // count, whatever the relay says. Peers that are joining reach us within
+  // it. A split that lasts still shows. Until then such peers are pending:
+  // neither counted nor shown as gone.
+  const pending = new Set();
+  if (cutOffSince instanceof Map) {
+    for (const peerId of Array.from(cutOffSince.keys())) {
+      if (!cutOff.has(peerId)) cutOffSince.delete(peerId);
+    }
+    for (const peerId of cutOff) {
+      if (!cutOffSince.has(peerId)) cutOffSince.set(peerId, now);
+      if (now - cutOffSince.get(peerId) < cutOffGraceMs) pending.add(peerId);
+      else live.add(peerId);
+    }
+  } else {
+    for (const peerId of cutOff) live.add(peerId);
+  }
+
+  const fading = new Set(Array.from(peerIds).filter((peerId) => !live.has(peerId) && !pending.has(peerId)));
+  return { localPeerId, live, reachable, pending, fading, usableLinks };
 }
 
 /**
@@ -124,26 +148,9 @@ export function graphLiveness(graph, requestedLocalPeerId = '', { relayListed = 
 export function graphCoverageSnapshot(graph, requestedLocalPeerId = '', requestedKnownPeerCount = 0, options = {}) {
   const { localPeerId, live, reachable } = graphLiveness(graph, requestedLocalPeerId, options);
   const hasLocalPeer = Boolean(localPeerId && live.has(localPeerId));
-  // Peers that are joining link up among themselves a moment before their
-  // piece of the ring reaches ours. With options.cutOffSince (a Map the caller
-  // keeps between calls), a live peer we cannot reach counts against coverage
-  // only once it has stayed out of reach for options.cutOffGraceMs; a split
-  // that lasts still shows.
-  const { cutOffSince = null, cutOffGraceMs = 0, now = Date.now() } = options;
-  let settling = 0;
-  if (cutOffSince instanceof Map) {
-    for (const peerId of Array.from(cutOffSince.keys())) {
-      if (!live.has(peerId) || reachable.has(peerId)) cutOffSince.delete(peerId);
-    }
-    for (const peerId of live) {
-      if (reachable.has(peerId)) continue;
-      if (!cutOffSince.has(peerId)) cutOffSince.set(peerId, now);
-      if (now - cutOffSince.get(peerId) < cutOffGraceMs) settling += 1;
-    }
-  }
   const knownPeers = Math.max(
     0,
-    live.size - settling - (hasLocalPeer ? 1 : 0),
+    live.size - (hasLocalPeer ? 1 : 0),
     Math.floor(Number(requestedKnownPeerCount) || 0),
   );
   if (!hasLocalPeer) return { reachablePeers: 0, knownPeers, coverage: 0 };
