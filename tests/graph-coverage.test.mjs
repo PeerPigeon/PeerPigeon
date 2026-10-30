@@ -340,3 +340,18 @@ test('a part we cannot reach yet counts against coverage only once it stays cut 
   graphCoverageSnapshot(joined, 'me', 0, { ...options, now: 13000 });
   assert.equal(cutOffSince.size, 0);
 });
+
+test('with no current relay list, peers that left together stop counting at once', () => {
+  const graph = {
+    nodes: [{ id: 'me', isSelf: true }, { id: 'a' }, { id: 'x' }, { id: 'y' }],
+    links: [
+      { source: 'me', target: 'a', direct: true },
+      { source: 'a', target: 'me' },
+      { source: 'x', target: 'y' },
+    ],
+  };
+  const snapshot = graphCoverageSnapshot(graph, 'me', 0, { relayListed: [] });
+  assert.equal(snapshot.knownPeers, 1);
+  assert.equal(snapshot.coverage, 1);
+  assert.equal(graphPeerSummary(graph, { relayListed: [] }).fading, 2);
+});

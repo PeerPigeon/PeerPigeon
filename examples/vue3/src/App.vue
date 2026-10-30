@@ -3751,11 +3751,19 @@ export default {
       });
     },
 
-    /** The relay's current peer list, or null while we are off the relay (an idle list is stale). */
+    /**
+     * The relay's current peer list, used to confirm that a part of the
+     * network we cannot reach is still alive. While this peer has released
+     * the relay (healthy peers do) that list is stale, so it returns an empty
+     * list: only peers we reach count. Peers that just left together keep
+     * vouching for each other in their last reports and would otherwise read
+     * as a live part we cannot reach. A real split leaves a peer missing a
+     * ring neighbour, which wakes its relay, and then the part counts again.
+     */
     relayListedPeers() {
       const client = this.mesh?.signalingClient;
-      if (!client?.isConnected?.() || client?.client?.relayIdle === true) return null;
-      return this.mesh?.getActiveSignalingPeers?.() ?? null;
+      if (!client?.isConnected?.() || client?.client?.relayIdle === true) return [];
+      return this.mesh?.getActiveSignalingPeers?.() ?? [];
     },
 
     syncGossipStatus() {
