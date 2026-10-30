@@ -106,6 +106,7 @@ var FreeRTCClientAdapter = class {
     this.trickleIce = options?.trickleIce ?? true;
     this.meshSignaling = options?.meshSignaling ?? null;
     this.relayOnDemand = (options?.relayOnDemand ?? true) && this.meshSignaling !== null;
+    this.relayHold = options?.relayHold ?? null;
     this.addSelfAlias(this.requestedPeerId);
     this.addSelfAlias(this.previousPeerId);
     for (const peerId of this.retiredPeerIds) this.addSelfAlias(peerId);
@@ -183,7 +184,7 @@ var FreeRTCClientAdapter = class {
       iceServers: this.defaultIceServers ?? void 0,
       trickleIce: this.trickleIce,
       autoConnect: false,
-      relay: this.relayOnDemand ? { mode: "on-demand" } : {},
+      relay: this.relayOnDemand ? { mode: "on-demand", ...this.relayHold ? { hold: this.relayHold } : {} } : {},
       onRelayStateChange: ({ state } = {}) => {
         if (!isCurrentClient()) return;
         this.emitter.emit("signaling:log", { message: `[signal] relay ${String(state)} on ${signalUrl}` });
@@ -5292,13 +5293,16 @@ var PartialMesh = class {
     if (overflow <= 0) return;
     this.rebalanceCooldownUntilMs = Math.max(this.rebalanceCooldownUntilMs, Date.now() + 2e3);
     const protectedPeerIds = this.cecrProtectedConnectedPeerIds();
+    const coordinatePeerIds = this.cecrCoordinateNeighbors();
     const bridgePeerIds = this.localBridgeConnectedPeerIds();
     const dropOrder = connectedPeers.map((peerId) => ({
       peerId,
       connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0,
+      coordinate: coordinatePeerIds.has(peerId),
       cecrProtected: protectedPeerIds.has(peerId),
       graphBridge: bridgePeerIds.has(peerId)
     })).sort((a, b) => {
+      if (a.coordinate !== b.coordinate) return a.coordinate ? 1 : -1;
       if (a.graphBridge !== b.graphBridge) return a.graphBridge ? 1 : -1;
       if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? 1 : -1;
       if (a.connectedAt !== b.connectedAt) return a.connectedAt - b.connectedAt;
@@ -5365,31 +5369,51 @@ var PartialMesh = class {
   }
   cecrCoordinateNeighbors() {
     const selfId = this.normalizePeerId(this.clientId);
-    const liveIds = Array.from(/* @__PURE__ */ new Set([selfId, ...this.globalPeers])).filter(Boolean);
+    const relayListed = this.hasActiveSignalingSnapshot ? Array.from(this.activeSignalingPeers).filter((peerId) => this.discoveredPeers.has(peerId)) : [];
+    const liveIds = Array.from(/* @__PURE__ */ new Set([selfId, ...this.globalPeers, ...relayListed])).filter((peerId) => peerId && !this.retiredPeerIds.has(peerId) && (peerId === selfId || !this.isSelfAlias(peerId)));
     const numeric = liveIds.map((peerId) => ({ peerId, value: this.cecrNumericPeerId(peerId) })).filter((peer) => peer.value != null).sort((left, right) => left.value < right.value ? -1 : left.value > right.value ? 1 : left.peerId.localeCompare(right.peerId));
     const selfIndex = numeric.findIndex((peer) => peer.peerId === selfId);
     const required = /* @__PURE__ */ new Set();
-    if (selfIndex > 0) required.add(numeric[selfIndex - 1].peerId);
-    if (selfIndex >= 0 && selfIndex + 1 < numeric.length) required.add(numeric[selfIndex + 1].peerId);
+    if (selfIndex < 0 || numeric.length < 2) return required;
+    const count = numeric.length;
+    required.add(numeric[(selfIndex - 1 + count) % count].peerId);
+    required.add(numeric[(selfIndex + 1) % count].peerId);
+    required.delete(selfId);
     return required;
+  }
+  /**
+   * 0: a coordinate neighbour (the next peer either side in ID order). Those
+   *    links alone join every peer into one line, so they come before
+   *    anything else: with maxPeers 2 they are the whole topology.
+   * 1: a peer in a distance bucket none of our links covers yet.
+   * 2: anyone else.
+   */
+  /** True while one of this peer's coordinate neighbours is not connected. */
+  missingCoordinateNeighbour() {
+    const connected = new Set(this.getConnectedPeers());
+    for (const peerId of this.cecrCoordinateNeighbors()) {
+      if (!connected.has(peerId)) return true;
+    }
+    return false;
   }
   cecrOverlayDialPriority(peerId) {
     const selfId = this.normalizePeerId(this.clientId);
     const self = this.cecrNumericPeerId(selfId);
     const candidate = this.cecrNumericPeerId(peerId);
-    if (self == null || candidate == null || !this.globalPeers.has(peerId)) return 1;
     if (this.cecrCoordinateNeighbors().has(peerId)) return 0;
+    if (self == null || candidate == null || !this.globalPeers.has(peerId)) return 2;
     const candidateRank = this.cecrBucketRank(self ^ candidate);
     const bucketCovered = this.getConnectedPeers().some((connectedPeerId) => {
       const connected = this.cecrNumericPeerId(connectedPeerId);
       return connected != null && this.cecrBucketRank(self ^ connected) === candidateRank;
     });
-    return bucketCovered ? 1 : 0;
+    return bucketCovered ? 2 : 1;
   }
   cecrProtectedConnectedPeerIds() {
     const protectedIds = this.cecrCoordinateNeighbors();
     const self = this.cecrNumericPeerId(this.clientId ?? "");
     if (self == null) return protectedIds;
+    if (this.config.maxPeers <= protectedIds.size) return protectedIds;
     const representativeByBucket = /* @__PURE__ */ new Map();
     for (const peerId of this.getConnectedPeers().slice().sort()) {
       const peer = this.cecrNumericPeerId(peerId);
@@ -5446,11 +5470,15 @@ var PartialMesh = class {
     if (!closestCandidate || !farthestConnected) {
       return false;
     }
+    if (farthestConnected.cecrProtected) {
+      return false;
+    }
     const connectedAgeMs = now - (farthestConnected.connectedAt || 0);
     if (connectedAgeMs < 4e3) {
       return false;
     }
-    const repairsCecrOverlay = this.cecrOverlayDialPriority(closestCandidate.peerId) === 0;
+    const candidatePriority = this.cecrOverlayDialPriority(closestCandidate.peerId);
+    const repairsCecrOverlay = candidatePriority === 0 || candidatePriority === 1 && this.config.maxPeers > this.cecrCoordinateNeighbors().size;
     const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 4n < farthestConnected.distance * 3n;
     if (!materiallyCloser) {
       return false;
@@ -5524,6 +5552,10 @@ var PartialMesh = class {
       retiredPeerIds,
       iceServers: this.config.iceServers,
       trickleIce: this.config.trickleIce,
+      // Stay reachable on the relay while a coordinate neighbour is not yet
+      // linked. That neighbour may sit in another part of the mesh, where
+      // only the relay can carry the offer; both ends hold until it forms.
+      relayHold: () => this.missingCoordinateNeighbour(),
       meshSignaling: {
         canRoute: (peerId) => this.meshCanSignal(peerId),
         send: (envelope) => {
@@ -6850,11 +6882,17 @@ var PeerPigeonNode = class {
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
     this.storageOptions = storage;
+    const meshReaches = (peerId) => {
+      if (!this.gossip.canRouteDirect(peerId)) return false;
+      if (this.mesh.getConnectedPeers().includes(peerId)) return true;
+      const hops = this.mesh.getHopDistance(peerId);
+      return hops != null && hops > 0;
+    };
     this.mesh.setMeshSignaling({
-      canRoute: (peerId) => this.gossip.canRouteDirect(peerId),
+      canRoute: (peerId) => meshReaches(peerId),
       send: (envelope) => {
         const to = String(envelope?.to ?? "").trim();
-        if (!to || !this.gossip.canRouteDirect(to)) return false;
+        if (!to || !meshReaches(to)) return false;
         return this.gossip.sendDirect(to, { __ppType: MESH_SIGNAL_PAYLOAD_TYPE, envelope }) !== null;
       }
     });

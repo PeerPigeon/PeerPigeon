@@ -1270,6 +1270,15 @@ declare class PartialMesh {
     private cecrNumericPeerId;
     private cecrBucketRank;
     private cecrCoordinateNeighbors;
+    /**
+     * 0: a coordinate neighbour (the next peer either side in ID order). Those
+     *    links alone join every peer into one line, so they come before
+     *    anything else: with maxPeers 2 they are the whole topology.
+     * 1: a peer in a distance bucket none of our links covers yet.
+     * 2: anyone else.
+     */
+    /** True while one of this peer's coordinate neighbours is not connected. */
+    private missingCoordinateNeighbour;
     private cecrOverlayDialPriority;
     private cecrProtectedConnectedPeerIds;
     private maybeRebalanceForCloserPeer;

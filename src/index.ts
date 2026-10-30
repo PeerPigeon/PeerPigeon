@@ -1181,15 +1181,21 @@ export class PartialMesh {
     // edge. Dropping the newest edge here permanently trapped 2/2 cycles and
     // isolated peers in separate CECR components.
     const protectedPeerIds = this.cecrProtectedConnectedPeerIds();
+    const coordinatePeerIds = this.cecrCoordinateNeighbors();
     const bridgePeerIds = this.localBridgeConnectedPeerIds();
     const dropOrder = connectedPeers
       .map((peerId) => ({
         peerId,
         connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0,
+        coordinate: coordinatePeerIds.has(peerId),
         cecrProtected: protectedPeerIds.has(peerId),
         graphBridge: bridgePeerIds.has(peerId),
       }))
       .sort((a, b) => {
+        // A coordinate neighbour is kept above all: those links are the one
+        // structure that always joins every peer, so a temporary bridge gives
+        // way to it rather than holding it out.
+        if (a.coordinate !== b.coordinate) return a.coordinate ? 1 : -1;
         if (a.graphBridge !== b.graphBridge) return a.graphBridge ? 1 : -1;
         if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? 1 : -1;
         // When all other safety signals tie, replace an old edge and retain
@@ -1267,36 +1273,70 @@ export class PartialMesh {
 
   private cecrCoordinateNeighbors(): Set<string> {
     const selfId = this.normalizePeerId(this.clientId);
-    const liveIds = Array.from(new Set([selfId, ...this.globalPeers])).filter(Boolean);
+    // Membership only spans the part of the mesh we are joined to. Peers the
+    // relay lists right now are added, so a separate part of a split mesh
+    // shows up in the order: its peers become coordinate neighbours of ours,
+    // get dialled, and the parts join (then membership merges).
+    const relayListed = this.hasActiveSignalingSnapshot
+      ? Array.from(this.activeSignalingPeers).filter((peerId) => this.discoveredPeers.has(peerId))
+      : [];
+    const liveIds = Array.from(new Set([selfId, ...this.globalPeers, ...relayListed]))
+      .filter((peerId) => peerId && !this.retiredPeerIds.has(peerId) && (peerId === selfId || !this.isSelfAlias(peerId)));
     const numeric = liveIds
       .map((peerId) => ({ peerId, value: this.cecrNumericPeerId(peerId) }))
       .filter((peer): peer is { peerId: string; value: bigint } => peer.value != null)
       .sort((left, right) => left.value < right.value ? -1 : left.value > right.value ? 1 : left.peerId.localeCompare(right.peerId));
     const selfIndex = numeric.findIndex((peer) => peer.peerId === selfId);
     const required = new Set<string>();
-    if (selfIndex > 0) required.add(numeric[selfIndex - 1].peerId);
-    if (selfIndex >= 0 && selfIndex + 1 < numeric.length) required.add(numeric[selfIndex + 1].peerId);
+    if (selfIndex < 0 || numeric.length < 2) return required;
+    // The next ID either side, wrapping round: a ring. Without the wrap the two
+    // end peers had a free slot each and kept dialing into full peers, which
+    // shed a link to take them and broke the line they were part of.
+    const count = numeric.length;
+    required.add(numeric[(selfIndex - 1 + count) % count].peerId);
+    required.add(numeric[(selfIndex + 1) % count].peerId);
+    required.delete(selfId);
     return required;
+  }
+
+  /**
+   * 0: a coordinate neighbour (the next peer either side in ID order). Those
+   *    links alone join every peer into one line, so they come before
+   *    anything else: with maxPeers 2 they are the whole topology.
+   * 1: a peer in a distance bucket none of our links covers yet.
+   * 2: anyone else.
+   */
+  /** True while one of this peer's coordinate neighbours is not connected. */
+  private missingCoordinateNeighbour(): boolean {
+    const connected = new Set(this.getConnectedPeers());
+    for (const peerId of this.cecrCoordinateNeighbors()) {
+      if (!connected.has(peerId)) return true;
+    }
+    return false;
   }
 
   private cecrOverlayDialPriority(peerId: string): number {
     const selfId = this.normalizePeerId(this.clientId);
     const self = this.cecrNumericPeerId(selfId);
     const candidate = this.cecrNumericPeerId(peerId);
-    if (self == null || candidate == null || !this.globalPeers.has(peerId)) return 1;
     if (this.cecrCoordinateNeighbors().has(peerId)) return 0;
+    if (self == null || candidate == null || !this.globalPeers.has(peerId)) return 2;
     const candidateRank = this.cecrBucketRank(self ^ candidate);
     const bucketCovered = this.getConnectedPeers().some((connectedPeerId) => {
       const connected = this.cecrNumericPeerId(connectedPeerId);
       return connected != null && this.cecrBucketRank(self ^ connected) === candidateRank;
     });
-    return bucketCovered ? 1 : 0;
+    return bucketCovered ? 2 : 1;
   }
 
   private cecrProtectedConnectedPeerIds(): Set<string> {
     const protectedIds = this.cecrCoordinateNeighbors();
     const self = this.cecrNumericPeerId(this.clientId ?? '');
     if (self == null) return protectedIds;
+    // Bucket representatives are protected only with room to spare beyond the
+    // coordinate neighbours. With maxPeers 2 there is none: protecting them
+    // kept non-neighbour links in the way and the ring never joined up.
+    if (this.config.maxPeers <= protectedIds.size) return protectedIds;
     const representativeByBucket = new Map<number, string>();
     for (const peerId of this.getConnectedPeers().slice().sort()) {
       const peer = this.cecrNumericPeerId(peerId);
@@ -1369,6 +1409,14 @@ export class PartialMesh {
       return false;
     }
 
+    // Every link we hold is one the overlay needs (coordinate neighbours,
+    // bucket representatives): the overflow would only be trimmed off again,
+    // and the peer we dialled would shed a link to take us. That dial/shed
+    // loop never stopped on a token ring.
+    if (farthestConnected.cecrProtected) {
+      return false;
+    }
+
     // Keep existing edges sticky for a short period to prevent oscillation.
     const connectedAgeMs = now - (farthestConnected.connectedAt || 0);
     if (connectedAgeMs < 4_000) {
@@ -1382,7 +1430,11 @@ export class PartialMesh {
     // Rebalance only for an actual CECR coverage repair or a materially closer
     // coordinate. Cross-component admission is handled separately by tolerant
     // overflow plus trimExcessPeers(), which preserves graph bridges.
-    const repairsCecrOverlay = this.cecrOverlayDialPriority(closestCandidate.peerId) === 0;
+    // Repair means a missing coordinate neighbour, or (with spare capacity) an
+    // uncovered distance bucket.
+    const candidatePriority = this.cecrOverlayDialPriority(closestCandidate.peerId);
+    const repairsCecrOverlay = candidatePriority === 0
+      || (candidatePriority === 1 && this.config.maxPeers > this.cecrCoordinateNeighbors().size);
     const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 4n < farthestConnected.distance * 3n;
     if (!materiallyCloser) {
       return false;
@@ -1476,6 +1528,10 @@ export class PartialMesh {
       retiredPeerIds,
       iceServers: this.config.iceServers,
       trickleIce: this.config.trickleIce,
+      // Stay reachable on the relay while a coordinate neighbour is not yet
+      // linked. That neighbour may sit in another part of the mesh, where
+      // only the relay can carry the offer; both ends hold until it forms.
+      relayHold: () => this.missingCoordinateNeighbour(),
       meshSignaling: {
         canRoute: (peerId: string) => this.meshCanSignal(peerId),
         send: (envelope: Record<string, unknown>) => {
@@ -3286,11 +3342,21 @@ export class PeerPigeonNode {
     // Signaling prefers the mesh: a negotiation frame for any peer the
     // gossip layer can route to rides a direct frame through neighbours, and
     // only frames with no mesh route fall back to a relay.
+    // A member that XOR routing could head toward is not necessarily one the
+    // mesh reaches: in another part of a split mesh, the frame dies on the way
+    // and the negotiation hangs with no relay fallback. Use the mesh only for a
+    // peer the topology graph actually reaches.
+    const meshReaches = (peerId: string): boolean => {
+      if (!this.gossip.canRouteDirect(peerId)) return false;
+      if (this.mesh.getConnectedPeers().includes(peerId)) return true;
+      const hops = this.mesh.getHopDistance(peerId);
+      return hops != null && hops > 0;
+    };
     this.mesh.setMeshSignaling({
-      canRoute: (peerId) => this.gossip.canRouteDirect(peerId),
+      canRoute: (peerId) => meshReaches(peerId),
       send: (envelope) => {
         const to = String(envelope?.to ?? '').trim();
-        if (!to || !this.gossip.canRouteDirect(to)) return false;
+        if (!to || !meshReaches(to)) return false;
         return this.gossip.sendDirect(to, { __ppType: MESH_SIGNAL_PAYLOAD_TYPE, envelope }) !== null;
       },
     });

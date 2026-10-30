@@ -102,6 +102,7 @@ export class FreeRTCClientAdapter {
   private readonly trickleIce: boolean;
   private readonly meshSignaling: MeshSignaling | null;
   private readonly relayOnDemand: boolean;
+  private readonly relayHold: (() => boolean) | null;
   private readonly emitter = new Emitter();
   private readonly knownPeers = new Set<string>();
   private readonly knownPeerLastSeenAtMs = new Map<string, number>();
@@ -165,6 +166,8 @@ export class FreeRTCClientAdapter {
     meshSignaling?: MeshSignaling | null;
     /** Let go of the relay while the mesh is healthy. Default: on whenever mesh signaling is wired. */
     relayOnDemand?: boolean;
+    /** With relayOnDemand: true keeps the relay while the mesh still needs it to form a link. */
+    relayHold?: () => boolean;
   }) {
     const normalizedSignalUrls = Array.from(new Set(
       (Array.isArray(signalUrls) ? signalUrls : [signalUrls])
@@ -194,6 +197,7 @@ export class FreeRTCClientAdapter {
     this.meshSignaling = options?.meshSignaling ?? null;
     // A released relay is only safe when negotiation can travel by mesh.
     this.relayOnDemand = (options?.relayOnDemand ?? true) && this.meshSignaling !== null;
+    this.relayHold = options?.relayHold ?? null;
     this.addSelfAlias(this.requestedPeerId);
     this.addSelfAlias(this.previousPeerId);
     for (const peerId of this.retiredPeerIds) this.addSelfAlias(peerId);
@@ -281,7 +285,7 @@ export class FreeRTCClientAdapter {
       iceServers: this.defaultIceServers ?? undefined,
       trickleIce: this.trickleIce,
       autoConnect: false,
-      relay: this.relayOnDemand ? { mode: 'on-demand' } : {},
+      relay: this.relayOnDemand ? { mode: 'on-demand', ...(this.relayHold ? { hold: this.relayHold } : {}) } : {},
       onRelayStateChange: ({ state }: { state?: string } = {}) => {
         if (!isCurrentClient()) return;
         this.emitter.emit('signaling:log', { message: `[signal] relay ${String(state)} on ${signalUrl}` });
