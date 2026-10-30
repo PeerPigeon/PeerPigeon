@@ -24,10 +24,12 @@
         <button
           v-if="isRunning"
           type="button"
-          class="btn"
+          class="link-btn icon-btn"
           data-testid="stop-mesh"
+          aria-label="Leave the mesh"
+          title="Leave the mesh"
           @click="stopMesh"
-        >Leave<span class="wide-only"> the mesh</span></button>
+        ><FontAwesomeIcon :icon="icons.leave" aria-hidden="true" /></button>
       </div>
     </header>
 
@@ -563,6 +565,7 @@ import {
   faXmark,
   faSun,
   faMoon,
+  faRightFromBracket,
 } from '@fortawesome/free-solid-svg-icons';
 import PeerNetworkGraph from './components/PeerNetworkGraph.vue';
 import { canonicalPeerId } from './peer-id.js';
@@ -606,6 +609,7 @@ const APP_ICONS = Object.freeze({
   broadcast: faSatelliteDish,
   warning: faTriangleExclamation,
   close: faXmark,
+  leave: faRightFromBracket,
   light: faSun,
   dark: faMoon,
 });
@@ -4354,6 +4358,17 @@ export default {
   color: var(--mark);
 }
 
+.link-btn.icon-btn {
+  color: var(--ink-2);
+  font-size: 1.05rem;
+  line-height: 1;
+  padding: 0.35rem;
+}
+
+.link-btn.icon-btn:hover {
+  color: var(--stop);
+}
+
 .link-btn.theme-switch {
   margin-left: auto;
   color: var(--ink-2);
@@ -5327,7 +5342,6 @@ select.input {
     align-items: stretch;
   }
 
-  .wide-only,
   .stage-count {
     display: none;
   }
