@@ -1,5 +1,5 @@
 <template>
-  <div id="app">
+  <div id="app" :data-theme="theme">
     <header class="bar">
       <a class="brand" href="https://github.com/PeerPigeon/PeerPigeon" title="PeerPigeon on GitHub">
         <img src="/pigeonlogo.svg" alt="" class="brand-logo" />
@@ -11,6 +11,13 @@
         <code class="room-name">{{ effectiveSessionId }}</code>
         <button type="button" class="link-btn" data-testid="copy-share-link" @click="copyShareLink">Copy link</button>
       </div>
+
+      <button
+        type="button"
+        class="link-btn theme-switch"
+        :aria-label="theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"
+        @click="setTheme(theme === 'dark' ? 'light' : 'dark')"
+      >{{ theme === 'dark' ? 'Light' : 'Dark' }}</button>
 
       <div class="bar-actions">
         <button
@@ -664,6 +671,10 @@ export default {
   },
   data() {
     return {
+      // Dark unless this browser chose light (Light / Dark in the top bar).
+      theme: (() => {
+        try { return localStorage.getItem('peerpigeon:theme') === 'light' ? 'light' : 'dark'; } catch { return 'dark'; }
+      })(),
       mesh: null,
       icons: APP_ICONS,
       wifiIconMask: FONT_AWESOME_WIFI_MASK,
@@ -777,6 +788,7 @@ export default {
   },
   mounted() {
     window.__app = this;
+    this.setTheme(this.theme);
     const params = new URLSearchParams(window.location.search);
 
     // ==== IMPORTANT: URL params take ABSOLUTE priority for test isolation ====
@@ -1116,6 +1128,14 @@ export default {
     }
   },
   methods: {
+    setTheme(theme) {
+      this.theme = theme === 'light' ? 'light' : 'dark';
+      // The page behind the app (overscroll, the browser chrome) follows too.
+      document.documentElement.dataset.theme = this.theme;
+      document.documentElement.style.colorScheme = this.theme;
+      try { localStorage.setItem('peerpigeon:theme', this.theme); } catch { /* private mode: not remembered */ }
+    },
+
     usesAutomaticSignalingServer(value) {
       const raw = String(value || '').trim();
       if (!raw) return true;
@@ -4277,6 +4297,8 @@ export default {
   --stop: #a8473d;
   --stop-wash: #f1dcd8;
   --night: #1b2228;
+  --zebra: rgba(214, 220, 224, 0.35);
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2356616b' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --radius: 6px;
   --font: 'Archivo', system-ui, sans-serif;
   --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
@@ -4295,6 +4317,46 @@ export default {
   margin: 0;
   padding: 0;
   background: #e9ecee;
+}
+
+:global(html[data-theme='dark']),
+:global(html[data-theme='dark'] body) {
+  background: #14191d;
+}
+
+/* Night slate: the same feathers after dark. */
+#app[data-theme='dark'] {
+  --paper: #14191d;
+  --surface: #1c2328;
+  --ink: #e3e8eb;
+  --ink-2: #98a4ad;
+  --line: #2b343b;
+  --line-strong: #44505a;
+  --wing: #252d33;
+  --slate: #8796a3;
+  --sheen: #3f9c88;
+  --sheen-deep: #4fb39f;
+  --sheen-wash: #1d3732;
+  --mark: #d6b234;
+  --stop: #e07a6d;
+  --stop-wash: #3a2522;
+  --night: #0e1215;
+  --zebra: rgba(255, 255, 255, 0.025);
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2398a4ad' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+#app[data-theme='dark'] .msg-note.partial {
+  color: var(--mark);
+}
+
+.link-btn.theme-switch {
+  margin-left: auto;
+  color: var(--ink-2);
+}
+
+/* The logo is a black bird: on night slate it is drawn white. */
+#app[data-theme='dark'] .brand-logo {
+  filter: invert(1);
 }
 
 #app *,
@@ -4376,7 +4438,11 @@ export default {
 }
 
 .bar-actions {
-  margin-left: auto;
+  margin-left: 0.5rem;
+}
+
+.bar-actions:empty {
+  display: none;
 }
 
 /* ---------- controls ---------- */
@@ -4491,7 +4557,7 @@ select.input {
   -webkit-appearance: none;
   appearance: none;
   padding-right: 2rem;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2356616b' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image: var(--select-arrow);
   background-repeat: no-repeat;
   background-position: right 0.7rem center;
 }
@@ -5142,7 +5208,7 @@ select.input {
 }
 
 .log-line:nth-child(even) {
-  background: rgba(214, 220, 224, 0.35);
+  background: var(--zebra);
 }
 
 .log-time,
