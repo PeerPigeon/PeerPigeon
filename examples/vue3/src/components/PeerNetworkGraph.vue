@@ -208,9 +208,10 @@ function nodeCoreAppearance(node) {
     // star/circle transition. Activity is already conveyed by opacity, size,
     // and the outer glow; changing the core color made distinct peers merge.
     color: node?.color || '#7df9ff',
-    alpha: node?.distantPoint
+    // A silent peer (still on its membership lease, no live links) fades out.
+    alpha: (node?.distantPoint
       ? circleAlpha + (0.96 - circleAlpha) * easedShrink
-      : 0.96 + (circleAlpha - 0.96) * easedGrowth,
+      : 0.96 + (circleAlpha - 0.96) * easedGrowth) * (node?.isFading ? 0.3 : 1),
   };
 }
 
@@ -1161,6 +1162,8 @@ export default {
         peerId: hovered.id,
         detail: hovered.isSelf
           ? 'This peer · 0 hops away'
+          : hovered.isFading
+            ? 'Gone quiet: no live links, so it is left out of gossip health. It disappears when its lease runs out.'
           : `${hovered.isDirect
             ? (hovered.isTolerant ? 'Tolerant direct connection' : 'Direct connection')
             : (hovered.isDiscovered ? 'Discovered peer' : 'Indirect peer')} · ${hopDetail}`,

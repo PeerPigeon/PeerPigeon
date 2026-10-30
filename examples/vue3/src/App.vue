@@ -172,7 +172,8 @@
             >
               {{ networkGraphPeerSummary.direct }} direct,
               {{ networkGraphPeerSummary.indirect }} through others,
-              {{ networkGraphPeerSummary.total }} in all
+              {{ networkGraphPeerSummary.total }} in all<template v-if="networkGraphPeerSummary.fading">,
+              {{ networkGraphPeerSummary.fading }} gone quiet</template>
             </span>
             <span
               class="stage-gossip"
@@ -574,6 +575,7 @@ import {
   gossipBadgeState,
   gossipQualityForCoverage,
   graphCoverageSnapshot as calculateGraphCoverageSnapshot,
+  graphLiveness,
   graphPeerSummary,
 } from './graph-coverage.js';
 
@@ -3069,7 +3071,12 @@ export default {
             source: edge.source,
             target: edge.target,
             direct: Boolean(edge.direct),
+            observedBy: Array.isArray(edge.observedBy) ? edge.observedBy : [],
           }));
+        // Peers still on their lease but with no live links fade out and are
+        // left out of every count (see graphLiveness).
+        const { fading } = graphLiveness({ nodes, links }, localSelf);
+        for (const node of nodes) node.isFading = fading.has(node.id);
         return { nodes, links };
       }
 
@@ -3678,12 +3685,10 @@ export default {
     },
 
     gossipCoverageSnapshot(graph = this.networkGraphModel) {
+      // Live peers only. The CECR network-size estimate is not used here: it is
+      // a high-water mark that keeps counting a departed peer for a while.
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-      const totalNetworkPeers = Math.max(
-        1,
-        Number(this.gossip?.getCecrState?.()?.networkSizeEstimate || 0),
-      );
-      return calculateGraphCoverageSnapshot(graph, self, totalNetworkPeers - 1);
+      return calculateGraphCoverageSnapshot(graph, self);
     },
 
     syncGossipStatus() {

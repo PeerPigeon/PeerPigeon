@@ -6,6 +6,7 @@ import {
   gossipBadgeState,
   gossipQualityForCoverage,
   graphCoverageSnapshot,
+  graphLiveness,
   graphPeerSummary,
 } from '../examples/vue3/src/graph-coverage.js';
 
@@ -171,6 +172,50 @@ test('a healthy four-peer CECR token ring reports three of three gossip peers', 
     indirect: 1,
     direct: 2,
     total: 4,
+    fading: 0,
+  });
+});
+
+test('a closed peer still on lease does not pull gossip down', () => {
+  // d closed its tab. Its lease has not run out, so it is still a node, and its
+  // own last report still claims a link to b, but b no longer reports it.
+  const graph = {
+    nodes: [
+      { id: 'self', isSelf: true },
+      { id: 'a', isDirect: true },
+      { id: 'b' },
+      { id: 'd' },
+    ],
+    links: [
+      { source: 'self', target: 'a', direct: true, observedBy: ['self'] },
+      { source: 'a', target: 'b', observedBy: ['a', 'b'] },
+      { source: 'b', target: 'd', observedBy: ['d'] },
+    ],
+  };
+
+  assert.deepEqual(graphCoverageSnapshot(graph, 'self'), {
+    reachablePeers: 2,
+    knownPeers: 2,
+    coverage: 1,
+  });
+  assert.deepEqual(graphPeerSummary(graph), { indirect: 1, direct: 1, total: 3, fading: 1 });
+  assert.deepEqual(Array.from(graphLiveness(graph).fading), ['d']);
+});
+
+test('a live peer cut off from us still counts against gossip', () => {
+  // c and e confirm their link to each other, but nothing links them to us.
+  const graph = {
+    nodes: ['self', 'a', 'c', 'e'].map((id) => ({ id, isSelf: id === 'self' })),
+    links: [
+      { source: 'self', target: 'a', direct: true, observedBy: ['self'] },
+      { source: 'c', target: 'e', observedBy: ['c', 'e'] },
+    ],
+  };
+
+  assert.deepEqual(graphCoverageSnapshot(graph, 'self'), {
+    reachablePeers: 1,
+    knownPeers: 3,
+    coverage: 1 / 3,
   });
 });
 
