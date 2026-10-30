@@ -2406,7 +2406,20 @@ export class PartialMesh {
       // another part of the mesh. One link joins the parts (membership then
       // merges and the ring re-forms), so dial it within the tolerance even
       // though it is no coordinate neighbour of ours yet.
-      const foreign = available.filter((peerId) => !this.globalPeers.has(peerId) && this.activeSignalingPeers.has(peerId));
+      // Only one peer of our part dials each such peer: the one of us on the
+      // relay nearest to it. Every full peer dialling the same newcomer (or a
+      // peer that never answers) was a storm of offers and overflow trims.
+      const selfId = this.normalizePeerId(this.clientId);
+      const ourListed = [selfId, ...Array.from(this.globalPeers).filter((peerId) => this.activeSignalingPeers.has(peerId))];
+      const weAreNearest = (peerId: string): boolean => {
+        const mine = this.peerDistance(selfId, peerId);
+        return ourListed.every((member) => member === selfId || this.peerDistance(member, peerId) > mine);
+      };
+      const foreign = available.filter((peerId) => (
+        !this.globalPeers.has(peerId)
+        && this.activeSignalingPeers.has(peerId)
+        && weAreNearest(peerId)
+      ));
       if (foreign.length > 0 && now - this.lastBridgeDialAtMs >= BRIDGE_DIAL_INTERVAL_MS) {
         this.lastBridgeDialAtMs = now;
         const target = foreign.slice().sort((a, b) => this.compareDialCandidates(a, b))[0];
