@@ -592,6 +592,9 @@ import {
   graphPeerSummary,
 } from './graph-coverage.js';
 
+/** How long the gossip badge holds through losing every link before it says Offline. */
+const NO_LINKS_GRACE_MS = 4000;
+
 const APP_ICONS = Object.freeze({
   state: faCircle,
   network: faDiagramProject,
@@ -680,6 +683,8 @@ export default {
   },
   data() {
     return {
+      // True for a moment after the last link drops; see gossipBadgeSnapshot.
+      noLinksHeld: false,
       // Dark unless this browser chose light (Light / Dark in the top bar).
       theme: (() => {
         try { return localStorage.getItem('peerpigeon:theme') === 'light' ? 'light' : 'dark'; } catch { return 'dark'; }
@@ -963,12 +968,22 @@ export default {
   },
   computed: {
     gossipBadgeSnapshot() {
-      return gossipBadgeState({
+      const badge = gossipBadgeState({
         running: this.isRunning,
         suspended: this.browserSuspended,
         connectedPeerCount: this.connectedPeersList.length,
         coverageSnapshot: this.gossipCoverageSnapshot(),
       });
+      // Losing every link for a moment is normal when neighbours leave
+      // together (the end of a stress test); a link to a live peer follows
+      // within a second. Show the last live badge through that blip, and
+      // Offline only if no link comes back within NO_LINKS_GRACE_MS.
+      if (badge.label !== 'Offline') {
+        this.lastLiveGossipBadge = badge;
+        return badge;
+      }
+      if (this.noLinksHeld && this.lastLiveGossipBadge) return this.lastLiveGossipBadge;
+      return badge;
     },
 
     networkGraphStatusLabel() {
@@ -1087,6 +1102,15 @@ export default {
     }
   },
   watch: {
+    'connectedPeersList.length'(count, previous) {
+      clearTimeout(this.noLinksHoldTimer);
+      if (count === 0 && previous > 0 && this.isRunning) {
+        this.noLinksHeld = true;
+        this.noLinksHoldTimer = setTimeout(() => { this.noLinksHeld = false; }, NO_LINKS_GRACE_MS);
+      } else {
+        this.noLinksHeld = false;
+      }
+    },
     isRunning(running) {
       this.$nextTick(() => this.scheduleNetworkGraphBadgePinUpdate());
       if (running) this.scheduleDiagnosticScroll();
@@ -3742,6 +3766,19 @@ export default {
 
       const coverageSnapshot = this.gossipCoverageSnapshot();
       if ((this.connectedPeersList || []).length === 0) {
+        // Losing every link for a moment is normal when neighbours leave
+        // together (the end of a stress test): a link to a live peer follows
+        // within a second. Hold the last gossip badge through that blip and
+        // only call it offline if no link comes back.
+        const now = Date.now();
+        if (this.noLinksSince == null) this.noLinksSince = now;
+        const heldTitle = String(this.status?.title || '');
+        const holding = heldTitle.startsWith('Gossip ') && heldTitle !== 'Gossip Offline';
+        if (holding && now - this.noLinksSince < NO_LINKS_GRACE_MS) {
+          clearTimeout(this.noLinksTimer);
+          this.noLinksTimer = setTimeout(() => this.syncGossipStatus(), NO_LINKS_GRACE_MS - (now - this.noLinksSince) + 50);
+          return;
+        }
         this.showStatus(
           'Gossip Offline',
           `Gossip Offline (${coverageSnapshot.reachablePeers}/${coverageSnapshot.knownPeers} reachable; no live remote connections)`,
@@ -3749,6 +3786,8 @@ export default {
         );
         return;
       }
+      this.noLinksSince = null;
+      clearTimeout(this.noLinksTimer);
       const coverage = coverageSnapshot.coverage;
       const { label: quality, statusType } = gossipQualityForCoverage(coverage);
 
@@ -4237,6 +4276,8 @@ export default {
   },
 
   beforeUnmount() {
+    clearTimeout(this.noLinksTimer);
+    clearTimeout(this.noLinksHoldTimer);
     clearTimeout(this.storageTableScrollTimer);
     this.storageTableScrollTimer = null;
     if (this.diagnosticScrollFrame != null) {
