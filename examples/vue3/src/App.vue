@@ -16,8 +16,9 @@
         type="button"
         class="link-btn theme-switch"
         :aria-label="theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"
+        :title="theme === 'dark' ? 'Light mode' : 'Dark mode'"
         @click="setTheme(theme === 'dark' ? 'light' : 'dark')"
-      >{{ theme === 'dark' ? 'Light' : 'Dark' }}</button>
+      ><FontAwesomeIcon :icon="theme === 'dark' ? icons.light : icons.dark" aria-hidden="true" /></button>
 
       <div class="bar-actions">
         <button
@@ -560,6 +561,8 @@ import {
   faTriangleExclamation,
   faWifi,
   faXmark,
+  faSun,
+  faMoon,
 } from '@fortawesome/free-solid-svg-icons';
 import PeerNetworkGraph from './components/PeerNetworkGraph.vue';
 import { canonicalPeerId } from './peer-id.js';
@@ -603,6 +606,8 @@ const APP_ICONS = Object.freeze({
   broadcast: faSatelliteDish,
   warning: faTriangleExclamation,
   close: faXmark,
+  light: faSun,
+  dark: faMoon,
 });
 
 const [wifiIconWidth, wifiIconHeight, , , wifiIconPathData] = faWifi.icon;
@@ -4352,6 +4357,13 @@ export default {
 .link-btn.theme-switch {
   margin-left: auto;
   color: var(--ink-2);
+  font-size: 1.05rem;
+  line-height: 1;
+  padding: 0.35rem;
+}
+
+.link-btn.theme-switch:hover {
+  color: var(--ink);
 }
 
 /* The logo is a black bird: on night slate it is drawn white. */
