@@ -321,11 +321,11 @@
                 <span>Owner’s public key</span>
                 <input v-model="storageLookupOwnerId" class="input" placeholder="Yours, if left blank" @input="refreshStorageList" />
               </label>
-              <label class="field">
+              <label class="field" :class="{ 'field-wide': storageActiveSpace === 'user' }">
                 <span>Key</span>
                 <input v-model="storageFormKey" class="input" placeholder="profile.theme" />
               </label>
-              <label class="field">
+              <label class="field field-wide">
                 <span>Value</span>
                 <input v-model="storageFormValue" class="input" placeholder='{"darkMode": true}' :disabled="storageActiveSpace === 'epublic'" />
               </label>
@@ -4477,6 +4477,20 @@ export default {
   padding: 0.45rem 0.6rem;
 }
 
+/* One height for every box, select or not: Safari draws its own, shorter select. */
+.input {
+  height: 2.4rem;
+}
+
+select.input {
+  -webkit-appearance: none;
+  appearance: none;
+  padding-right: 2rem;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2356616b' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.7rem center;
+}
+
 .input:focus {
   outline: none;
   border-color: var(--sheen);
@@ -4485,7 +4499,7 @@ export default {
 
 .input:disabled {
   color: var(--ink-2);
-  background: var(--paper);
+  background-color: var(--paper);
 }
 
 .check {
