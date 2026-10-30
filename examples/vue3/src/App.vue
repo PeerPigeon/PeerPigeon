@@ -991,7 +991,7 @@ export default {
     },
 
     networkGraphPeerSummary() {
-      return graphPeerSummary(this.networkGraphModel);
+      return graphPeerSummary(this.networkGraphModel, { relayListed: this.relayListedPeers() });
     },
 
     combinedNetworkHealth() {
@@ -3104,7 +3104,7 @@ export default {
           }));
         // Peers still on their lease but with no live links fade out and are
         // left out of every count (see graphLiveness).
-        const { fading } = graphLiveness({ nodes, links }, localSelf);
+        const { fading } = graphLiveness({ nodes, links }, localSelf, { relayListed: this.relayListedPeers() });
         for (const node of nodes) node.isFading = fading.has(node.id);
         return { nodes, links };
       }
@@ -3717,7 +3717,14 @@ export default {
       // Live peers only. The CECR network-size estimate is not used here: it is
       // a high-water mark that keeps counting a departed peer for a while.
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-      return calculateGraphCoverageSnapshot(graph, self);
+      return calculateGraphCoverageSnapshot(graph, self, 0, { relayListed: this.relayListedPeers() });
+    },
+
+    /** The relay's current peer list, or null while we are off the relay (an idle list is stale). */
+    relayListedPeers() {
+      const client = this.mesh?.signalingClient;
+      if (!client?.isConnected?.() || client?.client?.relayIdle === true) return null;
+      return this.mesh?.getActiveSignalingPeers?.() ?? null;
     },
 
     syncGossipStatus() {

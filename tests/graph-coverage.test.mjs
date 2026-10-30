@@ -298,3 +298,23 @@ test('combined health explicitly shows suspended and empty states', () => {
   assert.equal(empty.bars, 0);
   assert.equal(empty.title, 'Network 0/0 · Gossip 0/0 · Combined: Poor');
 });
+
+test('peers that all left at once stop counting as soon as the relay no longer lists them', () => {
+  // x and y left together. Their last reports still name each other, so
+  // without the relay's list they look like a live part cut off from us.
+  const graph = {
+    nodes: ['self', 'a', 'x', 'y'].map((id) => ({ id, isSelf: id === 'self' })),
+    links: [
+      { source: 'self', target: 'a', direct: true, observedBy: ['self'] },
+      { source: 'x', target: 'y', observedBy: ['x', 'y'] },
+    ],
+  };
+  assert.equal(graphCoverageSnapshot(graph, 'self').knownPeers, 3);
+  assert.deepEqual(graphCoverageSnapshot(graph, 'self', 0, { relayListed: ['a'] }), {
+    reachablePeers: 1,
+    knownPeers: 1,
+    coverage: 1,
+  });
+  // A live cut-off part keeps a peer on the relay, and still counts.
+  assert.equal(graphCoverageSnapshot(graph, 'self', 0, { relayListed: ['y'] }).knownPeers, 3);
+});

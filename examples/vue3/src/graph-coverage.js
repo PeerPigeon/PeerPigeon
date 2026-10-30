@@ -26,7 +26,7 @@ function normalizePeerId(value) {
  * Returns the live peers (self included), the reachable peers (self included),
  * the links gossip can use, and the peers still listed but silent ("fading").
  */
-export function graphLiveness(graph, requestedLocalPeerId = '') {
+export function graphLiveness(graph, requestedLocalPeerId = '', { relayListed = null } = {}) {
   const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
   const links = Array.isArray(graph?.links) ? graph.links : [];
   const peerIds = new Set();
@@ -79,13 +79,36 @@ export function graphLiveness(graph, requestedLocalPeerId = '') {
     }
   }
 
-  // Alive: everything we reach, plus both ends of any link both ends report.
+  // Alive: everything we reach, plus parts cut off from us whose links both
+  // ends report. Peers that all left at once still report each other until
+  // their leases run out, so when the relay's current list is known, a cut-off
+  // part counts only if one of its peers is on it (a live part keeps at least
+  // one peer there).
   const live = new Set(reachable);
+  const mutual = new Map();
   for (const { source, target, observedBy } of edges) {
-    if (observedBy.has(source) && observedBy.has(target)) {
-      live.add(source);
-      live.add(target);
+    if (reachable.has(source) && reachable.has(target)) continue;
+    if (!(observedBy.has(source) && observedBy.has(target))) continue;
+    if (!mutual.has(source)) mutual.set(source, new Set());
+    if (!mutual.has(target)) mutual.set(target, new Set());
+    mutual.get(source).add(target);
+    mutual.get(target).add(source);
+  }
+  const listed = relayListed ? new Set(Array.from(relayListed, normalizePeerId)) : null;
+  const placed = new Set();
+  for (const start of mutual.keys()) {
+    if (placed.has(start)) continue;
+    const part = [start];
+    placed.add(start);
+    for (let index = 0; index < part.length; index += 1) {
+      for (const next of mutual.get(part[index]) ?? []) {
+        if (placed.has(next)) continue;
+        placed.add(next);
+        part.push(next);
+      }
     }
+    if (listed && !part.some((peerId) => listed.has(peerId) || reachable.has(peerId))) continue;
+    for (const peerId of part) live.add(peerId);
   }
 
   const fading = new Set(Array.from(peerIds).filter((peerId) => !live.has(peerId)));
@@ -98,8 +121,8 @@ export function graphLiveness(graph, requestedLocalPeerId = '') {
  * requestedKnownPeerCount can raise the known count (a caller with fresher
  * evidence of more live peers); the demo passes none.
  */
-export function graphCoverageSnapshot(graph, requestedLocalPeerId = '', requestedKnownPeerCount = 0) {
-  const { localPeerId, live, reachable } = graphLiveness(graph, requestedLocalPeerId);
+export function graphCoverageSnapshot(graph, requestedLocalPeerId = '', requestedKnownPeerCount = 0, options = {}) {
+  const { localPeerId, live, reachable } = graphLiveness(graph, requestedLocalPeerId, options);
   const hasLocalPeer = Boolean(localPeerId && live.has(localPeerId));
   const knownPeers = Math.max(
     0,
@@ -116,9 +139,9 @@ export function graphCoverageSnapshot(graph, requestedLocalPeerId = '', requeste
 }
 
 /** Count live peers by their relationship to the local peer; silent peers are counted apart as fading. */
-export function graphPeerSummary(graph) {
+export function graphPeerSummary(graph, options = {}) {
   const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
-  const { live, fading } = graphLiveness(graph);
+  const { live, fading } = graphLiveness(graph, '', options);
   let direct = 0;
   let indirect = 0;
   let total = 0;

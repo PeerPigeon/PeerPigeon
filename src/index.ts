@@ -2373,6 +2373,22 @@ export class PartialMesh {
       return sorted.slice(0, Math.min(count, sorted.length));
     };
 
+    // Pending dials to peers that neither the relay lists nor the mesh
+    // reaches are most likely to peers that are gone (their offers wait out a
+    // long retry budget). They must not hold the slots an under-connected
+    // peer needs: after a crowd left at once, a tab sat with no links for
+    // half a minute, its slots held by dials to departed ring neighbours,
+    // while a live peer the relay listed went undialled.
+    const livePendingCount = Array.from(this.peers.values()).filter((peer) => (
+      !peer.connected && (this.activeSignalingPeers.has(peer.id) || this.meshCanSignal(peer.id))
+    )).length;
+    if (connectedCount < this.config.minPeers && connectedCount + livePendingCount < this.config.minPeers && available.length > 0) {
+      for (const peerId of pickCandidates(Math.max(1, this.config.minPeers - connectedCount))) {
+        this.connectToPeerInternal(peerId, true);
+      }
+      return;
+    }
+
     if (totalInProgress < this.config.minPeers) {
       // Need more connections.
       const needed = this.config.minPeers - totalInProgress;

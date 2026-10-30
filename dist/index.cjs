@@ -6215,6 +6215,13 @@ var PartialMesh = class {
       const sorted = available.slice().sort((a, b) => this.compareDialCandidates(a, b));
       return sorted.slice(0, Math.min(count, sorted.length));
     };
+    const livePendingCount = Array.from(this.peers.values()).filter((peer) => !peer.connected && (this.activeSignalingPeers.has(peer.id) || this.meshCanSignal(peer.id))).length;
+    if (connectedCount < this.config.minPeers && connectedCount + livePendingCount < this.config.minPeers && available.length > 0) {
+      for (const peerId of pickCandidates(Math.max(1, this.config.minPeers - connectedCount))) {
+        this.connectToPeerInternal(peerId, true);
+      }
+      return;
+    }
     if (totalInProgress < this.config.minPeers) {
       const needed = this.config.minPeers - totalInProgress;
       const emergencyBurst = emergencyIsolated ? Math.min(3, Math.max(2, available.length)) : 0;
