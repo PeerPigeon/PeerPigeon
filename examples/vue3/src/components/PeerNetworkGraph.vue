@@ -797,25 +797,25 @@ export default {
       const corner = 10;
       const iconX = left + 19;
       const labelX = left + 40;
-      const legendFont = '700 9px Monaco, "Courier New", monospace';
+      const legendFont = '500 11px Archivo, system-ui, sans-serif';
       const rowStartY = top + 22;
       const rowGap = 24;
       const selfNode = projectedNodes.find((node) => node.isSelf);
       const selfAppearance = selfNode ? nodeCoreAppearance(selfNode) : null;
       const items = [
         {
-          label: selfNode?.id ? `YOU (${formatPeerId(selfNode.id)})` : 'YOU',
+          label: selfNode?.id ? `You (${formatPeerId(selfNode.id)})` : 'You',
           type: 'node',
           radius: 12,
           color: selfAppearance?.color || 'rgba(125, 249, 255, 0.82)',
           alpha: selfAppearance?.alpha ?? 1,
         },
-        { label: '1 HOP', type: 'node', radius: 8, color: 'rgba(125, 249, 255, 0.72)' },
-        { label: '2 HOPS', type: 'node', radius: 8 / Math.sqrt(2), color: 'rgba(125, 211, 252, 0.7)' },
-        { label: '3+ HOPS', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: '#ffffff' },
-        { label: 'DIRECT', type: 'line' },
-        { label: 'RELAYED', type: 'line', dashed: true },
-        { label: 'ACTIVE', type: 'active' },
+        { label: '1 hop', type: 'node', radius: 8, color: 'rgba(125, 249, 255, 0.72)' },
+        { label: '2 hops', type: 'node', radius: 8 / Math.sqrt(2), color: 'rgba(125, 211, 252, 0.7)' },
+        { label: '3 or more hops', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: '#ffffff' },
+        { label: 'Direct', type: 'line' },
+        { label: 'Relayed', type: 'line', dashed: true },
+        { label: 'Sending now', type: 'active' },
       ];
 
       ctx.save();

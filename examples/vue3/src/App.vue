@@ -1,86 +1,113 @@
 <template>
   <div id="app">
-    <header>
-      <div class="header-brand">
-        <img src="/pigeonlogo.svg" alt="PeerPigeon" class="header-logo" />
-        <h1>PeerPigeon Demo</h1>
+    <header class="bar">
+      <a class="brand" href="https://github.com/PeerPigeon/PeerPigeon" title="PeerPigeon on GitHub">
+        <img src="/pigeonlogo.svg" alt="" class="brand-logo" />
+        <span class="brand-name">PeerPigeon</span>
+      </a>
+
+      <div class="room" :title="effectiveSessionId">
+        <span class="room-label">Room</span>
+        <code class="room-name">{{ effectiveSessionId }}</code>
+        <button type="button" class="link-btn" data-testid="copy-share-link" @click="copyShareLink">Copy link</button>
       </div>
-      <p>Distributed peer networking using WebRTC, partial mesh and gossip</p>
+
+      <div class="bar-actions">
+        <button
+          v-if="isRunning"
+          type="button"
+          class="btn"
+          data-testid="stop-mesh"
+          @click="stopMesh"
+        >Leave<span class="wide-only"> the mesh</span></button>
+      </div>
     </header>
 
     <main>
-      <!-- Control Panel -->
-      <section class="control-panel">
-        <div class="button-group">
-          <div class="effective-session-inline" :title="effectiveSessionId">
-            <span class="field-label">Effective Session</span>
-            <span class="effective-session-value">{{ effectiveSessionId }}</span>
-          </div>
-          <div class="share-link-inline">
-            <span class="field-label">Share</span>
-            <div class="share-link-actions">
-              <button
-                type="button"
-                class="btn btn-small"
-                data-testid="copy-share-link"
-                @click="copyShareLink"
-              >
-                Copy Link
-              </button>
-            </div>
-          </div>
-          <label class="field field-topology-inline">
-            <span class="field-label">Topology</span>
-            <select
-              ref="topologySelect"
-              :value="topology"
-              @change="onTopologyChange"
-              :disabled="isConnecting"
-              class="input"
-              data-testid="topology"
-            >
-              <option value="token-ring">Token Ring (target 2, tolerant 1)</option>
-              <option value="star">Star (1-20)</option>
-              <option value="partial-mesh">Partial Mesh (2-5)</option>
-              <option value="dense-mesh">Dense Mesh (3-10)</option>
-              <option value="custom">Custom</option>
-            </select>
-          </label>
-          <div class="button-actions">
-            <button 
-              @click="startMesh" 
-              :disabled="isRunning || isConnecting"
-              class="btn btn-primary"
-              data-testid="start-mesh"
-            >
-              {{ isConnecting ? 'Connecting...' : 'Start Mesh' }}
-            </button>
-            <button 
-              @click="stopMesh" 
-              :disabled="!isRunning"
-              class="btn btn-danger"
-              data-testid="stop-mesh"
-            >
-              Stop Mesh
-            </button>
-          </div>
-
-          <div
-            v-if="!isRunning"
-            class="status-field"
-            :class="`status-${status.type}`"
-            data-testid="status-message"
-          >
-            {{ status.message || 'Idle' }}
-          </div>
+      <!-- Before joining: one settings sheet -->
+      <section v-if="!isRunning" class="setup">
+        <div class="setup-intro">
+          <h1>Start a mesh in your browser</h1>
+          <p>
+            Join, then open this page in another tab or on another device with the same room.
+            The browsers find each other through a relay, connect directly over WebRTC, and
+            pass messages along by gossip.
+          </p>
         </div>
 
-        <div class="config-grid">
+        <fieldset class="topologies">
+          <legend>Topology</legend>
+          <label
+            v-for="option in topologyOptions"
+            :key="option.id"
+            class="topology"
+            :class="{ chosen: topology === option.id }"
+          >
+            <input
+              type="radio"
+              name="topology"
+              :value="option.id"
+              :checked="topology === option.id"
+              :disabled="isConnecting"
+              data-testid="topology"
+              @change="onTopologyChange"
+            />
+            <span class="topology-name">{{ option.name }}</span>
+            <span class="topology-note">{{ option.note }}</span>
+          </label>
+        </fieldset>
+
+        <div v-if="topology === 'custom'" class="limits">
           <label class="field">
-            <span class="field-label">Server</span>
+            <span>Fewest peers</span>
+            <input
+              ref="minPeersInput"
+              v-model.number="minPeers"
+              type="number" min="1" max="50"
+              :disabled="isConnecting"
+              class="input"
+              data-testid="min-peers"
+              @input="onPeerBoundsInput"
+            />
+          </label>
+          <label class="field">
+            <span>Most peers</span>
+            <input
+              v-model.number="maxPeers"
+              type="number" min="1" max="50"
+              :disabled="isConnecting"
+              class="input"
+              data-testid="max-peers"
+              @input="onPeerBoundsInput"
+            />
+          </label>
+          <label class="field">
+            <span>Spare links</span>
+            <input
+              v-model.number="tolerantPeers"
+              type="number" min="0" max="20"
+              :disabled="isConnecting"
+              class="input"
+              data-testid="tolerant-peers"
+              @input="onPeerBoundsInput"
+            />
+          </label>
+        </div>
+
+        <div class="where">
+          <label class="field">
+            <span>Room</span>
+            <input v-model.trim="roomSessionId" :disabled="isConnecting" class="input" data-testid="room-session-id" placeholder="my-room" />
+          </label>
+          <label class="field">
+            <span>Network</span>
+            <input v-model.trim="networkName" :disabled="isConnecting" class="input" data-testid="network-name" placeholder="peerpigeon" />
+          </label>
+          <label class="field field-wide">
+            <span>Relay</span>
             <input
               v-model.trim="signalingServer"
-              :disabled="isRunning || isConnecting"
+              :disabled="isConnecting"
               class="input"
               data-testid="signaling-server"
               list="federated-signaling-servers"
@@ -89,107 +116,37 @@
             />
             <datalist id="federated-signaling-servers">
               <option value="auto">Automatic</option>
-              <option
-                v-for="relayUrl in signalingServerOptions"
-                :key="relayUrl"
-                :value="relayUrl"
-              ></option>
+              <option v-for="relayUrl in signalingServerOptions" :key="relayUrl" :value="relayUrl"></option>
             </datalist>
+            <small>Leave it on auto and the nearest healthy relay is chosen for you.</small>
           </label>
-
-          <label class="field">
-            <span class="field-label">Network Name</span>
-            <input
-              v-model.trim="networkName"
-              :disabled="isRunning || isConnecting"
-              class="input"
-              data-testid="network-name"
-              placeholder="peerpigeon"
-            />
-          </label>
-
-          <label class="field">
-            <span class="field-label">Room / Session ID</span>
-            <input
-              v-model.trim="roomSessionId"
-              :disabled="isRunning || isConnecting"
-              class="input"
-              data-testid="room-session-id"
-              placeholder="my-room"
-            />
-          </label>
-
-          <label class="field field-number">
-            <span class="field-label">Min Peers</span>
-            <input
-              ref="minPeersInput"
-              v-model.number="minPeers"
-              @input="onPeerBoundsInput"
-              type="number"
-              min="1"
-              max="50"
-              :disabled="isRunning || isConnecting"
-              class="input"
-              data-testid="min-peers"
-            />
-          </label>
-
-          <label class="field field-number">
-            <span class="field-label">Max Peers</span>
-            <input
-              v-model.number="maxPeers"
-              @input="onPeerBoundsInput"
-              type="number"
-              min="1"
-              max="50"
-              :disabled="isRunning || isConnecting"
-              class="input"
-              data-testid="max-peers"
-            />
-          </label>
-
-          <label class="field field-number">
-            <span class="field-label">Tolerant</span>
-            <input
-              v-model.number="tolerantPeers"
-              @input="onPeerBoundsInput"
-              type="number"
-              min="0"
-              max="20"
-              :disabled="isRunning || isConnecting"
-              class="input"
-              data-testid="tolerant-peers"
-            />
-          </label>
-
         </div>
 
-        <div v-if="isRunning" class="control-stats-row">
-          <div class="control-stat control-stat-peer-id">
-            <span class="control-stat-label">Peer ID</span>
-            <span class="control-stat-value peer-id-full mono" :title="clientId" data-testid="client-id">{{ peerIdDisplay }}</span>
-          </div>
-          <div class="control-stat">
-            <span class="control-stat-label">Connected</span>
-            <span class="control-stat-value" data-testid="connected-peers">{{ connectedPeers }} / {{ maxPeers }}</span>
-          </div>
-          <div class="control-stat">
-            <span class="control-stat-label">Discovered</span>
-            <span class="control-stat-value" data-testid="discovered-peers">{{ discoveredPeers }}</span>
-          </div>
-          <div class="control-stat">
-            <span class="control-stat-label">Gossips</span>
-            <span class="control-stat-value" data-testid="messages-seen">{{ messagesSeen }}</span>
-          </div>
+        <div class="setup-go">
+          <button
+            type="button"
+            class="btn btn-go btn-big"
+            :disabled="isConnecting"
+            data-testid="start-mesh"
+            @click="startMesh"
+          >{{ isConnecting ? 'Joining…' : 'Join the mesh' }}</button>
+          <p
+            v-if="status.message && status.message !== 'Idle'"
+            class="status-line"
+            :class="`status-${status.type}`"
+            data-testid="status-message"
+          >{{ status.message }}</p>
         </div>
+      </section>
 
+      <!-- In the mesh -->
+      <section v-else class="live">
         <div
-          v-if="isRunning"
           ref="networkGraphContainer"
-          class="network-graph-container"
+          class="stage"
           data-testid="mesh-visualizer"
         >
-          <div class="network-graph-viewport">
+          <div class="stage-view">
             <PeerNetworkGraph
               ref="peerNetworkGraph"
               :nodes="networkGraphModel.nodes"
@@ -198,185 +155,160 @@
               :show-network-status="false"
             />
           </div>
-          <div
-            class="network-graph-sticky-badges"
-            :class="{ 'is-viewport-pinned': networkGraphBadgesPinned }"
-          >
-            <div class="network-graph-network-cluster">
-              <span
-                class="network-graph-combined-health"
-                :class="[
-                  `combined-health-${combinedNetworkHealth.state}`,
-                  { 'is-offline': connectedPeers === 0 },
-                ]"
-                :style="{
-                  '--network-health-fill': `${combinedNetworkHealth.fillPercent}%`,
-                  '--network-health-mask': connectedPeers === 0 || combinedNetworkHealth.state === 'suspended'
-                    ? wifiOfflineIconMask
-                    : wifiIconMask,
-                }"
-                :title="combinedNetworkHealth.title"
-                :aria-label="combinedNetworkHealth.title"
-                data-testid="network-combined-health"
-                role="img"
-              >
-                <span class="network-graph-combined-health-base" aria-hidden="true"></span>
-                <span class="network-graph-combined-health-mask" aria-hidden="true">
-                  <span class="network-graph-combined-health-fill"></span>
-                </span>
-              </span>
-              <div
-                class="network-graph-network-status"
-                :title="`Direct peers: ${networkGraphPeerSummary.direct}; indirect peers: ${networkGraphPeerSummary.indirect}; total peers: ${networkGraphPeerSummary.total}`"
-                :aria-label="`Network: ${networkGraphPeerSummary.direct} direct peers, ${networkGraphPeerSummary.indirect} indirect peers, ${networkGraphPeerSummary.total} total peers`"
-              >
-                <FontAwesomeIcon :icon="icons.network" class="network-graph-network-icon" aria-hidden="true" />
-                <span class="network-graph-network-copy">
-                  NETWORK
-                  <span class="network-graph-metric network-graph-metric-direct">{{ networkGraphPeerSummary.direct }}</span><span class="network-graph-metric-separator">:</span><span class="network-graph-metric network-graph-metric-indirect">{{ networkGraphPeerSummary.indirect }}</span><span class="network-graph-metric-separator">:</span><span class="network-graph-metric network-graph-metric-total">{{ networkGraphPeerSummary.total }}</span>
-                </span>
-              </div>
-            </div>
-            <div
-              class="network-graph-gossip-status"
-              :class="`gossip-state-${networkGossipState}`"
+          <div class="stage-top">
+            <span
+              class="signal"
+              :class="`signal-${connectedPeers === 0 ? 0 : combinedNetworkHealth.bars}`"
+              :title="combinedNetworkHealth.title"
+              :aria-label="combinedNetworkHealth.title"
+              role="img"
+              data-testid="network-combined-health"
+            >
+              <i v-for="n in 4" :key="n" :class="{ lit: connectedPeers > 0 && n <= combinedNetworkHealth.bars }"></i>
+            </span>
+            <span
+              class="stage-count"
+              :title="`Direct peers: ${networkGraphPeerSummary.direct}; indirect peers: ${networkGraphPeerSummary.indirect}; total peers: ${networkGraphPeerSummary.total}`"
+            >
+              {{ networkGraphPeerSummary.direct }} direct,
+              {{ networkGraphPeerSummary.indirect }} through others,
+              {{ networkGraphPeerSummary.total }} in all
+            </span>
+            <span
+              class="stage-gossip"
+              :class="`gossip-${networkGossipState}`"
               data-testid="status-message"
               role="status"
               aria-live="polite"
-            >
-              <span>{{ networkGraphStatusLabel }}</span>
-              <FontAwesomeIcon :icon="icons.state" class="network-graph-gossip-icon" aria-hidden="true" />
-            </div>
+            >{{ networkGraphStatusLabel }}</span>
           </div>
         </div>
 
-        <div class="workspace-tabs" v-if="isRunning">
-          <div class="tab-nav" role="tablist" aria-label="PeerPigeon panels">
+        <aside class="side">
+          <dl class="facts">
+            <div class="fact fact-you">
+              <dt>You</dt>
+              <dd class="mono" :title="clientId" data-testid="client-id">{{ peerIdDisplay }}</dd>
+            </div>
+            <div class="fact">
+              <dt>Connected</dt>
+              <dd data-testid="connected-peers">{{ connectedPeers }} / {{ maxPeers }}</dd>
+            </div>
+            <div class="fact">
+              <dt>Discovered</dt>
+              <dd data-testid="discovered-peers">{{ discoveredPeers }}</dd>
+            </div>
+            <div class="fact">
+              <dt>Gossip seen</dt>
+              <dd data-testid="messages-seen">{{ messagesSeen }}</dd>
+            </div>
+          </dl>
+
+          <label class="field side-topology">
+            <span>Topology</span>
+            <select
+              ref="topologySelect"
+              :value="topology"
+              :disabled="isConnecting"
+              class="input"
+              data-testid="topology"
+              @change="onTopologyChange"
+            >
+              <option v-for="option in topologyOptions" :key="option.id" :value="option.id">{{ option.name }}</option>
+            </select>
+          </label>
+
+          <div class="tabs" role="tablist" aria-label="PeerPigeon panels">
             <button
               v-for="tab in uiTabs"
               :key="tab.id"
               type="button"
               role="tab"
-              class="tab-btn"
+              class="tab"
               :aria-selected="activeTab === tab.id"
               :class="{ active: activeTab === tab.id }"
               @click="activeTab = tab.id"
-            >
-              {{ tab.label }}
-            </button>
+            >{{ tab.label }}</button>
           </div>
 
-          <div v-if="activeTab === 'message'" class="tab-panel chat" role="tabpanel" aria-label="Message panel">
-            <h3 class="section-heading">
-              <FontAwesomeIcon :icon="icons.message" class="section-heading-icon" aria-hidden="true" />
-              <span>Message</span>
-            </h3>
-            <div class="log-controls">
-              <button @click="clearLog" class="btn btn-small">Clear</button>
-              <label>
-                <input v-model="autoScroll" type="checkbox" />
-                Auto-scroll
-              </label>
-            </div>
-            <div ref="logContainer" class="log-container chat-container">
+          <!-- Messages -->
+          <div v-if="activeTab === 'message'" class="panel panel-messages" role="tabpanel" aria-label="Messages">
+            <div ref="logContainer" class="thread">
+              <p v-if="chatMessages.length === 0" class="empty">
+                Nothing yet. Say something and every peer in the room gets it.
+              </p>
               <div
                 v-for="(entry, idx) in chatMessages"
                 :key="idx"
-                :class="['log-entry', entry.type, { local: entry.local }]"
+                :class="['msg', entry.type, entryBubbleClass(entry), { local: entry.local }]"
               >
-                <div class="bubble" :class="entryBubbleClass(entry)">
-                  <div class="bubble-meta">
-                    <span
-                      class="sender"
-                      :title="entry.local ? '' : messagePeerSha1(entry.sender)"
-                    >{{ entry.local ? 'You' : formatMessagePeerId(entry.sender) }}</span>
-                    <span class="timestamp">{{ formatTime(entry.timestamp) }}</span>
-                  </div>
-                  <div class="bubble-text">
-                    <FontAwesomeIcon
-                      v-if="entry.icon && icons[entry.icon]"
-                      :icon="icons[entry.icon]"
-                      class="bubble-icon"
-                      aria-hidden="true"
-                    />
-                    <span>{{ entry.text }}</span>
-                  </div>
-                  <div
-                    v-if="entry.messageId && deliveryInferences[entry.messageId]"
-                    class="bubble-delivery"
-                    :class="deliveryInferenceClass(entry.messageId)"
-                  >
-                    {{ deliveryInferenceLabel(entry.messageId) }}
-                  </div>
-                  <div
-                    v-if="entry.type === 'received' && !entry.direct"
-                    class="bubble-hops"
-                    :title="formatHopTrace(entry.hopPath, entry.hops)"
-                  >{{ formatHopLatency(entry.hops, entry.latencyMs) }}</div>
+                <div class="msg-meta">
+                  <span class="msg-who" :title="entry.local ? '' : messagePeerSha1(entry.sender)">{{ entry.local ? 'You' : formatMessagePeerId(entry.sender) }}</span>
+                  <span v-if="entry.direct" class="msg-tag">direct</span>
+                  <span class="msg-time">{{ formatTime(entry.timestamp) }}</span>
                 </div>
+                <div class="msg-text">
+                  <FontAwesomeIcon v-if="entry.icon && icons[entry.icon]" :icon="icons[entry.icon]" class="msg-icon" aria-hidden="true" />
+                  <span>{{ entry.text }}</span>
+                </div>
+                <div
+                  v-if="entry.messageId && deliveryInferences[entry.messageId]"
+                  class="msg-note"
+                  :class="deliveryInferenceClass(entry.messageId)"
+                >{{ deliveryInferenceLabel(entry.messageId) }}</div>
+                <div
+                  v-if="entry.type === 'received' && !entry.direct"
+                  class="msg-note"
+                  :title="formatHopTrace(entry.hopPath, entry.hops)"
+                >{{ formatHopLatency(entry.hops, entry.latencyMs) }}</div>
               </div>
             </div>
 
-            <div class="message-input">
-              <div class="message-mode-controls">
-                <label class="mode-toggle">
+            <div class="compose">
+              <div class="compose-to">
+                <label class="check">
                   <input v-model="directMode" type="checkbox" />
-                  Direct
+                  <span>Only to one peer</span>
                 </label>
-                <select
-                  v-if="directMode"
-                  v-model="dmTarget"
-                  class="input message-target-select"
-                  data-testid="dm-target"
-                >
-                  <option value="" disabled>{{ globalPeersList.length ? 'Select peer…' : 'Waiting for peers…' }}</option>
-                  <option v-for="p in globalPeersList" :key="p" :value="p">{{ p.slice(0,8) }}…</option>
+                <select v-if="directMode" v-model="dmTarget" class="input" data-testid="dm-target">
+                  <option value="" disabled>{{ globalPeersList.length ? 'Choose a peer' : 'No peers yet' }}</option>
+                  <option v-for="p in globalPeersList" :key="p" :value="p">{{ p.slice(0, 8) }}…</option>
                 </select>
               </div>
-              <input
-                v-model="messageInput"
-                @keyup.enter="sendMessage"
-                :disabled="!isRunning"
-                :placeholder="directMode ? 'Type a direct message…' : 'Type a message...'"
-                data-testid="dm-input"
-                class="input"
-              />
-              <button
-                @click="sendMessage"
-                :disabled="!isRunning || !messageInput.trim() || (directMode && !dmTarget)"
-                class="btn btn-secondary"
-                data-testid="dm-send"
-              >
-                {{ directMode ? 'Send Direct' : 'Send' }}
-              </button>
-            </div>
-          </div>
-
-          <div v-else-if="activeTab === 'media'" class="tab-panel feature-panel" role="tabpanel" aria-label="Media panel">
-            <h3 class="section-heading">
-              <FontAwesomeIcon :icon="icons.media" class="section-heading-icon" aria-hidden="true" />
-              <span>Media</span>
-            </h3>
-            <p class="feature-copy">Media controls are scaffolded here for upcoming file and stream sharing workflows.</p>
-          </div>
-
-          <div v-else-if="activeTab === 'storage'" class="tab-panel feature-panel" role="tabpanel" aria-label="Storage panel">
-            <h3 class="section-heading">
-              <FontAwesomeIcon :icon="icons.storage" class="section-heading-icon" aria-hidden="true" />
-              <span>Storage</span>
-            </h3>
-            <p class="feature-copy">Key/value storage stays local until you Get a key and subscribe to its peer updates.</p>
-
-            <div class="storage-head">
-              <div class="storage-badge" :class="storageReady ? 'ready' : 'idle'">
-                {{ storageReady ? 'Ready' : 'Waiting for mesh identity' }}
+              <div class="compose-row">
+                <input
+                  v-model="messageInput"
+                  :disabled="!isRunning"
+                  :placeholder="directMode ? 'Message one peer' : 'Message everyone'"
+                  data-testid="dm-input"
+                  class="input"
+                  @keyup.enter="sendMessage"
+                />
+                <button
+                  type="button"
+                  class="btn btn-go"
+                  :disabled="!isRunning || !messageInput.trim() || (directMode && !dmTarget)"
+                  data-testid="dm-send"
+                  @click="sendMessage"
+                >Send</button>
               </div>
-              <div class="storage-help">Session: <span class="mono">{{ effectiveSessionId }}</span></div>
+              <div class="compose-foot">
+                <label class="check"><input v-model="autoScroll" type="checkbox" /><span>Follow new messages</span></label>
+                <button type="button" class="link-btn" @click="clearLog">Clear</button>
+              </div>
             </div>
+          </div>
 
-            <div class="storage-controls">
-              <label class="field storage-space-field">
-                <span class="field-label">Space</span>
+          <!-- Storage -->
+          <div v-else-if="activeTab === 'storage'" class="panel panel-storage" role="tabpanel" aria-label="Storage">
+            <p class="note">
+              Saved here first. Get a key to fetch it from peers and keep following its changes.
+              <span class="storage-state" :class="storageReady ? 'ready' : 'idle'">{{ storageReady ? 'Ready' : 'Waiting for this peer’s keys' }}</span>
+            </p>
+
+            <div class="storage-form">
+              <label class="field">
+                <span>Space</span>
                 <select v-model="storageActiveSpace" class="input" @change="refreshStorageList">
                   <option value="user">user</option>
                   <option value="private">private</option>
@@ -385,85 +317,62 @@
                   <option value="epublic">epublic (read-only)</option>
                 </select>
               </label>
-
-              <label v-if="storageActiveSpace === 'user'" class="field storage-owner-field">
-                <span class="field-label">Lookup owner pub key</span>
-                <input
-                  v-model="storageLookupOwnerId"
-                  class="input"
-                  placeholder="blank = your pub key"
-                  @input="refreshStorageList"
-                />
+              <label v-if="storageActiveSpace === 'user'" class="field">
+                <span>Owner’s public key</span>
+                <input v-model="storageLookupOwnerId" class="input" placeholder="Yours, if left blank" @input="refreshStorageList" />
               </label>
-
-              <label class="field storage-key-field">
-                <span class="field-label">Key</span>
-                <div class="storage-key-row">
-                  <input v-model="storageFormKey" class="input" placeholder="e.g. profile.theme" />
-                </div>
+              <label class="field">
+                <span>Key</span>
+                <input v-model="storageFormKey" class="input" placeholder="profile.theme" />
               </label>
-
-              <label class="field storage-value-field">
-                <span class="field-label">Value (JSON or text)</span>
-                <input v-model="storageFormValue" class="input" placeholder='{"darkMode":true}' :disabled="storageActiveSpace === 'epublic'" />
+              <label class="field">
+                <span>Value</span>
+                <input v-model="storageFormValue" class="input" placeholder='{"darkMode": true}' :disabled="storageActiveSpace === 'epublic'" />
               </label>
-
               <div class="storage-actions">
-                <button class="btn btn-secondary" :disabled="storageActiveSpace === 'epublic' || !isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="saveStorageEntry">
-                  Save
-                </button>
-                <button class="btn btn-danger" :disabled="storageActiveSpace === 'epublic' || !isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="deleteStorageEntry">
-                  Delete
-                </button>
-                <button class="btn storage-get-sync-btn" :class="{ active: isStorageKeyInterested(storageActiveSpace, storageFormKey) }" :disabled="!storageFormKey.trim() || !isRunning || !storageReady || storageBusy" @click="getStorageKey">
-                  Get
-                </button>
+                <button type="button" class="btn btn-go" :disabled="storageActiveSpace === 'epublic' || !isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="saveStorageEntry">Save</button>
+                <button type="button" class="btn" :class="{ on: isStorageKeyInterested(storageActiveSpace, storageFormKey) }" :disabled="!storageFormKey.trim() || !isRunning || !storageReady || storageBusy" @click="getStorageKey">Get</button>
+                <button type="button" class="btn btn-stop" :disabled="storageActiveSpace === 'epublic' || !isRunning || !storageReady || storageBusy || !storageFormKey.trim()" @click="deleteStorageEntry">Delete</button>
               </div>
             </div>
 
-            <div class="storage-space-note">{{ storageSpaceDescription }}</div>
+            <p class="note">{{ storageSpaceDescription }}</p>
 
-            <div class="storage-interest-list" v-if="interestedKeysForSpace(storageActiveSpace).length">
-              <div class="storage-interest-head">
-                <span class="storage-interest-title">Subscribed keys ({{ storageActiveSpace }})</span>
-                <button class="btn btn-small" @click="clearStorageKeyInterestForSpace(storageActiveSpace)">Clear all</button>
-              </div>
-              <div class="storage-interest-chips">
-                <button
-                  v-for="interest in interestedKeysForSpace(storageActiveSpace)"
-                  :key="interest.pk"
-                  class="storage-interest-chip"
-                  @click="setStorageKeyInterest(storageActiveSpace, interest.key, false, interest.ownerId)"
-                  :title="`Stop syncing ${interest.key}`"
-                >
-                  <span class="mono">{{ interest.key }}</span>
-                  <FontAwesomeIcon :icon="icons.close" aria-hidden="true" />
-                </button>
-              </div>
+            <div v-if="interestedKeysForSpace(storageActiveSpace).length" class="following">
+              <span>Following</span>
+              <button
+                v-for="interest in interestedKeysForSpace(storageActiveSpace)"
+                :key="interest.pk"
+                type="button"
+                class="chip"
+                :title="`Stop following ${interest.key}`"
+                @click="setStorageKeyInterest(storageActiveSpace, interest.key, false, interest.ownerId)"
+              ><span class="mono">{{ interest.key }}</span> <span aria-hidden="true">×</span></button>
+              <button type="button" class="link-btn" @click="clearStorageKeyInterestForSpace(storageActiveSpace)">Stop all</button>
             </div>
 
-            <div v-if="storageError" class="storage-error">{{ storageError }}</div>
+            <p v-if="storageError" class="error">{{ storageError }}</p>
 
-            <div class="storage-table-wrap">
-              <table class="storage-table">
+            <div class="table-wrap">
+              <table class="records">
                 <thead>
                   <tr>
                     <th>Key</th>
                     <th>Value</th>
                     <th>{{ storageOwnerLabel() }}</th>
-                    <th>Ver</th>
+                    <th>Version</th>
                     <th>Updated</th>
                   </tr>
                 </thead>
                 <tbody>
                   <tr v-if="storageRecords.length === 0">
-                    <td colspan="5" class="storage-empty">No records in {{ storageActiveSpace }} space.</td>
+                    <td colspan="5" class="empty">Nothing saved in {{ storageActiveSpace }} yet.</td>
                   </tr>
                   <tr v-for="record in storageRecords" :key="`${record.space}:${record.key}`" @click="selectStorageRecord(record)">
                     <td class="mono">{{ record.key }}</td>
-                    <td class="mono storage-value-cell">
+                    <td class="mono">
                       <div
-                        class="storage-value-scroll"
+                        class="cell-scroll"
                         :class="{ 'is-scrolling': storageTableScrollingKey === `${record.space}:${record.key}` }"
                         @scroll.passive="handleStorageTableValueScroll(record)"
                       >{{ storageRecordText(record.value) }}</div>
@@ -477,176 +386,100 @@
             </div>
           </div>
 
-          <div v-else-if="activeTab === 'crypto'" class="tab-panel feature-panel" role="tabpanel" aria-label="Crypto panel">
-            <h3 class="section-heading">
-              <FontAwesomeIcon :icon="icons.crypto" class="section-heading-icon" aria-hidden="true" />
-              <span>Crypto</span>
-            </h3>
-            <p class="feature-copy">Broadcasts use room-scoped encryption. Direct messages use peer-targeted UNSEA envelopes.</p>
+          <!-- Keys -->
+          <div v-else-if="activeTab === 'crypto'" class="panel panel-keys" role="tabpanel" aria-label="Keys">
+            <p class="note">Messages to everyone are encrypted for the room. Messages to one peer are sealed with that peer’s public key.</p>
 
-            <div class="crypto-grid">
-              <div class="crypto-card">
-                <h4>Public Info</h4>
-                <div class="crypto-row">
-                  <span class="crypto-label">Peer ID</span>
-                  <span class="crypto-value mono">{{ clientId || (isRunning ? 'Reconnecting…' : 'Not connected') }}</span>
-                </div>
-                <div class="crypto-row">
-                  <span class="crypto-label">Sign Public</span>
-                  <span class="crypto-value mono">{{ localPublicCryptoInfo?.pub || 'Loading…' }}</span>
-                </div>
-                <div class="crypto-row">
-                  <span class="crypto-label">Encrypt Public</span>
-                  <span class="crypto-value mono">{{ localPublicCryptoInfo?.epub || 'Loading…' }}</span>
-                </div>
-              </div>
+            <h3>Yours to share</h3>
+            <dl class="keys">
+              <dt>Peer ID</dt>
+              <dd class="mono">{{ clientId || (isRunning ? 'Reconnecting…' : 'Not connected') }}</dd>
+              <dt>Signing key</dt>
+              <dd class="mono">{{ localPublicCryptoInfo?.pub || 'Loading…' }}</dd>
+              <dt>Encryption key</dt>
+              <dd class="mono">{{ localPublicCryptoInfo?.epub || 'Loading…' }}</dd>
+            </dl>
 
-              <div class="crypto-card">
-                <div class="crypto-private-head">
-                  <h4>Private Info</h4>
-                  <button
-                    type="button"
-                    class="btn btn-small crypto-visibility-btn"
-                    @click="showPrivateCrypto = !showPrivateCrypto"
-                    :aria-pressed="showPrivateCrypto"
-                  >
-                    <FontAwesomeIcon
-                      :icon="showPrivateCrypto ? icons.eyeSlash : icons.eye"
-                      class="icon-eye"
-                      aria-hidden="true"
-                    />
-                    <span>{{ showPrivateCrypto ? 'Hide' : 'Show' }}</span>
-                  </button>
-                </div>
-                <div class="crypto-row">
-                  <span class="crypto-label">Sign Private</span>
-                  <span class="crypto-value mono">{{ showPrivateCrypto ? (localPrivateCryptoInfo?.priv || 'Loading…') : maskSecret(localPrivateCryptoInfo?.priv) }}</span>
-                </div>
-                <div class="crypto-row">
-                  <span class="crypto-label">Encrypt Private</span>
-                  <span class="crypto-value mono">{{ showPrivateCrypto ? (localPrivateCryptoInfo?.epriv || 'Loading…') : maskSecret(localPrivateCryptoInfo?.epriv) }}</span>
-                </div>
-              </div>
-
-              <div class="crypto-card crypto-card-wide">
-                <h4>Known Peer Public Keys</h4>
-                <div v-if="remoteCryptoPeers.length === 0" class="crypto-empty">No remote public keys learned yet.</div>
-                <div v-else class="crypto-peer-list">
-                  <div v-for="([peerId, info], idx) in remoteCryptoPeers" :key="`${peerId}-${idx}`" class="crypto-peer-row">
-                    <span class="crypto-peer-id mono">{{ peerId }}</span>
-                    <span class="crypto-peer-key mono">pub: {{ info.pub }}</span>
-                    <span class="crypto-peer-key mono">epub: {{ info.epub }}</span>
-                  </div>
-                </div>
-              </div>
+            <div class="keys-head">
+              <h3>Keep private</h3>
+              <button type="button" class="link-btn" :aria-pressed="showPrivateCrypto" @click="showPrivateCrypto = !showPrivateCrypto">
+                {{ showPrivateCrypto ? 'Hide' : 'Show' }}
+              </button>
             </div>
-          </div>
-        </div>
-      </section>
+            <dl class="keys">
+              <dt>Signing key</dt>
+              <dd class="mono">{{ showPrivateCrypto ? (localPrivateCryptoInfo?.priv || 'Loading…') : maskSecret(localPrivateCryptoInfo?.priv) }}</dd>
+              <dt>Encryption key</dt>
+              <dd class="mono">{{ showPrivateCrypto ? (localPrivateCryptoInfo?.epriv || 'Loading…') : maskSecret(localPrivateCryptoInfo?.epriv) }}</dd>
+            </dl>
 
-      <!-- Diagnostics -->
-      <section class="chat diagnostics" v-if="isRunning">
-        <div class="diagnostics-header">
-          <h3 class="section-heading">
-            <FontAwesomeIcon :icon="icons.diagnostics" class="section-heading-icon" aria-hidden="true" />
-            <span>Diagnostics</span>
-          </h3>
+            <h3>Other peers</h3>
+            <p v-if="remoteCryptoPeers.length === 0" class="empty">No other peer has shared its keys yet.</p>
+            <dl v-else class="keys">
+              <template v-for="([peerId, info], idx) in remoteCryptoPeers" :key="`${peerId}-${idx}`">
+                <dt class="mono">{{ peerId.slice(0, 8) }}…</dt>
+                <dd class="mono">{{ info.pub }}<br />{{ info.epub }}</dd>
+              </template>
+            </dl>
+          </div>
+        </aside>
+
+        <details class="diagnostics" open>
+          <summary>
+            <span class="diagnostics-title">Diagnostics</span>
+            <span class="diagnostics-count">{{ diagnosticMessages.length }} lines</span>
+          </summary>
           <div class="diagnostics-filters">
-            <fieldset class="diagnostics-capture-options">
-              <legend>Capture</legend>
-              <label class="diagnostics-capture-toggle">
-                <input
-                  v-model="chatLoggingEnabled"
-                  type="checkbox"
-                  data-testid="chat-logging-enabled"
-                />
-                <span>Chat</span>
-              </label>
-              <label class="diagnostics-capture-toggle">
-                <input
-                  v-model="diagnosticLoggingEnabled"
-                  type="checkbox"
-                  data-testid="diagnostic-logging-enabled"
-                />
-                <span>Diagnostics</span>
-              </label>
-            </fieldset>
-            <label class="diagnostics-filter">
-              <span>Verbosity</span>
-              <select
-                v-model.number="diagnosticSyslogLevel"
-                class="diagnostics-filter-select diagnostics-verbosity-select"
-                data-testid="diagnostics-verbosity"
-                aria-label="Diagnostics syslog verbosity"
-              >
-                <option
-                  v-for="level in diagnosticSyslogLevels"
-                  :key="level.value"
-                  :value="level.value"
-                >
-                  {{ level.name }} ({{ level.value }})
-                </option>
+            <label class="check">
+              <input v-model="chatLoggingEnabled" type="checkbox" data-testid="chat-logging-enabled" />
+              <span>Record messages</span>
+            </label>
+            <label class="check">
+              <input v-model="diagnosticLoggingEnabled" type="checkbox" data-testid="diagnostic-logging-enabled" />
+              <span>Record diagnostics</span>
+            </label>
+            <label class="field field-inline">
+              <span>Detail</span>
+              <select v-model.number="diagnosticSyslogLevel" class="input" data-testid="diagnostics-verbosity" aria-label="Diagnostics syslog verbosity">
+                <option v-for="level in diagnosticSyslogLevels" :key="level.value" :value="level.value">{{ level.name }} ({{ level.value }})</option>
               </select>
             </label>
-            <label class="diagnostics-filter">
-              <span>Source</span>
-              <select
-                v-model="diagnosticSourceFilter"
-                class="diagnostics-filter-select diagnostics-source-select"
-                data-testid="diagnostics-source"
-                aria-label="Diagnostics source filter"
-              >
-                <option
-                  v-for="source in diagnosticSourceFilters"
-                  :key="source.value"
-                  :value="source.value"
-                >
-                  {{ source.name }}
-                </option>
+            <label class="field field-inline">
+              <span>From</span>
+              <select v-model="diagnosticSourceFilter" class="input" data-testid="diagnostics-source" aria-label="Diagnostics source filter">
+                <option v-for="source in diagnosticSourceFilters" :key="source.value" :value="source.value">{{ source.name }}</option>
               </select>
             </label>
             <input
               v-if="diagnosticSourceFilter === 'custom'"
               v-model="diagnosticCustomSearch"
-              class="diagnostics-custom-search"
+              class="input"
               data-testid="diagnostics-custom-search"
               type="search"
               placeholder="Search diagnostics"
               aria-label="Search diagnostics"
             />
           </div>
-        </div>
-        <div
-          ref="diagLogContainer"
-          class="log-container diag-container"
-          data-testid="diag-log"
-          tabindex="0"
-          @scroll.passive="handleDiagnosticScroll"
-          @wheel.passive="markDiagnosticScrollIntent"
-          @touchstart.passive="markDiagnosticScrollIntent"
-          @keydown="handleDiagnosticScrollKey"
-          @pointerdown="handleDiagnosticPointerDown"
-        >
           <div
-            v-for="(entry, idx) in diagnosticMessages"
-            :key="`diag-${idx}`"
-            class="diag-entry"
+            ref="diagLogContainer"
+            class="log"
+            data-testid="diag-log"
+            tabindex="0"
+            @scroll.passive="handleDiagnosticScroll"
+            @wheel.passive="markDiagnosticScrollIntent"
+            @touchstart.passive="markDiagnosticScrollIntent"
+            @keydown="handleDiagnosticScrollKey"
+            @pointerdown="handleDiagnosticPointerDown"
           >
-            <span class="diag-time">{{ formatTime(entry.timestamp) }}</span>
-            <span class="diag-sender">{{ entry.sender }}</span>
-            <span class="diag-text">
-              {{ entry.text }}
-              <span
-                v-if="entry.duplicateCount > 1"
-                class="diag-duplicate-count"
-                :aria-label="`${entry.duplicateCount} occurrences`"
-              >×{{ entry.duplicateCount }}</span>
-            </span>
+            <div v-for="(entry, idx) in diagnosticMessages" :key="`diag-${idx}`" class="log-line">
+              <span class="log-time">{{ formatTime(entry.timestamp) }}</span>
+              <span class="log-from">{{ entry.sender }}</span>
+              <span class="log-text">{{ entry.text }}<span v-if="entry.duplicateCount > 1" class="log-repeat" :aria-label="`${entry.duplicateCount} occurrences`"> ×{{ entry.duplicateCount }}</span></span>
+            </div>
+            <p v-if="diagnosticMessages.length === 0" class="empty">Nothing matches these filters.</p>
           </div>
-          <div v-if="diagnosticMessages.length === 0" class="diag-empty">No diagnostics match these filters</div>
-        </div>
+        </details>
       </section>
-
     </main>
 
     <div
@@ -656,30 +489,26 @@
       @keydown.esc="cancelCustomTopology"
     >
       <div
-        class="modal-card"
+        class="modal"
         role="dialog"
         aria-modal="true"
         aria-labelledby="custom-topology-modal-title"
         aria-describedby="custom-topology-modal-description"
       >
-        <h2 id="custom-topology-modal-title">Stop mesh and customize?</h2>
+        <h2 id="custom-topology-modal-title">Leave the mesh to set your own limits?</h2>
         <p id="custom-topology-modal-description">
-          Switching to Custom will stop the active mesh. You can then change Min Peers,
-          Max Peers, and Tolerant before starting the mesh again.
+          A custom topology is set before joining. You’ll leave the mesh, set the fewest and
+          most peers, then join again.
         </p>
         <div class="modal-actions">
-          <button type="button" class="btn btn-small" @click="cancelCustomTopology">
-            Cancel
-          </button>
+          <button type="button" class="btn" @click="cancelCustomTopology">Stay in the mesh</button>
           <button
             ref="confirmCustomTopologyButton"
             type="button"
-            class="btn btn-danger btn-small"
+            class="btn btn-stop"
             data-testid="confirm-custom-topology"
             @click="confirmCustomTopology"
-          >
-            Stop Mesh &amp; Customize
-          </button>
+          >Leave and customize</button>
         </div>
       </div>
     </div>
@@ -905,10 +734,16 @@ export default {
       storageInterestSyncPendingSpaces: new Set(),
       uiStateKey: 'peerpigeon:ui-state',
       uiTabs: [
-        { id: 'message', label: 'Message' },
-        { id: 'media', label: 'Media' },
+        { id: 'message', label: 'Messages' },
         { id: 'storage', label: 'Storage' },
-        { id: 'crypto', label: 'Crypto' }
+        { id: 'crypto', label: 'Keys' }
+      ],
+      topologyOptions: [
+        { id: 'token-ring', name: 'Ring', note: 'Each peer links to two neighbors, with one spare.' },
+        { id: 'star', name: 'Star', note: 'One to twenty links per peer; a few peers become hubs.' },
+        { id: 'partial-mesh', name: 'Partial mesh', note: 'Two to five links per peer.' },
+        { id: 'dense-mesh', name: 'Dense mesh', note: 'Three to ten links per peer: more paths, more traffic.' },
+        { id: 'custom', name: 'Custom', note: 'Set the fewest and most peers yourself.' }
       ],
       graphStabilizeTimer: null,
       graphUpdateTimer: null,
@@ -4415,1544 +4250,1023 @@ export default {
 </script>
 
 <style scoped>
+/*
+  PeerPigeon, in "Pigeon slate" (shared with chess.peer.ooo).
+  Feather greys for the room, slate for structure, and the green sheen of a
+  pigeon's neck only for what is live: joining, sending, being connected.
+  The one loud thing is the network itself, drawn on a night sky.
+*/
+#app {
+  --paper: #e9ecee;
+  --surface: #f6f7f8;
+  --ink: #1c2126;
+  --ink-2: #56616b;
+  --line: #c6ced4;
+  --line-strong: #9aa6af;
+  --wing: #d6dce0;
+  --slate: #6e7f8d;
+  --sheen: #2e7d6f;
+  --sheen-deep: #24665a;
+  --sheen-wash: #d3e6e1;
+  --mark: #d6b234;
+  --stop: #a8473d;
+  --stop-wash: #f1dcd8;
+  --night: #1b2228;
+  --radius: 6px;
+  --font: 'Archivo', system-ui, sans-serif;
+  --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  min-height: 100dvh;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: 15px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
 :global(html),
 :global(body) {
-  width: 100%;
-  min-height: 100%;
   margin: 0;
   padding: 0;
+  background: #e9ecee;
 }
 
-* {
-  margin: 0;
-  padding: 0;
+#app *,
+#app *::before,
+#app *::after {
   box-sizing: border-box;
 }
 
-#app {
-  min-height: 100vh;
-  background: #e2e8f0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  color: #333;
-}
-
-header {
-  background: rgba(255, 255, 255, 0.95);
-  padding: 1.25rem 1rem;
-  text-align: center;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-}
-
-header h1 {
-  font-size: 2.5rem;
+#app :is(h1, h2, h3, p, dl, dd, fieldset) {
   margin: 0;
-  color: #0f172a;
+  padding: 0;
 }
 
-.header-brand {
+#app :focus-visible {
+  outline: 2px solid var(--sheen);
+  outline-offset: 2px;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 0.86em;
+}
+
+/* ---------- top bar ---------- */
+.bar {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 0.8rem;
-  margin-bottom: 0.5rem;
+  gap: 1.25rem;
+  height: 56px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
 }
 
-.header-logo {
-  width: 3.25rem;
-  height: 3.25rem;
-  display: block;
-  flex: 0 0 auto;
-}
-
-header p {
-  color: #666;
-  font-size: 1.1rem;
-}
-
-main {
-  max-width: 1200px;
-  margin: 1rem auto 0;
-  padding: 0 1rem;
-}
-
-main > section:last-child {
-  margin-bottom: 0;
-}
-
-section {
-  background: white;
-  border-radius: 12px;
-  padding: 1.1rem;
-  margin-bottom: 1rem;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
-}
-
-.section-heading {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.section-heading-icon {
-  width: 1em;
-  color: #0e7490;
-  flex: 0 0 auto;
-}
-
-.workspace-tabs {
-  padding-top: 0.85rem;
-}
-
-.tab-nav {
-  display: flex;
-  align-items: flex-end;
-  gap: 0.3rem;
-  margin-bottom: 0.8rem;
-  border-bottom: 1px solid #cfd7e7;
-}
-
-.tab-btn {
-  border: 1px solid transparent;
-  background: transparent;
-  color: #475569;
-  border-radius: 8px 8px 0 0;
-  padding: 0.45rem 0.78rem;
-  font-size: 0.84rem;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  cursor: pointer;
-  transition: background-color 0.2s ease, color 0.2s ease;
-}
-
-.tab-btn:hover {
-  background: #f1f5f9;
-  color: #334155;
-}
-
-.tab-btn.active {
-  background: #ffffff;
-  color: #1f2937;
-  border-color: #cfd7e7;
-  border-bottom-color: #ffffff;
-}
-
-.tab-panel {
-  min-height: 330px;
-}
-
-.feature-panel {
-  border: 1px dashed #cbd5e1;
-  border-radius: 10px;
-  padding: 1rem;
-  background: #f8fafc;
-}
-
-.feature-copy {
-  margin-top: 0.45rem;
-  color: #4b5563;
-  font-size: 0.95rem;
-  line-height: 1.45;
-}
-
-.storage-head {
-  margin-top: 0.7rem;
+.brand {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.6rem;
-}
-
-.storage-badge {
-  font-size: 0.75rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 0.25rem 0.45rem;
-  border-radius: 999px;
-  border: 1px solid #d1d5db;
-  color: #374151;
-  background: #f3f4f6;
-}
-
-.storage-badge.ready {
-  color: #065f46;
-  background: #ecfdf5;
-  border-color: #a7f3d0;
-}
-
-.storage-badge.idle {
-  color: #1e40af;
-  background: #eff6ff;
-  border-color: #bfdbfe;
-}
-
-.storage-help {
-  font-size: 0.8rem;
-  color: #475569;
-}
-
-.storage-controls {
-  margin-top: 0.75rem;
-  display: grid;
-  grid-template-columns: minmax(140px, 0.7fr) minmax(220px, 1.4fr) minmax(240px, 1.6fr) auto;
   gap: 0.55rem;
-  align-items: stretch;
+  color: var(--ink);
+  text-decoration: none;
 }
 
-.storage-controls .field {
-  justify-content: flex-start;
+.brand-logo {
+  width: 30px;
+  height: 30px;
 }
 
-.storage-controls .field-label {
-  min-height: 1rem;
+.brand-name {
+  font-weight: 800;
+  font-size: 1.15rem;
+  letter-spacing: -0.01em;
+}
+
+.room {
   display: flex;
-  align-items: center;
-}
-
-.storage-space-field,
-.storage-key-field,
-.storage-value-field {
+  align-items: baseline;
+  gap: 0.5rem;
   min-width: 0;
+  padding-left: 1.25rem;
+  border-left: 1px solid var(--line);
 }
 
-.storage-space-field .input,
-.storage-key-field .input,
-.storage-value-field .input {
-  box-sizing: border-box;
-  height: 2.375rem;
+.room-label {
+  color: var(--ink-2);
+  font-size: 0.85rem;
 }
 
-.storage-key-row {
-  display: flex;
-  gap: 0.4rem;
-  align-items: center;
-}
-
-.storage-key-row .input {
-  flex: 1;
-  min-width: 0;
-}
-
-.storage-get-sync-btn {
+.link-btn,
+.room-name {
   white-space: nowrap;
-  flex-shrink: 0;
 }
 
-.storage-get-sync-btn.active {
-  background: #3b82f6;
-  color: #fff;
-  border-color: #2563eb;
+.room-name {
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.storage-actions {
-  display: flex;
-  gap: 0.45rem;
-  align-items: center;
-  align-self: end;
+.bar-actions {
+  margin-left: auto;
 }
 
-.storage-space-note {
-  margin-top: 0.65rem;
-  font-size: 0.82rem;
-  color: #334155;
-}
-
-.storage-interest-list {
-  margin-top: 0.6rem;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  background: #f8fbff;
-  padding: 0.45rem 0.55rem;
-}
-
-.storage-interest-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  margin-bottom: 0.45rem;
-}
-
-.storage-interest-title {
-  font-size: 0.76rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: #334155;
-}
-
-.storage-interest-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-}
-
-.storage-interest-chip {
-  border: 1px solid #bae6fd;
-  background: #ffffff;
-  color: #1e293b;
-  border-radius: 999px;
-  font-size: 0.76rem;
-  padding: 0.18rem 0.48rem;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
-  cursor: pointer;
-}
-
-.storage-interest-chip:hover {
-  background: #eff6ff;
-}
-
-.storage-error {
-  margin-top: 0.45rem;
-  border: 1px solid #fecaca;
-  background: #fef2f2;
-  color: #991b1b;
-  border-radius: 8px;
-  font-size: 0.82rem;
-  padding: 0.4rem 0.55rem;
-}
-
-.storage-table-wrap {
-  margin-top: 0.7rem;
-  max-height: 240px;
-  overflow: auto;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  background: #ffffff;
-}
-
-.storage-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.8rem;
-}
-
-.storage-table th,
-.storage-table td {
-  border-bottom: 1px solid #e2e8f0;
-  padding: 0.42rem 0.5rem;
-  text-align: left;
-  vertical-align: top;
-}
-
-.storage-table th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: #f8fafc;
-  color: #334155;
-  font-size: 0.72rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.storage-table tbody tr {
-  cursor: pointer;
-}
-
-.storage-table tbody tr:hover {
-  background: #f8fbff;
-}
-
-.storage-value-cell {
-  width: 42%;
-  max-width: 320px;
-}
-
-.storage-value-scroll {
-  width: 100%;
-  height: 4.5rem;
-  min-height: 4.5rem;
-  max-height: 4.5rem;
-  overflow-x: hidden;
-  overflow-y: scroll;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  line-height: 1.3;
-  scrollbar-width: thin;
-  scrollbar-color: transparent transparent;
-  scrollbar-gutter: stable;
-  overscroll-behavior-y: contain;
-}
-
-.storage-value-scroll.is-scrolling {
-  scrollbar-color: rgba(71, 85, 105, 0.7) transparent;
-}
-
-.storage-value-scroll::-webkit-scrollbar {
-  width: 8px;
-  height: 0;
-}
-
-.storage-value-scroll::-webkit-scrollbar-track,
-.storage-value-scroll::-webkit-scrollbar-thumb {
-  background: transparent;
-}
-
-.storage-value-scroll.is-scrolling::-webkit-scrollbar-thumb {
-  border: 2px solid transparent;
-  border-radius: 999px;
-  background: rgba(71, 85, 105, 0.7);
-  background-clip: padding-box;
-}
-
-.storage-empty {
-  text-align: center;
-  color: #64748b;
-  padding: 0.8rem;
-}
-
-.crypto-grid {
-  margin-top: 0.75rem;
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 0.7rem;
-}
-
-.crypto-card {
-  border: 1px solid #cbd5e1;
-  border-radius: 10px;
-  background: #ffffff;
-  padding: 0.7rem;
-}
-
-.crypto-card h4 {
+/* ---------- controls ---------- */
+.btn {
+  font: inherit;
+  font-weight: 600;
   font-size: 0.9rem;
-  color: #1f2937;
-  margin-bottom: 0.55rem;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
 }
 
-.crypto-card-wide {
-  grid-column: 1 / -1;
+.btn:hover:not(:disabled) {
+  border-color: var(--ink-2);
 }
 
-.crypto-row {
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
-  margin-bottom: 0.45rem;
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
-.crypto-row:last-child {
-  margin-bottom: 0;
+.btn.on {
+  border-color: var(--sheen);
+  background: var(--sheen-wash);
 }
 
-.crypto-label {
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  color: #475569;
+.btn-go {
+  border-color: var(--sheen);
+  background: var(--sheen);
+  color: #fff;
 }
 
-.crypto-value {
-  font-size: 0.78rem;
-  color: #1e293b;
-  word-break: break-all;
+.btn-go:hover:not(:disabled) {
+  border-color: var(--sheen-deep);
+  background: var(--sheen-deep);
 }
 
-.crypto-private-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  margin-bottom: 0.55rem;
+.btn-stop {
+  border-color: var(--stop);
+  color: var(--stop);
 }
 
-.crypto-private-head h4 {
-  margin-bottom: 0;
+.btn-stop:hover:not(:disabled) {
+  border-color: var(--stop);
+  background: var(--stop-wash);
 }
 
-.crypto-visibility-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  text-transform: none;
-  letter-spacing: 0;
-  background: #334155;
-  color: #ffffff;
+.btn-big {
+  padding: 0.75rem 1.4rem;
+  font-size: 1rem;
 }
 
-.icon-eye {
-  width: 1em;
-  font-size: 0.92rem;
-  line-height: 1;
+.link-btn {
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--sheen);
+  cursor: pointer;
 }
 
-.crypto-empty {
-  font-size: 0.84rem;
-  color: #64748b;
-}
-
-.crypto-peer-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.45rem;
-  max-height: 220px;
-  overflow: auto;
-}
-
-.crypto-peer-row {
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
-  padding: 0.45rem;
-  background: #f8fafc;
-  display: flex;
-  flex-direction: column;
-  gap: 0.18rem;
-}
-
-.crypto-peer-id {
-  font-size: 0.8rem;
-  color: #1e293b;
-  word-break: break-all;
-}
-
-.crypto-peer-key {
-  font-size: 0.74rem;
-  color: #334155;
-  word-break: break-all;
-}
-
-/* Control Panel */
-.control-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 0.65rem;
-}
-
-.config-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 0.55rem;
+.link-btn:hover {
+  text-decoration: underline;
 }
 
 .field {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
-}
-
-.field-topology {
-  min-width: 280px;
-}
-
-.field-topology .input {
-  min-width: 280px;
-}
-
-.field-label {
-  font-size: 0.74rem;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: #4a4a4a;
-}
-
-.field-number .input {
-  text-align: center;
-}
-
-.field-session-derived {
-  justify-content: flex-end;
-}
-
-.session-derived-preview {
-  min-height: 42px;
-  display: flex;
-  align-items: center;
-  padding: 0.65rem 0.8rem;
-  border: 1px solid #d6d9de;
-  border-radius: 10px;
-  background: #f8fafc;
-  color: #1e293b;
-  word-break: break-all;
-}
-
-.button-group {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.55rem;
-  align-items: end;
-}
-
-.button-group > * {
-  justify-self: center;
-}
-
-.button-group .field {
-  align-items: center;
-}
-
-.button-group .field-label {
-  text-align: center;
-  width: 100%;
-}
-
-.field-topology-inline {
-  min-width: 220px;
-}
-
-.effective-session-inline {
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
-  align-items: center;
-  text-align: center;
+  gap: 0.3rem;
   min-width: 0;
-  width: 100%;
-  max-width: 280px;
 }
 
-.share-link-inline {
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
+.field > span {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.field small {
+  color: var(--ink-2);
+  font-size: 0.8rem;
+}
+
+.field-inline {
+  flex-direction: row;
   align-items: center;
-  justify-content: flex-end;
-}
-
-.share-link-actions {
-  display: flex;
-  gap: 0.4rem;
-  flex-wrap: wrap;
-  justify-content: center;
-}
-
-.effective-session-value {
-  font-family: 'Monaco', 'Courier New', monospace;
-  font-size: 0.84rem;
-  font-weight: 700;
-  color: #0369a1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.button-actions {
-  display: flex;
-  gap: 0.55rem;
-}
-
-.button-group .status-field {
-  min-width: 220px;
-  width: 100%;
-  max-width: 320px;
-  justify-content: center;
-  text-align: center;
-}
-
-.control-stats-row {
-  margin-top: 0.45rem;
-  border: 1px solid #d6d9de;
-  border-radius: 7px;
-  background: #f8fafc;
-  padding: 0.28rem 0.45rem;
-  display: grid;
-  grid-template-columns: minmax(0, 3fr) repeat(3, minmax(0, 1fr));
   gap: 0.45rem;
-  align-items: center;
-  min-height: 1.7rem;
-}
-
-.control-stats-row > * {
-  justify-self: center;
-}
-
-.control-stat {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  align-self: stretch;
-  justify-content: flex-start;
-  text-align: center;
-  gap: 0.12rem;
-}
-
-.control-stat-label {
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: #475569;
-}
-
-.control-stat-value {
-  font-size: 0.82rem;
-  font-weight: 700;
-  color: #0369a1;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.control-stat-peer-id {
-  width: 100%;
-  justify-self: stretch;
-  align-items: flex-start;
-  padding-left: 0.25rem;
-  text-align: left;
-}
-
-.peer-id-full {
-  display: block;
-  width: 100%;
-  overflow: visible;
-  font-size: clamp(0.58rem, 1.05vw, 0.72rem);
-  letter-spacing: -0.025em;
-  line-height: 1.15;
-  text-overflow: clip;
-}
-
-.message-input {
-  display: flex;
-  gap: 1rem;
-  width: 100%;
-  align-items: stretch;
 }
 
 .input {
-  padding: 0.5rem 0.7rem;
-  border: 2px solid #e0e0e0;
-  border-radius: 8px;
-  font-size: 0.92rem;
-  transition: border-color 0.3s;
-}
-
-.message-input .input {
-  flex: 1;
-  min-width: 0;
-}
-
-.message-mode-controls {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-  flex: 0 0 auto;
-}
-
-.mode-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-  font-size: 0.82rem;
-  color: #334155;
-  white-space: nowrap;
-}
-
-.message-target-select {
-  min-width: 150px;
-  max-width: 210px;
-}
-
-.message-input .btn {
-  flex: 0 0 120px;
-}
-
-.diagnostics {
-  border-top: 4px solid #2f6fec;
-}
-
-.diagnostics-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  margin-bottom: 1rem;
-}
-
-.diagnostics-header .section-heading {
-  margin-bottom: 0;
-}
-
-.diagnostics-filters {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 0.65rem;
-  flex-wrap: wrap;
-}
-
-.diagnostics-capture-options {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.55rem;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  color: #334155;
-  font-size: 0.78rem;
-}
-
-.diagnostics-capture-options legend {
-  float: left;
-  margin-right: 0.05rem;
-  font-weight: 700;
-}
-
-.diagnostics-capture-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.25rem;
-  cursor: pointer;
-  user-select: none;
-}
-
-.diagnostics-capture-toggle input {
-  margin: 0;
-  accent-color: #2f6fec;
-}
-
-.diagnostics-filter {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  color: #334155;
-  font-size: 0.78rem;
-  font-weight: 700;
-}
-
-.diagnostics-filter-select,
-.diagnostics-custom-search {
-  padding: 0.38rem 1.8rem 0.38rem 0.55rem;
-  border: 1px solid #94a3b8;
-  border-radius: 7px;
-  background: #ffffff;
-  color: #0f172a;
+  width: 100%;
   font: inherit;
-}
-
-.diagnostics-verbosity-select {
-  min-width: 9.5rem;
-}
-
-.diagnostics-source-select {
-  min-width: 7rem;
-}
-
-.diagnostics-custom-search {
-  width: min(16rem, 42vw);
-  min-width: 10rem;
-  padding-right: 0.55rem;
-  font-size: 0.78rem;
-}
-
-.diagnostics-filter-select:focus-visible,
-.diagnostics-custom-search:focus-visible {
-  outline: 2px solid #2f6fec;
-  outline-offset: 2px;
-}
-
-.log-container.diag-container {
-  max-height: 260px;
-  overflow: auto;
-  overflow-anchor: none;
-  background: #0f172a;
-  color: #f8fafc;
-  border-color: #334155;
-}
-
-.diag-entry {
-  display: grid;
-  grid-template-columns: 6rem 8.5rem minmax(0, 1fr);
-  gap: 0.65rem;
-  padding: 0.5rem 0.6rem;
-  font-family: 'Monaco', 'Courier New', monospace;
-  font-size: clamp(0.84rem, 1.3vw, 0.92rem);
-  line-height: 1.45;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
-}
-
-.diag-time {
-  color: #bfdbfe;
-}
-
-.diag-sender {
-  color: #bbf7d0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.diag-text {
-  color: #f8fafc;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.diag-duplicate-count {
-  display: inline-block;
-  margin-left: 0.45rem;
-  padding: 0.08rem 0.4rem;
-  border: 1px solid #64748b;
-  border-radius: 999px;
-  background: #1e293b;
-  color: #f8fafc;
-  font-size: 0.76rem;
-  font-weight: 800;
-  line-height: 1.25;
-  white-space: nowrap;
-}
-
-.diag-empty {
-  padding: 0.6rem;
-  color: #94a3b8;
-  font-size: 0.85rem;
+  font-size: 0.92rem;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 0.45rem 0.6rem;
 }
 
 .input:focus {
   outline: none;
-  border-color: #0e7490;
+  border-color: var(--sheen);
+  box-shadow: 0 0 0 2px var(--sheen-wash);
 }
 
 .input:disabled {
-  background: #f5f5f5;
-  color: #999;
+  color: var(--ink-2);
+  background: var(--paper);
 }
 
-/* Buttons */
-.btn {
-  padding: 0.5rem 0.9rem;
-  border: none;
-  border-radius: 8px;
-  font-size: 0.9rem;
-  font-weight: 600;
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.88rem;
   cursor: pointer;
-  transition: all 0.3s;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
 }
 
-.btn:hover:not(:disabled) {
-  transform: translateY(-2px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+.check input,
+.topology input {
+  accent-color: var(--sheen);
 }
 
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.btn-primary {
-  background: #0e7490;
-  color: white;
-}
-
-.btn-secondary {
-  background: linear-gradient(135deg, #00c896 0%, #00a876 100%);
-  color: white;
-}
-
-.btn-danger {
-  background: #dc2626;
-  color: white;
-}
-
-.btn-small {
-  padding: 0.35rem 0.65rem;
-  font-size: 0.8rem;
-}
-
-/* Stats */
-.stats {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 0.45rem;
-}
-
-.stat-box {
-  display: flex;
-  justify-content: space-between;
-  padding: 0.5rem 0.6rem;
-  background: #f8f9fa;
-  border-left: 4px solid #0e7490;
-  border-radius: 6px;
-  align-items: center;
-  min-height: 2.15rem;
-}
-
-.stat-box .label {
-  font-weight: 600;
-  color: #333;
-  font-size: 0.8rem;
-}
-
-.stat-box .value {
-  font-weight: 700;
-  color: #0e7490;
-  font-size: 0.95rem;
-}
-
-.stat-box .mono {
-  font-family: 'Monaco', 'Courier New', monospace;
+.empty,
+.note {
+  color: var(--ink-2);
   font-size: 0.9rem;
-  word-break: break-all;
 }
 
-/* Inline status field */
-.status-field {
-  border: 1px solid #d6d9de;
-  border-radius: 8px;
-  padding: 0.38rem 0.55rem;
-  font-size: 0.83rem;
-  color: #3e4a59;
-  background: #f8fafc;
-  min-height: 1.7rem;
+.error {
+  color: var(--stop);
+  font-size: 0.9rem;
+}
+
+/* ---------- before joining ---------- */
+.setup {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-areas:
+    'intro intro'
+    'topologies where'
+    'limits where'
+    'go go';
+  gap: 1.75rem 3rem;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 3rem 24px 4rem;
+}
+
+.setup-intro {
+  grid-area: intro;
+  max-width: 62ch;
+}
+
+.setup-intro h1 {
+  font-size: 2.1rem;
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.75rem;
+}
+
+.setup-intro p {
+  color: var(--ink-2);
+  font-size: 1.02rem;
+}
+
+.topologies {
+  grid-area: topologies;
+  border: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.topologies legend,
+.where::before {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ink-2);
+  padding: 0;
+  margin-bottom: 0.4rem;
+}
+
+.topology {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-areas:
+    'radio name'
+    'radio note';
+  column-gap: 0.65rem;
+  align-items: baseline;
+  padding: 0.6rem 0;
+  border-top: 1px solid var(--line);
+  cursor: pointer;
+}
+
+.topology:last-child {
+  border-bottom: 1px solid var(--line);
+}
+
+.topology input {
+  grid-area: radio;
+  margin: 0;
+}
+
+.topology-name {
+  grid-area: name;
+  font-weight: 600;
+}
+
+.topology-note {
+  grid-area: note;
+  color: var(--ink-2);
+  font-size: 0.88rem;
+}
+
+.topology.chosen .topology-name {
+  color: var(--sheen-deep);
+}
+
+.limits {
+  grid-area: limits;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+}
+
+.where {
+  grid-area: where;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-content: start;
+  gap: 1rem 0.75rem;
+}
+
+.where::before {
+  content: 'Where to meet';
+  grid-column: 1 / -1;
+  margin-bottom: -0.4rem;
+}
+
+.field-wide {
+  grid-column: 1 / -1;
+}
+
+.setup-go {
+  grid-area: go;
   display: flex;
   align-items: center;
+  gap: 1rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--line);
 }
 
-.status-field.status-connecting {
-  color: #0f4c81;
-  background: #edf5ff;
-  border-color: #c6dfff;
+.status-line {
+  font-size: 0.9rem;
+  color: var(--ink-2);
 }
 
-.status-field.status-success {
-  color: #165b3d;
-  background: #effaf3;
-  border-color: #bfe6cd;
+.status-line.status-error {
+  color: var(--stop);
 }
 
-.status-field.status-error {
-  color: #8b1d1d;
-  background: #fff1f1;
-  border-color: #f1c3c3;
-}
-
-.network-graph-container {
-  position: relative;
-  box-sizing: border-box;
-  width: 100%;
+/* ---------- in the mesh ---------- */
+.live {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(320px, 30vw, 420px);
+  grid-template-areas:
+    'stage side'
+    'diag diag';
+  gap: 24px 28px;
+  max-width: 1440px;
   margin: 0 auto;
-  max-width: 1040px;
-  height: 410px;
-  min-height: 410px;
-  border: 1px solid rgba(255, 255, 255, 0.2);
-  border-radius: 18px;
-  box-shadow: 0 24px 55px rgba(15, 23, 42, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.12);
-  background: linear-gradient(135deg, #151515 0%, #262626 100%);
-  overflow: visible;
+  padding: 24px;
 }
 
-.network-graph-viewport {
-  position: absolute;
-  inset: 0;
+.stage {
+  grid-area: stage;
+  position: relative;
+  min-height: 560px;
+  height: calc(100dvh - 56px - 48px);
+  max-height: 820px;
+  border-radius: 10px;
+  background: var(--night);
   overflow: hidden;
-  border-radius: inherit;
 }
 
-.network-graph-container::before {
-  content: '';
+.stage-view {
   position: absolute;
   inset: 0;
-  pointer-events: none;
-  z-index: 1;
-  background:
-    radial-gradient(circle at 18% 20%, rgba(255, 255, 255, 0.055), transparent 32%),
-    radial-gradient(circle at 84% 78%, rgba(255, 255, 255, 0.035), transparent 35%);
 }
 
-.network-graph-sticky-badges {
+.stage-top {
   position: absolute;
   top: 0;
   left: 0;
-  z-index: 4;
+  right: 0;
+  z-index: 3;
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
+  align-items: center;
   gap: 0.75rem;
-  width: 100%;
-  height: 2.85rem;
-  padding: 0.72rem 0.8rem 0;
+  padding: 0.85rem 1rem;
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 0.85rem;
   pointer-events: none;
 }
 
-.network-graph-sticky-badges.is-viewport-pinned {
-  position: fixed;
-  left: 50%;
-  z-index: 999;
-  width: min(calc(100vw - 1.6rem), 1040px);
-  transform: translateX(-50%);
-}
-
-.network-graph-network-cluster {
-  display: flex;
-  align-items: center;
-  gap: 0.48rem;
-  min-width: 0;
-  max-width: calc(50% - 0.375rem);
-}
-
-.network-graph-combined-health {
-  --network-health-fill: 0%;
-  --network-health-mask: none;
-  --network-health-backdrop-filter: grayscale(1) invert(1) contrast(4);
+.stage-gossip {
+  margin-left: auto;
+  padding-left: 0.9rem;
   position: relative;
+}
+
+.stage-gossip::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin-top: -3.5px;
+  border-radius: 50%;
+  background: #8b949c;
+}
+
+.gossip-green::before { background: #5fc4a9; }
+.gossip-yellow::before { background: var(--mark); }
+.gossip-red::before { background: #e07a6d; }
+
+.signal {
   display: inline-flex;
-  width: 1.25em;
-  height: 1.25em;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  font-size: 0.625rem;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
   pointer-events: auto;
   cursor: help;
 }
 
-.network-graph-combined-health-base {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  background: rgba(255, 255, 255, 0.001);
-  -webkit-mask: var(--network-health-mask) center / contain no-repeat;
-  mask: var(--network-health-mask) center / contain no-repeat;
-  -webkit-backdrop-filter: var(--network-health-backdrop-filter);
-  backdrop-filter: var(--network-health-backdrop-filter);
-  opacity: 0;
-}
-
-.network-graph-combined-health-mask {
-  position: absolute;
-  right: 0;
-  bottom: 0;
-  left: 0;
-  height: var(--network-health-fill);
-  overflow: hidden;
-}
-
-.network-graph-combined-health-fill {
-  position: absolute;
-  bottom: 0;
-  left: 0;
-  width: 100%;
-  height: 1.25em;
-  background: rgba(255, 255, 255, 0.001);
-  -webkit-mask: var(--network-health-mask) center / contain no-repeat;
-  mask: var(--network-health-mask) center / contain no-repeat;
-  -webkit-backdrop-filter: var(--network-health-backdrop-filter);
-  backdrop-filter: var(--network-health-backdrop-filter);
-}
-
-.network-graph-combined-health.is-offline .network-graph-combined-health-base,
-.combined-health-suspended .network-graph-combined-health-base {
-  opacity: 1;
-}
-
-.network-graph-network-status,
-.network-graph-gossip-status {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.42rem;
-  width: max-content;
-  max-width: calc(50% - 0.375rem);
-  padding: 0.38rem 0.62rem;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 999px;
-  background: rgba(9, 9, 9, 0.76);
-  box-shadow: 0 5px 18px rgba(0, 0, 0, 0.3);
-  color: #f8fafc;
-  font-size: 0.76rem;
-  font-weight: 700;
-  line-height: 1.2;
-  pointer-events: none;
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-}
-
-.network-graph-network-status {
-  max-width: 100%;
-  background: rgba(15, 23, 42, 0.82);
-  color: rgba(255, 255, 255, 0.8);
-  font-family: Monaco, 'Courier New', monospace;
-  font-size: 0.625rem;
-  letter-spacing: 0.08em;
-}
-
-.network-graph-network-icon {
-  width: 1em;
-  color: #8ff7ff;
-  flex: 0 0 auto;
-}
-
-.network-graph-network-copy {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.network-graph-gossip-status > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.network-graph-metric-direct,
-.network-graph-metric-total {
-  color: rgba(255, 255, 255, 0.92);
-  opacity: 1;
-  -webkit-text-fill-color: rgba(255, 255, 255, 0.92);
-}
-
-.network-graph-metric-indirect {
-  display: inline-block;
-  color: #fff;
-  opacity: 0.42;
-  -webkit-text-fill-color: #fff;
-}
-
-.network-graph-metric-separator {
-  color: rgba(255, 255, 255, 0.66);
-}
-
-.network-graph-gossip-icon {
-  width: 0.58rem;
-  height: 0.58rem;
-  flex: 0 0 auto;
-  filter: drop-shadow(0 0 4px currentColor);
-}
-
-.gossip-state-green .network-graph-gossip-icon {
-  color: #4ade80;
-}
-
-.gossip-state-yellow .network-graph-gossip-icon {
-  color: #facc15;
-}
-
-.gossip-state-red .network-graph-gossip-icon {
-  color: #f87171;
-}
-
-.gossip-state-grey .network-graph-gossip-icon {
-  color: #9ca3af;
-}
-
-.network-graph-svg {
-  width: 100%;
-  height: 340px;
+.signal i {
   display: block;
+  width: 3px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.22);
 }
 
-.network-link {
-  stroke-width: 2px;
-  opacity: 0.95;
+.signal i:nth-child(1) { height: 3px; }
+.signal i:nth-child(2) { height: 6px; }
+.signal i:nth-child(3) { height: 9px; }
+.signal i:nth-child(4) { height: 12px; }
+
+.signal i.lit {
+  background: #5fc4a9;
 }
 
-.network-node {
-  cursor: grab;
-}
+.signal-1 i.lit { background: #e07a6d; }
+.signal-2 i.lit { background: var(--mark); }
 
-.network-node:active {
-  cursor: grabbing;
-}
-
-.network-node-label {
-  font-family: 'Monaco', 'Courier New', monospace;
-  font-size: 11.5px;
-  font-weight: 800;
-  pointer-events: none;
-  user-select: none;
-}
-
-.network-node.self .network-node-core {
-  animation: self-node-pulse 1.8s ease-in-out infinite;
-}
-
-.network-empty {
-  fill: #93c5fd;
-  font-size: 14px;
-  font-family: 'Monaco', 'Courier New', monospace;
-}
-
-@keyframes self-node-pulse {
-  0%,
-  100% {
-    filter: url(#network-node-glow);
-  }
-  50% {
-    filter: url(#network-node-glow) brightness(1.14);
-  }
-}
-
-/* Chat */
-.chat h3 {
-  margin-bottom: 1rem;
-}
-
-.log-controls {
-  display: flex;
-  gap: 1rem;
-  align-items: center;
-  margin-bottom: 1rem;
-}
-
-.log-controls label {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  font-size: 0.9rem;
-}
-
-.log-container {
-  height: 300px;
-  max-height: 50vh;
-  overflow-y: auto;
-  overflow-x: hidden;
-  background: #f8f9fa;
-  border-radius: 8px;
-  padding: 1rem;
-  border: 1px solid #e0e0e0;
-  scroll-behavior: smooth;
-}
-
-.chat-container {
+/* side column */
+.side {
+  grid-area: side;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  padding-right: 6px; /* space for scrollbar */
+  min-width: 0;
+  min-height: 0;
+  height: calc(100dvh - 56px - 48px);
+  min-height: 560px;
+  max-height: 820px;
 }
 
-.log-entry {
-  display: flex;
+.facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.9rem;
+  row-gap: 0.75rem;
 }
 
-.log-entry.signaling {
-  background: #e3f2fd;
-  color: #1976d2;
+.fact dt {
+  font-size: 0.8rem;
+  color: var(--ink-2);
 }
 
-.log-entry.discovered {
-  background: #fff3e0;
-  color: #e65100;
+.fact dd {
+  font-size: 1.35rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
 }
 
-.log-entry.connected {
-  background: #e8f5e9;
-  color: #2e7d32;
+.fact-you {
+  grid-column: 1 / -1;
 }
 
-.log-entry.disconnected {
-  background: #fce4ec;
-  color: #c2185b;
-}
-
-.bubble {
-  display: inline-block;
-  max-width: 100%;
-  width: fit-content;
-  padding: 0.6rem 0.8rem;
-  border-radius: 12px;
-  box-shadow: 0 2px 6px rgba(0,0,0,0.08);
-  white-space: pre-wrap;
-  word-break: break-word;
+.fact-you dd {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  font-weight: 500;
   overflow-wrap: anywhere;
 }
 
-.bubble.me {
-  margin-left: auto;
-  background: #16a34a !important; /* green */
-  color: #ffffff !important;
-  border-bottom-right-radius: 4px;
-  border: 1px solid #0f7a36;
+.side-topology {
+  padding: 0.9rem 0;
 }
 
-.bubble.peer {
-  margin-right: auto;
-  background: #dbeafe !important; /* light blue */
-  color: #1e3a8a !important;
-  border-bottom-left-radius: 4px;
-  border: 1px solid #bfdbfe;
+.tabs {
+  display: flex;
+  gap: 1.25rem;
+  border-bottom: 1px solid var(--line);
 }
 
-.bubble.dm-me {
-  margin-left: auto;
-  background: #0369a1 !important;
-  color: #fff !important;
-  border-bottom-right-radius: 4px;
-  border: 1px solid #075985;
+.tab {
+  font: inherit;
+  font-weight: 600;
+  font-size: 0.92rem;
+  padding: 0.5rem 0;
+  margin-bottom: -1px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--ink-2);
+  cursor: pointer;
 }
 
-.bubble.dm-peer {
-  margin-right: auto;
-  background: #ecfeff !important;
-  color: #155e75 !important;
-  border-bottom-left-radius: 4px;
-  border: 1px solid #a5f3fc;
+.tab:hover {
+  color: var(--ink);
 }
 
-/* Ensure the chat section itself clips any inner overflow */
-.chat {
+.tab.active {
+  color: var(--ink);
+  border-bottom-color: var(--sheen);
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  flex: 1;
+  min-height: 0;
+  padding-top: 0.85rem;
+  overflow-y: auto;
+}
+
+/* messages */
+.panel-messages {
   overflow: hidden;
 }
 
-.bubble-meta {
+.thread {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-right: 0.25rem;
+}
+
+.msg {
+  max-width: 88%;
+  padding: 0.45rem 0.65rem;
+  border-radius: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  align-self: flex-start;
+}
+
+.msg.local {
+  align-self: flex-end;
+  background: var(--sheen-wash);
+  border-color: transparent;
+}
+
+.msg.dm-peer,
+.msg.dm-me {
+  border-style: dashed;
+  border-color: var(--slate);
+}
+
+.msg-meta {
+  display: flex;
+  gap: 0.45rem;
+  align-items: baseline;
+  font-size: 0.78rem;
+  color: var(--ink-2);
+}
+
+.msg-who {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.msg-tag {
+  font-style: italic;
+}
+
+.msg-time {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.msg-text {
+  overflow-wrap: anywhere;
+}
+
+.msg-icon {
+  margin-right: 0.35rem;
+  color: var(--ink-2);
+}
+
+.msg-note {
+  font-size: 0.76rem;
+  color: var(--ink-2);
+}
+
+.msg-note.partial {
+  color: #8a6a10;
+}
+
+.compose {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
+}
+
+.compose-to {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.compose-to .input {
+  width: auto;
+  flex: 1;
+}
+
+.compose-row {
   display: flex;
   gap: 0.5rem;
-  font-size: 0.75rem;
-  opacity: 0.8;
 }
 
-.bubble-text {
-  margin-top: 0.25rem;
-  word-break: break-word;
+.compose-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* storage */
+.storage-state {
+  margin-left: 0.35rem;
+  font-weight: 600;
+}
+
+.storage-state.ready {
+  color: var(--sheen-deep);
+}
+
+.storage-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 0.65rem;
+}
+
+.storage-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.storage-actions .btn-stop {
+  margin-left: auto;
+}
+
+.following {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+}
+
+.chip {
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.chip:hover {
+  border-color: var(--stop);
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+.records {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.84rem;
+}
+
+.records th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink-2);
+  padding: 0.35rem 0.5rem 0.35rem 0;
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.records td {
+  padding: 0.4rem 0.5rem 0.4rem 0;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.records tbody tr:hover td {
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.cell-scroll {
+  max-width: 14rem;
+  max-height: 4.5em;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* keys */
+.panel-keys h3 {
+  font-size: 0.95rem;
+  font-weight: 700;
+  margin-top: 0.4rem;
+}
+
+.keys-head {
   display: flex;
   align-items: baseline;
-  gap: 0.4rem;
+  justify-content: space-between;
 }
 
-.bubble-icon {
-  width: 0.95em;
-  flex: 0 0 auto;
-  opacity: 0.9;
+.keys {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.35rem 0.85rem;
+  font-size: 0.85rem;
 }
 
-.bubble-delivery {
-  margin-top: 0.3rem;
-  font-size: 0.7rem;
+.keys dt {
+  color: var(--ink-2);
+}
+
+.keys dd {
+  overflow-wrap: anywhere;
+}
+
+/* diagnostics */
+.diagnostics {
+  grid-area: diag;
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
+}
+
+.diagnostics summary {
+  display: flex;
+  align-items: baseline;
+  gap: 0.65rem;
+  cursor: pointer;
+  list-style: none;
+}
+
+.diagnostics summary::-webkit-details-marker {
+  display: none;
+}
+
+.diagnostics summary::before {
+  content: '';
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--ink-2);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 0.15s;
+}
+
+.diagnostics[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.diagnostics-title {
   font-weight: 700;
-  opacity: 0.78;
 }
 
-.bubble-delivery.complete {
-  color: #d1fae5;
+.diagnostics-count {
+  color: var(--ink-2);
+  font-size: 0.85rem;
 }
 
-.bubble-delivery.partial {
-  color: #fee2e2;
+.diagnostics-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1.25rem;
+  padding: 0.75rem 0;
 }
 
-.bubble-hops {
-  margin-top: 0.25rem;
-  font-size: 0.75rem;
-  opacity: 0.7;
-  cursor: help;
+.diagnostics-filters .input {
+  width: auto;
 }
 
+.log {
+  max-height: 340px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  padding: 0.35rem 0;
+}
+
+.log-line {
+  display: grid;
+  grid-template-columns: 6.5rem 7rem minmax(0, 1fr);
+  gap: 0.75rem;
+  padding: 0.1rem 0.75rem;
+}
+
+.log-line:nth-child(even) {
+  background: rgba(214, 220, 224, 0.35);
+}
+
+.log-time,
+.log-from {
+  color: var(--ink-2);
+}
+
+.log-text {
+  overflow-wrap: anywhere;
+}
+
+.log-repeat {
+  color: var(--slate);
+  font-weight: 700;
+}
+
+.log .empty {
+  padding: 0.5rem 0.75rem;
+}
+
+/* ---------- dialog ---------- */
 .modal-backdrop {
   position: fixed;
   inset: 0;
   z-index: 1000;
-  display: grid;
-  place-items: center;
-  padding: 1rem;
-  background: rgba(15, 23, 42, 0.72);
-  backdrop-filter: blur(5px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(28, 33, 38, 0.42);
 }
 
-.modal-card {
+.modal {
   width: min(100%, 460px);
-  padding: 1.25rem;
-  border: 1px solid rgba(255, 255, 255, 0.22);
-  border-radius: 14px;
-  background: #ffffff;
-  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.38);
-  color: #1f2937;
+  padding: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 18px 50px rgba(28, 33, 38, 0.25);
 }
 
-.modal-card h2 {
-  margin: 0 0 0.55rem;
-  font-size: 1.2rem;
+.modal h2 {
+  font-size: 1.15rem;
+  margin-bottom: 0.6rem;
 }
 
-.modal-card p {
-  margin: 0;
-  color: #4b5563;
-  line-height: 1.5;
+.modal p {
+  color: var(--ink-2);
 }
 
 .modal-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 0.55rem;
-  margin-top: 1rem;
+  gap: 0.5rem;
+  margin-top: 1.25rem;
 }
 
-/* legacy message log helpers no longer used in chat bubbles */
-
-/* Responsive */
-@media (max-width: 768px) {
-  header h1 {
-    font-size: 1.8rem;
+/* ---------- small screens ---------- */
+@media (max-width: 900px) {
+  .bar {
+    gap: 0.75rem;
+    padding: 0 16px;
   }
 
-  .header-logo {
-    width: 2.5rem;
-    height: 2.5rem;
+  .room {
+    padding-left: 0.75rem;
   }
 
-  .message-input {
+  .room-label {
+    display: none;
+  }
+
+  .setup {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      'intro'
+      'topologies'
+      'limits'
+      'where'
+      'go';
+    padding: 2rem 16px 3rem;
+  }
+
+  .setup-intro h1 {
+    font-size: 1.7rem;
+  }
+
+  .setup-go {
     flex-direction: column;
-  }
-
-  .stats {
-    grid-template-columns: 1fr;
-  }
-
-  .control-stats-row {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .control-stat-peer-id {
-    grid-column: 1 / -1;
-  }
-
-  .peer-id-full {
-    font-size: clamp(0.55rem, 1.8vw, 0.68rem);
-  }
-
-  .network-graph-container {
-    height: 300px;
-    min-height: 300px;
-  }
-
-  .network-graph-svg {
-    height: 260px;
-  }
-
-  .field-topology,
-  .field-topology .input {
-    min-width: 0;
-    width: 100%;
-  }
-
-  .storage-head {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-
-  .storage-controls {
-    grid-template-columns: 1fr;
     align-items: stretch;
   }
 
-  .storage-actions {
-    flex-wrap: wrap;
+  .wide-only,
+  .stage-count {
+    display: none;
   }
 
-  .diagnostics-header {
-    align-items: flex-start;
-    flex-wrap: wrap;
+  .log-from {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .diagnostics-filters {
-    justify-content: flex-start;
+  .live {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      'stage'
+      'side'
+      'diag';
+    padding: 16px;
   }
 
-  .diag-entry {
-    grid-template-columns: 6rem minmax(0, 1fr);
-    gap: 0.2rem 0.6rem;
+  .stage {
+    height: 62vh;
+    min-height: 340px;
   }
 
-  .diag-text {
+  .side {
+    height: auto;
+    min-height: 0;
+    max-height: none;
+  }
+
+  .thread {
+    max-height: 50vh;
+  }
+
+  .log-line {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .log-text {
     grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 480px) {
+  .brand-name {
+    display: none;
+  }
+
+  .where,
+  .storage-form,
+  .limits {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .diagnostics summary::before {
+    transition: none;
   }
 }
 </style>
