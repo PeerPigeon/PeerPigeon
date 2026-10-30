@@ -4920,6 +4920,14 @@ export default {
   gap: 0.5rem;
 }
 
+/* No focus highlight on the message box */
+#app .compose-row .input:focus,
+#app .compose-row .input:focus-visible {
+  outline: none;
+  border-color: var(--line-strong);
+  box-shadow: none;
+}
+
 .compose-foot {
   display: flex;
   align-items: center;
