@@ -11,7 +11,8 @@
     "dev": "vite --host 0.0.0.0 --port 5173 --strictPort",
     "dev:raw": "vite --host 0.0.0.0 --strictPort",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "deploy": "npm run build && npx wrangler@4 deploy"
   },
   "dependencies": {
     "@fortawesome/fontawesome-svg-core": "^7.3.1",
