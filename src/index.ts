@@ -35,6 +35,8 @@ import type {
 
 // A link into a part of the mesh outside our membership is kept this long
 // past maxPeers, so membership can merge across it before trimming.
+// How long links stay open after a peer says it is leaving, so that frame goes out first.
+const LEAVE_FLUSH_MS = 250;
 const BRIDGE_GRACE_MS = 8_000;
 // At most one such bridge dial this often.
 const BRIDGE_DIAL_INTERVAL_MS = 5_000;
@@ -3290,9 +3292,56 @@ export class PartialMesh {
     }
 
   /**
-   * Disconnect from all peers and close signaling connection
+   * Tell our neighbours we are leaving: a CECR 'left' record for ourselves,
+   * which each of them merges and forwards. Without it the network keeps us
+   * as a member until our lease runs out (up to membershipLeaseMs): peers
+   * keep us as a ring neighbour, keep dialling us, and keep counting the
+   * links our last report listed. A peer that dies without saying goodbye
+   * still ages out by its lease. Returns whether anyone was told.
    */
-  public destroy(): void {
+  public announceLeave(): boolean {
+    const self = this.normalizePeerId(this.clientId);
+    const neighbours = this.getConnectedPeers();
+    if (!self || neighbours.length === 0 || !this.signalingClient) return false;
+    this.membershipSequence += 1;
+    const now = Date.now();
+    const left: CecrWireMembershipRecord = [this.membershipIncarnation, this.membershipSequence, 'left', now, null];
+    this.membershipRecordsById.set(self, {
+      peerId: self,
+      incarnation: this.membershipIncarnation,
+      sequence: this.membershipSequence,
+      state: 'left',
+      issuedAt: now,
+      validUntil: null,
+    });
+    const payload = JSON.stringify({
+      __membership: true,
+      peers: [],
+      retiredPeers: [],
+      records: { [self]: left },
+      capacities: {},
+      topology: {},
+    });
+    let told = false;
+    for (const peerId of neighbours) {
+      try {
+        this.signalingClient.send(peerId, payload);
+        told = true;
+      } catch {
+        // best-effort
+      }
+    }
+    return told;
+  }
+
+  /**
+   * Disconnect from all peers and close signaling connection. Neighbours are
+   * told we are leaving first (see announceLeave), and the links close
+   * LEAVE_FLUSH_MS later so that frame is not dropped with them. Returns how
+   * long the links stay open (0 when nobody was told); a caller about to end
+   * the process should wait that long.
+   */
+  public destroy(): number {
     if (this.maintenanceTimer) {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;
@@ -3302,14 +3351,19 @@ export class PartialMesh {
       this.membershipTimer = null;
     }
 
-    // Close all peer connections
-    for (const peerId of this.peers.keys()) {
-      try {
-        this.signalingClient?.closeConnection(peerId);
-      } catch {
-        // ignore
+    const announced = this.announceLeave();
+    const closingClient = this.signalingClient;
+    const closingPeerIds = Array.from(this.peers.keys());
+    const closeLinks = (): void => {
+      for (const peerId of closingPeerIds) {
+        try {
+          closingClient?.closeConnection(peerId);
+        } catch {
+          // ignore
+        }
       }
-    }
+      closingClient?.disconnect();
+    };
     this.peers.clear();
     this.connecting.clear();
     this.discoveredPeers.clear();
@@ -3337,15 +3391,19 @@ export class PartialMesh {
     this.dialFailureCount.clear();
     this.dialBackoffUntilMs.clear();
 
-    // Disconnect from signaling server
-    if (this.signalingClient) {
-      this.signalingClient.disconnect();
-      this.signalingClient = null;
+    // Disconnect from the signaling server along with the links.
+    this.signalingClient = null;
+    if (announced) {
+      const timer = setTimeout(closeLinks, LEAVE_FLUSH_MS);
+      (timer as { unref?: () => void }).unref?.();
+    } else {
+      closeLinks();
     }
 
     for (const handlers of this.eventHandlers.values()) {
       handlers.clear();
     }
+    return announced ? LEAVE_FLUSH_MS : 0;
   }
 }
 
@@ -3615,8 +3673,11 @@ export class PeerPigeonNode {
     this.storage = null;
     this.crypto?.destroy();
     this.gossip.destroy();
-    this.mesh.destroy();
+    const flushMs = this.mesh.destroy();
     this.started = false;
+    // Let the goodbye reach our neighbours before the caller moves on (a
+    // process that exits now would drop it).
+    if (flushMs > 0) await new Promise((resolve) => setTimeout(resolve, flushMs));
     for (const callbacks of Object.values(this.callbacks)) callbacks?.clear();
   }
 

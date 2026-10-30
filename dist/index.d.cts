@@ -1425,9 +1425,22 @@ declare class PartialMesh {
     private tryParseMembership;
     private mergeMembership;
     /**
-     * Disconnect from all peers and close signaling connection
+     * Tell our neighbours we are leaving: a CECR 'left' record for ourselves,
+     * which each of them merges and forwards. Without it the network keeps us
+     * as a member until our lease runs out (up to membershipLeaseMs): peers
+     * keep us as a ring neighbour, keep dialling us, and keep counting the
+     * links our last report listed. A peer that dies without saying goodbye
+     * still ages out by its lease. Returns whether anyone was told.
      */
-    destroy(): void;
+    announceLeave(): boolean;
+    /**
+     * Disconnect from all peers and close signaling connection. Neighbours are
+     * told we are leaving first (see announceLeave), and the links close
+     * LEAVE_FLUSH_MS later so that frame is not dropped with them. Returns how
+     * long the links stay open (0 when nobody was told); a caller about to end
+     * the process should wait that long.
+     */
+    destroy(): number;
 }
 type PeerPigeonNodeStorageOptions = Omit<StorageOptions, 'gossip' | 'peerId' | 'userId'> & {
     userId?: string;

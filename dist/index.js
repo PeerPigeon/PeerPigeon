@@ -4599,6 +4599,7 @@ function isMeshSignalPayload(value) {
   const candidate = value;
   return candidate.__ppType === MESH_SIGNAL_PAYLOAD_TYPE && !!candidate.envelope && typeof candidate.envelope === "object";
 }
+var LEAVE_FLUSH_MS = 250;
 var BRIDGE_GRACE_MS = 8e3;
 var BRIDGE_DIAL_INTERVAL_MS = 5e3;
 var DEFAULT_SIGNALING_SERVERS = Object.freeze([
@@ -6863,7 +6864,52 @@ var PartialMesh = class {
     }
   }
   /**
-   * Disconnect from all peers and close signaling connection
+   * Tell our neighbours we are leaving: a CECR 'left' record for ourselves,
+   * which each of them merges and forwards. Without it the network keeps us
+   * as a member until our lease runs out (up to membershipLeaseMs): peers
+   * keep us as a ring neighbour, keep dialling us, and keep counting the
+   * links our last report listed. A peer that dies without saying goodbye
+   * still ages out by its lease. Returns whether anyone was told.
+   */
+  announceLeave() {
+    const self = this.normalizePeerId(this.clientId);
+    const neighbours = this.getConnectedPeers();
+    if (!self || neighbours.length === 0 || !this.signalingClient) return false;
+    this.membershipSequence += 1;
+    const now = Date.now();
+    const left = [this.membershipIncarnation, this.membershipSequence, "left", now, null];
+    this.membershipRecordsById.set(self, {
+      peerId: self,
+      incarnation: this.membershipIncarnation,
+      sequence: this.membershipSequence,
+      state: "left",
+      issuedAt: now,
+      validUntil: null
+    });
+    const payload = JSON.stringify({
+      __membership: true,
+      peers: [],
+      retiredPeers: [],
+      records: { [self]: left },
+      capacities: {},
+      topology: {}
+    });
+    let told = false;
+    for (const peerId of neighbours) {
+      try {
+        this.signalingClient.send(peerId, payload);
+        told = true;
+      } catch {
+      }
+    }
+    return told;
+  }
+  /**
+   * Disconnect from all peers and close signaling connection. Neighbours are
+   * told we are leaving first (see announceLeave), and the links close
+   * LEAVE_FLUSH_MS later so that frame is not dropped with them. Returns how
+   * long the links stay open (0 when nobody was told); a caller about to end
+   * the process should wait that long.
    */
   destroy() {
     if (this.maintenanceTimer) {
@@ -6874,12 +6920,18 @@ var PartialMesh = class {
       clearInterval(this.membershipTimer);
       this.membershipTimer = null;
     }
-    for (const peerId of this.peers.keys()) {
-      try {
-        this.signalingClient?.closeConnection(peerId);
-      } catch {
+    const announced = this.announceLeave();
+    const closingClient = this.signalingClient;
+    const closingPeerIds = Array.from(this.peers.keys());
+    const closeLinks = () => {
+      for (const peerId of closingPeerIds) {
+        try {
+          closingClient?.closeConnection(peerId);
+        } catch {
+        }
       }
-    }
+      closingClient?.disconnect();
+    };
     this.peers.clear();
     this.connecting.clear();
     this.discoveredPeers.clear();
@@ -6906,13 +6958,17 @@ var PartialMesh = class {
     this.rebalanceCooldownUntilMs = 0;
     this.dialFailureCount.clear();
     this.dialBackoffUntilMs.clear();
-    if (this.signalingClient) {
-      this.signalingClient.disconnect();
-      this.signalingClient = null;
+    this.signalingClient = null;
+    if (announced) {
+      const timer = setTimeout(closeLinks, LEAVE_FLUSH_MS);
+      timer.unref?.();
+    } else {
+      closeLinks();
     }
     for (const handlers of this.eventHandlers.values()) {
       handlers.clear();
     }
+    return announced ? LEAVE_FLUSH_MS : 0;
   }
 };
 var RELAY_SCORES_PAYLOAD_TYPE = "pp-relay-scores";
@@ -7089,8 +7145,9 @@ var PeerPigeonNode = class {
     this.storage = null;
     this.crypto?.destroy();
     this.gossip.destroy();
-    this.mesh.destroy();
+    const flushMs = this.mesh.destroy();
     this.started = false;
+    if (flushMs > 0) await new Promise((resolve) => setTimeout(resolve, flushMs));
     for (const callbacks of Object.values(this.callbacks)) callbacks?.clear();
   }
   bindComponentEvents() {

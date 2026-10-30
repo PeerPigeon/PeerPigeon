@@ -933,7 +933,12 @@ export default {
       this.pageLifecycleResumeHandler?.(event);
     };
     this.pageLifecyclePageHideHandler = (event) => {
-      if (!event?.persisted) return;
+      if (!event?.persisted) {
+        // The tab is closing or navigating away: tell our neighbours, so the
+        // network drops us now instead of when our membership lease ends.
+        this.mesh?.announceLeave?.();
+        return;
+      }
       this.pageLifecycleFreezeHandler?.();
     };
     document.addEventListener('freeze', this.pageLifecycleFreezeHandler);
