@@ -21,7 +21,7 @@
     "d3": "^7.9.0",
     "freertc": "github:draeder/freertc#main",
     "peerpigeon": "file:../..",
-    "unsea": "^1.1.2",
+    "unsea": "https://codeload.github.com/draeder/unsea/tar.gz/5425b41d39cea5aa2116241af0fed82865ffea29",
     "vue": "^3.5.44"
   },
   "devDependencies": {
