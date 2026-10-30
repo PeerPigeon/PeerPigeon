@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
-import inject from '@rollup/plugin-inject'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -21,28 +20,12 @@ export default defineConfig({
         })
       }
     },
-    vue(),
-    inject({
-      Buffer: ['buffer', 'Buffer'],
-      process: 'process'
-    })
+    vue()
   ],
-  define: {
-    global: 'globalThis',
-    'process.env': {}
-  },
   resolve: {
     alias: {
-      peerpigeon: path.resolve(__dirname, '../../src/index.ts'),
-      events: 'events',
-      util: 'util',
-      stream: 'stream-browserify',
-      buffer: 'buffer',
-      process: 'process/browser'
+      peerpigeon: path.resolve(__dirname, '../../src/index.ts')
     }
-  },
-  optimizeDeps: {
-    include: ['events', 'util', 'stream-browserify', 'buffer', 'process']
   },
   server: {
     host: '0.0.0.0',

@@ -1,1 +1,0 @@
-export { GossipProtocol } from 'peerpigeon';
