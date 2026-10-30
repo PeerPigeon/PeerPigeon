@@ -33,6 +33,12 @@ import type {
   PeerPublicKey,
 } from './crypto.js';
 
+// A link into a part of the mesh outside our membership is kept this long
+// past maxPeers, so membership can merge across it before trimming.
+const BRIDGE_GRACE_MS = 8_000;
+// At most one such bridge dial this often.
+const BRIDGE_DIAL_INTERVAL_MS = 5_000;
+
 export const DEFAULT_SIGNALING_SERVERS = Object.freeze([
   'wss://peer.ooo/ws',
   'wss://decentralize.ooo/ws',
@@ -592,6 +598,11 @@ export class PartialMesh {
   private dialBackoffUntilMs: Map<string, number> = new Map();
   private rebalanceCooldownUntilMs: number = 0;
   private rebalanceAttemptAtMs: Map<string, number> = new Map();
+  // Links to peers outside our membership when they formed: a bridge to a
+  // separate part of the mesh, kept past maxPeers until membership merges.
+  private bridgeGraceUntilMs: Map<string, number> = new Map();
+  private lastBridgeDialAtMs = 0;
+  private bridgeTrimTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingRebalanceDropByTarget: Map<string, string> = new Map();
   /** Converged global peer membership — populated via in-band membership gossip. */
   private globalPeers: Set<string> = new Set();
@@ -1172,6 +1183,25 @@ export class PartialMesh {
     const overflow = connectedPeers.length - this.config.maxPeers;
     if (overflow <= 0) return;
 
+    // A link into a part of the mesh our membership did not include is held,
+    // within the tolerance, until membership has had time to merge across it.
+    // Trimmed at once it taught nothing: the parts never learned of each
+    // other and stayed separate rings.
+    const now = Date.now();
+    for (const [peerId, until] of this.bridgeGraceUntilMs) {
+      if (until <= now || !connectedPeers.includes(peerId)) this.bridgeGraceUntilMs.delete(peerId);
+    }
+    if (this.bridgeGraceUntilMs.size > 0 && overflow <= this.config.tolerantPeers) {
+      if (!this.bridgeTrimTimer) {
+        const wait = Math.max(...this.bridgeGraceUntilMs.values()) - now + 50;
+        this.bridgeTrimTimer = setTimeout(() => {
+          this.bridgeTrimTimer = null;
+          this.trimExcessPeers();
+        }, wait);
+      }
+      return;
+    }
+
     // Pause proactive expansion briefly so we do not oscillate around maxPeers.
     this.rebalanceCooldownUntilMs = Math.max(this.rebalanceCooldownUntilMs, Date.now() + 2_000);
 
@@ -1648,6 +1678,9 @@ export class PartialMesh {
       peerConnection.connected = true;
       this.peerConnectedAtMs.set(peerId, Date.now());
       this.connecting.delete(peerId);
+      if (!this.globalPeers.has(peerId)) {
+        this.bridgeGraceUntilMs.set(peerId, Date.now() + BRIDGE_GRACE_MS);
+      }
       this.noteLocalCapacityChanged();
       this.emit('peer:connected', peerId);
 
@@ -2369,6 +2402,18 @@ export class PartialMesh {
       && pendingCount < this.config.tolerantPeers
       && available.length > 0
     ) {
+      // A peer the relay lists that our membership has never included is in
+      // another part of the mesh. One link joins the parts (membership then
+      // merges and the ring re-forms), so dial it within the tolerance even
+      // though it is no coordinate neighbour of ours yet.
+      const foreign = available.filter((peerId) => !this.globalPeers.has(peerId) && this.activeSignalingPeers.has(peerId));
+      if (foreign.length > 0 && now - this.lastBridgeDialAtMs >= BRIDGE_DIAL_INTERVAL_MS) {
+        this.lastBridgeDialAtMs = now;
+        const target = foreign.slice().sort((a, b) => this.compareDialCandidates(a, b))[0];
+        this.emit('signaling:log', { message: `[bridge] dial ${target.slice(0, 8)}: listed by the relay, not in our membership` });
+        this.connectToPeerInternal(target, true);
+        return;
+      }
       // Each tolerance slot can hold one bounded dial-before-drop attempt. This
       // makes the configured value a real concurrency budget without ever
       // raising the steady-state retained degree above maxPeers.

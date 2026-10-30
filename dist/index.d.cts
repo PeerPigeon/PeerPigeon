@@ -1207,6 +1207,9 @@ declare class PartialMesh {
     private dialBackoffUntilMs;
     private rebalanceCooldownUntilMs;
     private rebalanceAttemptAtMs;
+    private bridgeGraceUntilMs;
+    private lastBridgeDialAtMs;
+    private bridgeTrimTimer;
     private pendingRebalanceDropByTarget;
     /** Converged global peer membership — populated via in-band membership gossip. */
     private globalPeers;

@@ -4652,6 +4652,8 @@ function isMeshSignalPayload(value) {
   const candidate = value;
   return candidate.__ppType === MESH_SIGNAL_PAYLOAD_TYPE && !!candidate.envelope && typeof candidate.envelope === "object";
 }
+var BRIDGE_GRACE_MS = 8e3;
+var BRIDGE_DIAL_INTERVAL_MS = 5e3;
 var DEFAULT_SIGNALING_SERVERS = Object.freeze([
   "wss://peer.ooo/ws",
   "wss://decentralize.ooo/ws",
@@ -4881,6 +4883,11 @@ var PartialMesh = class {
     this.dialBackoffUntilMs = /* @__PURE__ */ new Map();
     this.rebalanceCooldownUntilMs = 0;
     this.rebalanceAttemptAtMs = /* @__PURE__ */ new Map();
+    // Links to peers outside our membership when they formed: a bridge to a
+    // separate part of the mesh, kept past maxPeers until membership merges.
+    this.bridgeGraceUntilMs = /* @__PURE__ */ new Map();
+    this.lastBridgeDialAtMs = 0;
+    this.bridgeTrimTimer = null;
     this.pendingRebalanceDropByTarget = /* @__PURE__ */ new Map();
     /** Converged global peer membership — populated via in-band membership gossip. */
     this.globalPeers = /* @__PURE__ */ new Set();
@@ -5344,6 +5351,20 @@ var PartialMesh = class {
     const connectedPeers = this.getConnectedPeers();
     const overflow = connectedPeers.length - this.config.maxPeers;
     if (overflow <= 0) return;
+    const now = Date.now();
+    for (const [peerId, until] of this.bridgeGraceUntilMs) {
+      if (until <= now || !connectedPeers.includes(peerId)) this.bridgeGraceUntilMs.delete(peerId);
+    }
+    if (this.bridgeGraceUntilMs.size > 0 && overflow <= this.config.tolerantPeers) {
+      if (!this.bridgeTrimTimer) {
+        const wait = Math.max(...this.bridgeGraceUntilMs.values()) - now + 50;
+        this.bridgeTrimTimer = setTimeout(() => {
+          this.bridgeTrimTimer = null;
+          this.trimExcessPeers();
+        }, wait);
+      }
+      return;
+    }
     this.rebalanceCooldownUntilMs = Math.max(this.rebalanceCooldownUntilMs, Date.now() + 2e3);
     const protectedPeerIds = this.cecrProtectedConnectedPeerIds();
     const coordinatePeerIds = this.cecrCoordinateNeighbors();
@@ -5713,6 +5734,9 @@ var PartialMesh = class {
       peerConnection.connected = true;
       this.peerConnectedAtMs.set(peerId, Date.now());
       this.connecting.delete(peerId);
+      if (!this.globalPeers.has(peerId)) {
+        this.bridgeGraceUntilMs.set(peerId, Date.now() + BRIDGE_GRACE_MS);
+      }
       this.noteLocalCapacityChanged();
       this.emit("peer:connected", peerId);
       const rebalanceDropPeerId = this.pendingRebalanceDropByTarget.get(peerId);
@@ -6209,6 +6233,14 @@ var PartialMesh = class {
     } else if (connectedCount > this.config.maxPeers) {
       this.trimExcessPeers();
     } else if (connectedCount >= this.config.maxPeers && pendingCount < this.config.tolerantPeers && available.length > 0) {
+      const foreign = available.filter((peerId) => !this.globalPeers.has(peerId) && this.activeSignalingPeers.has(peerId));
+      if (foreign.length > 0 && now - this.lastBridgeDialAtMs >= BRIDGE_DIAL_INTERVAL_MS) {
+        this.lastBridgeDialAtMs = now;
+        const target = foreign.slice().sort((a, b) => this.compareDialCandidates(a, b))[0];
+        this.emit("signaling:log", { message: `[bridge] dial ${target.slice(0, 8)}: listed by the relay, not in our membership` });
+        this.connectToPeerInternal(target, true);
+        return;
+      }
       if (this.maybeRebalanceForCloserPeer(available)) {
         return;
       }
