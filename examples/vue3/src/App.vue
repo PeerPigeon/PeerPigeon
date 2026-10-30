@@ -594,6 +594,8 @@ import {
 
 /** How long the gossip badge holds through losing every link before it says Offline. */
 const NO_LINKS_GRACE_MS = 4000;
+/** How long a live peer we cannot reach is left out of gossip coverage (joining peers reach us within this). */
+const CUT_OFF_GRACE_MS = 10000;
 
 const APP_ICONS = Object.freeze({
   state: faCircle,
@@ -3741,7 +3743,12 @@ export default {
       // Live peers only. The CECR network-size estimate is not used here: it is
       // a high-water mark that keeps counting a departed peer for a while.
       const self = String(this.mesh?.getClientId?.() || this.clientId || '').trim();
-      return calculateGraphCoverageSnapshot(graph, self, 0, { relayListed: this.relayListedPeers() });
+      if (!this.cutOffSince) this.cutOffSince = new Map();
+      return calculateGraphCoverageSnapshot(graph, self, 0, {
+        relayListed: this.relayListedPeers(),
+        cutOffSince: this.cutOffSince,
+        cutOffGraceMs: CUT_OFF_GRACE_MS,
+      });
     },
 
     /** The relay's current peer list, or null while we are off the relay (an idle list is stale). */

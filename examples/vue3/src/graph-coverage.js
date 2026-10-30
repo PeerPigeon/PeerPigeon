@@ -124,9 +124,26 @@ export function graphLiveness(graph, requestedLocalPeerId = '', { relayListed = 
 export function graphCoverageSnapshot(graph, requestedLocalPeerId = '', requestedKnownPeerCount = 0, options = {}) {
   const { localPeerId, live, reachable } = graphLiveness(graph, requestedLocalPeerId, options);
   const hasLocalPeer = Boolean(localPeerId && live.has(localPeerId));
+  // Peers that are joining link up among themselves a moment before their
+  // piece of the ring reaches ours. With options.cutOffSince (a Map the caller
+  // keeps between calls), a live peer we cannot reach counts against coverage
+  // only once it has stayed out of reach for options.cutOffGraceMs; a split
+  // that lasts still shows.
+  const { cutOffSince = null, cutOffGraceMs = 0, now = Date.now() } = options;
+  let settling = 0;
+  if (cutOffSince instanceof Map) {
+    for (const peerId of Array.from(cutOffSince.keys())) {
+      if (!live.has(peerId) || reachable.has(peerId)) cutOffSince.delete(peerId);
+    }
+    for (const peerId of live) {
+      if (reachable.has(peerId)) continue;
+      if (!cutOffSince.has(peerId)) cutOffSince.set(peerId, now);
+      if (now - cutOffSince.get(peerId) < cutOffGraceMs) settling += 1;
+    }
+  }
   const knownPeers = Math.max(
     0,
-    live.size - (hasLocalPeer ? 1 : 0),
+    live.size - settling - (hasLocalPeer ? 1 : 0),
     Math.floor(Number(requestedKnownPeerCount) || 0),
   );
   if (!hasLocalPeer) return { reachablePeers: 0, knownPeers, coverage: 0 };

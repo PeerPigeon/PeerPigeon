@@ -318,3 +318,25 @@ test('peers that all left at once stop counting as soon as the relay no longer l
   // A live cut-off part keeps a peer on the relay, and still counts.
   assert.equal(graphCoverageSnapshot(graph, 'self', 0, { relayListed: ['y'] }).knownPeers, 3);
 });
+
+test('a part we cannot reach yet counts against coverage only once it stays cut off', () => {
+  const graph = {
+    nodes: [{ id: 'me', isSelf: true }, { id: 'a' }, { id: 'x' }, { id: 'y' }],
+    links: [
+      { source: 'me', target: 'a', direct: true },
+      { source: 'a', target: 'me' },
+      { source: 'x', target: 'y' },
+    ],
+  };
+  const cutOffSince = new Map();
+  const options = { cutOffSince, cutOffGraceMs: 10000 };
+  const joining = graphCoverageSnapshot(graph, 'me', 0, { ...options, now: 1000 });
+  assert.equal(joining.knownPeers, 1);
+  assert.equal(joining.coverage, 1);
+  const split = graphCoverageSnapshot(graph, 'me', 0, { ...options, now: 12000 });
+  assert.equal(split.knownPeers, 3);
+  assert.equal(split.reachablePeers, 1);
+  const joined = { ...graph, links: [...graph.links, { source: 'a', target: 'x' }] };
+  graphCoverageSnapshot(joined, 'me', 0, { ...options, now: 13000 });
+  assert.equal(cutOffSince.size, 0);
+});
