@@ -3000,7 +3000,8 @@ async function chooseRelays(options) {
   const ranked = candidates.map((entry) => {
     const m = measure(entry.relay.nodeId);
     const healthy = isHealthy(entry.relay, m);
-    const tier = healthy && isDirect(entry) ? 0 : healthy && entry.relay.kind === "local" ? 1 : healthy ? 2 : 3;
+    const local = entry.relay.kind === "local";
+    const tier = isDirect(entry) ? healthy ? 0 : 1 : local ? healthy ? 2 : 4 : healthy ? 3 : 5;
     return { ...entry, tier, score: relayScore(entry.relay, m) };
   }).sort((a, b) => a.tier - b.tier || a.score - b.score || compareDistance(a.toPeer, b.toPeer, peerKey));
   if (options.previousUrl) {
@@ -5002,7 +5003,11 @@ async function discoverClosestSignalingServers(options) {
       measurements: options.measurements,
       previousUrl: options.previousUrl ? canonicalSignalingUrl(options.previousUrl) : null
     });
-    return ordered.slice(0, limit);
+    const chosen = ordered.slice(0, limit);
+    for (const url of ordered) {
+      if ((url.startsWith("webrtc-direct://") || url.startsWith("ws://127.0.0.1:")) && !chosen.includes(url)) chosen.push(url);
+    }
+    return chosen;
   }
   const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
   if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);

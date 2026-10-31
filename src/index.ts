@@ -425,7 +425,13 @@ export async function discoverClosestSignalingServers(options: {
       measurements: options.measurements,
       previousUrl: options.previousUrl ? canonicalSignalingUrl(options.previousUrl) : null,
     });
-    return ordered.slice(0, limit);
+    // Every directory relay stays in the list, whatever the limit: the limit
+    // trims the cloud relays, never a local relay this peer could use.
+    const chosen = ordered.slice(0, limit);
+    for (const url of ordered) {
+      if ((url.startsWith('webrtc-direct://') || url.startsWith('ws://127.0.0.1:')) && !chosen.includes(url)) chosen.push(url);
+    }
+    return chosen;
   }
   const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
   if (!bootstrap) throw new Error(`Invalid FreeRTC bootstrap URL: ${options.bootstrapServer}`);

@@ -159,8 +159,12 @@ export async function chooseRelays(options: ChooseRelaysOptions): Promise<string
   const ranked = candidates.map((entry) => {
     const m = measure(entry.relay.nodeId);
     const healthy = isHealthy(entry.relay, m);
-    // A healthy directory relay first, then other local relays, then cloud.
-    const tier = healthy && isDirect(entry) ? 0 : healthy && entry.relay.kind === 'local' ? 1 : healthy ? 2 : 3;
+    // Directory relays first, even one that failed lately (a failure record
+    // fades over minutes, and the cloud may be out of requests meanwhile:
+    // a tab sat on failing cloud relays while the local one was fine), the
+    // healthy ones ahead; then other local relays; then cloud.
+    const local = entry.relay.kind === 'local';
+    const tier = isDirect(entry) ? (healthy ? 0 : 1) : local ? (healthy ? 2 : 4) : healthy ? 3 : 5;
     return { ...entry, tier, score: relayScore(entry.relay, m) };
   }).sort((a, b) => a.tier - b.tier || a.score - b.score || compareDistance(a.toPeer, b.toPeer, peerKey));
 
