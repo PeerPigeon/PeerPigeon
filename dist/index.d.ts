@@ -952,6 +952,11 @@ declare const DEFAULT_CLOSE_SIGNALING_RELAY_COUNT = 4;
 declare const NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS = 4000;
 declare const NEGOTIATION_ACTIVE_ICE_DEADLINE_MS = 6000;
 declare const NEGOTIATION_OFFER_DEADLINE_MS = 20000;
+/**
+ * Whether this runtime can open a direct (WebRTC Direct) relay connection.
+ * Tested in Chromium and Node; Safari fails to open it, Firefox is untested.
+ */
+declare function directRelaySupported(): boolean;
 /** A relay to rank: its URL, and its FreeRTC node ID when known. */
 type SignalingRelayCandidate = string | {
     url: string;
@@ -1556,5 +1561,5 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, GossipProtocol, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, PeerPigeonCryptoProtocol, PeerPigeonNode, PeerPigeonStorage, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, RelayScoreBook, chooseRelays, PartialMesh as default, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, rankSignalingServersByDistance, relayScore, roomRoutingKey, selectClosestSignalingServer, sha1Hex };
+export { DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, GossipProtocol, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, PeerPigeonCryptoProtocol, PeerPigeonNode, PeerPigeonStorage, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, RelayScoreBook, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, rankSignalingServersByDistance, relayScore, roomRoutingKey, selectClosestSignalingServer, sha1Hex };
 export type { CecrConfigSnapshot, CecrMembershipRecordSnapshot, CecrOverlaySnapshot, CecrStateSnapshot, EncryptedBroadcastPayload, EncryptedDirectPayload, GossipAggregateDeliveryStatus, GossipBroadcastOptions, GossipDeliveryStatus, GossipMessage, GossipProtocolOptions, GossipStats, PartialMeshConfig, PartialMeshEvents, PartialMeshRuntimeConfig, PeerCapacityAdvertisement, PeerCapacitySnapshot, PeerConnection, PeerGraphEdge, PeerGraphNode, PeerGraphSnapshot, PeerPigeonCryptoEvents, PeerPigeonCryptoOptions, PeerPigeonKeyPair, PeerPigeonNodeEvents, PeerPigeonNodeMessage, PeerPigeonNodeOptions, PeerPigeonNodeStorageOptions, PeerPublicKey, RelayInfo, RelayKind, RelayMeasurement, RoomCipher, SharedRelayScore, SignalingRelayCandidate, StorageChangeOrigin, StorageEvents, StorageOptions, StoragePutOptions, StorageRecord, StorageRetrieveOptions, StorageSpace, StorageSyncFilterContext, StorageSyncOptions, StorageUnsubscribe };

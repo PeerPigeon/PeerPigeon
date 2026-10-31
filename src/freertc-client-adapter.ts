@@ -90,6 +90,11 @@ class Emitter {
  * PartialMesh keeps its existing event surface while signaling, federation,
  * negotiation, keepalive, and reconnect behavior come from freertc/client.
  */
+/** A tab gaining focus or becoming visible: not a sleep, a resume or a network change. */
+export function isAttentionChangeOnly(reason: string): boolean {
+  return /focus|visib/i.test(String(reason || ''));
+}
+
 export class FreeRTCClientAdapter {
   private signalUrls: string[];
   private readonly networkId: string;
@@ -510,7 +515,10 @@ export class FreeRTCClientAdapter {
     this.lastBootstrapAtMs = 0;
     this.healthProbeMisses = 0;
     this.resetHealthBootstrapWait();
-    this.client?.resetRecoveryBackoffs?.();
+    // Focus or visibility alone is not a resume: the retry backoffs are wall
+    // clock times and still mean what they meant. Clearing them on every focus
+    // made a tab re-offer at once to peers it had just failed with.
+    if (!isAttentionChangeOnly(reason)) this.client?.resetRecoveryBackoffs?.();
     // Notify PartialMesh so it can reset stale-age baselines. FreeRTC retains
     // ownership of restoration; this event must not trigger immediate redials.
     this.emitter.emit('lifecycle:resume', { reason });

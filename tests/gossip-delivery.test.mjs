@@ -1416,7 +1416,7 @@ test('resume clears every recovery backoff without resetting an active negotiati
       client: { mesh: { connections } },
     };
 
-    mesh.recoverAfterInactivity('visible');
+    mesh.recoverAfterInactivity('resume');
 
     assert.deepEqual(closed, []);
     assert.deepEqual(dials, []);

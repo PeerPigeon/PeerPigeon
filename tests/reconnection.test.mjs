@@ -139,7 +139,7 @@ test('Vue-style proxying does not suppress FreeRTC registration callbacks', () =
 });
 
 test('adapter leaves short retries in FreeRTC, then rotates an unresponsive federated relay', (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
   const originalWebSocket = globalThis.WebSocket;
   const attempts = [];
   const sockets = [];
@@ -212,7 +212,11 @@ test('adapter leaves short retries in FreeRTC, then rotates an unresponsive fede
     // forever. A socket that never registered is moved on the first missed
     // deadline; the three-miss grace is only for one still claiming
     // registration.
-    t.mock.timers.tick(RECOVERY_PROBE_TIMEOUT_MS);
+    // A connection still opening is given up to 45 s (a busy relay can be
+    // slow to accept); one that never opens is then moved on from.
+    for (let waited = 0; waited < 60_000 && !/^wss:\/\/next-nearest/.test(attempts.at(-1)); waited += 1_000) {
+      t.mock.timers.tick(1_000);
+    }
     assert.match(attempts.at(-1), /^wss:\/\/next-nearest\.example\/ws/);
   } finally {
     adapter.disconnect();
@@ -251,10 +255,13 @@ test('resume clears every adapter and FreeRTC recovery backoff immediately', (t)
     assert.equal(adapter.waitingForTransportClose, false);
     assert.equal(adapter.lastBootstrapAtMs, 0);
 
-    // Focus/pageshow events in the same thaw are not blocked by an old throttle.
+    // Focus/pageshow events in the same thaw are not blocked by an old throttle,
+    // but focus alone does not wipe retry backoffs (a click is not a thaw).
     assert.equal(adapter.recoverAfterInactivity('focus'), true);
-    assert.equal(resets, 2);
+    assert.equal(resets, 1);
     assert.equal(discoveryRequests, 2);
+    assert.equal(adapter.recoverAfterInactivity('pageshow'), true);
+    assert.equal(resets, 2);
   } finally {
     adapter.disconnect();
   }

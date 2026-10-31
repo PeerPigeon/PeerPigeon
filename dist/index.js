@@ -40,6 +40,9 @@ var Emitter = class {
     }
   }
 };
+function isAttentionChangeOnly(reason) {
+  return /focus|visib/i.test(String(reason || ""));
+}
 var FreeRTCClientAdapter = class {
   constructor(signalUrls, options) {
     this.emitter = new Emitter();
@@ -400,7 +403,7 @@ var FreeRTCClientAdapter = class {
     this.lastBootstrapAtMs = 0;
     this.healthProbeMisses = 0;
     this.resetHealthBootstrapWait();
-    this.client?.resetRecoveryBackoffs?.();
+    if (!isAttentionChangeOnly(reason)) this.client?.resetRecoveryBackoffs?.();
     this.emitter.emit("lifecycle:resume", { reason });
     for (const peerId of Array.from(this.connectedPeers)) {
       const entry = this.client?.mesh?.connections?.get?.(peerId);
@@ -4688,6 +4691,13 @@ var NEGOTIATION_OFFER_DEADLINE_MS = 2e4;
 var MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1e3;
 var DISCOVERY_REFRESH_MIN_MS = 2e3;
 var DISCOVERY_REFRESH_MAX_MS = 5 * 6e4;
+function directRelaySupported() {
+  if (typeof navigator === "undefined" || typeof navigator.userAgent !== "string") return true;
+  const ua = navigator.userAgent;
+  if (/Firefox\//.test(ua)) return false;
+  if (/Safari\//.test(ua) && !/(Chrome|Chromium|CriOS|Edg)\//.test(ua)) return false;
+  return true;
+}
 function canonicalDirectRelayUrl(value) {
   const [base, query = ""] = value.split("?");
   if (!isDirectRelayUrl(base)) return null;
@@ -4760,7 +4770,7 @@ async function selectClosestSignalingServer(peerId, relayUrls) {
   return ranked[0];
 }
 async function discoverSignalingRelays(options) {
-  const directLookup = options.directory === false ? Promise.resolve([]) : lookupDirectRelays({ name: options.directory || DEFAULT_DIRECTORY_NAME, fetchImpl: options.fetchImpl }).then((records) => records.map((record) => ({
+  const directLookup = options.directory === false || !directRelaySupported() ? Promise.resolve([]) : lookupDirectRelays({ name: options.directory || DEFAULT_DIRECTORY_NAME, fetchImpl: options.fetchImpl }).then((records) => records.map((record) => ({
     url: canonicalSignalingUrl(record.tunnel ? `${record.direct}?tunnel=${encodeURIComponent(record.tunnel)}` : record.direct),
     nodeId: record.node_id,
     kind: "local",
@@ -5418,7 +5428,7 @@ var PartialMesh = class {
    * once it is up.
    */
   startLocalRelayReturn() {
-    if (!this.config.automaticSignalingServer || this.config.relayDirectory === false) return;
+    if (!this.config.automaticSignalingServer || this.config.relayDirectory === false || !directRelaySupported()) return;
     if (typeof globalThis.RTCPeerConnection !== "function") return;
     if (this.localRelayTimer) clearInterval(this.localRelayTimer);
     this.localRelayTimer = setInterval(() => {
@@ -6004,8 +6014,10 @@ var PartialMesh = class {
   }
   recoverMeshAfterInactivity(reason) {
     const now = Date.now();
-    this.dialFailureCount.clear();
-    this.dialBackoffUntilMs.clear();
+    if (!isAttentionChangeOnly(reason)) {
+      this.dialFailureCount.clear();
+      this.dialBackoffUntilMs.clear();
+    }
     this.rebalanceAttemptAtMs.clear();
     this.rebalanceCooldownUntilMs = 0;
     this.lastUnderConnectedRecoveryAtMs = 0;
@@ -7523,6 +7535,7 @@ export {
   RelayScoreBook,
   chooseRelays,
   index_default as default,
+  directRelaySupported,
   discoverClosestSignalingServer,
   discoverClosestSignalingServers,
   discoverSignalingRelays,

@@ -1,5 +1,5 @@
 import { isDirectRelayUrl, lookupDirectRelays, directRelayChannel, DEFAULT_DIRECTORY_NAME } from 'freertc/client';
-import FreeRTCClientAdapter, { type MeshSignaling } from './freertc-client-adapter.js';
+import FreeRTCClientAdapter, { type MeshSignaling, isAttentionChangeOnly } from './freertc-client-adapter.js';
 
 /** Payload type of a signaling envelope carried inside a gossip direct frame. */
 export const MESH_SIGNAL_PAYLOAD_TYPE = 'pp-signal-v1';
@@ -116,6 +116,18 @@ const DISCOVERY_REFRESH_MAX_MS = 5 * 60_000;
 
 // A direct relay (freertc src/direct): webrtc-direct://<ip>:<port>/sha256/<fp>,
 // optionally ?tunnel=<its tunnel URL> for when the direct path fails.
+/**
+ * Whether this runtime can open a direct (WebRTC Direct) relay connection.
+ * Tested in Chromium and Node; Safari fails to open it, Firefox is untested.
+ */
+export function directRelaySupported(): boolean {
+  if (typeof navigator === 'undefined' || typeof navigator.userAgent !== 'string') return true;
+  const ua = navigator.userAgent;
+  if (/Firefox\//.test(ua)) return false;
+  if (/Safari\//.test(ua) && !/(Chrome|Chromium|CriOS|Edg)\//.test(ua)) return false;
+  return true;
+}
+
 function canonicalDirectRelayUrl(value: string): string | null {
   const [base, query = ''] = value.split('?');
   if (!isDirectRelayUrl(base)) return null;
@@ -244,7 +256,7 @@ export async function discoverSignalingRelays(options: {
   // Direct relays come from one DNS-over-HTTPS lookup, read alongside the
   // registry. They are local relays a browser reaches with no cloud relay in
   // the way; a direct entry also falls back to the relay's tunnel.
-  const directLookup: Promise<RelayInfo[]> = options.directory === false
+  const directLookup: Promise<RelayInfo[]> = options.directory === false || !directRelaySupported()
     ? Promise.resolve([])
     : lookupDirectRelays({ name: options.directory || DEFAULT_DIRECTORY_NAME, fetchImpl: options.fetchImpl })
       .then((records) => records.map((record) => ({
@@ -1265,7 +1277,7 @@ export class PartialMesh {
    * once it is up.
    */
   private startLocalRelayReturn(): void {
-    if (!this.config.automaticSignalingServer || this.config.relayDirectory === false) return;
+    if (!this.config.automaticSignalingServer || this.config.relayDirectory === false || !directRelaySupported()) return;
     if (typeof globalThis.RTCPeerConnection !== 'function') return;
     if (this.localRelayTimer) clearInterval(this.localRelayTimer);
     this.localRelayTimer = setInterval(() => { void this.returnToLocalRelay(); }, LOCAL_RELAY_CHECK_MS);
@@ -2021,9 +2033,13 @@ export class PartialMesh {
     // A thaw is a new recovery opportunity. No failure, dial, discovery, or
     // rebalance backoff from before suspension may delay it. Active negotiation
     // age remains intact so a permanently stuck transport still reaches its
-    // safety deadline.
-    this.dialFailureCount.clear();
-    this.dialBackoffUntilMs.clear();
+    // safety deadline. A focus or visibility change is no thaw: the backoffs
+    // are wall-clock times and stay, or every click into the window re-dialled
+    // the peers that had just failed.
+    if (!isAttentionChangeOnly(reason)) {
+      this.dialFailureCount.clear();
+      this.dialBackoffUntilMs.clear();
+    }
     this.rebalanceAttemptAtMs.clear();
     this.rebalanceCooldownUntilMs = 0;
     this.lastUnderConnectedRecoveryAtMs = 0;
