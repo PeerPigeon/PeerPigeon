@@ -15,6 +15,15 @@ test('a healthy local relay comes before every cloud relay', async () => {
   }
 });
 
+test('a relay from the DNS directory comes first, however far it is from the room', async () => {
+  const direct = relay(`webrtc-direct://203.0.113.7:9443/sha256/${'a'.repeat(64)}`, 'local');
+  const many = Array.from({ length: 12 }, (_, i) => relay(`wss://home${i}.example/t/x/ws`, 'local'));
+  for (let i = 0; i < 20; i += 1) {
+    const [first] = await chooseRelays({ peerId: hex(), ...room, relays: [...many, direct], candidates: 2 });
+    assert.equal(first, direct.url);
+  }
+});
+
 test('a local relay that keeps failing, or is nearly full, loses to cloud', async () => {
   const local = relay('wss://home.example/t/x/ws', 'local');
   const cloud = relay('wss://a.example/ws');

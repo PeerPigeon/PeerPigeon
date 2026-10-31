@@ -143,13 +143,21 @@ export async function chooseRelays(options: ChooseRelaysOptions): Promise<string
   }));
 
   const byRoom = [...placed].sort((a, b) => compareDistance(a.toRoom, b.toRoom, roomKey) || a.relay.url.localeCompare(b.relay.url));
-  const candidates = byRoom.slice(0, Math.max(1, options.candidates ?? RELAY_CANDIDATES));
-  const rest = byRoom.slice(candidates.length).sort((a, b) => compareDistance(a.toPeer, b.toPeer, peerKey) || a.relay.url.localeCompare(b.relay.url));
+  // Relays from the DNS directory (direct, reached with no cloud relay in the
+  // way) are always candidates, however far they are from the room; the
+  // others compete for the remaining places by distance.
+  const isDirect = (entry: { relay: RelayInfo }) => entry.relay.url.startsWith('webrtc-direct://');
+  const direct = byRoom.filter(isDirect);
+  const others = byRoom.filter((entry) => !isDirect(entry));
+  const othersTaken = Math.max(1, options.candidates ?? RELAY_CANDIDATES);
+  const candidates = [...direct, ...others.slice(0, othersTaken)];
+  const rest = others.slice(othersTaken).sort((a, b) => compareDistance(a.toPeer, b.toPeer, peerKey) || a.relay.url.localeCompare(b.relay.url));
 
   const ranked = candidates.map((entry) => {
     const m = measure(entry.relay.nodeId);
     const healthy = isHealthy(entry.relay, m);
-    const tier = healthy && entry.relay.kind === 'local' ? 0 : healthy ? 1 : 2;
+    // A healthy directory relay first, then other local relays, then cloud.
+    const tier = healthy && isDirect(entry) ? 0 : healthy && entry.relay.kind === 'local' ? 1 : healthy ? 2 : 3;
     return { ...entry, tier, score: relayScore(entry.relay, m) };
   }).sort((a, b) => a.tier - b.tier || a.score - b.score || compareDistance(a.toPeer, b.toPeer, peerKey));
 
