@@ -4653,6 +4653,9 @@ function isMeshSignalPayload(value) {
   const candidate = value;
   return candidate.__ppType === MESH_SIGNAL_PAYLOAD_TYPE && !!candidate.envelope && typeof candidate.envelope === "object";
 }
+var FILL_REFUSED_WINDOW_MS = 6e4;
+var FILL_BACKOFF_MIN_MS = 15e3;
+var FILL_BACKOFF_MAX_MS = 12e4;
 var RENEWAL_FORWARD_MS = 300;
 var LEAVE_FLUSH_MS = 250;
 var BRIDGE_GRACE_MS = 8e3;
@@ -4925,6 +4928,8 @@ var PartialMesh = class {
     this.membershipSequence = 0;
     /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
     this.peerCapacityById = /* @__PURE__ */ new Map();
+    this.fillBackoffMs = 0;
+    this.fillBackoffUntilMs = 0;
     /** Relayed adjacency snapshots used to reconstruct the known network graph. */
     this.peerTopologyById = /* @__PURE__ */ new Map();
     this.localCapacityUpdatedAtMs = Date.now();
@@ -5419,11 +5424,17 @@ var PartialMesh = class {
       connectedAt: this.peerConnectedAtMs.get(peerId) ?? 0,
       coordinate: coordinatePeerIds.has(peerId),
       cecrProtected: protectedPeerIds.has(peerId),
-      graphBridge: bridgePeerIds.has(peerId)
+      graphBridge: bridgePeerIds.has(peerId),
+      // Links the neighbour has beyond its minimum (unknown counts as none).
+      spare: (() => {
+        const capacity = this.freshPeerCapacity(peerId);
+        return capacity ? Math.max(0, capacity.connectedPeers - this.config.minPeers) : 0;
+      })()
     })).sort((a, b) => {
       if (a.coordinate !== b.coordinate) return a.coordinate ? 1 : -1;
       if (a.graphBridge !== b.graphBridge) return a.graphBridge ? 1 : -1;
       if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? 1 : -1;
+      if (a.spare !== b.spare) return b.spare - a.spare;
       if (a.connectedAt !== b.connectedAt) return a.connectedAt - b.connectedAt;
       return a.peerId.localeCompare(b.peerId);
     });
@@ -5823,6 +5834,10 @@ var PartialMesh = class {
         this.peers.delete(peerId);
         this.peerConnectedAtMs.delete(peerId);
         this.connecting.delete(peerId);
+        if (data.reason === "capacity_shed" && peerConnection.initiator && connectedAt > 0 && Date.now() - connectedAt < FILL_REFUSED_WINDOW_MS) {
+          this.fillBackoffMs = Math.min(FILL_BACKOFF_MAX_MS, Math.max(FILL_BACKOFF_MIN_MS, this.fillBackoffMs * 2));
+          this.fillBackoffUntilMs = Date.now() + this.fillBackoffMs;
+        }
         if (wasConnected) {
           this.noteTransportDisconnect(peerId, connectedAt, data.reason);
           this.noteLocalCapacityChanged();
@@ -6277,10 +6292,18 @@ var PartialMesh = class {
         this.connectToPeer(peerId);
       }
     } else if (totalInProgress < this.config.maxPeers && available.length > 0) {
-      if (now < this.rebalanceCooldownUntilMs) {
+      if (now < this.rebalanceCooldownUntilMs || now < this.fillBackoffUntilMs) {
         return;
       }
-      for (const peerId of pickCandidates(1)) {
+      if (this.fillBackoffMs > 0 && now - this.fillBackoffUntilMs > FILL_BACKOFF_MAX_MS) this.fillBackoffMs = 0;
+      const withRoom = (peerId) => {
+        const capacity = this.freshPeerCapacity(peerId);
+        if (this.cecrOverlayDialPriority(peerId) === 0) return true;
+        if (!capacity) return !this.globalPeers.has(peerId);
+        return capacity.connectedPeers < capacity.maxPeers;
+      };
+      const fill = pickCandidates(available.length).filter(withRoom).slice(0, 1);
+      for (const peerId of fill) {
         this.connectToPeer(peerId);
       }
     } else if (connectedCount > this.config.maxPeers) {

@@ -37,6 +37,11 @@ import type {
 // A link into a part of the mesh outside our membership is kept this long
 // past maxPeers, so membership can merge across it before trimming.
 // How long a merged membership update waits to be forwarded, so updates arriving together go out as one frame.
+// A free slot is not refilled from a peer that just shed our link (it was full):
+// wait 15 s, doubling to 2 min, before filling again.
+const FILL_REFUSED_WINDOW_MS = 60_000;
+const FILL_BACKOFF_MIN_MS = 15_000;
+const FILL_BACKOFF_MAX_MS = 120_000;
 const RENEWAL_FORWARD_MS = 300;
 // How long links stay open after a peer says it is leaving, so that frame goes out first.
 const LEAVE_FLUSH_MS = 250;
@@ -669,6 +674,8 @@ export class PartialMesh {
   private membershipSequence = 0;
   /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
   private peerCapacityById: Map<string, PeerCapacityAdvertisement> = new Map();
+  private fillBackoffMs = 0;
+  private fillBackoffUntilMs = 0;
   /** Relayed adjacency snapshots used to reconstruct the known network graph. */
   private peerTopologyById: Map<string, PeerTopologyAdvertisement> = new Map();
   private localCapacityUpdatedAtMs: number = Date.now();
@@ -1286,6 +1293,11 @@ export class PartialMesh {
         coordinate: coordinatePeerIds.has(peerId),
         cecrProtected: protectedPeerIds.has(peerId),
         graphBridge: bridgePeerIds.has(peerId),
+        // Links the neighbour has beyond its minimum (unknown counts as none).
+        spare: (() => {
+          const capacity = this.freshPeerCapacity(peerId);
+          return capacity ? Math.max(0, capacity.connectedPeers - this.config.minPeers) : 0;
+        })(),
       }))
       .sort((a, b) => {
         // A coordinate neighbour is kept above all: those links are the one
@@ -1294,6 +1306,11 @@ export class PartialMesh {
         if (a.coordinate !== b.coordinate) return a.coordinate ? 1 : -1;
         if (a.graphBridge !== b.graphBridge) return a.graphBridge ? 1 : -1;
         if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? 1 : -1;
+        // Then shed the link whose other end loses least: the neighbour with
+        // the most links of its own. Shedding a neighbour that then has a free
+        // slot only sends it dialling again (and some full peer shedding
+        // again), so the mesh never settles.
+        if (a.spare !== b.spare) return b.spare - a.spare;
         // When all other safety signals tie, replace an old edge and retain
         // the newly admitted candidate that triggered the tolerant overflow.
         if (a.connectedAt !== b.connectedAt) return a.connectedAt - b.connectedAt;
@@ -1800,6 +1817,18 @@ export class PartialMesh {
         this.peers.delete(peerId);
         this.peerConnectedAtMs.delete(peerId);
         this.connecting.delete(peerId);
+        // The other end shed a link we had just dialled: it was full. Hold
+        // off filling free slots for a while (longer each time) instead of
+        // pushing the next full peer into shedding someone else.
+        if (
+          data.reason === 'capacity_shed'
+          && peerConnection.initiator
+          && connectedAt > 0
+          && Date.now() - connectedAt < FILL_REFUSED_WINDOW_MS
+        ) {
+          this.fillBackoffMs = Math.min(FILL_BACKOFF_MAX_MS, Math.max(FILL_BACKOFF_MIN_MS, this.fillBackoffMs * 2));
+          this.fillBackoffUntilMs = Date.now() + this.fillBackoffMs;
+        }
         if (wasConnected) {
           this.noteTransportDisconnect(peerId, connectedAt, data.reason);
           this.noteLocalCapacityChanged();
@@ -2470,12 +2499,29 @@ export class PartialMesh {
         this.connectToPeer(peerId);
       }
     } else if (totalInProgress < this.config.maxPeers && available.length > 0) {
-      if (now < this.rebalanceCooldownUntilMs) {
+      if (now < this.rebalanceCooldownUntilMs || now < this.fillBackoffUntilMs) {
         return;
       }
+      // A fill that has not been refused for a while earns its backoff back.
+      if (this.fillBackoffMs > 0 && now - this.fillBackoffUntilMs > FILL_BACKOFF_MAX_MS) this.fillBackoffMs = 0;
       // Once the mesh is minimally healthy, keep adding a small number of bridge links.
       // This helps later-joining peers connect across sub-clusters instead of staying siloed.
-      for (const peerId of pickCandidates(1)) {
+      // Only to a peer with room, or one the mesh structure needs (a CECR
+      // coordinate neighbour). Filling a free slot from a peer already full
+      // made it accept, shed an older link, and leave that peer with a free
+      // slot to fill the same way: a mesh that never settled, hundreds of
+      // links torn down and redialled a minute.
+      const withRoom = (peerId: string): boolean => {
+        const capacity = this.freshPeerCapacity(peerId);
+        if (this.cecrOverlayDialPriority(peerId) === 0) return true;
+        // A member of our part with no fresh advertisement is most likely
+        // full (a settled peer advertises nothing new); only a peer outside
+        // our membership is worth a dial on no information.
+        if (!capacity) return !this.globalPeers.has(peerId);
+        return capacity.connectedPeers < capacity.maxPeers;
+      };
+      const fill = pickCandidates(available.length).filter(withRoom).slice(0, 1);
+      for (const peerId of fill) {
         this.connectToPeer(peerId);
       }
     } else if (connectedCount > this.config.maxPeers) {

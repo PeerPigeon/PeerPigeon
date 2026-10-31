@@ -1229,6 +1229,8 @@ declare class PartialMesh {
     private membershipSequence;
     /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
     private peerCapacityById;
+    private fillBackoffMs;
+    private fillBackoffUntilMs;
     /** Relayed adjacency snapshots used to reconstruct the known network graph. */
     private peerTopologyById;
     private localCapacityUpdatedAtMs;
