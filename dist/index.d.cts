@@ -958,7 +958,8 @@ declare const NEGOTIATION_ACTIVE_ICE_DEADLINE_MS = 6000;
 declare const NEGOTIATION_OFFER_DEADLINE_MS = 20000;
 /**
  * Whether this runtime can open a direct (WebRTC Direct) relay connection.
- * Tested in Chromium and Node; Safari fails to open it, Firefox is untested.
+ * Opened in Chromium, Node and Safari (27, 2026-10-31: the channel opens in
+ * about 0.6 s); Firefox is untested, so it keeps using the other relays.
  */
 declare function directRelaySupported(): boolean;
 /** A relay to rank: its URL, and its FreeRTC node ID when known. */

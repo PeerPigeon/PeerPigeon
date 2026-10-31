@@ -122,14 +122,12 @@ const NEEDY_UNREPORTED_MS = 15_000;
 // optionally ?tunnel=<its tunnel URL> for when the direct path fails.
 /**
  * Whether this runtime can open a direct (WebRTC Direct) relay connection.
- * Tested in Chromium and Node; Safari fails to open it, Firefox is untested.
+ * Opened in Chromium, Node and Safari (27, 2026-10-31: the channel opens in
+ * about 0.6 s); Firefox is untested, so it keeps using the other relays.
  */
 export function directRelaySupported(): boolean {
   if (typeof navigator === 'undefined' || typeof navigator.userAgent !== 'string') return true;
-  const ua = navigator.userAgent;
-  if (/Firefox\//.test(ua)) return false;
-  if (/Safari\//.test(ua) && !/(Chrome|Chromium|CriOS|Edg)\//.test(ua)) return false;
-  return true;
+  return !/Firefox\//.test(navigator.userAgent);
 }
 
 function canonicalDirectRelayUrl(value: string): string | null {

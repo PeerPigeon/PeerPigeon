@@ -4795,10 +4795,7 @@ var LINK_LOG_MAX = 200;
 var NEEDY_UNREPORTED_MS = 15e3;
 function directRelaySupported() {
   if (typeof navigator === "undefined" || typeof navigator.userAgent !== "string") return true;
-  const ua = navigator.userAgent;
-  if (/Firefox\//.test(ua)) return false;
-  if (/Safari\//.test(ua) && !/(Chrome|Chromium|CriOS|Edg)\//.test(ua)) return false;
-  return true;
+  return !/Firefox\//.test(navigator.userAgent);
 }
 function canonicalDirectRelayUrl(value) {
   const [base, query = ""] = value.split("?");
@@ -4895,21 +4892,42 @@ async function discoverSignalingRelays(options) {
   const directIds = new Set(direct.map((relay) => relay.nodeId));
   return [...direct, ...fromRegistry.filter((relay) => !directIds.has(relay.nodeId))];
 }
-async function findRelayOnThisMachine(fetchImpl) {
-  try {
-    const response = await Promise.race([
-      (fetchImpl ?? globalThis.fetch)("http://127.0.0.1:8788/health", { cache: "no-store" }),
-      new Promise((resolve) => {
-        setTimeout(() => resolve(null), 1500);
-      })
-    ]);
-    if (!response?.ok) return null;
-    const health = await response.json();
-    if (!NODE_ID_RE2.test(String(health?.node_id ?? ""))) return null;
-    return { url: "ws://127.0.0.1:8788/ws", nodeId: String(health.node_id), kind: "local", connections: Number(health.peers || 0), capacity: 0, tunnelOnly: false };
-  } catch {
-    return null;
-  }
+async function findRelayOnThisMachine(_fetchImpl) {
+  const url = "ws://127.0.0.1:8788/ws";
+  const WS = globalThis.WebSocket;
+  if (typeof WS !== "function") return null;
+  const open = await new Promise((resolve) => {
+    let socket = null;
+    const timer = setTimeout(() => {
+      try {
+        socket?.close();
+      } catch {
+      }
+      resolve(false);
+    }, 1500);
+    try {
+      socket = new WS(`${url}?probe=1`);
+      socket.onopen = () => {
+        clearTimeout(timer);
+        try {
+          socket?.close(1e3, "probe");
+        } catch {
+        }
+        resolve(true);
+      };
+      socket.onerror = () => {
+        clearTimeout(timer);
+        resolve(false);
+      };
+    } catch {
+      clearTimeout(timer);
+      resolve(false);
+    }
+  });
+  if (!open) return null;
+  const ranking = await relayRankingId(url, null);
+  const nodeId = Array.from(ranking, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return { url, nodeId, kind: "local", connections: 0, capacity: 0, tunnelOnly: false };
 }
 function reachableFromThisPage(url) {
   const page = globalThis.location;
