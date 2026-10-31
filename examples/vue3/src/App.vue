@@ -1900,6 +1900,8 @@ export default {
         const records = allRecords
           .filter((record) => {
             if (!record || record.deleted === true) return false;
+            // The page's own diagnostics (pp-diag:<peer id>) are not user data.
+            if (String(record.key || '').startsWith('pp-diag:')) return false;
             if (this.storageActiveSpace !== 'user') return true;
             // If own identity not loaded yet, show nothing rather than leaking
             if (!selfOwner) return false;
