@@ -5037,9 +5037,11 @@ var PartialMesh = class {
     const url = new URL(rawUrl);
     const hostname = url.hostname.toLowerCase();
     const isLocalDevelopmentHost = hostname === "localhost" || hostname === "::1" || hostname.endsWith(".local") || /^127\./.test(hostname) || /^10\./.test(hostname) || /^192\.168\./.test(hostname) || /^169\.254\./.test(hostname) || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
+    const isIpAddress = /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) || hostname.startsWith("[");
+    const keepsPlainWs = isLocalDevelopmentHost || isIpAddress;
     if (url.protocol === "https:") url.protocol = "wss:";
-    if (url.protocol === "http:") url.protocol = isLocalDevelopmentHost ? "ws:" : "wss:";
-    if (url.protocol === "ws:" && !isLocalDevelopmentHost) url.protocol = "wss:";
+    if (url.protocol === "http:") url.protocol = keepsPlainWs ? "ws:" : "wss:";
+    if (url.protocol === "ws:" && !keepsPlainWs) url.protocol = "wss:";
     if (url.protocol !== "ws:" && url.protocol !== "wss:") {
       throw new Error(`Unsupported signaling protocol: ${url.protocol}`);
     }

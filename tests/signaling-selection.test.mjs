@@ -269,3 +269,15 @@ test('direct relays from the DNS directory come first, and a relay listed both w
   const none = await discoverSignalingRelays({ bootstrapServer: 'wss://peer.ooo/ws', fetchImpl, directory: false });
   assert.equal(none.some((relay) => relay.url.startsWith('webrtc-direct:')), false, 'directory: false skips the lookup');
 });
+
+test('a relay at a bare public IP keeps plain ws://; a named host is still upgraded to wss://', () => {
+  const mesh = new PartialMesh();
+  const normalize = (url) => mesh.normalizeSignalingUrl(url);
+  assert.equal(normalize('ws://67.52.200.58:8788/ws'), 'ws://67.52.200.58:8788/ws');
+  assert.equal(normalize('http://67.52.200.58:8788/ws'), 'ws://67.52.200.58:8788/ws');
+  assert.equal(normalize('ws://[2001:db8::7]:8788/ws'), 'ws://[2001:db8::7]:8788/ws');
+  assert.equal(normalize('ws://127.0.0.1:8788/ws'), 'ws://127.0.0.1:8788/ws');
+  assert.equal(normalize('ws://peer.ooo/ws'), 'wss://peer.ooo/ws');
+  assert.equal(normalize('https://peer.ooo/ws'), 'wss://peer.ooo/ws');
+  mesh.destroy?.();
+});

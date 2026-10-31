@@ -792,9 +792,13 @@ export class PartialMesh {
       || /^169\.254\./.test(hostname)
       || /^172\.(1[6-9]|2\d|3[01])\./.test(hostname);
 
+    // A bare IP address has no TLS certificate, so a relay there (a home relay
+    // on its router's public address) speaks plain ws: never upgrade it.
+    const isIpAddress = /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname) || hostname.startsWith('[');
+    const keepsPlainWs = isLocalDevelopmentHost || isIpAddress;
     if (url.protocol === 'https:') url.protocol = 'wss:';
-    if (url.protocol === 'http:') url.protocol = isLocalDevelopmentHost ? 'ws:' : 'wss:';
-    if (url.protocol === 'ws:' && !isLocalDevelopmentHost) url.protocol = 'wss:';
+    if (url.protocol === 'http:') url.protocol = keepsPlainWs ? 'ws:' : 'wss:';
+    if (url.protocol === 'ws:' && !keepsPlainWs) url.protocol = 'wss:';
     if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
       throw new Error(`Unsupported signaling protocol: ${url.protocol}`);
     }
