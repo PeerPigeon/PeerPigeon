@@ -311,6 +311,8 @@ class IndexedDbStorageDriver implements StorageDriver {
  */
 // A holder answers the same asker about the same key at most this often.
 const RETRIEVE_ANSWER_MIN_INTERVAL_MS = 10_000;
+// How long a Get that already has a local copy waits for a newer one.
+const RETRIEVE_LOCAL_WAIT_MS = 400;
 // Bounds on a connect-time digest and on what one digest may push back.
 const DIGEST_MAX_ENTRIES = 4_000;
 const DIGEST_MAX_PUSHES = 1_000;
@@ -495,6 +497,9 @@ export class PeerPigeonStorage {
 
   async retrieve<T = unknown>(space: StorageSpace, key: string, options: StorageRetrieveOptions = {}): Promise<StorageRecord<T> | null> {
     const normalizedKey = this.normalizeKey(key);
+    // Already subscribed: changes to this key are pushed here as they happen,
+    // so the local copy is current.
+    const wasSubscribed = this.isSubscribed(space, normalizedKey);
     // An explicit network Get is also the subscription boundary for future
     // remote changes to this exact key.
     this.subscribeKey(space, normalizedKey);
@@ -513,7 +518,19 @@ export class PeerPigeonStorage {
       ...(this.peerId ? { origin: this.peerId } : {}),
     };
 
-    const timeoutMs = Math.max(100, Math.floor(Number(options.timeoutMs ?? 2000)));
+    const fullTimeoutMs = Math.max(100, Math.floor(Number(options.timeoutMs ?? 2000)));
+    // A Get must not wait out the whole timeout for a record it already has.
+    // Holders answer one asker about one key at most every
+    // RETRIEVE_ANSWER_MIN_INTERVAL_MS, so a repeated Get often hears nothing
+    // and used to sit the full timeout. With a local copy: answer at once if
+    // subscribed (that copy is kept current), else give the room a moment
+    // for anything newer. The request still goes out; a newer answer that
+    // arrives later is applied and announced as a change.
+    if (existing && wasSubscribed) {
+      void this.broadcastSyncPayload(request).catch(() => {});
+      return existing;
+    }
+    const timeoutMs = existing ? Math.min(fullTimeoutMs, RETRIEVE_LOCAL_WAIT_MS) : fullTimeoutMs;
 
     return await new Promise<StorageRecord<T> | null>(async (resolve) => {
       const timeout = setTimeout(async () => {

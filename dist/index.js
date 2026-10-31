@@ -3217,6 +3217,7 @@ var IndexedDbStorageDriver = class _IndexedDbStorageDriver {
   }
 };
 var RETRIEVE_ANSWER_MIN_INTERVAL_MS = 1e4;
+var RETRIEVE_LOCAL_WAIT_MS = 400;
 var DIGEST_MAX_ENTRIES = 4e3;
 var DIGEST_MAX_PUSHES = 1e3;
 var PeerPigeonStorage = class {
@@ -3359,6 +3360,7 @@ var PeerPigeonStorage = class {
   }
   async retrieve(space, key, options = {}) {
     const normalizedKey = this.normalizeKey(key);
+    const wasSubscribed = this.isSubscribed(space, normalizedKey);
     this.subscribeKey(space, normalizedKey);
     const existing = await this.get(space, normalizedKey);
     if (space === "private") return existing;
@@ -3373,7 +3375,13 @@ var PeerPigeonStorage = class {
       timestamp: Date.now(),
       ...this.peerId ? { origin: this.peerId } : {}
     };
-    const timeoutMs = Math.max(100, Math.floor(Number(options.timeoutMs ?? 2e3)));
+    const fullTimeoutMs = Math.max(100, Math.floor(Number(options.timeoutMs ?? 2e3)));
+    if (existing && wasSubscribed) {
+      void this.broadcastSyncPayload(request).catch(() => {
+      });
+      return existing;
+    }
+    const timeoutMs = existing ? Math.min(fullTimeoutMs, RETRIEVE_LOCAL_WAIT_MS) : fullTimeoutMs;
     return await new Promise(async (resolve) => {
       const timeout = setTimeout(async () => {
         this.pendingRetrieveRequests.delete(reqId);
