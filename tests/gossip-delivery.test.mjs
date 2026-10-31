@@ -1938,3 +1938,22 @@ test('PeerPigeonNode provides the unified JS API', async () => {
     await node.destroy();
   }
 });
+
+test('a peer that said it is leaving is not rediscovered or dialled until it rejoins', () => {
+  const mesh = new PartialMesh({ autoConnect: false });
+  mesh.clientId = 'a'.repeat(64);
+  const leaver = 'b'.repeat(64);
+  const now = Date.now();
+  mesh.addDiscoveredPeer(leaver);
+  assert.equal(mesh.discoveredPeers.has(leaver), true);
+  mesh.mergeMembership([], [], {}, {}, leaver, { [leaver]: [1, 5, 'left', now, null] });
+  assert.equal(mesh.discoveredPeers.has(leaver), false, 'dropped on its goodbye');
+  mesh.addDiscoveredPeer(leaver);
+  assert.equal(mesh.discoveredPeers.has(leaver), false, 'a stale relay list does not bring it back');
+  mesh.discoveredPeers.add(leaver);
+  assert.equal(mesh.dialCandidatePeerIds(false).includes(leaver), false, 'never a dial candidate');
+  mesh.mergeMembership([], [], {}, {}, leaver, { [leaver]: [2, 1, 'alive', now + 1, now + 60_000] });
+  mesh.addDiscoveredPeer(leaver);
+  assert.equal(mesh.discoveredPeers.has(leaver), true, 'it rejoined with a newer record');
+  mesh.destroy?.();
+});

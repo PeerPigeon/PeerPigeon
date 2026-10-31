@@ -5145,9 +5145,31 @@ var PartialMesh = class {
     this.discoveryRefreshWaitMs = DISCOVERY_REFRESH_MIN_MS;
     this.lastDiscoveryRefreshAtMs = 0;
   }
+  /**
+   * A peer that said it was leaving (its own 'left' membership record, which
+   * only a newer 'alive' record from it overrides). Relay lists and gossip
+   * can still name it for a while; it is not rediscovered or dialled.
+   */
+  hasLeft(peerId) {
+    return this.membershipRecordsById.get(peerId)?.state === "left";
+  }
+  /** Drop every trace of a peer that left, so nothing dials it again. */
+  forgetDepartedPeer(peerId) {
+    this.discoveredPeers.delete(peerId);
+    this.discoveredAtMs.delete(peerId);
+    this.activeSignalingPeers.delete(peerId);
+    if (this.connecting.has(peerId) && !this.peers.get(peerId)?.connected) {
+      this.connecting.delete(peerId);
+      this.peers.delete(peerId);
+      try {
+        this.signalingClient?.closeConnection?.(peerId);
+      } catch {
+      }
+    }
+  }
   addDiscoveredPeer(peerId) {
     const id = this.normalizePeerId(peerId);
-    if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id)) return;
+    if (!id || this.isSelfAlias(id) || this.retiredPeerIds.has(id) || this.hasLeft(id)) return;
     if (this.discoveredPeers.has(id)) return;
     this.discoveredPeers.add(id);
     this.discoveredAtMs.set(id, Date.now());
@@ -6391,7 +6413,7 @@ var PartialMesh = class {
       }
     }
     return Array.from(candidates).filter(
-      (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId)
+      (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId) && !this.hasLeft(peerId)
     );
   }
   maintainPeerConnections() {
@@ -7080,8 +7102,10 @@ var PartialMesh = class {
       };
       if (this.mergeMembershipRecord(record, now)) {
         membershipChanged = true;
-        if (record.state === "left") departureMerged = true;
-        else {
+        if (record.state === "left") {
+          departureMerged = true;
+          this.forgetDepartedPeer(peerId);
+        } else {
           renewed.push(peerId);
           if (!wasMember) returning.push(peerId);
         }
@@ -7100,6 +7124,7 @@ var PartialMesh = class {
       };
       if (this.mergeMembershipRecord(left, now)) {
         membershipChanged = true;
+        this.forgetDepartedPeer(normalizedFromPeerId);
         departureMerged = true;
       }
     }

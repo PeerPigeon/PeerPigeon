@@ -1250,6 +1250,14 @@ declare class PartialMesh {
     private isSelfAlias;
     /** Real news arrived, so ask again at full speed. */
     private noteDiscoveryNews;
+    /**
+     * A peer that said it was leaving (its own 'left' membership record, which
+     * only a newer 'alive' record from it overrides). Relay lists and gossip
+     * can still name it for a while; it is not rediscovered or dialled.
+     */
+    private hasLeft;
+    /** Drop every trace of a peer that left, so nothing dials it again. */
+    private forgetDepartedPeer;
     private addDiscoveredPeer;
     private loadOrCreateBrowserPeerId;
     private rememberBrowserPeerSignalUrls;
