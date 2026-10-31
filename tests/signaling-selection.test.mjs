@@ -291,3 +291,24 @@ test('a relay at a bare public IP keeps plain ws://; a named host is still upgra
   assert.equal(normalize('https://peer.ooo/ws'), 'wss://peer.ooo/ws');
   mesh.destroy?.();
 });
+
+test('an https page never picks a plain ws:// relay away from this machine', async () => {
+  const { discoverSignalingRelays, reachableFromThisPage } = await import('../dist/index.js');
+  const had = Object.getOwnPropertyDescriptor(globalThis, 'location');
+  Object.defineProperty(globalThis, 'location', { value: { protocol: 'https:' }, configurable: true });
+  try {
+    assert.equal(reachableFromThisPage('ws://67.52.200.58:8788/ws'), false);
+    assert.equal(reachableFromThisPage('ws://127.0.0.1:8788/ws'), true);
+    assert.equal(reachableFromThisPage('wss://peer.ooo/ws'), true);
+    const fetchImpl = async () => new Response(JSON.stringify({ relays: [
+      { url: 'ws://67.52.200.58:8788/ws', relay_kind: 'local' },
+      { url: 'ws://67.52.200.58:8788/t/' + 'f'.repeat(64) + '/ws', relay_kind: 'local' },
+      { url: 'wss://decentralize.ooo/ws' },
+    ] }));
+    const relays = await discoverSignalingRelays({ bootstrapServer: 'wss://peer.ooo/ws', fetchImpl, directory: false });
+    assert.equal(relays.some((relay) => relay.url.startsWith('ws://67.')), false);
+    assert.ok(relays.some((relay) => relay.url === 'wss://decentralize.ooo/ws'));
+  } finally {
+    if (had) Object.defineProperty(globalThis, 'location', had); else delete globalThis.location;
+  }
+});

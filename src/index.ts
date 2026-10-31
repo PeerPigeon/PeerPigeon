@@ -276,12 +276,29 @@ export async function discoverSignalingRelays(options: {
         tunnelOnly: false,
       })).filter((relay) => Boolean(relay.url)))
       .catch(() => []);
-  const fromRegistry = await discoverRegistryRelays(options);
+  const fromRegistry = (await discoverRegistryRelays(options)).filter((relay) => reachableFromThisPage(relay.url));
   const direct = await directLookup;
   if (direct.length === 0) return fromRegistry;
   // A relay listed both ways is kept once, as its direct entry.
   const directIds = new Set(direct.map((relay) => relay.nodeId));
   return [...direct, ...fromRegistry.filter((relay) => !directIds.has(relay.nodeId))];
+}
+
+/**
+ * Whether this page may open the relay's URL at all. An https page cannot
+ * open a plain ws:// connection except to this machine (browsers block it
+ * as mixed content), so a relay at ws://<public ip> is never tried there; a
+ * browser reaches such a relay through its direct (WebRTC) address instead.
+ */
+export function reachableFromThisPage(url: string): boolean {
+  const page = (globalThis as { location?: { protocol?: string } }).location;
+  if (page?.protocol !== 'https:' || !String(url).startsWith('ws://')) return true;
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    return host === 'localhost' || host.endsWith('.localhost') || host === '::1' || /^127\./.test(host);
+  } catch {
+    return false;
+  }
 }
 
 async function discoverRegistryRelays(options: {
@@ -402,7 +419,7 @@ export async function discoverClosestSignalingServers(options: {
       const body = await response.json() as { relays?: Array<{ url?: string; node_id?: string } | string> };
       for (const record of Array.isArray(body?.relays) ? body.relays : []) {
         const normalized = canonicalSignalingUrl(typeof record === 'string' ? record : String(record?.url || ''));
-        if (!normalized) continue;
+        if (!normalized || !reachableFromThisPage(normalized)) continue;
         const nodeId = typeof record === 'string' ? null : (record?.node_id ?? null);
         if (!candidates.has(normalized) || (nodeId && !candidates.get(normalized))) candidates.set(normalized, nodeId);
       }
