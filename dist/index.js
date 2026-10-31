@@ -1245,6 +1245,7 @@ var _GossipProtocol = class _GossipProtocol {
         ...message,
         hops: message.hops + 1,
         path: this.extendRoutePath(message.path, peerId),
+        sentAt: [...Array.isArray(message.sentAt) ? message.sentAt.filter((t) => typeof t === "number").slice(-(MAX_ROUTE_TRACE_PEERS - 1)) : [], Date.now()],
         ...deliveryState ? { delivery: this.deliveryEnvelopeForState(deliveryState) } : {}
       };
       try {
@@ -1308,10 +1309,10 @@ var _GossipProtocol = class _GossipProtocol {
     if (this.messageLog.size > this.maxTrackedMessages) {
       this.pruneTracking();
     }
-    this.emit("messageReceived", { message, local: false, fromPeer: fromPeerId, receivedAt });
     if (message.hops < message.maxHops) {
       this.propagate(message, fromPeerId);
     }
+    this.emit("messageReceived", { message, local: false, fromPeer: fromPeerId, receivedAt });
   }
   // ─── Epidemic anti-entropy ────────────────────────────────────────
   retainGossipMessage(message, retainedAt = Date.now()) {

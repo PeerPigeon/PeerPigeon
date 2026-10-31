@@ -176,6 +176,8 @@ export type GossipMessage = {
   type: 'gossip';
   /** Bounded first-arrival route trace for diagnostics. */
   path?: string[];
+  /** When each peer on the path sent it on (ms since epoch, its own clock), bounded like path. */
+  sentAt?: number[];
   spread?: GossipSpreadEnvelope;
   delivery?: GossipDeliveryEnvelope;
   aggregate?: GossipAggregateEnvelope;
@@ -666,6 +668,7 @@ export class GossipProtocol {
         ...message,
         hops: message.hops + 1,
         path: this.extendRoutePath(message.path, peerId),
+        sentAt: [...(Array.isArray(message.sentAt) ? message.sentAt.filter((t) => typeof t === 'number').slice(-(MAX_ROUTE_TRACE_PEERS - 1)) : []), Date.now()],
         ...(deliveryState ? { delivery: this.deliveryEnvelopeForState(deliveryState) } : {})
       };
 
@@ -749,11 +752,14 @@ export class GossipProtocol {
       this.pruneTracking();
     }
 
-    this.emit('messageReceived', { message, local: false, fromPeer: fromPeerId, receivedAt });
-
+    // Pass it on before handing it to this peer's own listeners: whatever
+    // they do (decrypt, render, store) must not hold up the rest of the
+    // mesh. In a busy browser tab that was the slowest part of a hop.
     if (message.hops < message.maxHops) {
       this.propagate(message, fromPeerId);
     }
+
+    this.emit('messageReceived', { message, local: false, fromPeer: fromPeerId, receivedAt });
   }
 
   // ─── Epidemic anti-entropy ────────────────────────────────────────

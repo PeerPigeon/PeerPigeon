@@ -170,6 +170,8 @@ type GossipMessage = {
     type: 'gossip';
     /** Bounded first-arrival route trace for diagnostics. */
     path?: string[];
+    /** When each peer on the path sent it on (ms since epoch, its own clock), bounded like path. */
+    sentAt?: number[];
     spread?: GossipSpreadEnvelope;
     delivery?: GossipDeliveryEnvelope;
     aggregate?: GossipAggregateEnvelope;
