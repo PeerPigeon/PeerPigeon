@@ -2991,7 +2991,7 @@ async function chooseRelays(options) {
     return { relay, toRoom: nearest(ids, roomKey), toPeer: nearest(ids, peerKey) };
   }));
   const byRoom = [...placed].sort((a, b) => compareDistance(a.toRoom, b.toRoom, roomKey) || a.relay.url.localeCompare(b.relay.url));
-  const isDirect = (entry) => entry.relay.url.startsWith("webrtc-direct://");
+  const isDirect = (entry) => entry.relay.url.startsWith("webrtc-direct://") || entry.relay.url.startsWith("ws://127.0.0.1:");
   const direct = byRoom.filter(isDirect);
   const others = byRoom.filter((entry) => !isDirect(entry));
   const othersTaken = Math.max(1, options.candidates ?? RELAY_CANDIDATES);
@@ -4886,11 +4886,30 @@ async function discoverSignalingRelays(options) {
     capacity: Number(record.capacity || 0),
     tunnelOnly: false
   })).filter((relay) => Boolean(relay.url))).catch(() => []);
+  const onThisMachine = typeof globalThis.location !== "undefined" && !directRelaySupported() ? findRelayOnThisMachine(options.fetchImpl) : Promise.resolve(null);
   const fromRegistry = (await discoverRegistryRelays(options)).filter((relay) => reachableFromThisPage(relay.url));
+  const mine = await onThisMachine;
+  if (mine) fromRegistry.unshift(mine);
   const direct = await directLookup;
   if (direct.length === 0) return fromRegistry;
   const directIds = new Set(direct.map((relay) => relay.nodeId));
   return [...direct, ...fromRegistry.filter((relay) => !directIds.has(relay.nodeId))];
+}
+async function findRelayOnThisMachine(fetchImpl) {
+  try {
+    const response = await Promise.race([
+      (fetchImpl ?? globalThis.fetch)("http://127.0.0.1:8788/health", { cache: "no-store" }),
+      new Promise((resolve) => {
+        setTimeout(() => resolve(null), 1500);
+      })
+    ]);
+    if (!response?.ok) return null;
+    const health = await response.json();
+    if (!NODE_ID_RE2.test(String(health?.node_id ?? ""))) return null;
+    return { url: "ws://127.0.0.1:8788/ws", nodeId: String(health.node_id), kind: "local", connections: Number(health.peers || 0), capacity: 0, tunnelOnly: false };
+  } catch {
+    return null;
+  }
 }
 function reachableFromThisPage(url) {
   const page = globalThis.location;

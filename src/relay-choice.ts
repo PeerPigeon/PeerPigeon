@@ -146,7 +146,10 @@ export async function chooseRelays(options: ChooseRelaysOptions): Promise<string
   // Relays from the DNS directory (direct, reached with no cloud relay in the
   // way) are always candidates, however far they are from the room; the
   // others compete for the remaining places by distance.
-  const isDirect = (entry: { relay: RelayInfo }) => entry.relay.url.startsWith('webrtc-direct://');
+  // A relay on this machine (ws://127.0.0.1, found by a browser that cannot
+  // open direct relays) ranks with them.
+  const isDirect = (entry: { relay: RelayInfo }) => entry.relay.url.startsWith('webrtc-direct://')
+    || entry.relay.url.startsWith('ws://127.0.0.1:');
   const direct = byRoom.filter(isDirect);
   const others = byRoom.filter((entry) => !isDirect(entry));
   const othersTaken = Math.max(1, options.candidates ?? RELAY_CANDIDATES);

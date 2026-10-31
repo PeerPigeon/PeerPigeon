@@ -280,12 +280,47 @@ export async function discoverSignalingRelays(options: {
         tunnelOnly: false,
       })).filter((relay) => Boolean(relay.url)))
       .catch(() => []);
+  // A browser that cannot open direct relays (Safari, Firefox) can still
+  // reach a relay on its own machine: browsers let an https page open
+  // ws://127.0.0.1, unlike any other plain ws:// address.
+  const onThisMachine = typeof globalThis.location !== 'undefined' && !directRelaySupported()
+    ? findRelayOnThisMachine(options.fetchImpl)
+    : Promise.resolve(null);
   const fromRegistry = (await discoverRegistryRelays(options)).filter((relay) => reachableFromThisPage(relay.url));
+  const mine = await onThisMachine;
+  if (mine) fromRegistry.unshift(mine);
   const direct = await directLookup;
   if (direct.length === 0) return fromRegistry;
   // A relay listed both ways is kept once, as its direct entry.
   const directIds = new Set(direct.map((relay) => relay.nodeId));
   return [...direct, ...fromRegistry.filter((relay) => !directIds.has(relay.nodeId))];
+}
+
+/**
+ * The relay on this machine (node-relay's default port), if one answers a
+ * WebSocket. (A fetch of its /health is held to stricter rules: Chromium's
+ * private-network checks.)
+ */
+async function findRelayOnThisMachine(_fetchImpl?: typeof fetch): Promise<RelayInfo | null> {
+  const url = 'ws://127.0.0.1:8788/ws';
+  const WS = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
+  if (typeof WS !== 'function') return null;
+  const open = await new Promise<boolean>((resolve) => {
+    let socket: WebSocket | null = null;
+    const timer = setTimeout(() => { try { socket?.close(); } catch { /* ignore */ } resolve(false); }, 1_500);
+    try {
+      socket = new WS(`${url}?probe=1`);
+      socket.onopen = () => { clearTimeout(timer); try { socket?.close(1000, 'probe'); } catch { /* ignore */ } resolve(true); };
+      socket.onerror = () => { clearTimeout(timer); resolve(false); };
+    } catch {
+      clearTimeout(timer);
+      resolve(false);
+    }
+  });
+  if (!open) return null;
+  const ranking = await relayRankingId(url, null);
+  const nodeId = Array.from(ranking, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return { url, nodeId, kind: 'local', connections: 0, capacity: 0, tunnelOnly: false };
 }
 
 /**
