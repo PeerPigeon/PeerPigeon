@@ -649,6 +649,7 @@ declare class PeerPigeonStorage {
     private readonly onDirectMessageBound;
     private readonly onPeerConnectedBound;
     private readonly retrieveAnsweredAt;
+    private readonly retrieveAnswerTimes;
     private readonly pendingRetrieveRequests;
     private closed;
     private readonly onGossipMessageBound;
@@ -674,6 +675,9 @@ declare class PeerPigeonStorage {
     putSystem<T = unknown>(space: StorageSpace, key: string, value: T, options?: StoragePutOptions): Promise<StorageRecord<T>>;
     get<T = unknown>(space: StorageSpace, key: string): Promise<StorageRecord<T> | null>;
     retrieve<T = unknown>(space: StorageSpace, key: string, options?: StorageRetrieveOptions): Promise<StorageRecord<T> | null>;
+    /** How long to wait for a Get's answer: twice the slowest recent answer, within bounds. */
+    private expectedAnswerMs;
+    private noteAnswerTime;
     delete(space: StorageSpace, key: string): Promise<boolean>;
     deleteSystem(space: StorageSpace, key: string): Promise<boolean>;
     list(space: StorageSpace): Promise<StorageRecord[]>;

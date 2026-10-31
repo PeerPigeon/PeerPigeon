@@ -225,3 +225,15 @@ test('a Get with no local copy asks again when the first answer is lost', async 
     await close();
   }
 });
+
+test('a Get for a key nobody has gives up long before the timeout', async () => {
+  const { storageB, close } = await pair();
+  try {
+    const started = Date.now();
+    const got = await storageB.retrieve('public', 'nobody-has-this', { timeoutMs: 10_000 });
+    assert.equal(got, null);
+    assert.ok(Date.now() - started < 2000, `took ${Date.now() - started} ms`);
+  } finally {
+    await close();
+  }
+});

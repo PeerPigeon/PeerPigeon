@@ -133,6 +133,8 @@ type StorageRetrieveRequest = {
   timestamp: number;
   /** The requester's mesh peer id, so a holder can answer it directly. */
   origin?: string;
+  /** The same request again: its answer did not arrive. */
+  retry?: boolean;
 };
 
 type StorageRetrieveResponse = {
@@ -313,9 +315,14 @@ class IndexedDbStorageDriver implements StorageDriver {
 // Answers now go to the asker alone (sendDirect), not the room, so a short
 // interval is enough to stop one asker's repeats from costing each holder.
 const RETRIEVE_ANSWER_MIN_INTERVAL_MS = 1_000;
+const RETRIEVE_RETRY_ANSWER_MIN_INTERVAL_MS = 250;
 // With no local copy, ask again this often until answered: a routed answer
 // can be lost on the way.
 const RETRIEVE_RETRY_MS = 1_200;
+// How long a Get for a key no peer here has waits: before any answers have
+// been timed, and at the least once they have.
+const RETRIEVE_FIRST_WAIT_MS = 1_500;
+const RETRIEVE_MIN_WAIT_MS = 600;
 // Bounds on a connect-time digest and on what one digest may push back.
 const DIGEST_MAX_ENTRIES = 4_000;
 const DIGEST_MAX_PUSHES = 1_000;
@@ -336,6 +343,8 @@ export class PeerPigeonStorage {
   private readonly onDirectMessageBound: GossipDirectListener;
   private readonly onPeerConnectedBound: GossipPeerListener;
   private readonly retrieveAnsweredAt = new Map<string, number>();
+  // How long recent Gets took to be answered (ms), newest last.
+  private readonly retrieveAnswerTimes: number[] = [];
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
   private readonly onGossipMessageBound: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void;
@@ -528,7 +537,12 @@ export class PeerPigeonStorage {
       void this.broadcastSyncPayload(request).catch(() => {});
       return existing;
     }
-    const timeoutMs = fullTimeoutMs;
+    // Nobody can answer "I don't have it", so a missing key is silence. Wait
+    // only as long as answers have recently taken (twice the slowest of the
+    // last few, at least RETRIEVE_MIN_WAIT_MS), not the whole timeout. An
+    // answer that comes later is still applied and announced as a change.
+    const timeoutMs = Math.min(fullTimeoutMs, this.expectedAnswerMs());
+    const askedAt = Date.now();
 
     return await new Promise<StorageRecord<T> | null>(async (resolve) => {
       const timeout = setTimeout(async () => {
@@ -543,17 +557,31 @@ export class PeerPigeonStorage {
         resolve(value);
       };
       this.pendingRetrieveRequests.set(reqId, {
-        resolve: (value) => done(value as StorageRecord<T> | null),
+        resolve: (value) => {
+          if (value) this.noteAnswerTime(Date.now() - askedAt);
+          done(value as StorageRecord<T> | null);
+        },
         timeout,
       });
 
       await this.broadcastSyncPayload(request);
       retry = setInterval(() => {
         if (!this.pendingRetrieveRequests.has(reqId)) { if (retry) clearInterval(retry); return; }
-        void this.broadcastSyncPayload({ ...request, timestamp: Date.now() }).catch(() => {});
-      }, RETRIEVE_RETRY_MS);
+        void this.broadcastSyncPayload({ ...request, timestamp: Date.now(), retry: true }).catch(() => {});
+      }, Math.min(RETRIEVE_RETRY_MS, Math.max(300, Math.floor(timeoutMs / 2))));
       (retry as { unref?: () => void }).unref?.();
     });
+  }
+
+  /** How long to wait for a Get's answer: twice the slowest recent answer, within bounds. */
+  private expectedAnswerMs(): number {
+    if (this.retrieveAnswerTimes.length < 3) return RETRIEVE_FIRST_WAIT_MS;
+    return Math.max(RETRIEVE_MIN_WAIT_MS, 2 * Math.max(...this.retrieveAnswerTimes));
+  }
+
+  private noteAnswerTime(ms: number): void {
+    this.retrieveAnswerTimes.push(ms);
+    if (this.retrieveAnswerTimes.length > 8) this.retrieveAnswerTimes.shift();
   }
 
   async delete(space: StorageSpace, key: string): Promise<boolean> {
@@ -1096,9 +1124,14 @@ export class PeerPigeonStorage {
     // holder answering every ask — and by broadcast — was 1,500 answers in
     // thirty seconds for one record; the room does not need to hear an
     // answer meant for one peer, and one peer does not need it twice.
-    const answerKey = `${request.origin ?? request.actorId}:${request.space}:${request.key}`;
+    // A Get asking again (retry: its answer was lost) is answered again,
+    // keyed by its own request; a new Get from the same asker for the same
+    // key, at most once a second.
+    const asker = `${request.origin ?? request.actorId}:${request.space}:${request.key}`;
+    const answerKey = request.retry ? `${asker}:${request.reqId}` : asker;
+    const minInterval = request.retry ? RETRIEVE_RETRY_ANSWER_MIN_INTERVAL_MS : RETRIEVE_ANSWER_MIN_INTERVAL_MS;
     const answeredAt = this.retrieveAnsweredAt.get(answerKey) ?? 0;
-    if (Date.now() - answeredAt < RETRIEVE_ANSWER_MIN_INTERVAL_MS) return;
+    if (Date.now() - answeredAt < minInterval) return;
     this.retrieveAnsweredAt.set(answerKey, Date.now());
     if (this.retrieveAnsweredAt.size > 2048) {
       for (const [key, at] of this.retrieveAnsweredAt) {

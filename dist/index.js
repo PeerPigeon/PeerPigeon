@@ -3217,7 +3217,10 @@ var IndexedDbStorageDriver = class _IndexedDbStorageDriver {
   }
 };
 var RETRIEVE_ANSWER_MIN_INTERVAL_MS = 1e3;
+var RETRIEVE_RETRY_ANSWER_MIN_INTERVAL_MS = 250;
 var RETRIEVE_RETRY_MS = 1200;
+var RETRIEVE_FIRST_WAIT_MS = 1500;
+var RETRIEVE_MIN_WAIT_MS = 600;
 var DIGEST_MAX_ENTRIES = 4e3;
 var DIGEST_MAX_PUSHES = 1e3;
 var PeerPigeonStorage = class {
@@ -3228,6 +3231,8 @@ var PeerPigeonStorage = class {
     this.subscribedKeys = /* @__PURE__ */ new Set();
     this.subscribedEntries = /* @__PURE__ */ new Map();
     this.retrieveAnsweredAt = /* @__PURE__ */ new Map();
+    // How long recent Gets took to be answered (ms), newest last.
+    this.retrieveAnswerTimes = [];
     this.pendingRetrieveRequests = /* @__PURE__ */ new Map();
     this.closed = false;
     this.instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
@@ -3380,7 +3385,8 @@ var PeerPigeonStorage = class {
       });
       return existing;
     }
-    const timeoutMs = fullTimeoutMs;
+    const timeoutMs = Math.min(fullTimeoutMs, this.expectedAnswerMs());
+    const askedAt = Date.now();
     return await new Promise(async (resolve) => {
       const timeout = setTimeout(async () => {
         this.pendingRetrieveRequests.delete(reqId);
@@ -3393,7 +3399,10 @@ var PeerPigeonStorage = class {
         resolve(value);
       };
       this.pendingRetrieveRequests.set(reqId, {
-        resolve: (value) => done(value),
+        resolve: (value) => {
+          if (value) this.noteAnswerTime(Date.now() - askedAt);
+          done(value);
+        },
         timeout
       });
       await this.broadcastSyncPayload(request);
@@ -3402,11 +3411,20 @@ var PeerPigeonStorage = class {
           if (retry) clearInterval(retry);
           return;
         }
-        void this.broadcastSyncPayload({ ...request, timestamp: Date.now() }).catch(() => {
+        void this.broadcastSyncPayload({ ...request, timestamp: Date.now(), retry: true }).catch(() => {
         });
-      }, RETRIEVE_RETRY_MS);
+      }, Math.min(RETRIEVE_RETRY_MS, Math.max(300, Math.floor(timeoutMs / 2))));
       retry.unref?.();
     });
+  }
+  /** How long to wait for a Get's answer: twice the slowest recent answer, within bounds. */
+  expectedAnswerMs() {
+    if (this.retrieveAnswerTimes.length < 3) return RETRIEVE_FIRST_WAIT_MS;
+    return Math.max(RETRIEVE_MIN_WAIT_MS, 2 * Math.max(...this.retrieveAnswerTimes));
+  }
+  noteAnswerTime(ms) {
+    this.retrieveAnswerTimes.push(ms);
+    if (this.retrieveAnswerTimes.length > 8) this.retrieveAnswerTimes.shift();
   }
   async delete(space, key) {
     const mutation = await this.applyLocalDelete(space, key, false);
@@ -3852,9 +3870,11 @@ var PeerPigeonStorage = class {
       timestamp: Date.now(),
       record: existing
     };
-    const answerKey = `${request.origin ?? request.actorId}:${request.space}:${request.key}`;
+    const asker = `${request.origin ?? request.actorId}:${request.space}:${request.key}`;
+    const answerKey = request.retry ? `${asker}:${request.reqId}` : asker;
+    const minInterval = request.retry ? RETRIEVE_RETRY_ANSWER_MIN_INTERVAL_MS : RETRIEVE_ANSWER_MIN_INTERVAL_MS;
     const answeredAt = this.retrieveAnsweredAt.get(answerKey) ?? 0;
-    if (Date.now() - answeredAt < RETRIEVE_ANSWER_MIN_INTERVAL_MS) return;
+    if (Date.now() - answeredAt < minInterval) return;
     this.retrieveAnsweredAt.set(answerKey, Date.now());
     if (this.retrieveAnsweredAt.size > 2048) {
       for (const [key, at] of this.retrieveAnsweredAt) {
