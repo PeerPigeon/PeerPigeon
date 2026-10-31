@@ -54,7 +54,10 @@ export const SIGNALING_HEALTH_INTERVAL_MS = 15_000;
 // straight back to the interval.
 const SIGNALING_HEALTH_MAX_INTERVAL_MS = 5 * 60_000;
 const DISCOVERY_ABSENCE_GRACE_MS = 30_000;
-const DISCOVERY_ACTIVE_MAX_AGE_MS = 18_000;
+// The relay refreshes a peer's stored announcement only when half its 30 s
+// lease is gone (about every 24 s for a peer announcing every 12 s), so a live
+// peer's listed age reaches the mid-20s. 18 s dropped live peers.
+const DISCOVERY_ACTIVE_MAX_AGE_MS = 35_000;
 
 function generateMessageId(bytesLength = 8): string {
   const bytes = new Uint8Array(bytesLength);
@@ -638,11 +641,12 @@ export class FreeRTCClientAdapter {
       .map((candidate) => ({
         peerId: this.normalizePeerId(candidate?.peerId),
         advertisedAt: Number(candidate?.advertisedAt),
+        listedAt: Number(candidate?.listedAt),
       }))
       .filter(({ peerId }) => peerId && !this.isSelfAlias(peerId));
     const snapshotPeers = new Set<string>(normalizedCandidates.map(({ peerId }) => peerId));
     const activeSnapshotPeers = new Set<string>();
-    for (const { peerId, advertisedAt } of normalizedCandidates) {
+    for (const { peerId, advertisedAt, listedAt } of normalizedCandidates) {
       this.knownPeerLastSeenAtMs.set(peerId, now);
       if (Number.isFinite(advertisedAt)) {
         const previous = this.knownPeerAdvertisedAtMs.get(peerId) ?? Number.NEGATIVE_INFINITY;
@@ -652,8 +656,11 @@ export class FreeRTCClientAdapter {
       const failedAdvertisementAt = this.failedPeerAdvertisementAtMs.get(peerId);
       const hasNewAdvertisement = failedAdvertisementAt == null
         || (Number.isFinite(advertisedAt) && advertisedAt > failedAdvertisementAt);
-      const isFresh = !Number.isFinite(advertisedAt)
-        || now - advertisedAt <= DISCOVERY_ACTIVE_MAX_AGE_MS;
+      // Age on the relay's own clock (when it sent the list, minus when the
+      // peer last announced): this peer's clock and the relay's may differ by
+      // seconds, and a peer on another machine judged every listing stale.
+      const age = Number.isFinite(listedAt) ? listedAt - advertisedAt : now - advertisedAt;
+      const isFresh = !Number.isFinite(advertisedAt) || age <= DISCOVERY_ACTIVE_MAX_AGE_MS;
       if (hasNewAdvertisement && isFresh) {
         activeSnapshotPeers.add(peerId);
         if (failedAdvertisementAt != null) this.failedPeerAdvertisementAtMs.delete(peerId);

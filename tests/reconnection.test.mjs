@@ -869,7 +869,7 @@ test('stale relay leases remain in discovery grace but not in the active peer co
 
   adapter.handleBootstrapCandidates([
     { peerId: currentPeerId, advertisedAt: Date.now() },
-    { peerId: stalePeerId, advertisedAt: Date.now() - 20_000 },
+    { peerId: stalePeerId, advertisedAt: Date.now() - 60_000 },
   ]);
 
   assert.deepEqual(new Set(snapshot.peers), new Set([currentPeerId, stalePeerId]));
@@ -908,4 +908,20 @@ test('adapter exposes FreeRTC connecting state so inbound negotiations are owned
   adapter.handleConnectionState({ peerId, state: 'connecting' });
 
   assert.deepEqual(pending, [{ peerId }]);
+});
+
+test('a listed peer is judged fresh on the relay clock, whatever this machine clock says', () => {
+  const adapter = new FreeRTCClientAdapter(['wss://relay.example/ws'], { peerId: '1'.repeat(64) });
+  let active = null;
+  adapter.on('peers-updated', (data) => { active = data.activePeers; });
+  // The relay's clock runs 2 minutes behind this machine's; the peer last
+  // announced 20 s before the relay sent the list (the relay rewrites
+  // announcements only every ~24 s).
+  const relayNow = Date.now() - 120_000;
+  adapter.handleBootstrapCandidates([
+    { peerId: '2'.repeat(64), advertisedAt: relayNow - 20_000, listedAt: relayNow },
+    { peerId: '3'.repeat(64), advertisedAt: relayNow - 60_000, listedAt: relayNow },
+  ]);
+  assert.deepEqual(active, ['2'.repeat(64)], 'the live peer is dialable; the stale one is not');
+  adapter.disconnect();
 });
