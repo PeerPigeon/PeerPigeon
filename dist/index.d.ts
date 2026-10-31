@@ -1213,6 +1213,7 @@ declare class PartialMesh {
     /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
     private orphanRtcFirstSeenAtMs;
     private peerConnectedAtMs;
+    private linkLog;
     private discoveredAtMs;
     /** Peers present in the relay's latest un-graced discovery snapshot. */
     private activeSignalingPeers;
@@ -1360,6 +1361,16 @@ declare class PartialMesh {
     private noteDialFailure;
     private noteDialSuccess;
     private forgetStaleDialFailures;
+    private noteLink;
+    /** The last links that opened or closed, newest last: when, which peer, and why it closed. */
+    getLinkLog(): Array<{
+        at: number;
+        peer: string;
+        event: 'up' | 'down';
+        by: 'local' | 'remote';
+        reason: string;
+        links: number;
+    }>;
     private noteTransportDisconnect;
     private noteStablePeerConnections;
     private noteIntentionalShed;
@@ -1554,6 +1565,14 @@ declare class PeerPigeonNode {
     getCecrState(): CecrStateSnapshot;
     getClientId(): string | null;
     getConnectedPeers(): string[];
+    getLinkLog(): {
+        at: number;
+        peer: string;
+        event: "up" | "down";
+        by: "local" | "remote";
+        reason: string;
+        links: number;
+    }[];
     getDiscoveredPeers(): string[];
     getActiveSignalingPeers(): string[];
     getGlobalPeers(): string[];

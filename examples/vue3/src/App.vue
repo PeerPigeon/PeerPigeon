@@ -808,6 +808,7 @@ export default {
   },
   mounted() {
     window.__app = this;
+    this.startDiagnostics();
     this.setTheme(this.theme);
     const params = new URLSearchParams(window.location.search);
 
@@ -1692,6 +1693,71 @@ export default {
       return incomingUpdatedAt > existingUpdatedAt;
     },
 
+    // Diagnostics that publish themselves. Every browser peer keeps its last
+    // links opened and closed (with why), relay log lines and page events
+    // (hidden, offline, ...), and stores them in the room's storage under
+    // pp-diag:<peer id>: every 30 s when something new happened, and a few
+    // seconds after it gets links back from having none. So a collapse can be
+    // read afterwards from any other peer, with nobody watching the console.
+    startDiagnostics() {
+      if (this.diagTimer) return;
+      this.diagEvents = [];
+      this.diagPublishedAt = 0;
+      this.diagLastNoteAt = 0;
+      this.diagHadLinks = false;
+      const note = (text) => this.noteDiagnostic(text);
+      document.addEventListener('visibilitychange', () => note(`[page] ${document.visibilityState}`));
+      window.addEventListener('online', () => note('[page] online'));
+      window.addEventListener('offline', () => note('[page] offline'));
+      window.addEventListener('focus', () => note('[page] focus'));
+      window.addEventListener('blur', () => note('[page] blur'));
+      window.addEventListener('pageshow', (e) => note(`[page] pageshow${e.persisted ? ' (from cache)' : ''}`));
+      window.addEventListener('pagehide', () => note('[page] pagehide'));
+      this.diagTimer = setInterval(() => this.diagnosticsTick(), 5_000);
+    },
+
+    noteDiagnostic(text) {
+      if (!this.diagEvents) return;
+      this.diagEvents.push(`${new Date().toISOString().slice(11, 23)} ${String(text).slice(0, 200)}`);
+      if (this.diagEvents.length > 60) this.diagEvents.splice(0, this.diagEvents.length - 60);
+      this.diagLastNoteAt = Date.now();
+    },
+
+    async diagnosticsTick() {
+      const mesh = this.mesh;
+      if (!mesh?.getLinkLog) return;
+      const links = mesh.getConnectedPeers().length;
+      const recovered = links > 0 && this.diagHadLinks === false && this.diagPublishedAt > 0;
+      if (links === 0 && this.diagHadLinks) this.noteDiagnostic('[mesh] no links');
+      this.diagHadLinks = links > 0;
+      const log = mesh.getLinkLog();
+      const newest = Math.max(this.diagLastNoteAt || 0, log.length ? log[log.length - 1].at : 0);
+      const due = recovered || (newest > this.diagPublishedAt && Date.now() - this.diagPublishedAt >= 30_000);
+      if (!due || links === 0) return;
+      try {
+        if (!this.storageReady || !this.storage) await this.ensureStorageReady({ fastPath: true });
+        if (!this.storage) return;
+        const peerId = String(mesh.getClientId?.() || mesh.clientId || '');
+        if (!peerId) return;
+        const ua = navigator.userAgent;
+        const browser = /Firefox\//.test(ua) ? 'Firefox' : /Edg\//.test(ua) ? 'Edge' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'other';
+        await this.storage.put('public', `pp-diag:${peerId}`, {
+          peer: peerId,
+          browser,
+          at: Date.now(),
+          visible: document.visibilityState,
+          relay: String(mesh.signalingClient?.currentSignalUrl || ''),
+          links,
+          // [time, peer, up/down, local/remote, reason, links after]
+          linkLog: log.slice(-80).map((e) => [new Date(e.at).toISOString().slice(11, 23), e.peer.slice(0, 8), e.event, e.by, e.reason, e.links]),
+          events: this.diagEvents.slice(-60),
+        });
+        this.diagPublishedAt = Date.now();
+      } catch {
+        // best effort; next tick tries again
+      }
+    },
+
     async ensureStorageReady(options = {}) {
       const fastPath = options && options.fastPath === true;
       if (this.shouldDeferStorageInit()) {
@@ -2195,7 +2261,10 @@ export default {
         window.__peerpigeon = this.mesh;
         this.mesh.on('signaling:log', (event) => {
           const text = String(event?.message ?? '');
-          if (/\[signal\]|\[relay\]/.test(text)) console.info(text);
+          if (/\[signal\]|\[relay\]/.test(text)) {
+            console.info(text);
+            this.noteDiagnostic(text);
+          }
         });
 
         this.gossip = new GossipProtocol(this.mesh);

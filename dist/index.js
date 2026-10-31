@@ -4738,6 +4738,7 @@ var NEGOTIATION_OFFER_DEADLINE_MS = 2e4;
 var MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1e3;
 var DISCOVERY_REFRESH_MIN_MS = 2e3;
 var DISCOVERY_REFRESH_MAX_MS = 5 * 6e4;
+var LINK_LOG_MAX = 200;
 function directRelaySupported() {
   if (typeof navigator === "undefined" || typeof navigator.userAgent !== "string") return true;
   const ua = navigator.userAgent;
@@ -4976,6 +4977,9 @@ var PartialMesh = class {
     /** First local observation of FreeRTC negotiations not tracked by PartialMesh. */
     this.orphanRtcFirstSeenAtMs = /* @__PURE__ */ new Map();
     this.peerConnectedAtMs = /* @__PURE__ */ new Map();
+    // Every link that opened or closed, with why it closed: the last
+    // LINK_LOG_MAX, newest last. See getLinkLog().
+    this.linkLog = [];
     this.discoveredAtMs = /* @__PURE__ */ new Map();
     /** Peers present in the relay's latest un-graced discovery snapshot. */
     this.activeSignalingPeers = /* @__PURE__ */ new Set();
@@ -5953,6 +5957,7 @@ var PartialMesh = class {
         this.bridgeGraceUntilMs.set(peerId, Date.now() + BRIDGE_GRACE_MS);
       }
       this.noteLocalCapacityChanged();
+      this.noteLink(peerId, "up", "local", "connected");
       this.emit("peer:connected", peerId);
       const rebalanceDropPeerId = this.pendingRebalanceDropByTarget.get(peerId);
       if (rebalanceDropPeerId) {
@@ -5997,6 +6002,7 @@ var PartialMesh = class {
           this.fillBackoffUntilMs = Date.now() + this.fillBackoffMs;
         }
         if (wasConnected) {
+          this.noteLink(peerId, "down", "remote", data.reason || "unknown");
           this.noteTransportDisconnect(peerId, connectedAt, data.reason);
           this.noteLocalCapacityChanged();
           this.emit("peer:disconnected", peerId);
@@ -6315,6 +6321,14 @@ var PartialMesh = class {
       this.dialFailureCount.delete(peerId);
     }
   }
+  noteLink(peerId, event, by, reason) {
+    this.linkLog.push({ at: Date.now(), peer: peerId, event, by, reason, links: this.getConnectedPeers().length });
+    if (this.linkLog.length > LINK_LOG_MAX) this.linkLog.splice(0, this.linkLog.length - LINK_LOG_MAX);
+  }
+  /** The last links that opened or closed, newest last: when, which peer, and why it closed. */
+  getLinkLog() {
+    return this.linkLog.map((entry) => ({ ...entry }));
+  }
   noteTransportDisconnect(peerId, connectedAt, reason) {
     if (reason === "local_close" || reason === "capacity_shed") return;
     const connectedForMs = connectedAt > 0 ? Date.now() - connectedAt : 0;
@@ -6588,6 +6602,7 @@ var PartialMesh = class {
         this.discoveredPeers.delete(peerId);
       }
       if (wasConnected) {
+        this.noteLink(peerId, "down", "local", reason);
         this.noteLocalCapacityChanged();
         this.emit("peer:disconnected", peerId);
         this.broadcastMembership();
@@ -7416,6 +7431,9 @@ var PeerPigeonNode = class {
   }
   getConnectedPeers() {
     return this.mesh.getConnectedPeers();
+  }
+  getLinkLog() {
+    return this.mesh.getLinkLog();
   }
   getDiscoveredPeers() {
     return this.mesh.getDiscoveredPeers();
