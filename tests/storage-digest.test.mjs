@@ -209,3 +209,19 @@ test('a Get with a local copy answers at once, and a newer value arrives as a ch
     await close();
   }
 });
+
+test('a Get with no local copy asks again when the first answer is lost', async () => {
+  const { b, storageA, storageB, close } = await pair();
+  try {
+    await storageA.put('public', 'far-key', 'v1', { silent: true });
+    const realBroadcast = b.broadcast;
+    let dropped = 0;
+    b.broadcast = (data) => (dropped++ === 0 ? 'lost' : realBroadcast(data));
+    const started = Date.now();
+    const got = await storageB.retrieve('public', 'far-key', { timeoutMs: 5000 });
+    assert.equal(got?.value, 'v1');
+    assert.ok(Date.now() - started < 2500, `took ${Date.now() - started} ms`);
+  } finally {
+    await close();
+  }
+});

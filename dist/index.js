@@ -3216,7 +3216,8 @@ var IndexedDbStorageDriver = class _IndexedDbStorageDriver {
     });
   }
 };
-var RETRIEVE_ANSWER_MIN_INTERVAL_MS = 1e4;
+var RETRIEVE_ANSWER_MIN_INTERVAL_MS = 1e3;
+var RETRIEVE_RETRY_MS = 1200;
 var DIGEST_MAX_ENTRIES = 4e3;
 var DIGEST_MAX_PUSHES = 1e3;
 var PeerPigeonStorage = class {
@@ -3384,13 +3385,27 @@ var PeerPigeonStorage = class {
       const timeout = setTimeout(async () => {
         this.pendingRetrieveRequests.delete(reqId);
         const latest = await this.get(space, normalizedKey);
-        resolve(latest);
+        done(latest);
       }, timeoutMs);
+      let retry = null;
+      const done = (value) => {
+        if (retry) clearInterval(retry);
+        resolve(value);
+      };
       this.pendingRetrieveRequests.set(reqId, {
-        resolve: (value) => resolve(value),
+        resolve: (value) => done(value),
         timeout
       });
       await this.broadcastSyncPayload(request);
+      retry = setInterval(() => {
+        if (!this.pendingRetrieveRequests.has(reqId)) {
+          if (retry) clearInterval(retry);
+          return;
+        }
+        void this.broadcastSyncPayload({ ...request, timestamp: Date.now() }).catch(() => {
+        });
+      }, RETRIEVE_RETRY_MS);
+      retry.unref?.();
     });
   }
   async delete(space, key) {

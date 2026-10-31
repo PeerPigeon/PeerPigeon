@@ -310,7 +310,12 @@ class IndexedDbStorageDriver implements StorageDriver {
  * - epublic is internal-only and can only be mutated through putSystem/deleteSystem
  */
 // A holder answers the same asker about the same key at most this often.
-const RETRIEVE_ANSWER_MIN_INTERVAL_MS = 10_000;
+// Answers now go to the asker alone (sendDirect), not the room, so a short
+// interval is enough to stop one asker's repeats from costing each holder.
+const RETRIEVE_ANSWER_MIN_INTERVAL_MS = 1_000;
+// With no local copy, ask again this often until answered: a routed answer
+// can be lost on the way.
+const RETRIEVE_RETRY_MS = 1_200;
 // Bounds on a connect-time digest and on what one digest may push back.
 const DIGEST_MAX_ENTRIES = 4_000;
 const DIGEST_MAX_PUSHES = 1_000;
@@ -529,15 +534,25 @@ export class PeerPigeonStorage {
       const timeout = setTimeout(async () => {
         this.pendingRetrieveRequests.delete(reqId);
         const latest = await this.get<T>(space, normalizedKey);
-        resolve(latest);
+        done(latest);
       }, timeoutMs);
 
+      let retry: ReturnType<typeof setInterval> | null = null;
+      const done = (value: StorageRecord<T> | null) => {
+        if (retry) clearInterval(retry);
+        resolve(value);
+      };
       this.pendingRetrieveRequests.set(reqId, {
-        resolve: (value) => resolve(value as StorageRecord<T> | null),
+        resolve: (value) => done(value as StorageRecord<T> | null),
         timeout,
       });
 
       await this.broadcastSyncPayload(request);
+      retry = setInterval(() => {
+        if (!this.pendingRetrieveRequests.has(reqId)) { if (retry) clearInterval(retry); return; }
+        void this.broadcastSyncPayload({ ...request, timestamp: Date.now() }).catch(() => {});
+      }, RETRIEVE_RETRY_MS);
+      (retry as { unref?: () => void }).unref?.();
     });
   }
 
