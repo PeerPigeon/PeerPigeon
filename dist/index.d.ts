@@ -1047,6 +1047,8 @@ interface PartialMeshConfig {
      * use only the bootstrap's registry.
      */
     relayDirectory?: string | false;
+    /** Write PeerPigeon's own console messages (hard resets, errors thrown by event handlers). Off by default. */
+    debug?: boolean;
     /**
      * FreeRTC network/application namespace. Peers must match both networkId and
      * sessionId (room) even when they use different federated relay domains.

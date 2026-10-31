@@ -1163,8 +1163,10 @@ export default {
       this.saveUiState();
     },
     diagnosticLoggingEnabled(on) {
-      // Turned off: drop what was recorded, so nothing is kept or rendered.
+      // Turned off: drop what was recorded, so nothing is kept or rendered,
+      // and PeerPigeon writes nothing to the console either.
       if (!on) this.diagnosticLogBuffer = [];
+      if (this.mesh?.config) this.mesh.config.debug = on === true;
       this.saveUiState();
     },
     activeTab(nextTab) {
@@ -2270,7 +2272,8 @@ export default {
           autoConnect: true,
           // Fallback watchdog for environments that never surface transport
           // failure events; initial and replacement dials are still immediate.
-          underConnectedResetMs: 20_000
+          underConnectedResetMs: 20_000,
+          debug: this.diagnosticLoggingEnabled === true,
         });
 
         // For debugging from the console: the mesh, and its relay log.
@@ -2278,7 +2281,8 @@ export default {
         this.mesh.on('signaling:log', (event) => {
           const text = String(event?.message ?? '');
           if (/\[signal\]|\[relay\]/.test(text)) {
-            console.info(text);
+            // The console stays quiet unless Diagnostics is on.
+            if (this.diagnosticLoggingEnabled) console.info(text);
             this.noteDiagnostic(text);
           }
         });
@@ -2462,7 +2466,7 @@ export default {
 
         this.startSignalingWatchdog();
       } catch (error) {
-        console.error('Failed to start mesh:', error);
+        if (this.diagnosticLoggingEnabled) console.error('Failed to start mesh:', error);
         this.showStatus('Error', error.message || String(error), 'error');
         this.isRunning = false;
         this.isConnecting = false;
@@ -4074,7 +4078,7 @@ export default {
         && !isInternalChatText(entry.text);
       const diagnosticEntry = (entry.type !== 'sent' && entry.type !== 'received') || entry.system;
 
-      if (import.meta.env.DEV && type !== 'info') {
+      if (import.meta.env.DEV && this.diagnosticLoggingEnabled && type !== 'info') {
         // Mirror all app logs to browser console for rapid debugging.
         // eslint-disable-next-line no-console
         console.log(`[mesh:${type}] ${sender} ${text}`);

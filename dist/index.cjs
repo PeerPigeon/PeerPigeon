@@ -5149,6 +5149,7 @@ var PartialMesh = class {
       signalingServers,
       automaticSignalingServer,
       relayDirectory: config.relayDirectory ?? import_client2.DEFAULT_DIRECTORY_NAME,
+      debug: config.debug === true,
       networkId: config.networkId ?? config.sessionId ?? "peerpigeon",
       sessionId: config.sessionId ?? "default-session",
       autoDiscover: config.autoDiscover ?? true,
@@ -6502,7 +6503,7 @@ var PartialMesh = class {
       }
     }
     try {
-      console.warn(`[PartialMesh] hardReset(${reason}) clientId=${this.clientId ?? ""} discovered=${this.discoveredPeers.size}`);
+      if (this.config.debug) console.warn(`[PartialMesh] hardReset(${reason}) clientId=${this.clientId ?? ""} discovered=${this.discoveredPeers.size}`);
     } catch {
     }
   }
@@ -7002,7 +7003,7 @@ var PartialMesh = class {
         try {
           handler(...args);
         } catch (err) {
-          console.error(`Error in event handler for ${event}:`, err);
+          if (this.config.debug) console.error(`Error in event handler for ${event}:`, err);
         }
       });
     }

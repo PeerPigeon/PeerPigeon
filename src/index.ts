@@ -523,6 +523,8 @@ export interface PartialMeshConfig {
    * use only the bootstrap's registry.
    */
   relayDirectory?: string | false;
+  /** Write PeerPigeon's own console messages (hard resets, errors thrown by event handlers). Off by default. */
+  debug?: boolean;
 
   /**
    * FreeRTC network/application namespace. Peers must match both networkId and
@@ -789,6 +791,7 @@ export class PartialMesh {
       signalingServers,
       automaticSignalingServer,
       relayDirectory: config.relayDirectory ?? DEFAULT_DIRECTORY_NAME,
+      debug: config.debug === true,
       networkId: config.networkId ?? config.sessionId ?? 'peerpigeon',
       sessionId: config.sessionId ?? 'default-session',
       autoDiscover: config.autoDiscover ?? true,
@@ -2573,10 +2576,10 @@ export class PartialMesh {
       }
     }
 
-    // Best-effort debug signal.
+    // Best-effort debug signal (config.debug).
     try {
       // eslint-disable-next-line no-console
-      console.warn(`[PartialMesh] hardReset(${reason}) clientId=${this.clientId ?? ''} discovered=${this.discoveredPeers.size}`);
+      if (this.config.debug) console.warn(`[PartialMesh] hardReset(${reason}) clientId=${this.clientId ?? ''} discovered=${this.discoveredPeers.size}`);
     } catch {
       // ignore
     }
@@ -3256,7 +3259,7 @@ export class PartialMesh {
         try {
           (handler as any)(...args);
         } catch (err) {
-          console.error(`Error in event handler for ${event}:`, err);
+          if (this.config.debug) console.error(`Error in event handler for ${event}:`, err);
         }
       });
     }
