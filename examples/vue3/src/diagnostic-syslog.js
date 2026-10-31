@@ -23,8 +23,11 @@ export function appendBoundedLogEntry(entries, entry, maximumEntries) {
   if (limit === 0) return entries;
 
   entries.push(entry);
-  const overflow = entries.length - limit;
-  if (overflow > 0) entries.splice(0, overflow);
+  // Trim in batches: removing one entry from the front of a large reactive
+  // array touches every index, on every new line. Let it run up to a tenth
+  // over, then drop back to the limit in one splice.
+  const slack = limit >= 100 ? Math.floor(limit / 10) : 0;
+  if (entries.length > limit + slack) entries.splice(0, entries.length - limit);
   return entries;
 }
 

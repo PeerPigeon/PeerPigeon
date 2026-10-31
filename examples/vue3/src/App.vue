@@ -482,7 +482,7 @@
             @keydown="handleDiagnosticScrollKey"
             @pointerdown="handleDiagnosticPointerDown"
           >
-            <div v-for="(entry, idx) in diagnosticMessages" :key="`diag-${idx}`" class="log-line">
+            <div v-for="(entry, idx) in diagnosticShown" :key="entry.seq ?? `diag-${idx}`" class="log-line">
               <span class="log-time">{{ formatTime(entry.timestamp) }}</span>
               <span class="log-from">{{ entry.sender }}</span>
               <span class="log-text">{{ entry.text }}<span v-if="entry.duplicateCount > 1" class="log-repeat" :aria-label="`${entry.duplicateCount} occurrences`"> ×{{ entry.duplicateCount }}</span></span>
@@ -600,6 +600,8 @@ const NO_LINKS_GRACE_MS = 10000;
  * from membership before they could count; joining peers reach us well within it.
  */
 const CUT_OFF_GRACE_MS = 35000;
+// Diagnostic lines rendered in the page (the buffer keeps more).
+const DIAGNOSTIC_RENDER_LIMIT = 300;
 
 const APP_ICONS = Object.freeze({
   state: faCircle,
@@ -1069,6 +1071,14 @@ export default {
     messageLog() {
       return [...this.chatLogBuffer, ...this.diagnosticLogBuffer]
         .sort((left, right) => Number(left?.timestamp || 0) - Number(right?.timestamp || 0));
+    },
+    // Only the newest lines go in the page. All 5,000 were re-rendered on
+    // every new line (keyed by position, so every key changed once the
+    // buffer was full), which kept the main thread busy and grew message
+    // latency as the buffer filled.
+    diagnosticShown() {
+      const all = this.diagnosticMessages;
+      return all.length > DIAGNOSTIC_RENDER_LIMIT ? all.slice(-DIAGNOSTIC_RENDER_LIMIT) : all;
     },
     diagnosticMessages() {
       const visibleEntries = this.diagnosticLogBuffer.filter((entry) => {
@@ -4070,6 +4080,7 @@ export default {
         appendBoundedLogEntry(this.chatLogBuffer, entry, CHAT_LOG_BUFFER_LIMIT);
         if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
       } else if (diagnosticEntry && this.diagnosticLoggingEnabled) {
+        entry.seq = (this.diagnosticSeq = (this.diagnosticSeq || 0) + 1);
         appendBoundedLogEntry(this.diagnosticLogBuffer, entry, DIAGNOSTIC_LOG_BUFFER_LIMIT);
         this.scheduleDiagnosticScroll();
       }

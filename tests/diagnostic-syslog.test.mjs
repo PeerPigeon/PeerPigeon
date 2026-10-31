@@ -24,6 +24,12 @@ test('chat and diagnostics use independent bounded buffers', () => {
   appendBoundedLogEntry(entries, 'two', 2);
   appendBoundedLogEntry(entries, 'three', 2);
   assert.deepEqual(entries, ['two', 'three']);
+  const big = [];
+  for (let i = 0; i < 1105; i += 1) appendBoundedLogEntry(big, i, 1000);
+  assert.ok(big.length <= 1100, 'never more than a tenth over');
+  assert.equal(big[big.length - 1], 1104, 'the newest is kept');
+  appendBoundedLogEntry(big, 'x', 1000);
+  assert.ok(big.length <= 1100);
 });
 
 test('diagnostic verbosity uses the complete RFC syslog severity ladder', () => {
