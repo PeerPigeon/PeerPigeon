@@ -675,6 +675,36 @@ test('a saturated component preserves a new cross-component bridge and sheds a r
   }
 });
 
+test('a full peer sheds a well-linked neighbour, not one that just dialled in from no links', () => {
+  const self = '0'.repeat(64);
+  const rich = ['1', '2', '3'].map((c) => c.repeat(64));
+  const newcomer = 'e'.repeat(64);
+  const closed = [];
+  const mesh = new PartialMesh({ minPeers: 2, maxPeers: 3, tolerantPeers: 1, autoDiscover: false, autoConnect: false });
+  try {
+    mesh.clientId = self;
+    mesh.selfAliases.add(self);
+    const now = Date.now();
+    rich.forEach((peerId, i) => {
+      mesh.peers.set(peerId, { id: peerId, connected: true, initiator: false });
+      mesh.peerConnectedAtMs.set(peerId, now - 60_000 + i);
+      mesh.peerCapacityById.set(peerId, { connectedPeers: 3, maxPeers: 3, updatedAt: now });
+    });
+    // The newest link, from a peer that has not reported its count yet.
+    mesh.peers.set(newcomer, { id: newcomer, connected: true, initiator: false });
+    mesh.peerConnectedAtMs.set(newcomer, now);
+    mesh.signalingClient = { closeConnection(peerId) { closed.push(peerId); }, disconnect() {} };
+    // The well-linked neighbours are this peer's coordinate neighbours, which
+    // used to outrank everything: the newcomer was shed every time.
+    mesh.cecrCoordinateNeighbors = () => new Set(rich);
+    mesh.trimExcessPeers();
+    assert.equal(closed.length, 1);
+    assert.equal(closed.includes(newcomer), false, 'the newcomer keeps its link');
+  } finally {
+    mesh.destroy();
+  }
+});
+
 test('mesh exposes capacity, slots, graph edges, and runtime configuration', () => {
   const mesh = new PartialMesh({
     minPeers: 1,

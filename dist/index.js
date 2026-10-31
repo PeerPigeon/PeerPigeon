@@ -4739,6 +4739,7 @@ var MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1e3;
 var DISCOVERY_REFRESH_MIN_MS = 2e3;
 var DISCOVERY_REFRESH_MAX_MS = 5 * 6e4;
 var LINK_LOG_MAX = 200;
+var NEEDY_UNREPORTED_MS = 15e3;
 function directRelaySupported() {
   if (typeof navigator === "undefined" || typeof navigator.userAgent !== "string") return true;
   const ua = navigator.userAgent;
@@ -5590,8 +5591,19 @@ var PartialMesh = class {
       spare: (() => {
         const capacity = this.freshPeerCapacity(peerId);
         return capacity ? Math.max(0, capacity.connectedPeers - this.config.minPeers) : 0;
+      })(),
+      // A neighbour that would be left at or below its minimum: it reported
+      // minPeers links or fewer (this one included), or it connected just
+      // now and has not said (a peer dialling in from none). Shedding it
+      // sent it dialling the next full peer, which shed it too; a browser
+      // tab bled out to no links that way, one fresh link at a time.
+      needy: (() => {
+        const capacity = this.freshPeerCapacity(peerId);
+        if (capacity) return capacity.connectedPeers <= this.config.minPeers;
+        return now - (this.peerConnectedAtMs.get(peerId) ?? 0) < NEEDY_UNREPORTED_MS;
       })()
     })).sort((a, b) => {
+      if (a.needy !== b.needy) return a.needy ? 1 : -1;
       if (a.coordinate !== b.coordinate) return a.coordinate ? 1 : -1;
       if (a.graphBridge !== b.graphBridge) return a.graphBridge ? 1 : -1;
       if (a.cecrProtected !== b.cecrProtected) return a.cecrProtected ? 1 : -1;

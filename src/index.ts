@@ -114,6 +114,9 @@ const MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS = 1_000;
 const DISCOVERY_REFRESH_MIN_MS = 2_000;
 const DISCOVERY_REFRESH_MAX_MS = 5 * 60_000;
 const LINK_LOG_MAX = 200;
+// A link this new whose other end has not yet reported its link count is
+// treated as its only one when choosing which link to shed.
+const NEEDY_UNREPORTED_MS = 15_000;
 
 // A direct relay (freertc src/direct): webrtc-direct://<ip>:<port>/sha256/<fp>,
 // optionally ?tunnel=<its tunnel URL> for when the direct path fails.
@@ -1415,8 +1418,20 @@ export class PartialMesh {
           const capacity = this.freshPeerCapacity(peerId);
           return capacity ? Math.max(0, capacity.connectedPeers - this.config.minPeers) : 0;
         })(),
+        // A neighbour that would be left at or below its minimum: it reported
+        // minPeers links or fewer (this one included), or it connected just
+        // now and has not said (a peer dialling in from none). Shedding it
+        // sent it dialling the next full peer, which shed it too; a browser
+        // tab bled out to no links that way, one fresh link at a time.
+        needy: (() => {
+          const capacity = this.freshPeerCapacity(peerId);
+          if (capacity) return capacity.connectedPeers <= this.config.minPeers;
+          return now - (this.peerConnectedAtMs.get(peerId) ?? 0) < NEEDY_UNREPORTED_MS;
+        })(),
       }))
       .sort((a, b) => {
+        // A neighbour that cannot spare the link is kept above all else.
+        if (a.needy !== b.needy) return a.needy ? 1 : -1;
         // A coordinate neighbour is kept above all: those links are the one
         // structure that always joins every peer, so a temporary bridge gives
         // way to it rather than holding it out.
