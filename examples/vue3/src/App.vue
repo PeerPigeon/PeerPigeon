@@ -2179,6 +2179,13 @@ export default {
           underConnectedResetMs: 20_000
         });
 
+        // For debugging from the console: the mesh, and its relay log.
+        window.__peerpigeon = this.mesh;
+        this.mesh.on('signaling:log', (event) => {
+          const text = String(event?.message ?? '');
+          if (/\[signal\]|\[relay\]/.test(text)) console.info(text);
+        });
+
         this.gossip = new GossipProtocol(this.mesh);
 
         this.cryptoProtocol = new PeerPigeonCryptoProtocol(this.mesh, this.gossip, {

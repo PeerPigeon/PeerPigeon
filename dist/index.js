@@ -2901,6 +2901,10 @@ async function virtualIds(nodeId, count = RELAY_VIRTUAL_IDS) {
 function nearest(ids, target) {
   return ids.reduce((best, id) => compareDistance(id, best, target) < 0 ? id : best);
 }
+var FAILURE_HALF_LIFE_MS = 10 * 6e4;
+function failureFade(ageMs) {
+  return ageMs <= 0 ? 1 : 0.5 ** (ageMs / FAILURE_HALF_LIFE_MS);
+}
 function failureRate(m) {
   if (!m || m.attempts <= 0) return 0;
   return Math.min(1, m.failures / m.attempts);
@@ -2967,8 +2971,8 @@ function freshMeasurement(m, now) {
   if (!value || typeof value !== "object") return null;
   const at = Number(value.at);
   if (!Number.isFinite(at) || now - at > SCORE_MAX_AGE_MS || at > now + 6e4) return null;
-  const attempts = Math.max(0, Math.min(1e6, Math.floor(Number(value.attempts) || 0)));
-  const failures = Math.max(0, Math.min(attempts, Math.floor(Number(value.failures) || 0)));
+  const attempts = Math.max(0, Math.min(1e6, Number(value.attempts) || 0));
+  const failures = Math.max(0, Math.min(attempts, Number(value.failures) || 0));
   const joinMs = value.joinMs === null || value.joinMs === void 0 ? null : Number(value.joinMs);
   return {
     joinMs: joinMs !== null && Number.isFinite(joinMs) && joinMs >= 0 ? Math.min(6e4, joinMs) : null,
@@ -3009,6 +3013,11 @@ var RelayScoreBook = class _RelayScoreBook {
     if (!NODE_ID_RE.test(nodeId)) return;
     const entry = this.entry(nodeId);
     const own = entry.own ?? { joinMs: null, attempts: 0, failures: 0, at: 0 };
+    if (own.at > 0) {
+      const fade = failureFade(this.now() - own.at);
+      own.attempts *= fade;
+      own.failures *= fade;
+    }
     own.attempts += 1;
     if (!result.ok) own.failures += 1;
     const joinMs = Number(result.joinMs);
@@ -3056,8 +3065,9 @@ var RelayScoreBook = class _RelayScoreBook {
     let joinWeight = 0;
     let at = 0;
     for (const { m, weight } of parts) {
+      const fade = failureFade(now - m.at);
       attempts += m.attempts * weight;
-      failures += m.failures * weight;
+      failures += m.failures * weight * fade;
       if (m.joinMs !== null) {
         joinSum += m.joinMs * weight;
         joinWeight += weight;

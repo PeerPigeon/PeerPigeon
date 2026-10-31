@@ -88,6 +88,12 @@ function nearest(ids: Uint8Array[], target: Uint8Array): Uint8Array {
   return ids.reduce((best, id) => (compareDistance(id, best, target) < 0 ? id : best));
 }
 
+/** Failures count half after FAILURE_HALF_LIFE_MS, a quarter after twice that, and so on. */
+const FAILURE_HALF_LIFE_MS = 10 * 60_000;
+export function failureFade(ageMs: number): number {
+  return ageMs <= 0 ? 1 : 0.5 ** (ageMs / FAILURE_HALF_LIFE_MS);
+}
+
 export function failureRate(m: RelayMeasurement | null | undefined): number {
   if (!m || m.attempts <= 0) return 0;
   return Math.min(1, m.failures / m.attempts);
@@ -201,8 +207,8 @@ function freshMeasurement(m: unknown, now: number): RelayMeasurement | null {
   if (!value || typeof value !== 'object') return null;
   const at = Number(value.at);
   if (!Number.isFinite(at) || now - at > SCORE_MAX_AGE_MS || at > now + 60_000) return null;
-  const attempts = Math.max(0, Math.min(1_000_000, Math.floor(Number(value.attempts) || 0)));
-  const failures = Math.max(0, Math.min(attempts, Math.floor(Number(value.failures) || 0)));
+  const attempts = Math.max(0, Math.min(1_000_000, Number(value.attempts) || 0));
+  const failures = Math.max(0, Math.min(attempts, Number(value.failures) || 0));
   const joinMs = value.joinMs === null || value.joinMs === undefined ? null : Number(value.joinMs);
   return {
     joinMs: joinMs !== null && Number.isFinite(joinMs) && joinMs >= 0 ? Math.min(60_000, joinMs) : null,
@@ -255,6 +261,11 @@ export class RelayScoreBook {
     if (!NODE_ID_RE.test(nodeId)) return;
     const entry = this.entry(nodeId);
     const own = entry.own ?? { joinMs: null, attempts: 0, failures: 0, at: 0 };
+    if (own.at > 0) {
+      const fade = failureFade(this.now() - own.at);
+      own.attempts *= fade;
+      own.failures *= fade;
+    }
     own.attempts += 1;
     if (!result.ok) own.failures += 1;
     const joinMs = Number(result.joinMs);
@@ -304,8 +315,11 @@ export class RelayScoreBook {
     let joinWeight = 0;
     let at = 0;
     for (const { m, weight } of parts) {
+      // Old failures fade: a relay that was down earlier (restarted, asleep)
+      // is judged by how it does now, not held below every other relay.
+      const fade = failureFade(now - m.at);
       attempts += m.attempts * weight;
-      failures += m.failures * weight;
+      failures += m.failures * weight * fade;
       if (m.joinMs !== null) { joinSum += m.joinMs * weight; joinWeight += weight; }
       at = Math.max(at, m.at);
     }
