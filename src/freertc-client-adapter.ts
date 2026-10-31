@@ -91,7 +91,7 @@ class Emitter {
  * negotiation, keepalive, and reconnect behavior come from freertc/client.
  */
 export class FreeRTCClientAdapter {
-  private readonly signalUrls: readonly string[];
+  private signalUrls: string[];
   private readonly networkId: string;
   private readonly roomId: string;
   private readonly requestedPeerId: string;
@@ -205,6 +205,28 @@ export class FreeRTCClientAdapter {
 
   on(event: string, handler: Handler): void {
     this.emitter.on(event, handler);
+  }
+
+  /** The relay this peer signals through now. */
+  get currentSignalUrl(): string {
+    return this.activeSignalUrl;
+  }
+
+  /**
+   * Signal through another relay from now on (it goes first in the list).
+   * Open peer channels stay up; only the signaling connection moves.
+   */
+  switchSignalUrl(signalUrl: string, reason = 'relay_switch'): boolean {
+    const url = String(signalUrl || '').trim();
+    if (!url || url === this.activeSignalUrl) return false;
+    this.signalUrls = [url, ...this.signalUrls.filter((existing) => existing !== url)];
+    this.activeSignalIndex = 0;
+    this.emitter.emit('signaling:log', { message: `[signal] ${reason}: moving signaling to ${url}` });
+    if (this.client && typeof this.client.switchRelay === 'function') {
+      this.ensureRegistrationRecoveryProbe('relay switch');
+      this.client.switchRelay(url, reason);
+    }
+    return true;
   }
 
   private get activeSignalUrl(): string {
@@ -984,6 +1006,27 @@ export class FreeRTCClientAdapter {
       });
       this.emitter.emit('relay:failed', { signalUrl: previousSignalUrl, reason });
       this.connect();
+      return;
+    }
+
+    // With open peer channels, move to the next relay instead of retrying a
+    // dead one forever: signaling moves, the channels stay up. A local relay
+    // that comes back is returned to by PartialMesh's directory check.
+    if (this.signalUrls.length > 1 && typeof this.client.switchRelay === 'function') {
+      const previousSignalUrl = this.activeSignalUrl;
+      this.activeSignalIndex = (this.activeSignalIndex + 1) % this.signalUrls.length;
+      this.waitingForTransportClose = false;
+      this.emitter.emit('signaling:log', {
+        message: `[signal] ${reason}: ${previousSignalUrl} did not acknowledge; moving to ${this.activeSignalUrl} and keeping peer channels`,
+      });
+      this.emitter.emit('relay:failed', { signalUrl: previousSignalUrl, reason });
+      try {
+        this.ensureRegistrationRecoveryProbe('relay switch');
+        this.client.switchRelay(this.activeSignalUrl, reason);
+      } catch (error) {
+        this.emitter.emit('error', error);
+      }
+      this.recyclingSignalingTransport = false;
       return;
     }
 

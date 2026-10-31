@@ -1,4 +1,4 @@
-import { isDirectRelayUrl, lookupDirectRelays, DEFAULT_DIRECTORY_NAME } from 'freertc/client';
+import { isDirectRelayUrl, lookupDirectRelays, directRelayChannel, DEFAULT_DIRECTORY_NAME } from 'freertc/client';
 import FreeRTCClientAdapter, { type MeshSignaling } from './freertc-client-adapter.js';
 
 /** Payload type of a signaling envelope carried inside a gossip direct frame. */
@@ -39,6 +39,8 @@ import type {
 // How long a merged membership update waits to be forwarded, so updates arriving together go out as one frame.
 // A free slot is not refilled from a peer that just shed our link (it was full):
 // wait 15 s, doubling to 2 min, before filling again.
+// How often a peer not on a local relay checks the DNS directory for one.
+const LOCAL_RELAY_CHECK_MS = 60_000;
 const FILL_REFUSED_WINDOW_MS = 60_000;
 const FILL_BACKOFF_MIN_MS = 15_000;
 const FILL_BACKOFF_MAX_MS = 120_000;
@@ -675,6 +677,8 @@ export class PartialMesh {
   /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
   private peerCapacityById: Map<string, PeerCapacityAdvertisement> = new Map();
   private fillBackoffMs = 0;
+  private localRelayTimer: ReturnType<typeof setInterval> | null = null;
+  private localRelayCheckRunning = false;
   private fillBackoffUntilMs = 0;
   /** Relayed adjacency snapshots used to reconstruct the known network graph. */
   private peerTopologyById: Map<string, PeerTopologyAdvertisement> = new Map();
@@ -1249,6 +1253,55 @@ export class PartialMesh {
     return bridgePeerIds;
   }
 
+  /**
+   * A peer prefers a local relay (one in the DNS relay directory, reached
+   * directly). While it signals through any other relay it looks the
+   * directory up again every LOCAL_RELAY_CHECK_MS (a DNS-over-HTTPS lookup,
+   * no relay request), and when a listed relay answers a test connection it
+   * moves its signaling there; open peer channels stay up. So a peer that
+   * fell back to a cloud relay while the local one was down goes back to it
+   * once it is up.
+   */
+  private startLocalRelayReturn(): void {
+    if (!this.config.automaticSignalingServer || this.config.relayDirectory === false) return;
+    if (typeof globalThis.RTCPeerConnection !== 'function') return;
+    if (this.localRelayTimer) clearInterval(this.localRelayTimer);
+    this.localRelayTimer = setInterval(() => { void this.returnToLocalRelay(); }, LOCAL_RELAY_CHECK_MS);
+    (this.localRelayTimer as { unref?: () => void }).unref?.();
+  }
+
+  private async returnToLocalRelay(): Promise<void> {
+    const adapter = this.signalingClient as FreeRTCClientAdapter | null;
+    if (!adapter || this.localRelayCheckRunning) return;
+    const current = adapter.currentSignalUrl;
+    if (isDirectRelayUrl(String(current).split('?')[0])) return;
+    this.localRelayCheckRunning = true;
+    try {
+      const records = await lookupDirectRelays({
+        name: this.config.relayDirectory || DEFAULT_DIRECTORY_NAME,
+        network: this.config.networkId,
+        room: this.config.sessionId,
+      });
+      for (const record of records.slice(0, 2)) {
+        const url = canonicalSignalingUrl(record.tunnel ? `${record.direct}?tunnel=${encodeURIComponent(record.tunnel)}` : record.direct);
+        if (!url) continue;
+        try {
+          const { pc } = await directRelayChannel(record.direct, { timeoutMs: 5_000 });
+          try { pc.close(); } catch { /* ignore */ }
+        } catch {
+          continue; // listed but not answering: stay where we are
+        }
+        if (record.node_id) this.relayNodeIds.set(url, record.node_id);
+        adapter.switchSignalUrl(url, 'local relay is reachable');
+        return;
+      }
+    } catch {
+      // No directory answer: try again next time.
+    } finally {
+      this.localRelayCheckRunning = false;
+    }
+  }
+
   private trimExcessPeers(): void {
     const connectedPeers = this.getConnectedPeers();
     // maxPeers is the steady-state target. tolerantPeers must never increase
@@ -1657,6 +1710,8 @@ export class PartialMesh {
         },
       },
     });
+
+    this.startLocalRelayReturn();
 
     // Set up signaling event handlers
     this.relayAttemptStartedAt = Date.now();
@@ -3508,6 +3563,10 @@ export class PartialMesh {
    * the process should wait that long.
    */
   public destroy(): number {
+    if (this.localRelayTimer) {
+      clearInterval(this.localRelayTimer);
+      this.localRelayTimer = null;
+    }
     if (this.maintenanceTimer) {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;

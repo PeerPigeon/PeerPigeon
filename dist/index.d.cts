@@ -1230,6 +1230,8 @@ declare class PartialMesh {
     /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
     private peerCapacityById;
     private fillBackoffMs;
+    private localRelayTimer;
+    private localRelayCheckRunning;
     private fillBackoffUntilMs;
     /** Relayed adjacency snapshots used to reconstruct the known network graph. */
     private peerTopologyById;
@@ -1276,6 +1278,17 @@ declare class PartialMesh {
     private compareDialCandidates;
     /** Direct neighbors whose local edge is the only known path to part of the mesh. */
     private localBridgeConnectedPeerIds;
+    /**
+     * A peer prefers a local relay (one in the DNS relay directory, reached
+     * directly). While it signals through any other relay it looks the
+     * directory up again every LOCAL_RELAY_CHECK_MS (a DNS-over-HTTPS lookup,
+     * no relay request), and when a listed relay answers a test connection it
+     * moves its signaling there; open peer channels stay up. So a peer that
+     * fell back to a cloud relay while the local one was down goes back to it
+     * once it is up.
+     */
+    private startLocalRelayReturn;
+    private returnToLocalRelay;
     private trimExcessPeers;
     private getOldestPendingAgeMs;
     private isHexId;

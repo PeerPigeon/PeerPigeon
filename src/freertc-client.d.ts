@@ -10,4 +10,5 @@ declare module 'freertc/client' {
     fetchImpl?: typeof fetch;
   }): Promise<Array<{ node_id: string; direct: string; tunnel: string | null; capacity: number; name: string | null }>>;
   export const DEFAULT_DIRECTORY_NAME: string;
+  export function directRelayChannel(url: string, options?: { timeoutMs?: number; PeerConnection?: any; label?: string }): Promise<{ pc: any; channel: any }>;
 }

@@ -168,6 +168,26 @@ var FreeRTCClientAdapter = class {
   on(event, handler) {
     this.emitter.on(event, handler);
   }
+  /** The relay this peer signals through now. */
+  get currentSignalUrl() {
+    return this.activeSignalUrl;
+  }
+  /**
+   * Signal through another relay from now on (it goes first in the list).
+   * Open peer channels stay up; only the signaling connection moves.
+   */
+  switchSignalUrl(signalUrl, reason = "relay_switch") {
+    const url = String(signalUrl || "").trim();
+    if (!url || url === this.activeSignalUrl) return false;
+    this.signalUrls = [url, ...this.signalUrls.filter((existing) => existing !== url)];
+    this.activeSignalIndex = 0;
+    this.emitter.emit("signaling:log", { message: `[signal] ${reason}: moving signaling to ${url}` });
+    if (this.client && typeof this.client.switchRelay === "function") {
+      this.ensureRegistrationRecoveryProbe("relay switch");
+      this.client.switchRelay(url, reason);
+    }
+    return true;
+  }
   get activeSignalUrl() {
     return this.signalUrls[this.activeSignalIndex % this.signalUrls.length];
   }
@@ -842,6 +862,23 @@ var FreeRTCClientAdapter = class {
       });
       this.emitter.emit("relay:failed", { signalUrl: previousSignalUrl, reason });
       this.connect();
+      return;
+    }
+    if (this.signalUrls.length > 1 && typeof this.client.switchRelay === "function") {
+      const previousSignalUrl = this.activeSignalUrl;
+      this.activeSignalIndex = (this.activeSignalIndex + 1) % this.signalUrls.length;
+      this.waitingForTransportClose = false;
+      this.emitter.emit("signaling:log", {
+        message: `[signal] ${reason}: ${previousSignalUrl} did not acknowledge; moving to ${this.activeSignalUrl} and keeping peer channels`
+      });
+      this.emitter.emit("relay:failed", { signalUrl: previousSignalUrl, reason });
+      try {
+        this.ensureRegistrationRecoveryProbe("relay switch");
+        this.client.switchRelay(this.activeSignalUrl, reason);
+      } catch (error) {
+        this.emitter.emit("error", error);
+      }
+      this.recyclingSignalingTransport = false;
       return;
     }
     if (typeof this.client.reconnectSignaling === "function") {
@@ -4653,6 +4690,7 @@ function isMeshSignalPayload(value) {
   const candidate = value;
   return candidate.__ppType === MESH_SIGNAL_PAYLOAD_TYPE && !!candidate.envelope && typeof candidate.envelope === "object";
 }
+var LOCAL_RELAY_CHECK_MS = 6e4;
 var FILL_REFUSED_WINDOW_MS = 6e4;
 var FILL_BACKOFF_MIN_MS = 15e3;
 var FILL_BACKOFF_MAX_MS = 12e4;
@@ -4929,6 +4967,8 @@ var PartialMesh = class {
     /** Relayed per-peer capacity used to give scarce, underfilled peers priority. */
     this.peerCapacityById = /* @__PURE__ */ new Map();
     this.fillBackoffMs = 0;
+    this.localRelayTimer = null;
+    this.localRelayCheckRunning = false;
     this.fillBackoffUntilMs = 0;
     /** Relayed adjacency snapshots used to reconstruct the known network graph. */
     this.peerTopologyById = /* @__PURE__ */ new Map();
@@ -5397,6 +5437,57 @@ var PartialMesh = class {
     }
     return bridgePeerIds;
   }
+  /**
+   * A peer prefers a local relay (one in the DNS relay directory, reached
+   * directly). While it signals through any other relay it looks the
+   * directory up again every LOCAL_RELAY_CHECK_MS (a DNS-over-HTTPS lookup,
+   * no relay request), and when a listed relay answers a test connection it
+   * moves its signaling there; open peer channels stay up. So a peer that
+   * fell back to a cloud relay while the local one was down goes back to it
+   * once it is up.
+   */
+  startLocalRelayReturn() {
+    if (!this.config.automaticSignalingServer || this.config.relayDirectory === false) return;
+    if (typeof globalThis.RTCPeerConnection !== "function") return;
+    if (this.localRelayTimer) clearInterval(this.localRelayTimer);
+    this.localRelayTimer = setInterval(() => {
+      void this.returnToLocalRelay();
+    }, LOCAL_RELAY_CHECK_MS);
+    this.localRelayTimer.unref?.();
+  }
+  async returnToLocalRelay() {
+    const adapter = this.signalingClient;
+    if (!adapter || this.localRelayCheckRunning) return;
+    const current = adapter.currentSignalUrl;
+    if ((0, import_client2.isDirectRelayUrl)(String(current).split("?")[0])) return;
+    this.localRelayCheckRunning = true;
+    try {
+      const records = await (0, import_client2.lookupDirectRelays)({
+        name: this.config.relayDirectory || import_client2.DEFAULT_DIRECTORY_NAME,
+        network: this.config.networkId,
+        room: this.config.sessionId
+      });
+      for (const record of records.slice(0, 2)) {
+        const url = canonicalSignalingUrl(record.tunnel ? `${record.direct}?tunnel=${encodeURIComponent(record.tunnel)}` : record.direct);
+        if (!url) continue;
+        try {
+          const { pc } = await (0, import_client2.directRelayChannel)(record.direct, { timeoutMs: 5e3 });
+          try {
+            pc.close();
+          } catch {
+          }
+        } catch {
+          continue;
+        }
+        if (record.node_id) this.relayNodeIds.set(url, record.node_id);
+        adapter.switchSignalUrl(url, "local relay is reachable");
+        return;
+      }
+    } catch {
+    } finally {
+      this.localRelayCheckRunning = false;
+    }
+  }
   trimExcessPeers() {
     const connectedPeers = this.getConnectedPeers();
     const overflow = connectedPeers.length - this.config.maxPeers;
@@ -5698,6 +5789,7 @@ var PartialMesh = class {
         }
       }
     });
+    this.startLocalRelayReturn();
     this.relayAttemptStartedAt = Date.now();
     this.signalingClient.on("relay:failed", (data) => {
       const nodeId = this.relayNodeIds.get(String(data?.signalUrl || ""));
@@ -7075,6 +7167,10 @@ var PartialMesh = class {
    * the process should wait that long.
    */
   destroy() {
+    if (this.localRelayTimer) {
+      clearInterval(this.localRelayTimer);
+      this.localRelayTimer = null;
+    }
     if (this.maintenanceTimer) {
       clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = null;
