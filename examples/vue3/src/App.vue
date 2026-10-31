@@ -1755,7 +1755,19 @@ export default {
         }
       }
       this.storageIdentity = nextIdentity;
-      this.storageChangeUnsubscribe = this.storage.subscribe(() => {
+      this.storageChangeUnsubscribe = this.storage.subscribe((event) => {
+        // Get answers from the local copy at once; a newer value that
+        // arrives afterwards lands here, so the form shows it too.
+        if (event?.op === 'upsert' && event.record && event.space === this.storageActiveSpace) {
+          const formKey = String(this.storageFormKey || '').trim();
+          const ownerId = event.space === 'user' ? this.storageLookupUserId() : null;
+          const wireKey = formKey ? this.storageWireKey(event.space, formKey, ownerId) : null;
+          if (wireKey && wireKey === event.key) {
+            this.storageFormValue = typeof event.record.value === 'string'
+              ? event.record.value
+              : JSON.stringify(event.record.value);
+          }
+        }
         if (this.activeTab === 'storage') {
           this.refreshStorageList({ silent: true });
         }

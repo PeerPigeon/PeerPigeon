@@ -191,7 +191,7 @@ test('a silent put is stored and served on request but gossips no mutation', asy
   }
 });
 
-test('a Get with a local copy does not wait out the timeout when nobody answers', async () => {
+test('a Get with a local copy answers at once, and a newer value arrives as a change', async () => {
   const { a, storageA, storageB, close } = await pair();
   try {
     await storageA.put('public', 'shared-key', 'v1');
@@ -204,7 +204,7 @@ test('a Get with a local copy does not wait out the timeout when nobody answers'
     const started = Date.now();
     const again = await storageB.retrieve('public', 'shared-key', { timeoutMs: 3000 });
     assert.equal(again?.value, 'v1');
-    assert.ok(Date.now() - started < 500, `took ${Date.now() - started} ms`);
+    assert.ok(Date.now() - started < 100, `took ${Date.now() - started} ms`);
   } finally {
     await close();
   }
