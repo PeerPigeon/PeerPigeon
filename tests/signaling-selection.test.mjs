@@ -266,6 +266,16 @@ test('direct relays from the DNS directory come first, and a relay listed both w
   assert.equal(relays[0].nodeId, identity.nodeId);
   assert.equal(relays.filter((relay) => relay.nodeId === identity.nodeId).length, 1, 'kept once, as its direct entry');
   assert.ok(relays.some((relay) => relay.url === 'wss://decentralize.ooo/ws'));
+  const withLan = await createSignedDirectoryRecord(identity, {
+    direct: `webrtc-direct://203.0.113.7:9443/sha256/${'a'.repeat(64)}`,
+    tunnel,
+    lan: ['192.168.50.20:9443'],
+  });
+  const lanFetch = async (url) => (String(url).includes('dns-query') || String(url).includes('/resolve')
+    ? new Response(JSON.stringify({ Answer: [{ type: 16, data: encodeDirectoryTxt(withLan) }] }))
+    : fetchImpl(url));
+  const lanRelays = await discoverSignalingRelays({ bootstrapServer: 'wss://peer.ooo/ws', fetchImpl: lanFetch, directory: `_relays.lan-${Date.now()}.example` });
+  assert.equal(lanRelays[0].url, `webrtc-direct://203.0.113.7:9443/sha256/${'a'.repeat(64)}?lan=${encodeURIComponent('192.168.50.20:9443')}&tunnel=${encodeURIComponent(tunnel)}`, 'the LAN address rides along');
   const none = await discoverSignalingRelays({ bootstrapServer: 'wss://peer.ooo/ws', fetchImpl, directory: false });
   assert.equal(none.some((relay) => relay.url.startsWith('webrtc-direct:')), false, 'directory: false skips the lookup');
 });

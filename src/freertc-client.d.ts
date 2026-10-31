@@ -8,7 +8,8 @@ declare module 'freertc/client' {
     room?: string;
     dohUrls?: string[];
     fetchImpl?: typeof fetch;
-  }): Promise<Array<{ node_id: string; direct: string; tunnel: string | null; capacity: number; name: string | null }>>;
+  }): Promise<Array<{ node_id: string; direct: string; tunnel: string | null; capacity: number; name: string | null; lan?: string[] }>>;
+  export function directoryRecordUrl(record: { direct: string; tunnel?: string | null; lan?: string[] }): string;
   export const DEFAULT_DIRECTORY_NAME: string;
   export function directRelayChannel(url: string, options?: { timeoutMs?: number; PeerConnection?: any; label?: string }): Promise<{ pc: any; channel: any }>;
 }

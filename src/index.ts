@@ -1,4 +1,4 @@
-import { isDirectRelayUrl, lookupDirectRelays, directRelayChannel, DEFAULT_DIRECTORY_NAME } from 'freertc/client';
+import { isDirectRelayUrl, lookupDirectRelays, directRelayChannel, directoryRecordUrl, DEFAULT_DIRECTORY_NAME } from 'freertc/client';
 import FreeRTCClientAdapter, { type MeshSignaling, isAttentionChangeOnly } from './freertc-client-adapter.js';
 
 /** Payload type of a signaling envelope carried inside a gossip direct frame. */
@@ -131,9 +131,17 @@ export function directRelaySupported(): boolean {
 function canonicalDirectRelayUrl(value: string): string | null {
   const [base, query = ''] = value.split('?');
   if (!isDirectRelayUrl(base)) return null;
-  const tunnel = new URLSearchParams(query).get('tunnel');
+  const params = new URLSearchParams(query);
+  const out = new URLSearchParams();
+  // lan: the relay's addresses on its own network (a router seldom loops its
+  // public address back inside), tried alongside the public one.
+  const lan = (params.get('lan') || '').split(',').filter((part) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(part));
+  if (lan.length) out.set('lan', lan.slice(0, 4).join(','));
+  const tunnel = params.get('tunnel');
   const canonicalTunnel = tunnel ? canonicalSignalingUrl(tunnel) : null;
-  return canonicalTunnel ? `${base}?tunnel=${encodeURIComponent(canonicalTunnel)}` : base;
+  if (canonicalTunnel) out.set('tunnel', canonicalTunnel);
+  const text = out.toString();
+  return text ? `${base}?${text}` : base;
 }
 
 function canonicalSignalingUrl(value: string | null | undefined): string | null {
@@ -260,7 +268,7 @@ export async function discoverSignalingRelays(options: {
     ? Promise.resolve([])
     : lookupDirectRelays({ name: options.directory || DEFAULT_DIRECTORY_NAME, fetchImpl: options.fetchImpl })
       .then((records) => records.map((record) => ({
-        url: canonicalSignalingUrl(record.tunnel ? `${record.direct}?tunnel=${encodeURIComponent(record.tunnel)}` : record.direct) as string,
+        url: canonicalSignalingUrl(directoryRecordUrl(record)) as string,
         nodeId: record.node_id,
         kind: 'local' as RelayKind,
         connections: 0,
@@ -1318,10 +1326,10 @@ export class PartialMesh {
         room: this.config.sessionId,
       });
       for (const record of records.slice(0, 2)) {
-        const url = canonicalSignalingUrl(record.tunnel ? `${record.direct}?tunnel=${encodeURIComponent(record.tunnel)}` : record.direct);
+        const url = canonicalSignalingUrl(directoryRecordUrl(record));
         if (!url) continue;
         try {
-          const { pc } = await directRelayChannel(record.direct, { timeoutMs: 5_000 });
+          const { pc } = await directRelayChannel(url, { timeoutMs: 5_000 });
           try { pc.close(); } catch { /* ignore */ }
         } catch {
           continue; // listed but not answering: stay where we are
