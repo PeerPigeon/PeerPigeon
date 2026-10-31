@@ -982,6 +982,13 @@ declare function discoverSignalingRelays(options: {
     directory?: string | false;
 }): Promise<RelayInfo[]>;
 /**
+ * Whether this page may open the relay's URL at all. An https page cannot
+ * open a plain ws:// connection except to this machine (browsers block it
+ * as mixed content), so a relay at ws://<public ip> is never tried there; a
+ * browser reaches such a relay through its direct (WebRTC) address instead.
+ */
+declare function reachableFromThisPage(url: string): boolean;
+/**
  * Read the public relay registry from one bootstrap, then order the relays.
  * Given a network and room, relays are chosen for the room (chooseRelays:
  * the room's relays, healthy local ones first, then by measured score);
@@ -1569,5 +1576,5 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, GossipProtocol, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, PeerPigeonCryptoProtocol, PeerPigeonNode, PeerPigeonStorage, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, RelayScoreBook, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, rankSignalingServersByDistance, relayScore, roomRoutingKey, selectClosestSignalingServer, sha1Hex };
+export { DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, GossipProtocol, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, PeerPigeonCryptoProtocol, PeerPigeonNode, PeerPigeonStorage, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, RelayScoreBook, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, rankSignalingServersByDistance, reachableFromThisPage, relayScore, roomRoutingKey, selectClosestSignalingServer, sha1Hex };
 export type { CecrConfigSnapshot, CecrMembershipRecordSnapshot, CecrOverlaySnapshot, CecrStateSnapshot, EncryptedBroadcastPayload, EncryptedDirectPayload, GossipAggregateDeliveryStatus, GossipBroadcastOptions, GossipDeliveryStatus, GossipMessage, GossipProtocolOptions, GossipStats, PartialMeshConfig, PartialMeshEvents, PartialMeshRuntimeConfig, PeerCapacityAdvertisement, PeerCapacitySnapshot, PeerConnection, PeerGraphEdge, PeerGraphNode, PeerGraphSnapshot, PeerPigeonCryptoEvents, PeerPigeonCryptoOptions, PeerPigeonKeyPair, PeerPigeonNodeEvents, PeerPigeonNodeMessage, PeerPigeonNodeOptions, PeerPigeonNodeStorageOptions, PeerPublicKey, RelayInfo, RelayKind, RelayMeasurement, RoomCipher, SharedRelayScore, SignalingRelayCandidate, StorageChangeOrigin, StorageEvents, StorageOptions, StoragePutOptions, StorageRecord, StorageRetrieveOptions, StorageSpace, StorageSyncFilterContext, StorageSyncOptions, StorageUnsubscribe };

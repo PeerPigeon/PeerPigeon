@@ -45,6 +45,7 @@ __export(index_exports, {
   isHealthy: () => isHealthy,
   isMeshSignalPayload: () => isMeshSignalPayload,
   rankSignalingServersByDistance: () => rankSignalingServersByDistance,
+  reachableFromThisPage: () => reachableFromThisPage,
   relayScore: () => relayScore,
   roomRoutingKey: () => roomRoutingKey,
   selectClosestSignalingServer: () => selectClosestSignalingServer,
@@ -2990,12 +2991,16 @@ async function chooseRelays(options) {
     return { relay, toRoom: nearest(ids, roomKey), toPeer: nearest(ids, peerKey) };
   }));
   const byRoom = [...placed].sort((a, b) => compareDistance(a.toRoom, b.toRoom, roomKey) || a.relay.url.localeCompare(b.relay.url));
-  const candidates = byRoom.slice(0, Math.max(1, options.candidates ?? RELAY_CANDIDATES));
-  const rest = byRoom.slice(candidates.length).sort((a, b) => compareDistance(a.toPeer, b.toPeer, peerKey) || a.relay.url.localeCompare(b.relay.url));
+  const isDirect = (entry) => entry.relay.url.startsWith("webrtc-direct://");
+  const direct = byRoom.filter(isDirect);
+  const others = byRoom.filter((entry) => !isDirect(entry));
+  const othersTaken = Math.max(1, options.candidates ?? RELAY_CANDIDATES);
+  const candidates = [...direct, ...others.slice(0, othersTaken)];
+  const rest = others.slice(othersTaken).sort((a, b) => compareDistance(a.toPeer, b.toPeer, peerKey) || a.relay.url.localeCompare(b.relay.url));
   const ranked = candidates.map((entry) => {
     const m = measure(entry.relay.nodeId);
     const healthy = isHealthy(entry.relay, m);
-    const tier = healthy && entry.relay.kind === "local" ? 0 : healthy ? 1 : 2;
+    const tier = healthy && isDirect(entry) ? 0 : healthy && entry.relay.kind === "local" ? 1 : healthy ? 2 : 3;
     return { ...entry, tier, score: relayScore(entry.relay, m) };
   }).sort((a, b) => a.tier - b.tier || a.score - b.score || compareDistance(a.toPeer, b.toPeer, peerKey));
   if (options.previousUrl) {
@@ -4755,9 +4760,15 @@ function directRelaySupported() {
 function canonicalDirectRelayUrl(value) {
   const [base, query = ""] = value.split("?");
   if (!(0, import_client2.isDirectRelayUrl)(base)) return null;
-  const tunnel = new URLSearchParams(query).get("tunnel");
+  const params = new URLSearchParams(query);
+  const out = new URLSearchParams();
+  const lan = (params.get("lan") || "").split(",").filter((part) => /^\d{1,3}(\.\d{1,3}){3}:\d{1,5}$/.test(part));
+  if (lan.length) out.set("lan", lan.slice(0, 4).join(","));
+  const tunnel = params.get("tunnel");
   const canonicalTunnel = tunnel ? canonicalSignalingUrl(tunnel) : null;
-  return canonicalTunnel ? `${base}?tunnel=${encodeURIComponent(canonicalTunnel)}` : base;
+  if (canonicalTunnel) out.set("tunnel", canonicalTunnel);
+  const text = out.toString();
+  return text ? `${base}?${text}` : base;
 }
 function canonicalSignalingUrl(value) {
   const text = String(value || "").trim();
@@ -4825,18 +4836,28 @@ async function selectClosestSignalingServer(peerId, relayUrls) {
 }
 async function discoverSignalingRelays(options) {
   const directLookup = options.directory === false || !directRelaySupported() ? Promise.resolve([]) : (0, import_client2.lookupDirectRelays)({ name: options.directory || import_client2.DEFAULT_DIRECTORY_NAME, fetchImpl: options.fetchImpl }).then((records) => records.map((record) => ({
-    url: canonicalSignalingUrl(record.tunnel ? `${record.direct}?tunnel=${encodeURIComponent(record.tunnel)}` : record.direct),
+    url: canonicalSignalingUrl((0, import_client2.directoryRecordUrl)(record)),
     nodeId: record.node_id,
     kind: "local",
     connections: 0,
     capacity: Number(record.capacity || 0),
     tunnelOnly: false
   })).filter((relay) => Boolean(relay.url))).catch(() => []);
-  const fromRegistry = await discoverRegistryRelays(options);
+  const fromRegistry = (await discoverRegistryRelays(options)).filter((relay) => reachableFromThisPage(relay.url));
   const direct = await directLookup;
   if (direct.length === 0) return fromRegistry;
   const directIds = new Set(direct.map((relay) => relay.nodeId));
   return [...direct, ...fromRegistry.filter((relay) => !directIds.has(relay.nodeId))];
+}
+function reachableFromThisPage(url) {
+  const page = globalThis.location;
+  if (page?.protocol !== "https:" || !String(url).startsWith("ws://")) return true;
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return host === "localhost" || host.endsWith(".localhost") || host === "::1" || /^127\./.test(host);
+  } catch {
+    return false;
+  }
 }
 async function discoverRegistryRelays(options) {
   const bootstrap = canonicalSignalingUrl(options.bootstrapServer);
@@ -4929,7 +4950,7 @@ async function discoverClosestSignalingServers(options) {
       const body = await response.json();
       for (const record of Array.isArray(body?.relays) ? body.relays : []) {
         const normalized = canonicalSignalingUrl(typeof record === "string" ? record : String(record?.url || ""));
-        if (!normalized) continue;
+        if (!normalized || !reachableFromThisPage(normalized)) continue;
         const nodeId = typeof record === "string" ? null : record?.node_id ?? null;
         if (!candidates.has(normalized) || nodeId && !candidates.get(normalized)) candidates.set(normalized, nodeId);
       }
@@ -5525,10 +5546,10 @@ var PartialMesh = class {
         room: this.config.sessionId
       });
       for (const record of records.slice(0, 2)) {
-        const url = canonicalSignalingUrl(record.tunnel ? `${record.direct}?tunnel=${encodeURIComponent(record.tunnel)}` : record.direct);
+        const url = canonicalSignalingUrl((0, import_client2.directoryRecordUrl)(record));
         if (!url) continue;
         try {
-          const { pc } = await (0, import_client2.directRelayChannel)(record.direct, { timeoutMs: 5e3 });
+          const { pc } = await (0, import_client2.directRelayChannel)(url, { timeoutMs: 5e3 });
           try {
             pc.close();
           } catch {
@@ -7621,6 +7642,7 @@ var index_default = PartialMesh;
   isHealthy,
   isMeshSignalPayload,
   rankSignalingServersByDistance,
+  reachableFromThisPage,
   relayScore,
   roomRoutingKey,
   selectClosestSignalingServer,
