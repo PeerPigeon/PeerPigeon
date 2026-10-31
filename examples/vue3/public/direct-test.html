@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Direct relay test</title>
+<style>
+  :root { --bg: #0f1115; --fg: #e6e6e6; --muted: #9aa0a6; --ok: #6fcf97; --bad: #eb5757; }
+  @media (prefers-color-scheme: light) { :root { --bg: #ffffff; --fg: #1d1d1f; --muted: #6e6e73; --ok: #1e8e3e; --bad: #c5221f; } }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.45 -apple-system, system-ui, sans-serif; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p { color: var(--muted); margin: 0 0 12px; }
+  #result { font-size: 16px; font-weight: 600; margin: 8px 0 12px; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  pre { white-space: pre-wrap; word-break: break-all; font: 12px/1.4 ui-monospace, Menlo, monospace; margin: 0; }
+</style>
+</head>
+<body>
+<h1>Direct relay test</h1>
+<p>Opens a WebRTC data channel straight to the relay listed in DNS, the way PeerPigeon does. Take a screenshot of this page when it finishes.</p>
+<div id="result">Running…</div>
+<pre id="log"></pre>
+<script>
+const logEl = document.getElementById('log');
+const t0 = performance.now();
+const log = (line) => { logEl.textContent += `${((performance.now() - t0) / 1000).toFixed(2)}s ${line}\n`; };
+const result = (text, ok) => { const el = document.getElementById('result'); el.textContent = text; el.className = ok ? 'ok' : 'bad'; };
+
+function decodeTxt(data) {
+  const parts = String(data).match(/"([^"]*)"/g);
+  const text = parts ? parts.map((p) => p.slice(1, -1)).join('') : String(data);
+  if (!text.startsWith('frtc1:')) return null;
+  const b64 = text.slice(6).replace(/-/g, '+').replace(/_/g, '/');
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(b64 + '==='.slice((b64.length + 3) % 4)), (c) => c.charCodeAt(0))));
+}
+
+function answerSdp(host, port, fp, credential, lan) {
+  const fpSdp = fp.toUpperCase().match(/.{2}/g).join(':');
+  const extra = (lan || []).map((e, i) => { const [h, p] = e.split(':'); return `a=candidate:${i + 2} 1 UDP 2130706430 ${h} ${p} typ host`; });
+  return ['v=0', `o=- 0 0 IN IP4 ${host}`, 's=-', 't=0 0', 'a=ice-lite', 'a=group:BUNDLE 0',
+    `m=application ${port} UDP/DTLS/SCTP webrtc-datachannel`, `c=IN IP4 ${host}`, 'a=mid:0',
+    `a=ice-ufrag:${credential}`, `a=ice-pwd:${credential}`, `a=fingerprint:sha-256 ${fpSdp}`,
+    'a=setup:passive', 'a=sctp-port:5000', 'a=max-message-size:262144',
+    `a=candidate:1 1 UDP 2130706431 ${host} ${port} typ host`, ...extra, 'a=end-of-candidates', ''].join('\r\n');
+}
+
+(async () => {
+  log(navigator.userAgent);
+  let record;
+  try {
+    const dns = await fetch('https://cloudflare-dns.com/dns-query?name=_relays.peer.ooo&type=TXT', { headers: { accept: 'application/dns-json' }, cache: 'no-store' }).then((r) => r.json());
+    record = (dns.Answer || []).map((a) => { try { return decodeTxt(a.data); } catch { return null; } }).find(Boolean);
+  } catch (e) { log(`DNS lookup failed: ${e.message}`); }
+  if (!record) { result('No relay listed in DNS', false); return; }
+  const m = /^webrtc-direct:\/\/(\d+\.\d+\.\d+\.\d+):(\d+)\/sha256\/([0-9a-f]{64})$/.exec(record.direct);
+  if (!m) { result('Listed relay has no IPv4 direct address', false); return; }
+  const [, host, port, fp] = m;
+  log(`relay ${record.name || record.node_id.slice(0, 8)} at ${host}:${port}${record.lan ? `, LAN ${record.lan.join(', ')}` : ''}`);
+
+  const pc = new RTCPeerConnection({ iceServers: [] });
+  const channel = pc.createDataChannel('freertc-relay');
+  pc.onicegatheringstatechange = () => log(`gathering: ${pc.iceGatheringState}`);
+  pc.oniceconnectionstatechange = () => log(`ice: ${pc.iceConnectionState}`);
+  pc.onconnectionstatechange = () => log(`connection: ${pc.connectionState}`);
+  pc.onsignalingstatechange = () => log(`signaling: ${pc.signalingState}`);
+  pc.onicecandidate = (e) => log(e.candidate ? `local candidate: ${e.candidate.candidate}` : 'local candidates done');
+  pc.onicecandidateerror = (e) => log(`candidate error ${e.errorCode} ${e.errorText || ''} ${e.url || ''}`);
+  channel.onopen = () => { log('CHANNEL OPEN'); channel.send(JSON.stringify({ type: 'ping' })); };
+  channel.onmessage = (e) => log(`relay says: ${String(e.data).slice(0, 120)}`);
+  channel.onerror = (e) => log(`channel error: ${e?.error?.message || e?.message || 'unknown'}`);
+  channel.onclose = () => log('channel closed');
+
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+    const sdp = pc.localDescription.sdp;
+    const ufrag = /a=ice-ufrag:(\S+)/.exec(sdp)?.[1];
+    const pwd = /a=ice-pwd:(\S+)/.exec(sdp)?.[1];
+    log(`offer: ufrag ${ufrag} (${ufrag?.length}), pwd length ${pwd?.length}, setup ${/a=setup:(\S+)/.exec(sdp)?.[1]}`);
+    const credential = `freertc+direct+v1/${ufrag}/${pwd}`;
+    log(`credential length ${credential.length}`);
+    await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp(host, port, fp, credential, record.lan) });
+    log('answer accepted');
+  } catch (e) {
+    log(`SDP step failed: ${e.name}: ${e.message}`);
+    result(`Failed while setting up: ${e.message}`, false);
+    return;
+  }
+
+  const opened = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), 10_000);
+    channel.addEventListener('open', () => { clearTimeout(timer); resolve(true); });
+    pc.addEventListener('connectionstatechange', () => { if (pc.connectionState === 'failed') { clearTimeout(timer); resolve(false); } });
+  });
+  try {
+    const stats = await pc.getStats();
+    stats.forEach((s) => {
+      if (s.type === 'candidate-pair') log(`pair ${s.state}${s.nominated ? ' nominated' : ''}: requests sent ${s.requestsSent ?? '?'}, responses ${s.responsesReceived ?? '?'}`);
+      if (s.type === 'remote-candidate') log(`remote candidate ${s.address ?? s.ip}:${s.port}`);
+      if (s.type === 'transport') log(`transport: dtls ${s.dtlsState}, ice ${s.iceState ?? ''}`);
+    });
+  } catch (e) { log(`stats failed: ${e.message}`); }
+  result(opened ? 'Direct channel OPENED' : 'Direct channel did NOT open', opened);
+  setTimeout(() => pc.close(), 3000);
+})();
+</script>
+</body>
+</html>
