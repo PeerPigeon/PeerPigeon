@@ -847,6 +847,10 @@ var FreeRTCClientAdapter = class {
   }
   recycleStaleSignalingTransport(reason) {
     if (this.intentionallyDisconnected || this.recyclingSignalingTransport || !this.client) return;
+    if (this.client.signalingOpening === true) {
+      this.emitter.emit("signaling:log", { message: `[signal] ${reason}: relay connection still opening; waiting for it` });
+      return;
+    }
     this.recyclingSignalingTransport = true;
     this.signalingConnected = false;
     this.clearRecoveryProbeTimer();

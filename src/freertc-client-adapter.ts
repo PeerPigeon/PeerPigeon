@@ -990,6 +990,13 @@ export class FreeRTCClientAdapter {
 
   private recycleStaleSignalingTransport(reason: string): void {
     if (this.intentionallyDisconnected || this.recyclingSignalingTransport || !this.client) return;
+    // A relay connection still opening is left to finish (see freertc's
+    // SOCKET_OPEN_DEADLINE_MS): replacing it put the next attempt at the back
+    // of a busy relay's queue, again and again, and the peer never got a relay.
+    if (this.client.signalingOpening === true) {
+      this.emitter.emit('signaling:log', { message: `[signal] ${reason}: relay connection still opening; waiting for it` });
+      return;
+    }
     this.recyclingSignalingTransport = true;
     this.signalingConnected = false;
     this.clearRecoveryProbeTimer();
