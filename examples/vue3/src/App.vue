@@ -435,7 +435,7 @@
           </div>
         </aside>
 
-        <details class="diagnostics" open>
+        <details class="diagnostics">
           <summary>
             <span class="diagnostics-title">Diagnostics</span>
             <span class="diagnostics-count">{{ diagnosticMessages.length }} lines</span>
@@ -447,7 +447,7 @@
             </label>
             <label class="check">
               <input v-model="diagnosticLoggingEnabled" type="checkbox" data-testid="diagnostic-logging-enabled" />
-              <span>Record diagnostics</span>
+              <span>Diagnostics</span>
             </label>
             <label class="field field-inline">
               <span>Detail</span>
@@ -729,7 +729,9 @@ export default {
       chatLogBuffer: [],
       diagnosticLogBuffer: [],
       chatLoggingEnabled: true,
-      diagnosticLoggingEnabled: true,
+      // Off by default: recording and showing every diagnostic line costs the
+      // page real time on a busy mesh. Turn it on to look at something.
+      diagnosticLoggingEnabled: false,
       diagnosticSyslogLevel: DEFAULT_DIAGNOSTIC_SYSLOG_LEVEL,
       diagnosticSyslogLevels: SYSLOG_LEVELS,
       diagnosticSourceFilter: 'all',
@@ -1160,7 +1162,9 @@ export default {
     chatLoggingEnabled() {
       this.saveUiState();
     },
-    diagnosticLoggingEnabled() {
+    diagnosticLoggingEnabled(on) {
+      // Turned off: drop what was recorded, so nothing is kept or rendered.
+      if (!on) this.diagnosticLogBuffer = [];
       this.saveUiState();
     },
     activeTab(nextTab) {
@@ -4328,7 +4332,7 @@ export default {
           diagnosticSourceFilter: normalizeDiagnosticSourceFilter(this.diagnosticSourceFilter),
           diagnosticCustomSearch: String(this.diagnosticCustomSearch || ''),
           chatLoggingEnabled: this.chatLoggingEnabled !== false,
-          diagnosticLoggingEnabled: this.diagnosticLoggingEnabled !== false,
+          diagnosticsOn: this.diagnosticLoggingEnabled === true,
           storageActiveSpace: this.storageActiveSpace || 'user',
           storageLookupOwnerId: String(this.storageLookupOwnerId || '').trim(),
         });
@@ -4374,8 +4378,10 @@ export default {
         if (typeof parsed.chatLoggingEnabled === 'boolean') {
           this.chatLoggingEnabled = parsed.chatLoggingEnabled;
         }
-        if (typeof parsed.diagnosticLoggingEnabled === 'boolean') {
-          this.diagnosticLoggingEnabled = parsed.diagnosticLoggingEnabled;
+        // Saved under a new name since diagnostics became off by default; an
+        // older saved diagnosticLoggingEnabled (true for everyone) is ignored.
+        if (typeof parsed.diagnosticsOn === 'boolean') {
+          this.diagnosticLoggingEnabled = parsed.diagnosticsOn;
         }
         const allowedSpaces = new Set(['public', 'user', 'frozen', 'private', 'epublic']);
         if (typeof parsed.storageActiveSpace === 'string' && allowedSpaces.has(parsed.storageActiveSpace)) {
