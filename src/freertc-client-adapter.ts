@@ -363,6 +363,13 @@ export class FreeRTCClientAdapter {
         if (!isCurrentClient()) return;
         this.handleNegotiationFailure(data);
       },
+      // A relay says no relay has this peer: it has left.
+      onPeerGone: (data: { peerId?: string }) => {
+        if (!isCurrentClient()) return;
+        const peerId = this.normalizePeerId(data?.peerId);
+        if (!peerId || this.isSelfAlias(peerId)) return;
+        this.emitter.emit('peer:gone', { peerId });
+      },
       onStatusChange: (status: string) => {
         if (!isCurrentClient()) return;
         const normalizedStatus = String(status).toLowerCase();

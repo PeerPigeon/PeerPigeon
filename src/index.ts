@@ -41,6 +41,8 @@ import type {
 // wait 15 s, doubling to 2 min, before filling again.
 // How often a peer not on a local relay checks the DNS directory for one.
 const LOCAL_RELAY_CHECK_MS = 60_000;
+// A peer a relay says no relay has is not dialled again for this long.
+const PEER_GONE_BACKOFF_MS = 60_000;
 const FILL_REFUSED_WINDOW_MS = 60_000;
 const FILL_BACKOFF_MIN_MS = 15_000;
 const FILL_BACKOFF_MAX_MS = 120_000;
@@ -1903,6 +1905,20 @@ export class PartialMesh {
       // Do not reuse the same relay snapshot after terminal offer exhaustion.
       // A subsequent fresh snapshot can make this peer active again.
       this.activeSignalingPeers.delete(peerId);
+    });
+
+    // No relay has this peer (the relay said so): it has left. Stop dialling
+    // it for a minute, instead of sending offers and ICE
+    // candidates that every relay serving the room would chase.
+    this.signalingClient.on('peer:gone', (data: { peerId: string }) => {
+      const peerId = this.normalizePeerId(data?.peerId);
+      if (!peerId || this.isSelfAlias(peerId) || this.peers.get(peerId)?.connected) return;
+      this.activeSignalingPeers.delete(peerId);
+      this.discoveredPeers.delete(peerId);
+      this.connecting.delete(peerId);
+      if (this.peers.has(peerId)) this.peers.delete(peerId);
+      this.dialBackoffUntilMs.set(peerId, Date.now() + PEER_GONE_BACKOFF_MS);
+      this.emit('signaling:log', { message: `[signal] ${peerId.slice(0, 12)} is on no relay: no longer dialling it` });
     });
 
     this.signalingClient.on('rtc:data', (data: { peerId: string; data: any }) => {
