@@ -887,7 +887,9 @@ export class FreeRTCClientAdapter {
     this.recoveryProbeTimer = setTimeout(() => {
       this.recoveryProbeTimer = null;
       if (this.intentionallyDisconnected) return;
-      if (typeof document !== 'undefined' && document.hidden) return;
+      // Hidden tabs skip the slow-discovery checks, but not a relay that is
+      // gone: with no registration they move on like a visible tab.
+      if (typeof document !== 'undefined' && document.hidden && this.client?.isRegistered) return;
       // The relay was released on purpose while this probe waited: nothing is missing.
       if (this.client?.relayIdle === true) return;
       if (recycleOnTimeout) {
@@ -938,14 +940,17 @@ export class FreeRTCClientAdapter {
     if (this.signalingHealthTimer) return;
     this.signalingHealthTimer = setInterval(() => {
       if (this.intentionallyDisconnected || this.recyclingSignalingTransport || this.recoveryProbeTimer) return;
-      if (typeof document !== 'undefined' && document.hidden) return;
       // A relay released on purpose has no acknowledgement to wait for; the client wakes it itself.
       if (this.client?.relayIdle === true) return;
+      // A tab with no relay at all recovers whether it is shown or not: a
+      // background tab whose relay went down otherwise never moved to
+      // another one, and drifted to no peers.
       if (!this.client?.isRegistered) {
         this.ensureRegistrationRecoveryProbe('health check');
         this.client?.connect?.();
         return;
       }
+      if (typeof document !== 'undefined' && document.hidden) return;
       if (Date.now() - this.lastBootstrapAtMs < this.healthBootstrapWaitMs) return;
       this.emitter.emit('signaling:log', {
         message: '[signal] health check: awaiting relay acknowledgement',
@@ -960,13 +965,13 @@ export class FreeRTCClientAdapter {
     this.initialSignalingHealthTimer = setTimeout(() => {
       this.initialSignalingHealthTimer = null;
       if (this.intentionallyDisconnected || this.recyclingSignalingTransport || this.recoveryProbeTimer) return;
-      if (typeof document !== 'undefined' && document.hidden) return;
       if (this.client?.relayIdle === true) return;
       if (!this.client?.isRegistered) {
         this.ensureRegistrationRecoveryProbe('initial health check');
         this.client?.connect?.();
         return;
       }
+      if (typeof document !== 'undefined' && document.hidden) return;
       if (this.connectedPeers.size > 0) return;
       this.emitter.emit('signaling:log', {
         message: '[signal] initial health check: awaiting relay acknowledgement',
