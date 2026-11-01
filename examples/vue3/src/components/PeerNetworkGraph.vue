@@ -7,6 +7,15 @@
       @pointermove="handlePointerMove"
       @pointerleave="handlePointerLeave"
     ></canvas>
+    <label class="peer-network-steer" title="Moving the pointer across the graph pushes its spin">
+      <input
+        type="checkbox"
+        :checked="steerWithPointer"
+        :disabled="rotationPaused"
+        @change="setSteerWithPointer($event.target.checked)"
+      />
+      <span>Steer with pointer</span>
+    </label>
     <button
       type="button"
       class="peer-network-rotation-toggle"
@@ -60,7 +69,13 @@ import { graphPeerSummary } from '../graph-coverage.js';
 
 const DISTANT_STAR_RADIUS_THRESHOLD = 5;
 const DISTANT_STAR_POINT_RADIUS = 1.65;
-const GRAPH_ROTATION_RADIANS_PER_MS = 0.000065;
+const GRAPH_ROTATION_RADIANS_PER_MS = 0.000108; // raeder.io's resting spin (0.0018 rad a frame at 60 fps)
+const RIGID_ROTATION = true;
+// Steering with the pointer (the "Steer with pointer" box): moving across the
+// graph pushes the spin against the motion, and it drifts back to rest.
+const STEER_MAX_RADIANS_PER_MS = 0.0018;
+const STEER_RELAX_PER_MS = 0.00024;
+const STEER_STORAGE_KEY = 'peerpigeon:graph-steer';
 const STAR_TO_CIRCLE_GROWTH_MS = 1800;
 const LINK_STYLE_TRANSITION_MS = 900;
 const LINK_VISIBILITY_TRANSITION_MS = 700;
@@ -136,6 +151,10 @@ function normalizedPeerPosition(peerId, isSelf) {
 
 function peerRotationSpeedFactor(peerId, hopDistance, isSelf) {
   if (isSelf) return 0;
+  // The graph turns as one body, as raeder.io's mesh does: every peer at the
+  // same speed, so links keep their shape. (The per-band parallax below is
+  // kept for reference; RIGID_ROTATION switches it off.)
+  if (RIGID_ROTATION) return 1;
 
   // Peers in the same hop band must not move in lockstep. The peer-ID hash
   // gives each peer a stable speed within its band, while non-overlapping
@@ -258,6 +277,9 @@ export default {
     return {
       networkGraphIcon: faDiagramProject,
       rotationPaused: false,
+      steerWithPointer: (() => {
+        try { return localStorage.getItem(STEER_STORAGE_KEY) === 'on'; } catch { return false; }
+      })(),
       tooltip: {
         visible: false,
         x: 0,
@@ -314,8 +336,15 @@ export default {
       projectedNodes: [],
       rotationDirection: Math.random() < 0.5 ? -1 : 1,
       rotationY: 0,
+      rotationX: 0,
+      spinY: 0,
+      spinX: 0,
       width: 1,
     };
+    this._scene.spinY = GRAPH_ROTATION_RADIANS_PER_MS * this._scene.rotationDirection;
+    // For tests and the console: the canvas leads back to its scene.
+    if (this.$refs.canvas) this.$refs.canvas.__peerGraphScene = this._scene;
+    this._steerLast = null;
     this._scene.paint = (timestamp) => this.paintFrame(timestamp);
     this._resumeAnimationHandler = () => this.restartAnimationLoop();
     this._visibilityAnimationHandler = () => {
@@ -627,12 +656,15 @@ export default {
         }
         visualState.starPointRadius = starPointRadius;
 
-        const effectiveRotationY = distantPoint
-          ? visualState.starRotationY
-          : scene.rotationY * visualState.rotationSpeedFactor + visualState.rotationOffset;
+        const effectiveRotationY = RIGID_ROTATION
+          ? scene.rotationY
+          : distantPoint
+            ? visualState.starRotationY
+            : scene.rotationY * visualState.rotationSpeedFactor + visualState.rotationOffset;
         const cosY = Math.cos(effectiveRotationY);
         const sinY = Math.sin(effectiveRotationY);
-        const tiltX = Math.sin(effectiveRotationY * 0.32) * 0.11;
+        // A gentle nod as it turns, plus any tilt the pointer gave it (raeder.io).
+        const tiltX = Math.sin(scene.rotationY * 0.3) * 0.1 + (scene.rotationX || 0);
         const cosX = Math.cos(tiltX);
         const sinX = Math.sin(tiltX);
         const autoX = node.x * cosY + node.z * sinY;
@@ -706,10 +738,11 @@ export default {
           visualState.starAnchorY = (orbitScreenY - centerY) / scale;
         }
 
-        let screenX = distantPoint
+        // Distant peers turn with the rest when the graph turns as one body.
+        let screenX = distantPoint && !RIGID_ROTATION
           ? centerX + visualState.starAnchorX * scale
           : orbitScreenX;
-        let screenY = distantPoint
+        let screenY = distantPoint && !RIGID_ROTATION
           ? centerY + visualState.starAnchorY * scale
           : orbitScreenY;
         if (visualState.reappearing) {
@@ -1098,7 +1131,13 @@ export default {
       const elapsed = scene.lastFrameAt ? Math.min(50, timestamp - scene.lastFrameAt) : 16;
       scene.lastFrameAt = timestamp;
       if (!this.rotationPaused) {
-        scene.rotationY += elapsed * GRAPH_ROTATION_RADIANS_PER_MS * scene.rotationDirection;
+        // Spin relaxes toward its resting speed after a push from the pointer.
+        const rest = GRAPH_ROTATION_RADIANS_PER_MS * scene.rotationDirection;
+        const relax = Math.min(1, elapsed * STEER_RELAX_PER_MS);
+        scene.spinY += (rest - scene.spinY) * relax;
+        scene.spinX += (0 - scene.spinX) * relax;
+        scene.rotationY += elapsed * scene.spinY;
+        scene.rotationX += elapsed * scene.spinX;
       }
 
       const ctx = scene.ctx;
@@ -1212,6 +1251,28 @@ export default {
       const y = event.clientY - rect.top;
       this._pointerPosition = { x, y };
       this.updateTooltipAt(x, y, rect);
+      this.steerAt(event, rect);
+    },
+
+    // Moving across the graph pushes its spin against the motion (raeder.io's
+    // feel), when the box is ticked.
+    steerAt(event, rect) {
+      const scene = this._scene;
+      if (!this.steerWithPointer || this.rotationPaused || !scene) { this._steerLast = null; return; }
+      const x = ((event.clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
+      const y = -(((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 - 1);
+      const last = this._steerLast;
+      this._steerLast = { x, y };
+      if (!last) return;
+      const clamp = (v) => Math.max(-STEER_MAX_RADIANS_PER_MS, Math.min(STEER_MAX_RADIANS_PER_MS, v));
+      scene.spinY = clamp(scene.spinY - (x - last.x) * 0.0012);
+      scene.spinX = clamp(scene.spinX + (y - last.y) * 0.0006);
+    },
+
+    setSteerWithPointer(on) {
+      this.steerWithPointer = Boolean(on);
+      this._steerLast = null;
+      try { localStorage.setItem(STEER_STORAGE_KEY, this.steerWithPointer ? 'on' : 'off'); } catch { /* private mode */ }
     },
 
     handlePointerLeave() {
@@ -1219,6 +1280,7 @@ export default {
         if (this._scene.canvas) this._scene.canvas.style.cursor = 'default';
       }
       this._pointerPosition = null;
+      this._steerLast = null;
       this.tooltip.visible = false;
     },
 
@@ -1241,6 +1303,31 @@ export default {
   width: 100%;
   height: 100%;
   touch-action: none;
+}
+
+.peer-network-steer {
+  position: absolute;
+  z-index: 2;
+  bottom: 19px;
+  right: 58px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: rgba(217, 223, 227, 0.72);
+  font: 500 11px/1 Archivo, system-ui, sans-serif;
+  cursor: pointer;
+  user-select: none;
+}
+
+.peer-network-steer input {
+  margin: 0;
+  accent-color: #56b09c;
+  cursor: pointer;
+}
+
+.peer-network-steer:has(input:disabled) {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .peer-network-rotation-toggle {
