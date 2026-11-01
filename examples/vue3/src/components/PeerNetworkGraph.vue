@@ -833,7 +833,8 @@ export default {
         { label: '3 or more hops', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: 'rgba(217, 223, 227, 0.9)' },
         { label: 'Direct', type: 'line' },
         { label: 'Relayed', type: 'line', relayed: true },
-        { label: 'Sending now', type: 'line', active: true },
+        // As the graph shows it: the peer's own colour, in a green halo.
+        { label: 'Sending now', type: 'active', radius: 5, color: 'rgba(217, 223, 227, 0.85)' },
       ];
 
       ctx.save();
@@ -874,22 +875,20 @@ export default {
           ctx.moveTo(iconX - 10, rowY);
           ctx.lineTo(iconX + 10, rowY);
           // Brighter than on the graph so a short sample reads, in the same colours.
-          ctx.strokeStyle = item.active
-            ? 'rgba(86, 176, 156, 0.95)'
-            : `rgba(217, 223, 227, ${item.relayed ? 0.55 * RELAYED_LINK_DIM : 0.55})`;
+          ctx.strokeStyle = `rgba(217, 223, 227, ${item.relayed ? 0.55 * RELAYED_LINK_DIM : 0.55})`;
           ctx.lineWidth = 1;
           ctx.stroke();
-          if (item.active) {
-            ctx.fillStyle = 'rgba(86, 176, 156, 0.95)';
-            for (const x of [iconX - 10, iconX + 10]) {
-              ctx.beginPath();
-              ctx.arc(x, rowY, 2.25, 0, Math.PI * 2);
-              ctx.fill();
-            }
-          }
           ctx.restore();
         } else {
           ctx.save();
+          if (item.type === 'active') {
+            // The same halo drawNode gives a sending peer: 1.8x, green, 0.32.
+            ctx.globalAlpha = 0.32;
+            ctx.fillStyle = 'rgb(86, 176, 156)';
+            ctx.beginPath();
+            ctx.arc(iconX, rowY, item.radius * 1.8, 0, Math.PI * 2);
+            ctx.fill();
+          }
           ctx.beginPath();
           ctx.arc(iconX, rowY, item.radius || 2, 0, Math.PI * 2);
           ctx.globalAlpha = item.alpha ?? 1;
