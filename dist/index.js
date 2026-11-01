@@ -1240,9 +1240,14 @@ var _GossipProtocol = class _GossipProtocol {
       this.refreshAggregateState(aggregateState);
     }
     const sentPeers = [];
+    const now = Date.now();
+    const heldMs = Math.max(0, now - (this.messageLog.get(message.id)?.timestamp ?? now));
+    const transitSoFar = Number.isFinite(message.transitMs) ? Number(message.transitMs) : 0;
     for (const peerId of connectedPeers) {
+      const rtt = this.mesh.getLinkRttMs?.(peerId) ?? null;
       const forwarded = {
         ...message,
+        transitMs: Math.round(transitSoFar + heldMs + (rtt && rtt > 0 ? rtt / 2 : 0)),
         hops: message.hops + 1,
         path: this.extendRoutePath(message.path, peerId),
         sentAt: [...Array.isArray(message.sentAt) ? message.sentAt.filter((t) => typeof t === "number").slice(-(MAX_ROUTE_TRACE_PEERS - 1)) : [], Date.now()],
@@ -6688,6 +6693,12 @@ var PartialMesh = class {
   /**
    * Get list of connected peer IDs
    */
+  /** Smoothed round trip of the link to a neighbour, ms, measured by its keepalive; null when unknown. */
+  getLinkRttMs(peerId) {
+    const entry = this.signalingClient?.client?.mesh?.connections?.get?.(peerId);
+    const rtt = Number(entry?.rttMs);
+    return Number.isFinite(rtt) && rtt > 0 ? rtt : null;
+  }
   getConnectedPeers() {
     return Array.from(this.peers.values()).filter((pc) => pc.connected).map((pc) => pc.id);
   }

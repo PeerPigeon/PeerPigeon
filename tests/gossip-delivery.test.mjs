@@ -1987,3 +1987,33 @@ test('a peer that said it is leaving is not rediscovered or dialled until it rej
   assert.equal(mesh.discoveredPeers.has(leaver), true, 'it rejoined with a newer record');
   mesh.destroy?.();
 });
+
+test('a gossip message carries its travel time from local measurements, whatever the clocks say', () => {
+  const { network, protocols } = makeProtocols(
+    ['01', '02', '03'],
+    new Map([
+      ['01', ['02']],
+      ['02', ['01', '03']],
+      ['03', ['02']],
+    ]),
+  );
+  try {
+    for (const mesh of network.meshes.values()) mesh.getLinkRttMs = () => 40;
+    let received = null;
+    protocols.get('03').on('messageReceived', (event) => { if (!event.local) received = event.message; });
+    // The sender's clock is a minute ahead: its timestamp is no use to the receiver.
+    const realNow = Date.now;
+    Date.now = () => realNow() + 60_000;
+    try {
+      protocols.get('01').broadcast('hello');
+    } finally {
+      Date.now = realNow;
+    }
+    assert.ok(received, 'delivered two hops away');
+    assert.equal(received.hops, 2);
+    // Two links at half of a 40 ms round trip each, and no time held in between.
+    assert.ok(received.transitMs >= 40 && received.transitMs < 60, `transitMs ${received.transitMs}`);
+  } finally {
+    destroyProtocols(protocols);
+  }
+});

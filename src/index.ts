@@ -2930,6 +2930,13 @@ export class PartialMesh {
   /**
    * Get list of connected peer IDs
    */
+  /** Smoothed round trip of the link to a neighbour, ms, measured by its keepalive; null when unknown. */
+  public getLinkRttMs(peerId: string): number | null {
+    const entry = (this.signalingClient as any)?.client?.mesh?.connections?.get?.(peerId);
+    const rtt = Number(entry?.rttMs);
+    return Number.isFinite(rtt) && rtt > 0 ? rtt : null;
+  }
+
   public getConnectedPeers(): string[] {
     return Array.from(this.peers.values())
       .filter(pc => pc.connected)

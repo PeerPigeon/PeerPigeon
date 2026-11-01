@@ -540,6 +540,7 @@ import {
 } from './message-payloads.js';
 import {
   calculateMessageLatency,
+  messageLatency,
   formatHopLatency,
   formatHopTrace,
   formatMessagePeerId,
@@ -2310,7 +2311,7 @@ export default {
           this.addLog('received', plaintext, sourcePeer, message.hops, false, {
             icon: 'received',
             receivedAt,
-            latencyMs: calculateMessageLatency(message?.timestamp ?? message?.data?.timestamp, receivedAt),
+            latencyMs: messageLatency(message, message?.timestamp ?? message?.data?.timestamp, receivedAt),
             hopPath: message?.path,
           });
           if (this.autoScroll) this.$nextTick(() => this.scrollToBottom());
@@ -3020,7 +3021,7 @@ export default {
           {
             icon,
             receivedAt,
-            latencyMs: calculateMessageLatency(message?.timestamp ?? payload?.timestamp, receivedAt),
+            latencyMs: messageLatency(message, message?.timestamp ?? payload?.timestamp, receivedAt),
             hopPath: message?.path,
           }
         );
@@ -3041,7 +3042,7 @@ export default {
         {
           icon,
           receivedAt,
-          latencyMs: calculateMessageLatency(message?.timestamp ?? payload?.timestamp, receivedAt),
+          latencyMs: messageLatency(message, message?.timestamp ?? payload?.timestamp, receivedAt),
           hopPath: message?.path,
         }
       );

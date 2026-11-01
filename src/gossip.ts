@@ -178,6 +178,13 @@ export type GossipMessage = {
   path?: string[];
   /** When each peer on the path sent it on (ms since epoch, its own clock), bounded like path. */
   sentAt?: number[];
+  /**
+   * How long the message has been on its way, in ms, from local measurements
+   * only: at each hop the time it waited in that peer plus half the round
+   * trip of the link it then crossed. Unlike receivedAt - timestamp it does
+   * not depend on the sender's and receiver's clocks agreeing.
+   */
+  transitMs?: number;
   spread?: GossipSpreadEnvelope;
   delivery?: GossipDeliveryEnvelope;
   aggregate?: GossipAggregateEnvelope;
@@ -272,6 +279,8 @@ interface MeshLike {
   on(event: 'peer:connected' | 'peer:disconnected', handler: (peerId: string) => void): void;
   getClientId(): string | null;
   getConnectedPeers(): string[];
+  /** Smoothed round trip of the link to a neighbour, ms; null when not measured yet. */
+  getLinkRttMs?(peerId: string): number | null;
   getDiscoveredPeers(): string[];
   getGlobalPeers(): string[];
   getCecrMembershipConfig?(): {
@@ -662,10 +671,15 @@ export class GossipProtocol {
     }
 
     const sentPeers: string[] = [];
+    const now = Date.now();
+    const heldMs = Math.max(0, now - (this.messageLog.get(message.id)?.timestamp ?? now));
+    const transitSoFar = Number.isFinite(message.transitMs) ? Number(message.transitMs) : 0;
 
     for (const peerId of connectedPeers) {
+      const rtt = this.mesh.getLinkRttMs?.(peerId) ?? null;
       const forwarded: GossipMessage = {
         ...message,
+        transitMs: Math.round(transitSoFar + heldMs + (rtt && rtt > 0 ? rtt / 2 : 0)),
         hops: message.hops + 1,
         path: this.extendRoutePath(message.path, peerId),
         sentAt: [...(Array.isArray(message.sentAt) ? message.sentAt.filter((t) => typeof t === 'number').slice(-(MAX_ROUTE_TRACE_PEERS - 1)) : []), Date.now()],

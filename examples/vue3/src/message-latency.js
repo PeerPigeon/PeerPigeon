@@ -19,6 +19,18 @@ export function calculateMessageLatency(sentAt, receivedAt = Date.now()) {
   return Math.max(0, Math.round(received - sent));
 }
 
+/**
+ * A received gossip message's travel time. transitMs is summed hop by hop
+ * from each peer's own measurements (time held there plus half the link's
+ * round trip), so it does not depend on clocks agreeing. receivedAt minus the
+ * sender's timestamp does: a sender whose clock ran ahead showed 0ms.
+ */
+export function messageLatency(message, sentAt, receivedAt = Date.now()) {
+  const transit = Number(message?.transitMs);
+  if (Number.isFinite(transit) && transit >= 0) return Math.round(transit);
+  return calculateMessageLatency(sentAt, receivedAt);
+}
+
 export function formatMessageLatency(value) {
   const milliseconds = Number(value);
   if (!Number.isFinite(milliseconds) || milliseconds < 0) return '';

@@ -8,6 +8,7 @@ import {
   formatHopTrace,
   formatMessageLatency,
   messagePeerSha1,
+  messageLatency,
 } from '../examples/vue3/src/message-latency.js';
 
 test('message latency measures original broadcast time to local receipt', () => {
@@ -45,4 +46,11 @@ test('message latency uses compact millisecond, second, and minute labels', () =
   assert.equal(formatMessageLatency(65_000), '1m 5s');
   assert.equal(formatHopLatency(1, 35), '1 hop, 35ms');
   assert.equal(formatHopLatency(2, 6_000), '2 hops, 6s');
+});
+
+test('a message carrying transitMs is timed by it, not by two clocks that disagree', () => {
+  // The sender's clock ran 300 ms ahead: by timestamps this looked like 0ms.
+  assert.equal(messageLatency({ transitMs: 48 }, 10_300, 10_050), 48);
+  assert.equal(messageLatency({}, 10_300, 10_050), 0);
+  assert.equal(messageLatency(null, 1_000, 1_035), 35);
 });
