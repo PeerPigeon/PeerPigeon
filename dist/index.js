@@ -6706,7 +6706,7 @@ var PartialMesh = class {
    */
   getGlobalPeers() {
     this.pruneMembershipRecords(Date.now(), false);
-    return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
+    return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId) && !this.hasLeft(peerId));
   }
   getCecrMembershipRecords() {
     this.pruneMembershipRecords();
@@ -7187,6 +7187,7 @@ var PartialMesh = class {
         if (record.state === "left") {
           departureMerged = true;
           this.forgetDepartedPeer(peerId);
+          renewed.push(peerId);
         } else {
           renewed.push(peerId);
           if (!wasMember) returning.push(peerId);

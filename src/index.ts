@@ -2954,7 +2954,9 @@ export class PartialMesh {
    */
   public getGlobalPeers(): string[] {
     this.pruneMembershipRecords(Date.now(), false);
-    return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId));
+    // A peer that announced it is leaving is not in the room any more, even
+    // while its tombstone is kept to stop others re-adding it.
+    return Array.from(this.globalPeers).filter((peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId) && !this.hasLeft(peerId));
   }
 
   public getCecrMembershipRecords(): CecrMembershipRecordSnapshot[] {
@@ -3559,6 +3561,9 @@ export class PartialMesh {
           if (record.state === 'left') {
             departureMerged = true;
             this.forgetDepartedPeer(peerId);
+            // Passed on like a renewal, so a goodbye crosses the whole mesh
+            // at once instead of waiting out the leaver's lease two hops away.
+            renewed.push(peerId);
           }
           else {
             renewed.push(peerId);
