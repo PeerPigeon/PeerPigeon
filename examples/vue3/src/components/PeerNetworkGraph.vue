@@ -93,7 +93,12 @@ function transitionValue(from, to, startedAt, duration, now) {
   return from + (to - from) * eased;
 }
 
-function limitScreenTravel(previousX, previousY, targetX, targetY, elapsedMs) {
+// Caps a node's on-screen jump per frame, so a change of layout never pops.
+// rotationTravel is how far the graph's own turning carries the node this
+// frame: that much is always allowed. Without it, a faster spin (steering
+// with the pointer, or a large graph) hit the cap and nodes cut across their
+// orbits, which drew the whole graph smaller.
+function limitScreenTravel(previousX, previousY, targetX, targetY, elapsedMs, rotationTravel = 0) {
   if (![previousX, previousY, targetX, targetY].every(Number.isFinite)) {
     return { x: targetX, y: targetY };
   }
@@ -103,6 +108,7 @@ function limitScreenTravel(previousX, previousY, targetX, targetY, elapsedMs) {
   const maximumTravel = Math.max(
     0.25,
     Math.min(MAX_NODE_TRAVEL_PX_PER_FRAME, elapsedMs * MAX_NODE_TRAVEL_PX_PER_MS),
+    rotationTravel,
   );
   if (distance <= maximumTravel || distance === 0) return { x: targetX, y: targetY };
   const ratio = maximumTravel / distance;
@@ -200,10 +206,10 @@ function peerSizeProfile(peerId, hopDistance, isSelf) {
 // Links and legend: bone on night, with one accent for traffic.
 const LINK_BONE = [217, 223, 227];
 const LINK_SHEEN = [86, 176, 156];
-const LINK_IDLE_ALPHA = 0.16;
-const LINK_ACTIVE_ALPHA = 0.55;
+const LINK_IDLE_ALPHA = 0.3;
+const LINK_ACTIVE_ALPHA = 0.7;
 /** How bright a relayed link is next to a direct one. */
-const RELAYED_LINK_DIM = 0.45;
+const RELAYED_LINK_DIM = 0.3;
 
 /** A link's colour at a given activity (0 idle, 1 sending): bone toward the accent. */
 function linkStroke(glow) {
@@ -797,12 +803,18 @@ export default {
           ))
           : (distantPoint ? 1 : 0);
         if (starShrinkProgress >= 1) visualState.starShrinkStartedAt = null;
+        // How far the turning itself moves this node this frame (radius x
+        // angle, with room to spare); the travel limit never holds that back.
+        const turnRate = this.rotationPaused ? 0 : Math.abs(scene.spinY || 0) + Math.abs(scene.spinX || 0);
+        const rotationTravel = Math.hypot(orbitScreenX - centerX, orbitScreenY - centerY)
+          * turnRate * frameElapsedMs * 1.5 + 0.5;
         const continuousPosition = limitScreenTravel(
           visualState.renderScreenX,
           visualState.renderScreenY,
           screenX,
           screenY,
           frameElapsedMs,
+          rotationTravel,
         );
         screenX = continuousPosition.x;
         screenY = continuousPosition.y;
@@ -908,7 +920,8 @@ export default {
           ctx.moveTo(iconX - 10, rowY);
           ctx.lineTo(iconX + 10, rowY);
           // Brighter than on the graph so a short sample reads, in the same colours.
-          ctx.strokeStyle = `rgba(217, 223, 227, ${item.relayed ? 0.55 * RELAYED_LINK_DIM : 0.55})`;
+          // Direct links are bright and solid; relayed ones the same line, faint.
+          ctx.strokeStyle = `rgba(217, 223, 227, ${item.relayed ? 0.75 * RELAYED_LINK_DIM : 0.75})`;
           ctx.lineWidth = 1;
           ctx.stroke();
           ctx.restore();
@@ -1147,6 +1160,7 @@ export default {
 
       const now = Date.now();
       const projected = this.projectNodes(scene, now);
+      scene.projectedNodes = projected;
       const byId = new Map(projected.map((node) => [node.id, node]));
       scene.links = scene.links.filter((link) => this.drawLink(ctx, link, byId, now));
       projected.slice().sort((a, b) => b.depth - a.depth).forEach((node) => this.drawNode(ctx, node));
