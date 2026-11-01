@@ -3,7 +3,7 @@
     <canvas
       ref="canvas"
       class="peer-network-canvas"
-      aria-label="Live PeerPigeon peer network. Solid edges are direct, dashed edges are relayed, node size indicates hop distance, white points are distant peers, and green edges are carrying messages."
+      aria-label="Live PeerPigeon peer network. Brighter edges are direct, fainter edges are relayed, node size indicates hop distance, white points are distant peers, and green edges are carrying messages."
       @pointermove="handlePointerMove"
       @pointerleave="handlePointerLeave"
     ></canvas>
@@ -183,6 +183,8 @@ const LINK_BONE = [217, 223, 227];
 const LINK_SHEEN = [86, 176, 156];
 const LINK_IDLE_ALPHA = 0.16;
 const LINK_ACTIVE_ALPHA = 0.55;
+/** How bright a relayed link is next to a direct one. */
+const RELAYED_LINK_DIM = 0.45;
 
 /** A link's colour at a given activity (0 idle, 1 sending): bone toward the accent. */
 function linkStroke(glow) {
@@ -830,7 +832,7 @@ export default {
         { label: '2 hops', type: 'node', radius: 8 / Math.sqrt(2), color: 'rgba(217, 223, 227, 0.5)' },
         { label: '3 or more hops', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: 'rgba(217, 223, 227, 0.9)' },
         { label: 'Direct', type: 'line' },
-        { label: 'Relayed', type: 'line', dashed: true },
+        { label: 'Relayed', type: 'line', relayed: true },
         { label: 'Sending now', type: 'line', active: true },
       ];
 
@@ -872,9 +874,10 @@ export default {
           ctx.moveTo(iconX - 10, rowY);
           ctx.lineTo(iconX + 10, rowY);
           // Brighter than on the graph so a short sample reads, in the same colours.
-          ctx.strokeStyle = item.active ? 'rgba(86, 176, 156, 0.95)' : 'rgba(217, 223, 227, 0.55)';
+          ctx.strokeStyle = item.active
+            ? 'rgba(86, 176, 156, 0.95)'
+            : `rgba(217, 223, 227, ${item.relayed ? 0.55 * RELAYED_LINK_DIM : 0.55})`;
           ctx.lineWidth = 1;
-          if (item.dashed) ctx.setLineDash([4, 4]);
           ctx.stroke();
           if (item.active) {
             ctx.fillStyle = 'rgba(86, 176, 156, 0.95)';
@@ -978,18 +981,18 @@ export default {
       state.glow += (activity - state.glow) * glowBlend;
       state.lastFrameAt = now;
 
-      const strokeVariant = (weight, dashed) => {
+      // Relayed links are solid like direct ones, only fainter.
+      const strokeVariant = (weight, relayed) => {
         const opacity = state.visibility * weight;
         if (opacity <= 0.002) return;
         ctx.save();
         ctx.beginPath();
         ctx.moveTo(state.sourceScreenX, state.sourceScreenY);
         ctx.lineTo(state.targetScreenX, state.targetScreenY);
-        if (dashed) ctx.setLineDash([5, 5]);
 
         // A quiet bone line; while a message crosses it, it turns the
         // accent green and brightens, with no blur (as on raeder.io).
-        ctx.globalAlpha = opacity;
+        ctx.globalAlpha = opacity * (relayed ? RELAYED_LINK_DIM : 1);
         ctx.lineWidth = 1;
         ctx.strokeStyle = linkStroke(state.glow);
         ctx.stroke();
