@@ -1252,6 +1252,7 @@ declare class PartialMesh {
     private lastDialFailureAtMs;
     private dialBackoffUntilMs;
     private rebalanceCooldownUntilMs;
+    private rebalanceCooldownMs;
     private rebalanceAttemptAtMs;
     private bridgeGraceUntilMs;
     private lastBridgeDialAtMs;

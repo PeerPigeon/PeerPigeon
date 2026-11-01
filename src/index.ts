@@ -46,6 +46,17 @@ const PEER_GONE_BACKOFF_MS = 60_000;
 const FILL_REFUSED_WINDOW_MS = 60_000;
 const FILL_BACKOFF_MIN_MS = 15_000;
 const FILL_BACKOFF_MAX_MS = 120_000;
+// Rebalancing (swapping a link for a closer or needed peer at maxPeers) is
+// what keeps a settled mesh churning: each swap costs two links (ours, and
+// the one the far end sheds to take us). A link this young is never swapped
+// out, and a peer that just swapped waits this long before the next.
+const REBALANCE_EDGE_MIN_AGE_MS = 60_000;
+const REBALANCE_COOLDOWN_MS = 30_000;
+// Each rebalance doubles the wait before the next, up to this: in a capped
+// mesh the overlay can never give every peer every neighbour it would like,
+// so repairs never run out on their own. Losing a link we did not choose, or
+// coming back from a suspension, starts it over.
+const REBALANCE_COOLDOWN_MAX_MS = 600_000;
 const RENEWAL_FORWARD_MS = 300;
 // How long links stay open after a peer says it is leaving, so that frame goes out first.
 const LEAVE_FLUSH_MS = 250;
@@ -747,6 +758,7 @@ export class PartialMesh {
   private lastDialFailureAtMs: Map<string, number> = new Map();
   private dialBackoffUntilMs: Map<string, number> = new Map();
   private rebalanceCooldownUntilMs: number = 0;
+  private rebalanceCooldownMs: number = REBALANCE_COOLDOWN_MS;
   private rebalanceAttemptAtMs: Map<string, number> = new Map();
   // Links to peers outside our membership when they formed: a bridge to a
   // separate part of the mesh, kept past maxPeers until membership merges.
@@ -1704,9 +1716,11 @@ export class PartialMesh {
       return false;
     }
 
-    // Keep existing edges sticky for a short period to prevent oscillation.
+    // Keep existing edges sticky to prevent oscillation. Four seconds let a
+    // settled mesh keep trading links: each swap freed a slot at the far end,
+    // which dialled someone full, who shed a link in turn, every minute.
     const connectedAgeMs = now - (farthestConnected.connectedAt || 0);
-    if (connectedAgeMs < 4_000) {
+    if (connectedAgeMs < REBALANCE_EDGE_MIN_AGE_MS) {
       return false;
     }
 
@@ -1722,7 +1736,9 @@ export class PartialMesh {
     const candidatePriority = this.cecrOverlayDialPriority(closestCandidate.peerId);
     const repairsCecrOverlay = candidatePriority === 0
       || (candidatePriority === 1 && this.config.maxPeers > this.cecrCoordinateNeighbors().size);
-    const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 4n < farthestConnected.distance * 3n;
+    // A swap only for a coordinate under half the distance: smaller gains are
+    // not worth the two links (ours and the one the far end sheds) they cost.
+    const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 2n < farthestConnected.distance;
     if (!materiallyCloser) {
       return false;
     }
@@ -1742,7 +1758,8 @@ export class PartialMesh {
       return false;
     }
 
-    this.rebalanceCooldownUntilMs = now + 4_000;
+    this.rebalanceCooldownUntilMs = now + this.rebalanceCooldownMs;
+    this.rebalanceCooldownMs = Math.min(REBALANCE_COOLDOWN_MAX_MS, this.rebalanceCooldownMs * 2);
     this.rebalanceAttemptAtMs.set(closestCandidate.peerId, now);
     this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now);
     this.pendingRebalanceDropByTarget.set(closestCandidate.peerId, farthestConnected.peerId);
@@ -2151,6 +2168,7 @@ export class PartialMesh {
     }
     this.rebalanceAttemptAtMs.clear();
     this.rebalanceCooldownUntilMs = 0;
+    this.rebalanceCooldownMs = REBALANCE_COOLDOWN_MS;
     this.lastUnderConnectedRecoveryAtMs = 0;
     this.noteDiscoveryNews();
     this.underConnectedSinceMs = null;
@@ -2497,6 +2515,9 @@ export class PartialMesh {
     // here too — counting those as dial failures put both ends of a healthy
     // capacity shed into mutual backoff.
     if (reason === 'local_close' || reason === 'capacity_shed') return;
+    // A link lost that we did not choose: the mesh changed, so rebalancing is
+    // worth its first, short wait again.
+    this.rebalanceCooldownMs = REBALANCE_COOLDOWN_MS;
 
     const connectedForMs = connectedAt > 0 ? Date.now() - connectedAt : 0;
     if (connectedForMs < STABLE_PEER_CONNECTION_MS) {
@@ -2684,6 +2705,13 @@ export class PartialMesh {
     const livePendingCount = Array.from(this.peers.values()).filter((peer) => (
       !peer.connected && (this.activeSignalingPeers.has(peer.id) || this.meshCanSignal(peer.id))
     )).length;
+    // A peer fills its free slots only up to one below maxPeers; the last
+    // slot is for others to dial in. Filling to the top kept a settled mesh
+    // trading links forever: a peer that lost a link (to a shed or a
+    // rebalance) at once dialled another, several dialled the same peer, it
+    // went over and shed someone, who dialled again. A peer knocked down one
+    // link now just stays there, and the chain stops after one step.
+    const fillCeiling = Math.max(this.config.minPeers + 1, this.config.maxPeers - 1);
     if (connectedCount < this.config.minPeers && connectedCount + livePendingCount < this.config.minPeers && available.length > 0) {
       for (const peerId of pickCandidates(Math.max(1, this.config.minPeers - connectedCount))) {
         this.connectToPeerInternal(peerId, true);
@@ -2704,7 +2732,7 @@ export class PartialMesh {
       for (const peerId of pickCandidates(tryCount)) {
         this.connectToPeer(peerId);
       }
-    } else if (totalInProgress < this.config.maxPeers && available.length > 0) {
+    } else if (totalInProgress < fillCeiling && available.length > 0) {
       if (now < this.rebalanceCooldownUntilMs || now < this.fillBackoffUntilMs) {
         return;
       }
@@ -2717,9 +2745,15 @@ export class PartialMesh {
       // made it accept, shed an older link, and leave that peer with a free
       // slot to fill the same way: a mesh that never settled, hundreds of
       // links torn down and redialled a minute.
+      // A peer above its minimum is healthy: it fills only from a peer that
+      // has said it has room. Even a coordinate neighbour that is full would
+      // shed a link to take us, starting the same chain of sheds and fills;
+      // in a settled mesh that alone traded links every minute.
+      const healthy = connectedCount > this.config.minPeers;
       const withRoom = (peerId: string): boolean => {
         const capacity = this.freshPeerCapacity(peerId);
-        if (this.cecrOverlayDialPriority(peerId) === 0) return true;
+        if (!healthy && this.cecrOverlayDialPriority(peerId) === 0) return true;
+        if (healthy) return Boolean(capacity) && capacity!.connectedPeers < capacity!.maxPeers;
         // A member of our part with no fresh advertisement is most likely
         // full (a settled peer advertises nothing new); only a peer outside
         // our membership is worth a dial on no information.
@@ -3798,6 +3832,7 @@ export class PartialMesh {
     this.noteDiscoveryNews();
     this.lastSignalingReconnectAtMs = 0;
     this.rebalanceCooldownUntilMs = 0;
+    this.rebalanceCooldownMs = REBALANCE_COOLDOWN_MS;
     this.dialFailureCount.clear();
     this.dialBackoffUntilMs.clear();
 

@@ -4730,6 +4730,9 @@ var PEER_GONE_BACKOFF_MS = 6e4;
 var FILL_REFUSED_WINDOW_MS = 6e4;
 var FILL_BACKOFF_MIN_MS = 15e3;
 var FILL_BACKOFF_MAX_MS = 12e4;
+var REBALANCE_EDGE_MIN_AGE_MS = 6e4;
+var REBALANCE_COOLDOWN_MS = 3e4;
+var REBALANCE_COOLDOWN_MAX_MS = 6e5;
 var RENEWAL_FORWARD_MS = 300;
 var LEAVE_FLUSH_MS = 250;
 var BRIDGE_GRACE_MS = 8e3;
@@ -5055,6 +5058,7 @@ var PartialMesh = class {
     this.lastDialFailureAtMs = /* @__PURE__ */ new Map();
     this.dialBackoffUntilMs = /* @__PURE__ */ new Map();
     this.rebalanceCooldownUntilMs = 0;
+    this.rebalanceCooldownMs = REBALANCE_COOLDOWN_MS;
     this.rebalanceAttemptAtMs = /* @__PURE__ */ new Map();
     // Links to peers outside our membership when they formed: a bridge to a
     // separate part of the mesh, kept past maxPeers until membership merges.
@@ -5834,12 +5838,12 @@ var PartialMesh = class {
       return false;
     }
     const connectedAgeMs = now - (farthestConnected.connectedAt || 0);
-    if (connectedAgeMs < 4e3) {
+    if (connectedAgeMs < REBALANCE_EDGE_MIN_AGE_MS) {
       return false;
     }
     const candidatePriority = this.cecrOverlayDialPriority(closestCandidate.peerId);
     const repairsCecrOverlay = candidatePriority === 0 || candidatePriority === 1 && this.config.maxPeers > this.cecrCoordinateNeighbors().size;
-    const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 4n < farthestConnected.distance * 3n;
+    const materiallyCloser = repairsCecrOverlay || closestCandidate.distance * 2n < farthestConnected.distance;
     if (!materiallyCloser) {
       return false;
     }
@@ -5850,7 +5854,8 @@ var PartialMesh = class {
     if (otherDiscoveredPeers < 1) {
       return false;
     }
-    this.rebalanceCooldownUntilMs = now + 4e3;
+    this.rebalanceCooldownUntilMs = now + this.rebalanceCooldownMs;
+    this.rebalanceCooldownMs = Math.min(REBALANCE_COOLDOWN_MAX_MS, this.rebalanceCooldownMs * 2);
     this.rebalanceAttemptAtMs.set(closestCandidate.peerId, now);
     this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now);
     this.pendingRebalanceDropByTarget.set(closestCandidate.peerId, farthestConnected.peerId);
@@ -6180,6 +6185,7 @@ var PartialMesh = class {
     }
     this.rebalanceAttemptAtMs.clear();
     this.rebalanceCooldownUntilMs = 0;
+    this.rebalanceCooldownMs = REBALANCE_COOLDOWN_MS;
     this.lastUnderConnectedRecoveryAtMs = 0;
     this.noteDiscoveryNews();
     this.underConnectedSinceMs = null;
@@ -6400,6 +6406,7 @@ var PartialMesh = class {
   }
   noteTransportDisconnect(peerId, connectedAt, reason) {
     if (reason === "local_close" || reason === "capacity_shed") return;
+    this.rebalanceCooldownMs = REBALANCE_COOLDOWN_MS;
     const connectedForMs = connectedAt > 0 ? Date.now() - connectedAt : 0;
     if (connectedForMs < STABLE_PEER_CONNECTION_MS) {
       this.noteDialFailure(peerId);
@@ -6530,6 +6537,7 @@ var PartialMesh = class {
       return sorted.slice(0, Math.min(count, sorted.length));
     };
     const livePendingCount = Array.from(this.peers.values()).filter((peer) => !peer.connected && (this.activeSignalingPeers.has(peer.id) || this.meshCanSignal(peer.id))).length;
+    const fillCeiling = Math.max(this.config.minPeers + 1, this.config.maxPeers - 1);
     if (connectedCount < this.config.minPeers && connectedCount + livePendingCount < this.config.minPeers && available.length > 0) {
       for (const peerId of pickCandidates(Math.max(1, this.config.minPeers - connectedCount))) {
         this.connectToPeerInternal(peerId, true);
@@ -6544,14 +6552,16 @@ var PartialMesh = class {
       for (const peerId of pickCandidates(tryCount)) {
         this.connectToPeer(peerId);
       }
-    } else if (totalInProgress < this.config.maxPeers && available.length > 0) {
+    } else if (totalInProgress < fillCeiling && available.length > 0) {
       if (now < this.rebalanceCooldownUntilMs || now < this.fillBackoffUntilMs) {
         return;
       }
       if (this.fillBackoffMs > 0 && now - this.fillBackoffUntilMs > FILL_BACKOFF_MAX_MS) this.fillBackoffMs = 0;
+      const healthy = connectedCount > this.config.minPeers;
       const withRoom = (peerId) => {
         const capacity = this.freshPeerCapacity(peerId);
-        if (this.cecrOverlayDialPriority(peerId) === 0) return true;
+        if (!healthy && this.cecrOverlayDialPriority(peerId) === 0) return true;
+        if (healthy) return Boolean(capacity) && capacity.connectedPeers < capacity.maxPeers;
         if (!capacity) return !this.globalPeers.has(peerId);
         return capacity.connectedPeers < capacity.maxPeers;
       };
@@ -7403,6 +7413,7 @@ var PartialMesh = class {
     this.noteDiscoveryNews();
     this.lastSignalingReconnectAtMs = 0;
     this.rebalanceCooldownUntilMs = 0;
+    this.rebalanceCooldownMs = REBALANCE_COOLDOWN_MS;
     this.dialFailureCount.clear();
     this.dialBackoffUntilMs.clear();
     this.signalingClient = null;
