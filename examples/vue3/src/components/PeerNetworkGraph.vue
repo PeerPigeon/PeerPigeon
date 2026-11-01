@@ -935,7 +935,7 @@ export default {
         { label: '1 hop', type: 'node', radius: 8, color: 'rgba(217, 223, 227, 0.6)' },
         { label: '2 hops', type: 'node', radius: 8 / Math.sqrt(2), color: 'rgba(217, 223, 227, 0.5)' },
         { label: '3 or 4 hops', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: 'rgba(217, 223, 227, 0.9)' },
-        { label: '5 or more (far behind)', type: 'star', radius: 0.6, color: 'rgba(217, 223, 227, 0.55)', faint: true },
+        { label: '5 or more (far away)', type: 'star', radius: 0.6, color: 'rgba(217, 223, 227, 0.55)', faint: true },
         { label: 'Gone (fading)', type: 'star', radius: DEAD_STAR_RADIUS, color: 'rgba(217, 223, 227, 0.4)', faint: true },
         { label: 'Direct', type: 'line' },
         { label: 'Relayed', type: 'line', relayed: true },
