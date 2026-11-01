@@ -71,6 +71,16 @@ const DISTANT_STAR_RADIUS_THRESHOLD = 5;
 const DISTANT_STAR_POINT_RADIUS = 1.65;
 const GRAPH_ROTATION_RADIANS_PER_MS = 0.000108; // raeder.io's resting spin (0.0018 rad a frame at 60 fps)
 const RIGID_ROTATION = true;
+// Peers 5 or more hops away are a far background layer: tiny dots on a wider
+// shell that turn slower than the graph (parallax), resting or steered.
+const BACKGROUND_HOPS = 5;
+const BACKGROUND_PARALLAX = 0.35;
+const BACKGROUND_SPREAD = 1.3;
+// Dead peers (gone quiet, or gone) stop where they are as still stars and fade
+// away: over 30 s while quiet on their lease, 6 s once they have left.
+const DEAD_STAR_RADIUS = 1.05;
+const DEAD_FADE_MS = 30_000;
+const DEAD_EXIT_FADE_MS = 6_000;
 // Steering with the pointer (the "Steer with pointer" box): moving across the
 // graph pushes the spin against the motion, and it drifts back to rest.
 const STEER_MAX_RADIANS_PER_MS = 0.0018;
@@ -252,7 +262,10 @@ function nodeCoreAppearance(node) {
     // A silent peer (still on its membership lease, no live links) fades out.
     alpha: (node?.distantPoint
       ? circleAlpha + (0.96 - circleAlpha) * easedShrink
-      : 0.96 + (circleAlpha - 0.96) * easedGrowth) * (node?.isFading ? 0.3 : 1),
+      : 0.96 + (circleAlpha - 0.96) * easedGrowth)
+      // Dead peers fade away; the background layer is dimmer.
+      * (node?.dead ? 0.7 * (Number.isFinite(node?.deadFade) ? node.deadFade : 1) : 1)
+      * (node?.background ? 0.55 : 1),
   };
 }
 
@@ -564,8 +577,16 @@ export default {
         // camera perspective. Direct peers retain the full remote radius.
         const sizeProfile = peerSizeProfile(node.id, node.hopDistance, node.isSelf);
         const baseRadius = sizeProfile.circleRadius;
-        const starPointRadius = sizeProfile.starPointRadius || DISTANT_STAR_POINT_RADIUS;
-        const distantPoint = !node.isSelf && baseRadius < DISTANT_STAR_RADIUS_THRESHOLD;
+        const hops = Number(node.hopDistance);
+        const dead = !node.isSelf && Boolean(node.isFading || node.exiting);
+        const background = !node.isSelf && !dead && Number.isFinite(hops) && hops >= BACKGROUND_HOPS;
+        const backgroundVariation = hashPeerId(`${node.id}:background`) / 0xffffffff;
+        const starPointRadius = dead
+          ? DEAD_STAR_RADIUS
+          : background
+            ? 0.42 + backgroundVariation * 0.22
+            : sizeProfile.starPointRadius || DISTANT_STAR_POINT_RADIUS;
+        const distantPoint = !node.isSelf && (baseRadius < DISTANT_STAR_RADIUS_THRESHOLD || dead || background);
         const rotationSpeedFactor = peerRotationSpeedFactor(
           node.id,
           node.hopDistance,
@@ -662,21 +683,46 @@ export default {
         }
         visualState.starPointRadius = starPointRadius;
 
+        // Dead: remember where it died (it stays there) and when.
+        if (dead && !visualState.dead) {
+          visualState.dead = true;
+          visualState.deadSince = now;
+          visualState.deadAnchorX = Number.isFinite(visualState.renderScreenX) ? (visualState.renderScreenX - centerX) / scale : null;
+          visualState.deadAnchorY = Number.isFinite(visualState.renderScreenY) ? (visualState.renderScreenY - centerY) / scale : null;
+        } else if (!dead && visualState.dead) {
+          // Back to life: it rejoins the turning graph from where it stood.
+          visualState.dead = false;
+          visualState.deadSince = null;
+          visualState.exitSince = null;
+          visualState.beginCirclePositionTransition = true;
+        }
+        if (node.exiting && !Number.isFinite(visualState.exitSince)) visualState.exitSince = now;
+        const deadFade = dead
+          ? Math.max(0, 1 - (now - visualState.deadSince) / DEAD_FADE_MS)
+            * (node.exiting ? Math.max(0, 1 - (now - visualState.exitSince) / DEAD_EXIT_FADE_MS) : 1)
+          : 1;
+
+        const layerTurn = background ? BACKGROUND_PARALLAX : 1;
         const effectiveRotationY = RIGID_ROTATION
-          ? scene.rotationY
+          ? scene.rotationY * layerTurn
           : distantPoint
             ? visualState.starRotationY
             : scene.rotationY * visualState.rotationSpeedFactor + visualState.rotationOffset;
         const cosY = Math.cos(effectiveRotationY);
         const sinY = Math.sin(effectiveRotationY);
-        // A gentle nod as it turns, plus any tilt the pointer gave it (raeder.io).
-        const tiltX = Math.sin(scene.rotationY * 0.3) * 0.1 + (scene.rotationX || 0);
+        // A gentle nod as it turns, plus any tilt the pointer gave it (raeder.io);
+        // the background layer nods and tilts less, as it turns less.
+        const tiltX = Math.sin(effectiveRotationY * 0.3) * 0.1 + (scene.rotationX || 0) * layerTurn;
         const cosX = Math.cos(tiltX);
         const sinX = Math.sin(tiltX);
-        const autoX = node.x * cosY + node.z * sinY;
-        const autoZ = -node.x * sinY + node.z * cosY;
-        const rotatedY = node.y * cosX - autoZ * sinX;
-        const rotatedZ = node.y * sinX + autoZ * cosX;
+        const spread = background ? BACKGROUND_SPREAD : 1;
+        const worldX = node.x * spread;
+        const worldY = node.y * spread;
+        const worldZ = node.z * spread;
+        const autoX = worldX * cosY + worldZ * sinY;
+        const autoZ = -worldX * sinY + worldZ * cosY;
+        const rotatedY = worldY * cosX - autoZ * sinX;
+        const rotatedZ = worldY * sinX + autoZ * cosX;
         const perspective = 3.2 / (3.2 + rotatedZ);
         const activity = this.activityStrength(node.id, now);
         const intro = Math.min(1, Math.max(0.18, (now - node.bornAt) / 520));
@@ -688,7 +734,13 @@ export default {
           : now - 16;
         const frameElapsedMs = Math.min(50, Math.max(1, now - previousProjectionAt));
         const visibilityTarget = visualState.present === false || node.exiting ? 0 : 1;
-        if (!Number.isFinite(visualState.visibilityOpacity)) {
+        if (node.exiting && !node.isSelf) {
+          // A peer that left fades as a still star rather than blinking out.
+          visualState.visibilityOpacity = Math.min(
+            Number.isFinite(visualState.visibilityOpacity) ? visualState.visibilityOpacity : 1,
+            deadFade,
+          );
+        } else if (!Number.isFinite(visualState.visibilityOpacity)) {
           // HMR may add this field to already-rendered peers. Preserve their
           // current visibility; only actual additions begin at zero.
           visualState.visibilityOpacity = 1;
@@ -744,13 +796,19 @@ export default {
           visualState.starAnchorY = (orbitScreenY - centerY) / scale;
         }
 
-        // Distant peers turn with the rest when the graph turns as one body.
-        let screenX = distantPoint && !RIGID_ROTATION
-          ? centerX + visualState.starAnchorX * scale
-          : orbitScreenX;
-        let screenY = distantPoint && !RIGID_ROTATION
-          ? centerY + visualState.starAnchorY * scale
-          : orbitScreenY;
+        // Distant peers turn with the rest when the graph turns as one body;
+        // a dead peer stays where it died.
+        const frozen = dead && visualState.deadAnchorX != null;
+        let screenX = frozen
+          ? centerX + visualState.deadAnchorX * scale
+          : distantPoint && !RIGID_ROTATION
+            ? centerX + visualState.starAnchorX * scale
+            : orbitScreenX;
+        let screenY = frozen
+          ? centerY + visualState.deadAnchorY * scale
+          : distantPoint && !RIGID_ROTATION
+            ? centerY + visualState.starAnchorY * scale
+            : orbitScreenY;
         if (visualState.reappearing) {
           const previousScreenX = Number.isFinite(visualState.renderAnchorX)
             ? centerX + visualState.renderAnchorX * scale
@@ -805,7 +863,7 @@ export default {
         if (starShrinkProgress >= 1) visualState.starShrinkStartedAt = null;
         // How far the turning itself moves this node this frame (radius x
         // angle, with room to spare); the travel limit never holds that back.
-        const turnRate = this.rotationPaused ? 0 : Math.abs(scene.spinY || 0) + Math.abs(scene.spinX || 0);
+        const turnRate = this.rotationPaused || dead ? 0 : (Math.abs(scene.spinY || 0) + Math.abs(scene.spinX || 0)) * layerTurn;
         const rotationTravel = Math.hypot(orbitScreenX - centerX, orbitScreenY - centerY)
           * turnRate * frameElapsedMs * 1.5 + 0.5;
         const continuousPosition = limitScreenTravel(
@@ -827,14 +885,18 @@ export default {
         return {
           ...node,
           activity,
-          depth: distantPoint ? node.z : rotatedZ,
+          // Background dots are drawn first (furthest), then dead stars, then the graph.
+          depth: background ? 100 + rotatedZ : dead ? 50 : distantPoint && !RIGID_ROTATION ? node.z : rotatedZ,
+          background,
+          dead,
+          deadFade,
           distantPoint,
           circleGrowthProgress,
           circleGrowthFromRadius: visualState.circleGrowthFromRadius ?? starPointRadius,
           starShrinkProgress,
           starShrinkFromRadius: visualState.starShrinkFromRadius,
           starPointRadius: visualState.starPointRadius,
-          labelOpacity: visualState.labelOpacity,
+          labelOpacity: visualState.labelOpacity * deadFade * (background ? 0.55 : 1),
           visibilityOpacity: visualState.visibilityOpacity,
           radius,
           screenX,
@@ -854,13 +916,10 @@ export default {
 
     drawLegend(ctx, width, height, projectedNodes = []) {
       const left = 16;
-      const panelHeight = 188;
-      const top = height - panelHeight - 14;
       const corner = 10;
       const iconX = left + 19;
       const labelX = left + 40;
       const legendFont = '500 11px Archivo, system-ui, sans-serif';
-      const rowStartY = top + 22;
       const rowGap = 24;
       const selfNode = projectedNodes.find((node) => node.isSelf);
       const selfAppearance = selfNode ? nodeCoreAppearance(selfNode) : null;
@@ -875,12 +934,18 @@ export default {
         // Peers keep their own colours; the legend shows size, so it is drawn in bone.
         { label: '1 hop', type: 'node', radius: 8, color: 'rgba(217, 223, 227, 0.6)' },
         { label: '2 hops', type: 'node', radius: 8 / Math.sqrt(2), color: 'rgba(217, 223, 227, 0.5)' },
-        { label: '3 or more hops', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: 'rgba(217, 223, 227, 0.9)' },
+        { label: '3 or 4 hops', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: 'rgba(217, 223, 227, 0.9)' },
+        { label: '5 or more (far behind)', type: 'star', radius: 0.6, color: 'rgba(217, 223, 227, 0.55)', faint: true },
+        { label: 'Gone (fading)', type: 'star', radius: DEAD_STAR_RADIUS, color: 'rgba(217, 223, 227, 0.4)', faint: true },
         { label: 'Direct', type: 'line' },
         { label: 'Relayed', type: 'line', relayed: true },
         // As the graph shows it: the peer's own colour, in a green halo.
         { label: 'Sending now', type: 'active', radius: 4, color: 'rgba(217, 223, 227, 0.85)' },
       ];
+
+      const panelHeight = items.length * rowGap + 20;
+      const top = height - panelHeight - 14;
+      const rowStartY = top + 22;
 
       ctx.save();
       ctx.font = legendFont;
@@ -949,7 +1014,7 @@ export default {
           ctx.fillStyle = item.color || 'rgba(217, 223, 227, 0.6)';
           if (item.type === 'star') {
             ctx.shadowColor = 'rgba(217, 223, 227, 0.7)';
-            ctx.shadowBlur = 5;
+            ctx.shadowBlur = item.faint ? 2 : 5;
           }
           ctx.fill();
           ctx.restore();
@@ -1099,8 +1164,9 @@ export default {
         : Math.max(4.5 * (1 - easedGrowth), radius * 1.8);
       ctx.save();
       if (node.distantPoint || growthProgress < 0.2) {
+        // Far and dead stars glimmer less than the graph's own.
         ctx.shadowColor = 'rgba(255, 255, 255, 0.78)';
-        ctx.shadowBlur = 6 + node.activity * 5;
+        ctx.shadowBlur = (node.background || node.dead ? 2 : 6) + node.activity * 5;
       }
       if (node.activity > 0) {
         ctx.globalAlpha = node.activity * 0.32 * visibilityOpacity;
