@@ -3,7 +3,7 @@
     <canvas
       ref="canvas"
       class="peer-network-canvas"
-      aria-label="Live PeerPigeon peer network. Solid edges are direct, dashed edges are relayed, node size indicates hop distance, white points are distant peers, and glow indicates activity."
+      aria-label="Live PeerPigeon peer network. Solid edges are direct, dashed edges are relayed, node size indicates hop distance, white points are distant peers, and green edges are carrying messages."
       @pointermove="handlePointerMove"
       @pointerleave="handlePointerLeave"
     ></canvas>
@@ -176,6 +176,20 @@ function peerSizeProfile(peerId, hopDistance, isSelf) {
     // while the additive floor and glow keep even very distant peers visible.
     starPointRadius: 0.65 + (1.15 + variation * 0.3) * starDistanceDecay,
   };
+}
+
+// Links and legend: bone on night, with one accent for traffic.
+const LINK_BONE = [217, 223, 227];
+const LINK_SHEEN = [86, 176, 156];
+const LINK_IDLE_ALPHA = 0.16;
+const LINK_ACTIVE_ALPHA = 0.55;
+
+/** A link's colour at a given activity (0 idle, 1 sending): bone toward the accent. */
+function linkStroke(glow) {
+  const g = Math.max(0, Math.min(1, Number(glow) || 0));
+  const mix = (i) => Math.round(LINK_BONE[i] + (LINK_SHEEN[i] - LINK_BONE[i]) * g);
+  const alpha = LINK_IDLE_ALPHA + (LINK_ACTIVE_ALPHA - LINK_IDLE_ALPHA) * g;
+  return `rgba(${mix(0)}, ${mix(1)}, ${mix(2)}, ${alpha.toFixed(3)})`;
 }
 
 function nodeCoreAppearance(node) {
@@ -808,15 +822,16 @@ export default {
           label: selfNode?.id ? `You (${formatPeerId(selfNode.id)})` : 'You',
           type: 'node',
           radius: 12,
-          color: selfAppearance?.color || 'rgba(125, 249, 255, 0.82)',
+          color: selfAppearance?.color || 'rgba(217, 223, 227, 0.82)',
           alpha: selfAppearance?.alpha ?? 1,
         },
-        { label: '1 hop', type: 'node', radius: 8, color: 'rgba(125, 249, 255, 0.72)' },
-        { label: '2 hops', type: 'node', radius: 8 / Math.sqrt(2), color: 'rgba(125, 211, 252, 0.7)' },
-        { label: '3 or more hops', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: '#ffffff' },
+        // Peers keep their own colours; the legend shows size, so it is drawn in bone.
+        { label: '1 hop', type: 'node', radius: 8, color: 'rgba(217, 223, 227, 0.6)' },
+        { label: '2 hops', type: 'node', radius: 8 / Math.sqrt(2), color: 'rgba(217, 223, 227, 0.5)' },
+        { label: '3 or more hops', type: 'star', radius: DISTANT_STAR_POINT_RADIUS, color: 'rgba(217, 223, 227, 0.9)' },
         { label: 'Direct', type: 'line' },
         { label: 'Relayed', type: 'line', dashed: true },
-        { label: 'Sending now', type: 'active' },
+        { label: 'Sending now', type: 'line', active: true },
       ];
 
       ctx.save();
@@ -838,41 +853,47 @@ export default {
       ctx.lineTo(left, top + corner);
       ctx.quadraticCurveTo(left, top, left + corner, top);
       ctx.closePath();
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.075)';
+      ctx.fillStyle = 'rgba(17, 21, 24, 0.62)';
       ctx.fill();
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+      ctx.strokeStyle = 'rgba(217, 223, 227, 0.1)';
       ctx.lineWidth = 1;
       ctx.stroke();
 
       ctx.font = legendFont;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.78)';
+      ctx.fillStyle = 'rgba(217, 223, 227, 0.72)';
 
       items.forEach((item, index) => {
         const rowY = rowStartY + index * rowGap;
         if (item.type === 'line') {
           ctx.save();
           ctx.beginPath();
-          ctx.moveTo(iconX - 9, rowY);
-          ctx.lineTo(iconX + 9, rowY);
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.72)';
+          ctx.moveTo(iconX - 10, rowY);
+          ctx.lineTo(iconX + 10, rowY);
+          // Brighter than on the graph so a short sample reads, in the same colours.
+          ctx.strokeStyle = item.active ? 'rgba(86, 176, 156, 0.95)' : 'rgba(217, 223, 227, 0.55)';
           ctx.lineWidth = 1;
           if (item.dashed) ctx.setLineDash([4, 4]);
           ctx.stroke();
+          if (item.active) {
+            ctx.fillStyle = 'rgba(86, 176, 156, 0.95)';
+            for (const x of [iconX - 10, iconX + 10]) {
+              ctx.beginPath();
+              ctx.arc(x, rowY, 2.25, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
           ctx.restore();
         } else {
           ctx.save();
           ctx.beginPath();
           ctx.arc(iconX, rowY, item.radius || 2, 0, Math.PI * 2);
           ctx.globalAlpha = item.alpha ?? 1;
-          ctx.fillStyle = item.color || '#8ff7ff';
+          ctx.fillStyle = item.color || 'rgba(217, 223, 227, 0.6)';
           if (item.type === 'star') {
-            ctx.shadowColor = 'rgba(255, 255, 255, 0.85)';
-            ctx.shadowBlur = 6;
-          } else if (item.type === 'active') {
-            ctx.shadowColor = 'rgba(143, 247, 255, 0.9)';
-            ctx.shadowBlur = 8;
+            ctx.shadowColor = 'rgba(217, 223, 227, 0.7)';
+            ctx.shadowBlur = 5;
           }
           ctx.fill();
           ctx.restore();
@@ -966,19 +987,11 @@ export default {
         ctx.lineTo(state.targetScreenX, state.targetScreenY);
         if (dashed) ctx.setLineDash([5, 5]);
 
-        if (state.glow > 0.002) {
-          ctx.globalAlpha = opacity * state.glow * 0.42;
-          ctx.strokeStyle = '#8ff7ff';
-          ctx.lineWidth = 1;
-          ctx.shadowColor = 'rgba(143, 247, 255, 0.72)';
-          ctx.shadowBlur = 8 + state.glow * 6;
-          ctx.stroke();
-        }
-
+        // A quiet bone line; while a message crosses it, it turns the
+        // accent green and brightens, with no blur (as on raeder.io).
         ctx.globalAlpha = opacity;
-        ctx.strokeStyle = `rgba(255, 255, 255, ${0.15 + state.glow * 0.35})`;
         ctx.lineWidth = 1;
-        ctx.shadowBlur = 0;
+        ctx.strokeStyle = linkStroke(state.glow);
         ctx.stroke();
         ctx.restore();
       };
@@ -1023,17 +1036,19 @@ export default {
       node.renderRadius = radius;
       // Match the banner's two-mesh treatment: a flat core plus a 1.5x
       // translucent outer circle that exists only during real peer activity.
+      // The halo is the accent green, as on raeder.io (a halo 1.8x the node);
+      // the core keeps the peer's own colour so peers stay told apart.
       const glowRadius = node.distantPoint
-        ? Math.max(4.5, radius * 1.5)
-        : Math.max(4.5 * (1 - easedGrowth), radius * 1.5);
+        ? Math.max(4.5, radius * 1.8)
+        : Math.max(4.5 * (1 - easedGrowth), radius * 1.8);
       ctx.save();
       if (node.distantPoint || growthProgress < 0.2) {
         ctx.shadowColor = 'rgba(255, 255, 255, 0.78)';
         ctx.shadowBlur = 6 + node.activity * 5;
       }
       if (node.activity > 0) {
-        ctx.globalAlpha = node.activity * 0.3 * visibilityOpacity;
-        ctx.fillStyle = activityColor;
+        ctx.globalAlpha = node.activity * 0.32 * visibilityOpacity;
+        ctx.fillStyle = 'rgb(86, 176, 156)';
         ctx.beginPath();
         ctx.arc(node.screenX, node.screenY, glowRadius, 0, Math.PI * 2);
         ctx.fill();
@@ -1238,9 +1253,9 @@ export default {
 
 .peer-network-rotation-toggle:hover,
 .peer-network-rotation-toggle:focus-visible {
-  border-color: rgba(143, 247, 255, 0.72);
+  border-color: rgba(86, 176, 156, 0.72);
   background: rgba(30, 41, 59, 0.82);
-  color: #8ff7ff;
+  color: #56b09c;
   outline: none;
 }
 
@@ -1288,7 +1303,7 @@ export default {
 
 .peer-network-status-icon {
   width: 1em;
-  color: #8ff7ff;
+  color: #56b09c;
   flex: 0 0 auto;
 }
 
@@ -1344,7 +1359,7 @@ export default {
 }
 
 .peer-network-tooltip small {
-  color: #8ff7ff;
+  color: #56b09c;
   font-size: 10px;
 }
 
