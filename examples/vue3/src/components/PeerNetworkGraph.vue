@@ -81,6 +81,8 @@ const BACKGROUND_SPREAD = 1.3;
 const DEAD_STAR_RADIUS = 1.05;
 const DEAD_FADE_MS = 30_000;
 const DEAD_EXIT_FADE_MS = 6_000;
+// Its peer ID goes first: over 4 s while quiet, or the first 40% of a gone fade.
+const DEAD_LABEL_FADE_MS = 4_000;
 // Steering with the pointer (the "Steer with pointer" box): moving across the
 // graph pushes the spin against the motion, and it drifts back to rest.
 const STEER_MAX_RADIANS_PER_MS = 0.0018;
@@ -701,6 +703,10 @@ export default {
           ? Math.max(0, 1 - (now - visualState.deadSince) / DEAD_FADE_MS)
             * (node.exiting ? Math.max(0, 1 - (now - visualState.exitSince) / DEAD_EXIT_FADE_MS) : 1)
           : 1;
+        const labelFade = dead
+          ? Math.max(0, 1 - (now - visualState.deadSince) / DEAD_LABEL_FADE_MS)
+            * (node.exiting ? Math.max(0, 1 - (now - visualState.exitSince) / (DEAD_EXIT_FADE_MS * 0.4)) : 1)
+          : 1;
 
         const layerTurn = background ? BACKGROUND_PARALLAX : 1;
         const effectiveRotationY = RIGID_ROTATION
@@ -896,7 +902,7 @@ export default {
           starShrinkProgress,
           starShrinkFromRadius: visualState.starShrinkFromRadius,
           starPointRadius: visualState.starPointRadius,
-          labelOpacity: visualState.labelOpacity * deadFade * (background ? 0.55 : 1),
+          labelOpacity: visualState.labelOpacity * labelFade * (background ? 0.55 : 1),
           visibilityOpacity: visualState.visibilityOpacity,
           radius,
           screenX,
