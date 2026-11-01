@@ -790,11 +790,17 @@ type PeerPigeonKeyPair = {
     priv: string;
     epub: string;
     epriv: string;
+    qpub?: string;
+    qpriv?: string;
+    kpub?: string;
+    kpriv?: string;
 };
 type PeerPublicKey = {
     peerId: string;
     pub: string;
     epub: string;
+    /** ML-KEM-768 public key, when the peer has one. */
+    kpub?: string;
     updatedAt: number;
     local: boolean;
 };

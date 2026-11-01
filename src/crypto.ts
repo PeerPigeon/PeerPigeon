@@ -1,4 +1,4 @@
-import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair } from 'unsea';
+import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair, hasPostQuantumKeys, upgradePair } from 'unsea';
 import type { DirectMessage, GossipBroadcastOptions, GossipMessage } from './gossip.js';
 
 export const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
@@ -11,20 +11,31 @@ const KEY_EXCHANGE_RETRY_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000];
 export const ENCRYPTED_BROADCAST_TYPE = 'pp-encrypted-broadcast-v1';
 export const ENCRYPTED_DIRECT_TYPE = 'pp-encrypted-direct-v1';
 
+// Direct messages are post-quantum hybrid encrypted (unsea 3: ECDH P-256 and
+// ML-KEM-768 together) when the recipient has announced an ML-KEM key (kpub);
+// to a peer that has not, they use ECDH alone, as before.
 export type PeerPigeonKeyPair = {
   pub: string;
   priv: string;
   epub: string;
   epriv: string;
+  qpub?: string;
+  qpriv?: string;
+  kpub?: string;
+  kpriv?: string;
 };
 
 export type PeerPublicKey = {
   peerId: string;
   pub: string;
   epub: string;
+  /** ML-KEM-768 public key, when the peer has one. */
+  kpub?: string;
   updatedAt: number;
   local: boolean;
 };
+
+const ML_KEM_768_PUBLIC_KEY_CHARS = 1579; // 1184 bytes, base64url
 
 export type RoomCipher = {
   alg: 'A256GCM';
@@ -106,6 +117,7 @@ type CryptoPublicInfoPayload = {
   from: string;
   pub: string;
   epub: string;
+  kpub?: string;
   timestamp: number;
 };
 
@@ -161,8 +173,10 @@ export class PeerPigeonCryptoProtocol {
 
   async init(): Promise<void> {
     if (this.initialized) return;
-    this.keyPair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await generateRandomPair();
-    this.validateKeyPair(this.keyPair);
+    const pair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await generateRandomPair();
+    this.validateKeyPair(pair);
+    // A pair from before post-quantum keys (stored, or supplied) gets them.
+    this.keyPair = hasPostQuantumKeys(pair) && pair.kpriv ? pair : upgradePair(pair);
     this.persistKeyPair(this.keyPair);
     this.initialized = true;
     this.gossip.on('messageReceived', this.onGossipMessageBound);
@@ -289,7 +303,10 @@ export class PeerPigeonCryptoProtocol {
       __ppType: ENCRYPTED_DIRECT_TYPE,
       from: String(this.mesh.getClientId() ?? '').trim(),
       to: target,
-      cipher: await encryptMessageWithMeta(String(plaintext), { epub: recipient.epub }),
+      cipher: await encryptMessageWithMeta(
+        String(plaintext),
+        recipient.kpub ? { epub: recipient.epub, kpub: recipient.kpub } : { epub: recipient.epub }
+      ),
       timestamp: Date.now(),
     };
   }
@@ -319,7 +336,8 @@ export class PeerPigeonCryptoProtocol {
 
   async decryptEncryptedDirect(payload: EncryptedDirectPayload): Promise<string> {
     if (!this.keyPair) throw new Error('Crypto protocol has not been initialized');
-    return await decryptMessageWithMeta(payload.cipher, this.keyPair.epriv);
+    // The whole pair: a post-quantum message needs kpriv as well as epriv.
+    return await decryptMessageWithMeta(payload.cipher, this.keyPair);
   }
 
   on<K extends keyof PeerPigeonCryptoEvents>(event: K, callback: PeerPigeonCryptoEvents[K]): void {
@@ -396,6 +414,7 @@ export class PeerPigeonCryptoProtocol {
       from: peerId,
       pub: this.keyPair.pub,
       epub: this.keyPair.epub,
+      ...(this.keyPair.kpub ? { kpub: this.keyPair.kpub } : {}),
       timestamp: Date.now(),
     };
   }
@@ -428,10 +447,13 @@ export class PeerPigeonCryptoProtocol {
     if (!id || typeof payload.pub !== 'string' || typeof payload.epub !== 'string') return;
     const existing = this.publicKeys.get(id);
     if (existing && existing.updatedAt > payload.timestamp) return;
+    const kpub = typeof payload.kpub === 'string' && payload.kpub.length === ML_KEM_768_PUBLIC_KEY_CHARS
+      && /^[A-Za-z0-9_-]+$/.test(payload.kpub) ? payload.kpub : undefined;
     const value: PeerPublicKey = {
       peerId: id,
       pub: payload.pub,
       epub: payload.epub,
+      ...(kpub ? { kpub } : {}),
       updatedAt: Number.isFinite(payload.timestamp) ? payload.timestamp : Date.now(),
       local: id === this.mesh.getClientId(),
     };

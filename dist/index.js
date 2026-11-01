@@ -4342,13 +4342,14 @@ var PeerPigeonStorage = class {
 };
 
 // src/crypto.ts
-import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair } from "unsea";
+import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair, hasPostQuantumKeys, upgradePair } from "unsea";
 var CRYPTO_PUBLIC_INFO_TYPE = "pp-crypto-public-info-v1";
 var CRYPTO_PUBLIC_REQUEST_TYPE = "pp-crypto-public-request-v1";
 var KEY_REQUEST_MIN_INTERVAL_MS = 5e3;
 var KEY_EXCHANGE_RETRY_DELAYS_MS = [250, 500, 1e3, 2e3, 4e3];
 var ENCRYPTED_BROADCAST_TYPE = "pp-encrypted-broadcast-v1";
 var ENCRYPTED_DIRECT_TYPE = "pp-encrypted-direct-v1";
+var ML_KEM_768_PUBLIC_KEY_CHARS = 1579;
 var PeerPigeonCryptoProtocol = class {
   constructor(mesh, gossip, options) {
     this.keyPair = null;
@@ -4389,8 +4390,9 @@ var PeerPigeonCryptoProtocol = class {
   }
   async init() {
     if (this.initialized) return;
-    this.keyPair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await generateRandomPair();
-    this.validateKeyPair(this.keyPair);
+    const pair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await generateRandomPair();
+    this.validateKeyPair(pair);
+    this.keyPair = hasPostQuantumKeys(pair) && pair.kpriv ? pair : upgradePair(pair);
     this.persistKeyPair(this.keyPair);
     this.initialized = true;
     this.gossip.on("messageReceived", this.onGossipMessageBound);
@@ -4497,7 +4499,10 @@ var PeerPigeonCryptoProtocol = class {
       __ppType: ENCRYPTED_DIRECT_TYPE,
       from: String(this.mesh.getClientId() ?? "").trim(),
       to: target,
-      cipher: await encryptMessageWithMeta(String(plaintext), { epub: recipient.epub }),
+      cipher: await encryptMessageWithMeta(
+        String(plaintext),
+        recipient.kpub ? { epub: recipient.epub, kpub: recipient.kpub } : { epub: recipient.epub }
+      ),
       timestamp: Date.now()
     };
   }
@@ -4517,7 +4522,7 @@ var PeerPigeonCryptoProtocol = class {
   }
   async decryptEncryptedDirect(payload) {
     if (!this.keyPair) throw new Error("Crypto protocol has not been initialized");
-    return await decryptMessageWithMeta(payload.cipher, this.keyPair.epriv);
+    return await decryptMessageWithMeta(payload.cipher, this.keyPair);
   }
   on(event, callback) {
     const callbacks = this.callbacks[event];
@@ -4583,6 +4588,7 @@ var PeerPigeonCryptoProtocol = class {
       from: peerId,
       pub: this.keyPair.pub,
       epub: this.keyPair.epub,
+      ...this.keyPair.kpub ? { kpub: this.keyPair.kpub } : {},
       timestamp: Date.now()
     };
   }
@@ -4612,10 +4618,12 @@ var PeerPigeonCryptoProtocol = class {
     if (!id || typeof payload.pub !== "string" || typeof payload.epub !== "string") return;
     const existing = this.publicKeys.get(id);
     if (existing && existing.updatedAt > payload.timestamp) return;
+    const kpub = typeof payload.kpub === "string" && payload.kpub.length === ML_KEM_768_PUBLIC_KEY_CHARS && /^[A-Za-z0-9_-]+$/.test(payload.kpub) ? payload.kpub : void 0;
     const value = {
       peerId: id,
       pub: payload.pub,
       epub: payload.epub,
+      ...kpub ? { kpub } : {},
       updatedAt: Number.isFinite(payload.timestamp) ? payload.timestamp : Date.now(),
       local: id === this.mesh.getClientId()
     };

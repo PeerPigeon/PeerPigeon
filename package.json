@@ -59,7 +59,7 @@
   },
   "dependencies": {
     "freertc": "git+https://github.com/draeder/freertc.git#main",
-    "unsea": "https://codeload.github.com/draeder/unsea/tar.gz/5425b41d39cea5aa2116241af0fed82865ffea29"
+    "unsea": "https://codeload.github.com/draeder/unsea/tar.gz/98ec176eede8639c44a783456b2c1a017b824c16"
   },
   "devDependencies": {
     "@playwright/test": "^1.55.0",
