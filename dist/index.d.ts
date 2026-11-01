@@ -172,6 +172,13 @@ type GossipMessage = {
     path?: string[];
     /** When each peer on the path sent it on (ms since epoch, its own clock), bounded like path. */
     sentAt?: number[];
+    /**
+     * How long the message has been on its way, in ms, from local measurements
+     * only: at each hop the time it waited in that peer plus half the round
+     * trip of the link it then crossed. Unlike receivedAt - timestamp it does
+     * not depend on the sender's and receiver's clocks agreeing.
+     */
+    transitMs?: number;
     spread?: GossipSpreadEnvelope;
     delivery?: GossipDeliveryEnvelope;
     aggregate?: GossipAggregateEnvelope;
@@ -210,6 +217,8 @@ interface MeshLike {
     on(event: 'peer:connected' | 'peer:disconnected', handler: (peerId: string) => void): void;
     getClientId(): string | null;
     getConnectedPeers(): string[];
+    /** Smoothed round trip of the link to a neighbour, ms; null when not measured yet. */
+    getLinkRttMs?(peerId: string): number | null;
     getDiscoveredPeers(): string[];
     getGlobalPeers(): string[];
     getCecrMembershipConfig?(): {
@@ -1417,6 +1426,17 @@ declare class PartialMesh {
     /**
      * Get list of connected peer IDs
      */
+    /**
+     * Ask the relay this peer is on to do something itself, such as a PigeonIdP
+     * account lookup ({ action: 'idp-get', namespace, alias }). Resolves with the
+     * relay's answer ({ ok: false, error: 'unsupported' } from a relay that does
+     * not serve it); rejects when not on a relay or when no answer comes.
+     */
+    relayRequest(body: Record<string, unknown>, options?: {
+        timeoutMs?: number;
+    }): Promise<any>;
+    /** Smoothed round trip of the link to a neighbour, ms, measured by its keepalive; null when unknown. */
+    getLinkRttMs(peerId: string): number | null;
     getConnectedPeers(): string[];
     /**
      * Get list of discovered peer IDs
@@ -1604,5 +1624,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, GossipProtocol, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, PeerPigeonCryptoProtocol, PeerPigeonNode, PeerPigeonStorage, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, RelayScoreBook, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, rankSignalingServersByDistance, reachableFromThisPage, relayScore, roomRoutingKey, selectClosestSignalingServer, sha1Hex };
-export type { CecrConfigSnapshot, CecrMembershipRecordSnapshot, CecrOverlaySnapshot, CecrStateSnapshot, EncryptedBroadcastPayload, EncryptedDirectPayload, GossipAggregateDeliveryStatus, GossipBroadcastOptions, GossipDeliveryStatus, GossipMessage, GossipProtocolOptions, GossipStats, PartialMeshConfig, PartialMeshEvents, PartialMeshRuntimeConfig, PeerCapacityAdvertisement, PeerCapacitySnapshot, PeerConnection, PeerGraphEdge, PeerGraphNode, PeerGraphSnapshot, PeerPigeonCryptoEvents, PeerPigeonCryptoOptions, PeerPigeonKeyPair, PeerPigeonNodeEvents, PeerPigeonNodeMessage, PeerPigeonNodeOptions, PeerPigeonNodeStorageOptions, PeerPublicKey, RelayInfo, RelayKind, RelayMeasurement, RoomCipher, SharedRelayScore, SignalingRelayCandidate, StorageChangeOrigin, StorageEvents, StorageOptions, StoragePutOptions, StorageRecord, StorageRetrieveOptions, StorageSpace, StorageSyncFilterContext, StorageSyncOptions, StorageUnsubscribe };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MESH_SIGNAL_PAYLOAD_TYPE, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, type SharedRelayScore, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, rankSignalingServersByDistance, reachableFromThisPage, relayScore, roomRoutingKey, selectClosestSignalingServer, sha1Hex };

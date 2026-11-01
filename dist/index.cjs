@@ -6746,6 +6746,17 @@ var PartialMesh = class {
   /**
    * Get list of connected peer IDs
    */
+  /**
+   * Ask the relay this peer is on to do something itself, such as a PigeonIdP
+   * account lookup ({ action: 'idp-get', namespace, alias }). Resolves with the
+   * relay's answer ({ ok: false, error: 'unsupported' } from a relay that does
+   * not serve it); rejects when not on a relay or when no answer comes.
+   */
+  async relayRequest(body, options = {}) {
+    const client = this.signalingClient?.client;
+    if (typeof client?.relayRequest !== "function") throw new Error("not on a relay");
+    return client.relayRequest(body, options);
+  }
   /** Smoothed round trip of the link to a neighbour, ms, measured by its keepalive; null when unknown. */
   getLinkRttMs(peerId) {
     const entry = this.signalingClient?.client?.mesh?.connections?.get?.(peerId);
