@@ -1028,7 +1028,9 @@ export default {
       const liveSource = byId.get(link.source);
       const liveTarget = byId.get(link.target);
       const directTarget = link.direct ? 1 : 0;
-      const visibilityTarget = link.exiting ? 0 : 1;
+      // A gone peer has no lines: they go out as it turns into a still star.
+      const touchesGone = Boolean(liveSource?.dead || liveTarget?.dead);
+      const visibilityTarget = link.exiting || touchesGone ? 0 : 1;
       let state = this._linkVisualStateByKey.get(link.key);
       if (!state) {
         if (!liveSource || !liveTarget) return false;
