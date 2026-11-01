@@ -834,7 +834,7 @@ export default {
         { label: 'Direct', type: 'line' },
         { label: 'Relayed', type: 'line', relayed: true },
         // As the graph shows it: the peer's own colour, in a green halo.
-        { label: 'Sending now', type: 'active', radius: 5, color: 'rgba(217, 223, 227, 0.85)' },
+        { label: 'Sending now', type: 'active', radius: 4, color: 'rgba(217, 223, 227, 0.85)' },
       ];
 
       ctx.save();
@@ -882,6 +882,14 @@ export default {
         } else {
           ctx.save();
           if (item.type === 'active') {
+            // A link carrying the message (as linkStroke draws it at full
+            // activity), and the peer sending it in its halo.
+            ctx.beginPath();
+            ctx.moveTo(iconX - 13, rowY);
+            ctx.lineTo(iconX + 13, rowY);
+            ctx.strokeStyle = linkStroke(1);
+            ctx.lineWidth = 1;
+            ctx.stroke();
             // The same halo drawNode gives a sending peer: 1.8x, green, 0.32.
             ctx.globalAlpha = 0.32;
             ctx.fillStyle = 'rgb(86, 176, 156)';
