@@ -101,6 +101,9 @@ export function isAttentionChangeOnly(reason: string): boolean {
 export class FreeRTCClientAdapter {
   private signalUrls: string[];
   private readonly networkId: string;
+  private readonly role: string | null;
+  // The role each listed peer was announced with (capabilities.role).
+  private readonly peerRoles = new Map<string, string>();
   private readonly roomId: string;
   private readonly requestedPeerId: string;
   private readonly previousPeerId: string | null;
@@ -176,6 +179,8 @@ export class FreeRTCClientAdapter {
     relayOnDemand?: boolean;
     /** With relayOnDemand: true keeps the relay while the mesh still needs it to form a link. */
     relayHold?: () => boolean;
+    /** What this peer is, in its announce (capabilities.role). */
+    role?: string | null;
   }) {
     const normalizedSignalUrls = Array.from(new Set(
       (Array.isArray(signalUrls) ? signalUrls : [signalUrls])
@@ -186,6 +191,7 @@ export class FreeRTCClientAdapter {
       throw new Error('At least one FreeRTC signaling relay is required');
     }
     this.signalUrls = normalizedSignalUrls;
+    this.role = options?.role ?? null;
     this.networkId = options?.networkId ?? 'default-session';
     this.roomId = options?.roomId ?? this.networkId;
     this.requestedPeerId = options?.peerId ?? generateMessageId(32);
@@ -314,6 +320,7 @@ export class FreeRTCClientAdapter {
       signalUrl,
       iceServers: this.defaultIceServers ?? undefined,
       trickleIce: this.trickleIce,
+      capabilities: this.role ? { role: this.role } : {},
       autoConnect: false,
       relay: this.relayOnDemand ? { mode: 'on-demand', ...(this.relayHold ? { hold: this.relayHold } : {}) } : {},
       onRelayStateChange: ({ state }: { state?: string } = {}) => {
@@ -635,6 +642,11 @@ export class FreeRTCClientAdapter {
     return Boolean(id && this.selfAliases.has(id));
   }
 
+  /** The role a relay listed this peer with, or null. */
+  getPeerRole(peerId: string): string | null {
+    return this.peerRoles.get(this.normalizePeerId(peerId)) ?? null;
+  }
+
   private handleBootstrapCandidates(candidates: any[]): void {
     const now = Date.now();
     const normalizedCandidates = (Array.isArray(candidates) ? candidates : [])
@@ -642,8 +654,13 @@ export class FreeRTCClientAdapter {
         peerId: this.normalizePeerId(candidate?.peerId),
         advertisedAt: Number(candidate?.advertisedAt),
         listedAt: Number(candidate?.listedAt),
+        role: typeof (candidate?.role ?? candidate?.capabilities?.role) === 'string' ? String(candidate?.role ?? candidate?.capabilities?.role) : null,
       }))
       .filter(({ peerId }) => peerId && !this.isSelfAlias(peerId));
+    for (const { peerId, role } of normalizedCandidates) {
+      if (role) this.peerRoles.set(peerId, role);
+      else this.peerRoles.delete(peerId);
+    }
     const snapshotPeers = new Set<string>(normalizedCandidates.map(({ peerId }) => peerId));
     const activeSnapshotPeers = new Set<string>();
     for (const { peerId, advertisedAt, listedAt } of normalizedCandidates) {

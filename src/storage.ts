@@ -1,3 +1,5 @@
+import { sha256Hex, type ServerRecord, type StorageServerLink } from './storage-servers.js';
+
 export type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
 export type StorageVersion = string | number;
 
@@ -78,6 +80,12 @@ export interface StorageOptions extends StorageSyncOptions {
    * namespace at once.
    */
   replicate?: string[];
+  /**
+   * With storage servers: once the room's servers hold a record, drop the
+   * local copy unless this node uses it (subscribed, replicated, private),
+   * and read it from the servers when asked. Default: true.
+   */
+  moveToServers?: boolean;
 }
 
 export type StorageEvents = {
@@ -363,6 +371,12 @@ export class PeerPigeonStorage {
   private readonly retrieveAnswerTimes: number[] = [];
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
+  private readonly moveToServers: boolean;
+  // Storage servers, when there are any (see storage-servers.ts).
+  private servers: StorageServerLink | null = null;
+  private serverIds: { room: string; seed: string } | null = null;
+  private serversReady = false;
+  private migrating: Promise<void> | null = null;
   private readonly onGossipMessageBound: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void;
   private readonly instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
   private crossTabChannel: BroadcastChannel | null = null;
@@ -384,6 +398,7 @@ export class PeerPigeonStorage {
     this.dbName = String(options.dbName ?? 'peerpigeon-storage-v1').trim() || 'peerpigeon-storage-v1';
     this.syncFilter = typeof options.syncFilter === 'function' ? options.syncFilter : null;
     this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
+    this.moveToServers = options.moveToServers !== false;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
         // ignore malformed or undecryptable sync messages
@@ -483,6 +498,7 @@ export class PeerPigeonStorage {
     if (space !== 'private' && !options.silent) {
       await this.broadcastMutation(mutation);
     }
+    if (space !== 'private') void this.pushToServers(mutation);
     return (await this.get(space, key)) as StorageRecord<T>;
   }
 
@@ -493,13 +509,18 @@ export class PeerPigeonStorage {
 
     const mutation = await this.applyLocalUpsert(space, key, value, options, true);
     await this.broadcastMutation(mutation);
+    void this.pushToServers(mutation);
     return (await this.get(space, key)) as StorageRecord<T>;
   }
 
   async get<T = unknown>(space: StorageSpace, key: string): Promise<StorageRecord<T> | null> {
     const driver = this.requireDriver();
     const pk = this.makePk(space, key);
-    const persisted = await driver.get(pk);
+    let persisted = await driver.get(pk);
+    if (!persisted && space !== 'private' && this.serversReady) {
+      // Kept on the room's servers rather than here: read it from them.
+      if (await this.readFromServers(space, this.normalizeKey(key))) persisted = await driver.get(pk);
+    }
     if (!persisted) return null;
 
     let value: unknown;
@@ -607,6 +628,7 @@ export class PeerPigeonStorage {
 
     if (space !== 'private') {
       await this.broadcastMutation(mutation);
+      void this.pushToServers(mutation);
     }
     return true;
   }
@@ -620,12 +642,18 @@ export class PeerPigeonStorage {
     if (!mutation) return false;
 
     await this.broadcastMutation(mutation);
+    void this.pushToServers(mutation);
     return true;
   }
 
   async list(space: StorageSpace): Promise<StorageRecord[]> {
     const driver = this.requireDriver();
     const persisted = await driver.listBySpace(space);
+    if (space !== 'private' && this.serversReady) {
+      // And what the room's servers keep that is not here (records moved to them).
+      const here = new Set(persisted.map((r) => r.key));
+      for (const record of await this.listFromServers(space)) if (!here.has(record.key)) persisted.push(record);
+    }
 
     const out: StorageRecord[] = [];
     for (const record of persisted) {
@@ -657,6 +685,8 @@ export class PeerPigeonStorage {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.servers = null;
+    this.serversReady = false;
 
     if (this.gossip) {
       this.gossip.off('messageReceived', this.onGossipMessageBound);
@@ -675,6 +705,128 @@ export class PeerPigeonStorage {
       pending.resolve(null);
     }
     this.pendingRetrieveRequests.clear();
+  }
+
+  // ---------------------------------------------------------------- servers
+
+  /**
+   * Uses storage servers (a link from storage-servers.ts) for this room: its
+   * records go to the room's closest servers, the ones already here are moved
+   * to them once they are there, and changes others make arrive from them.
+   */
+  async attachServers(link: StorageServerLink): Promise<void> {
+    const seed = `peerpigeon:storage-servers:v1:${this.sessionId}:${this.syncSecret}`;
+    const room = await sha256Hex(`${seed}:room`);
+    this.servers = link;
+    this.serverIds = { room, seed };
+    link.on((event) => {
+      if (this.closed || this.servers !== link) return;
+      if (event.type === 'servers' && event.room === room) {
+        const ready = event.servers.length > 0;
+        const cameUp = ready && !this.serversReady;
+        this.serversReady = ready;
+        if (cameUp) void this.migrateToServers().catch(() => {});
+      } else if (event.type === 'changed' && event.rec.room === room) {
+        void this.applyServerRecord(event.rec, false).catch(() => {});
+      }
+    });
+    link.keep(room);
+  }
+
+  /** Whether the room's servers are linked now, and how many. */
+  serverCount(): number {
+    return this.servers && this.serverIds ? this.servers.serversFor(this.serverIds.room).length : 0;
+  }
+
+  private async slotOf(space: StorageSpace, key: string): Promise<{ slot: string; tag: string; write: string }> {
+    const seed = this.serverIds!.seed;
+    const slot = await sha256Hex(`${seed}:slot:${space}:${key}`);
+    return { slot, tag: (await sha256Hex(`${seed}:space:${space}`)).slice(0, 16), write: await sha256Hex(`${seed}:write:${slot}`) };
+  }
+
+  /** Sends one change to the room's servers; resolves with how many took it. */
+  private async pushToServers(mutation: StorageMutation): Promise<number> {
+    if (!this.servers || !this.serverIds || !this.serversReady || mutation.space === 'private') return 0;
+    try {
+      const { slot, tag, write } = await this.slotOf(mutation.space, mutation.key);
+      const blob = await this.encryptSyncPayload(mutation);
+      return await this.servers.put({ room: this.serverIds.room, slot, tag, at: mutation.timestamp, blob, ...(mutation.space === 'frozen' ? { once: true } : {}) }, write);
+    } catch {
+      return 0;
+    }
+  }
+
+  /** A record from a server: decrypted, checked like any change from the mesh, and kept here. */
+  private async applyServerRecord(rec: Omit<ServerRecord, 'wh'>, asked: boolean): Promise<boolean> {
+    const mutation = await this.decryptSyncEnvelope(rec.blob as CipherPayload);
+    if (!this.isStorageMutation(mutation) || mutation.space === 'private') return false;
+    // Changes pushed to this node are kept only for keys it uses; one it asked for is kept regardless.
+    if (!asked && !this.shouldAcceptRemoteSync(mutation.space, mutation.key, { kind: 'mutation', actorId: mutation.actorId })) return false;
+    return await this.applyRemoteMutation(mutation);
+  }
+
+  private async readFromServers(space: StorageSpace, key: string): Promise<boolean> {
+    if (!this.servers || !this.serverIds) return false;
+    try {
+      const { slot } = await this.slotOf(space, key);
+      const rec = await this.servers.get(this.serverIds.room, slot);
+      return rec ? await this.applyServerRecord(rec, true) : false;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The records of a space the room's servers keep, decrypted (not kept here). */
+  private async listFromServers(space: StorageSpace): Promise<PersistedRecord[]> {
+    if (!this.servers || !this.serverIds) return [];
+    try {
+      const { tag } = await this.slotOf(space, '');
+      const out: PersistedRecord[] = [];
+      for (const rec of await this.servers.list(this.serverIds.room, tag)) {
+        const mutation = await this.decryptSyncEnvelope(rec.blob as CipherPayload);
+        if (this.isStorageMutation(mutation) && mutation.op === 'upsert' && mutation.record && mutation.space === space) {
+          out.push({ ...mutation.record, pk: this.makePk(space, mutation.key), updatedAt: mutation.timestamp });
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The room's servers came up: everything kept here (but private) goes to
+   * them, and, once they hold it, what this node does not use is dropped here.
+   */
+  private migrateToServers(): Promise<void> {
+    return (this.migrating ??= (async () => {
+      const driver = this.requireDriver();
+      for (const space of ['public', 'user', 'frozen', 'epublic'] as StorageSpace[]) {
+        for (const record of await driver.listBySpace(space)) {
+          if (this.closed || !this.serversReady) return;
+          const mutation: StorageMutation = {
+            __ppType: 'pp-storage-op-v1',
+            opId: this.makeMutationId(this.userId),
+            op: 'upsert',
+            space,
+            key: record.key,
+            // A user record is created by its owner: whoever receives it checks that.
+            actorId: space === 'user' ? (record.ownerId ?? this.userId) : this.userId,
+            timestamp: record.updatedAt,
+            record,
+          };
+          const took = await this.pushToServers(mutation);
+          if (took > 0 && this.moveToServers && !this.usesLocally(space, record.key)) {
+            await driver.delete(record.pk);
+          }
+        }
+      }
+    })().finally(() => { this.migrating = null; }));
+  }
+
+  /** Whether this node keeps a record here even when servers hold it: one it subscribes to or replicates. */
+  private usesLocally(space: StorageSpace, key: string): boolean {
+    return this.isSubscribed(space, key) || ((space === 'public' || space === 'user') && this.replicates(key));
   }
 
   private async applyLocalUpsert(space: StorageSpace, key: string, value: unknown, options: StoragePutOptions, allowSystemWrite = false): Promise<StorageMutation> {

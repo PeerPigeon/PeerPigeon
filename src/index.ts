@@ -25,6 +25,9 @@ import type {
   GossipProtocolOptions,
 } from './gossip.js';
 import { PeerPigeonStorage } from './storage.js';
+import { StorageServerLink, StorageServer, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE } from './storage-servers.js';
+export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS } from './storage-servers.js';
+export type { ServerRecord, ServerRecordStore, StorageServerStats } from './storage-servers.js';
 import type { StorageOptions } from './storage.js';
 import { PeerPigeonCryptoProtocol } from './crypto.js';
 export { sha1Hex } from './sha1.js';
@@ -503,6 +506,18 @@ export async function discoverClosestSignalingServer(options: {
 
 export interface PartialMeshConfig {
   /**
+   * What this peer is, said in its announce (capabilities.role) and listed by
+   * relays with it: a short lowercase word, such as 'storage'. Default: none.
+   */
+  role?: string | null;
+  /**
+   * Which roles this peer dials on its own: null (default) dials any peer;
+   * ['storage'] only peers listed with that role; [] none at all (it still
+   * answers dials, and connectToPeer still dials anyone).
+   */
+  dialRoles?: readonly string[] | null;
+
+  /**
    * Minimum number of peers to maintain connections with
    */
   minPeers?: number;
@@ -718,7 +733,9 @@ export type PartialMeshEvents = {
  * Uses FreeRTC for signaling and maintains a configurable number of peer connections.
  */
 export class PartialMesh {
-  private config: Required<PartialMeshConfig>;
+  private config: Required<Omit<PartialMeshConfig, 'role' | 'dialRoles'>>;
+  private readonly role: string | null;
+  private readonly dialRoles: ReadonlySet<string> | null;
   private peers: Map<string, PeerConnection> = new Map();
   private signalingClient: any = null;
   private discoveredPeers: Set<string> = new Set();
@@ -795,6 +812,8 @@ export class PartialMesh {
     const signalingServers = configuredSignalingServers.length > 0
       ? configuredSignalingServers
       : [...DEFAULT_SIGNALING_SERVERS];
+    this.role = typeof config.role === 'string' && /^[a-z0-9][a-z0-9-]{0,31}$/.test(config.role) ? config.role : null;
+    this.dialRoles = Array.isArray(config.dialRoles) ? new Set(config.dialRoles.map(String)) : null;
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
@@ -1833,6 +1852,7 @@ export class PartialMesh {
       retiredPeerIds,
       iceServers: this.config.iceServers,
       trickleIce: this.config.trickleIce,
+      role: this.role,
       // Stay reachable on the relay while a coordinate neighbour is not yet
       // linked. That neighbour may sit in another part of the mesh, where
       // only the relay can carry the offer; both ends hold until it forms.
@@ -2668,8 +2688,20 @@ export class PartialMesh {
       }
     }
     return Array.from(candidates).filter(
-      (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId) && !this.hasLeft(peerId),
+      (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId) && !this.hasLeft(peerId) && this.dialsRole(peerId),
     );
+  }
+
+  /** The role a relay listed this peer with (its announce's capabilities.role), or null. */
+  public getPeerRole(peerId: string): string | null {
+    return (this.signalingClient as { getPeerRole?: (id: string) => string | null } | null)?.getPeerRole?.(this.normalizePeerId(peerId)) ?? null;
+  }
+
+  /** Whether this peer dials that one on its own (dialRoles). */
+  private dialsRole(peerId: string): boolean {
+    if (!this.dialRoles) return true;
+    const role = this.getPeerRole(peerId);
+    return role !== null && this.dialRoles.has(role);
   }
 
   private maintainPeerConnections(): void {
@@ -2809,12 +2841,14 @@ export class PartialMesh {
    * Connect to a specific peer
    */
   public connectToPeer(peerId: string): void {
-    this.connectToPeerInternal(peerId, false);
+    this.connectToPeerInternal(peerId, false, true);
   }
 
-  private connectToPeerInternal(peerId: string, allowTemporaryOverflow: boolean): void {
+  private connectToPeerInternal(peerId: string, allowTemporaryOverflow: boolean, asked = false): void {
     const selfId = this.normalizePeerId(this.clientId);
     const normalizedPeerId = this.normalizePeerId(peerId);
+    // Dials of its own go only to the roles it dials; one asked for goes anywhere.
+    if (!asked && normalizedPeerId && !this.dialsRole(normalizedPeerId)) return;
     const signalingConnected = this.signalingClient?.isConnected?.() ?? true;
     const emergencyIsolated = this.getConnectedPeerCount() === 0
       && this.dialCandidatePeerIds(true).length > 0;
@@ -3049,6 +3083,8 @@ export class PartialMesh {
       ...this.config,
       signalingServers: [...this.config.signalingServers],
       iceServers: this.config.iceServers ? this.config.iceServers.map((server) => ({ ...server })) : null,
+      role: this.role,
+      dialRoles: this.dialRoles ? [...this.dialRoles] : null,
     };
   }
 
@@ -3854,6 +3890,12 @@ export class PartialMesh {
 
 export type PeerPigeonNodeStorageOptions = Omit<StorageOptions, 'gossip' | 'peerId' | 'userId'> & {
   userId?: string;
+  /**
+   * Use storage servers when there are any (default: true): the room's
+   * records go to its closest servers, are read from them, and move to them
+   * from here (see storage-servers.ts). false keeps storage on the mesh alone.
+   */
+  servers?: boolean;
 };
 
 export type PeerPigeonNodeOptions = PartialMeshConfig & {
@@ -3907,6 +3949,8 @@ export class PeerPigeonNode {
   public storage: PeerPigeonStorage | null = null;
 
   private readonly storageOptions: false | PeerPigeonNodeStorageOptions;
+  private readonly signalingOptions: Pick<PartialMeshConfig, 'signalingServer' | 'signalingServers' | 'automaticSignalingServer' | 'relayDirectory' | 'iceServers'>;
+  private serverLink: StorageServerLink | null = null;
   private readonly callbacks: Partial<Record<keyof PeerPigeonNodeEvents, Set<Function>>> = {};
   private started = false;
   private relayScoreTimer: ReturnType<typeof setInterval> | null = null;
@@ -3916,6 +3960,8 @@ export class PeerPigeonNode {
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
     this.storageOptions = storage;
+    const { signalingServer, signalingServers, automaticSignalingServer, relayDirectory, iceServers } = meshOptions;
+    this.signalingOptions = { signalingServer, signalingServers, automaticSignalingServer, relayDirectory, iceServers };
     // Signaling prefers the mesh: a negotiation frame for any peer the
     // gossip layer can route to rides a direct frame through neighbours, and
     // only frames with no mesh route fall back to a relay.
@@ -3967,7 +4013,7 @@ export class PeerPigeonNode {
           ?? (this.crypto ? this.crypto.getKeyPair().epub : '')
         ).trim();
         if (!userId) throw new Error('storage.userId is required when crypto is disabled');
-        const { userId: _ignoredUserId, ...storageOptions } = this.storageOptions;
+        const { userId: _ignoredUserId, servers: useServers = true, ...storageOptions } = this.storageOptions;
         const config = this.mesh.getConfig();
         this.storage = new PeerPigeonStorage({
           ...storageOptions,
@@ -3977,6 +4023,13 @@ export class PeerPigeonNode {
           gossip: this.gossip,
         });
         await this.storage.init();
+        if (useServers) {
+          // A second, small node in the storage servers' scope: it dials no one
+          // on its own, only the servers closest to this room.
+          this.serverLink = new StorageServerLink(PeerPigeonNode.serverScopeNode(this.signalingOptions, { dialRoles: [] }));
+          await this.storage.attachServers(this.serverLink);
+          void this.serverLink.start().catch(() => {});
+        }
       }
       await this.mesh.init();
     } catch (error) {
@@ -4025,6 +4078,10 @@ export class PeerPigeonNode {
   getConnectedPeers(): string[] { return this.mesh.getConnectedPeers(); }
   getLinkLog() { return this.mesh.getLinkLog(); }
   getDiscoveredPeers(): string[] { return this.mesh.getDiscoveredPeers(); }
+  /** The role a relay listed this peer with, or null. */
+  getPeerRole(peerId: string): string | null { return this.mesh.getPeerRole(peerId); }
+  /** Dial this peer now, whatever its role. */
+  connectToPeer(peerId: string): void { this.mesh.connectToPeer(peerId); }
   getActiveSignalingPeers(): string[] { return this.mesh.getActiveSignalingPeers(); }
   getGlobalPeers(): string[] { return this.mesh.getGlobalPeers(); }
 
@@ -4113,8 +4170,42 @@ export class PeerPigeonNode {
     this.callbacks[event]?.delete(callback);
   }
 
+  /**
+   * A node in the storage servers' scope, on the same relays as this one: for
+   * a server (role 'storage', dialing other servers) or a peer's link to them.
+   */
+  static serverScopeNode(
+    signaling: Pick<PartialMeshConfig, 'signalingServer' | 'signalingServers' | 'automaticSignalingServer' | 'relayDirectory' | 'iceServers'>,
+    options: Pick<PartialMeshConfig, 'role' | 'dialRoles' | 'maxPeers' | 'minPeers'> = {},
+  ): PeerPigeonNode {
+    const defined = Object.fromEntries(Object.entries(signaling).filter(([, v]) => v !== undefined));
+    return new PeerPigeonNode({
+      ...defined,
+      networkId: STORAGE_SERVER_NETWORK,
+      sessionId: STORAGE_SERVER_ROOM,
+      minPeers: options.minPeers ?? 0,
+      maxPeers: options.maxPeers ?? 8,
+      role: options.role ?? null,
+      dialRoles: options.dialRoles ?? [],
+      crypto: false,
+      storage: false,
+    });
+  }
+
+  /** A storage server on the same relays as this node's settings (see storage-servers.ts). */
+  static storageServer(
+    signaling: Pick<PartialMeshConfig, 'signalingServer' | 'signalingServers' | 'automaticSignalingServer' | 'relayDirectory' | 'iceServers'> = {},
+    store?: import('./storage-servers.js').ServerRecordStore,
+  ): StorageServer {
+    return new StorageServer(
+      PeerPigeonNode.serverScopeNode(signaling, { role: STORAGE_SERVER_ROLE, dialRoles: [STORAGE_SERVER_ROLE], maxPeers: 32, minPeers: 0 }),
+      store,
+    );
+  }
+
   async destroy(): Promise<void> {
     if (this.relayScoreTimer) { clearInterval(this.relayScoreTimer); this.relayScoreTimer = null; }
+    if (this.serverLink) { await this.serverLink.close(); this.serverLink = null; }
     if (this.storage) await this.storage.close();
     this.storage = null;
     this.crypto?.destroy();

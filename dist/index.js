@@ -45,6 +45,8 @@ function isAttentionChangeOnly(reason) {
 }
 var FreeRTCClientAdapter = class {
   constructor(signalUrls, options) {
+    // The role each listed peer was announced with (capabilities.role).
+    this.peerRoles = /* @__PURE__ */ new Map();
     this.emitter = new Emitter();
     this.knownPeers = /* @__PURE__ */ new Set();
     this.knownPeerLastSeenAtMs = /* @__PURE__ */ new Map();
@@ -98,6 +100,7 @@ var FreeRTCClientAdapter = class {
       throw new Error("At least one FreeRTC signaling relay is required");
     }
     this.signalUrls = normalizedSignalUrls;
+    this.role = options?.role ?? null;
     this.networkId = options?.networkId ?? "default-session";
     this.roomId = options?.roomId ?? this.networkId;
     this.requestedPeerId = options?.peerId ?? generateMessageId(32);
@@ -209,6 +212,7 @@ var FreeRTCClientAdapter = class {
       signalUrl,
       iceServers: this.defaultIceServers ?? void 0,
       trickleIce: this.trickleIce,
+      capabilities: this.role ? { role: this.role } : {},
       autoConnect: false,
       relay: this.relayOnDemand ? { mode: "on-demand", ...this.relayHold ? { hold: this.relayHold } : {} } : {},
       onRelayStateChange: ({ state } = {}) => {
@@ -502,13 +506,22 @@ var FreeRTCClientAdapter = class {
     const id = this.normalizePeerId(peerId);
     return Boolean(id && this.selfAliases.has(id));
   }
+  /** The role a relay listed this peer with, or null. */
+  getPeerRole(peerId) {
+    return this.peerRoles.get(this.normalizePeerId(peerId)) ?? null;
+  }
   handleBootstrapCandidates(candidates) {
     const now = Date.now();
     const normalizedCandidates = (Array.isArray(candidates) ? candidates : []).map((candidate) => ({
       peerId: this.normalizePeerId(candidate?.peerId),
       advertisedAt: Number(candidate?.advertisedAt),
-      listedAt: Number(candidate?.listedAt)
+      listedAt: Number(candidate?.listedAt),
+      role: typeof (candidate?.role ?? candidate?.capabilities?.role) === "string" ? String(candidate?.role ?? candidate?.capabilities?.role) : null
     })).filter(({ peerId }) => peerId && !this.isSelfAlias(peerId));
+    for (const { peerId, role } of normalizedCandidates) {
+      if (role) this.peerRoles.set(peerId, role);
+      else this.peerRoles.delete(peerId);
+    }
     const snapshotPeers = new Set(normalizedCandidates.map(({ peerId }) => peerId));
     const activeSnapshotPeers = /* @__PURE__ */ new Set();
     for (const { peerId, advertisedAt, listedAt } of normalizedCandidates) {
@@ -3138,6 +3151,429 @@ var RelayScoreBook = class _RelayScoreBook {
   }
 };
 
+// src/storage-servers.ts
+var STORAGE_SERVER_NETWORK = "peerpigeon-storage";
+var STORAGE_SERVER_ROOM = "servers";
+var STORAGE_SERVER_ROLE = "storage";
+var STORAGE_REPLICAS = 3;
+var REQUEST_TIMEOUT_MS = 4e3;
+var BATCH_RECORDS = 64;
+var BATCH_BYTES = 96 * 1024;
+var PP = "pp-ss-v1";
+async function sha256Hex(text) {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function xorDistance(a, b) {
+  return BigInt(`0x${a}`) ^ BigInt(`0x${b}`);
+}
+function closestIds(target, ids, hashed, count = STORAGE_REPLICAS) {
+  return [...ids].filter((id) => hashed.has(id)).map((id) => ({ id, d: xorDistance(hashed.get(id), target) })).sort((x, y) => x.d < y.d ? -1 : x.d > y.d ? 1 : 0).slice(0, count).map((x) => x.id);
+}
+var strip = ({ wh: _wh, ...rec }) => rec;
+function isMsg(data) {
+  return !!data && typeof data === "object" && data.pp === PP && typeof data.t === "string";
+}
+function validId(v, len = 64) {
+  return typeof v === "string" && v.length === len && /^[0-9a-f]+$/.test(v);
+}
+function validRecord(rec) {
+  const r = rec;
+  return !!r && validId(r.room) && validId(r.slot) && validId(r.tag, 16) && Number.isFinite(r.at) && r.blob !== void 0;
+}
+function batches(items) {
+  const out = [];
+  let cur = [], bytes = 0;
+  for (const item of items) {
+    const size = JSON.stringify(item).length;
+    if (cur.length && (cur.length >= BATCH_RECORDS || bytes + size > BATCH_BYTES)) {
+      out.push(cur);
+      cur = [];
+      bytes = 0;
+    }
+    cur.push(item);
+    bytes += size;
+  }
+  if (cur.length) out.push(cur);
+  return out;
+}
+var reqCounter = 0;
+var newReq = () => `${Date.now().toString(36)}-${(reqCounter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+var StorageServerLink = class {
+  constructor(node) {
+    this.node = node;
+    this.hashed = /* @__PURE__ */ new Map();
+    this.pending = /* @__PURE__ */ new Map();
+    this.listings = /* @__PURE__ */ new Map();
+    this.rooms = /* @__PURE__ */ new Map();
+    this.listeners = /* @__PURE__ */ new Set();
+    this.timer = null;
+    this.closed = false;
+    this.refreshing = null;
+    this.refreshAgain = false;
+    node.on("message", (m) => {
+      if (m.kind === "direct" && m.fromPeerId) this.onMessage(m.fromPeerId, m.data);
+    });
+    node.on("peerConnected", () => void this.refresh());
+    node.on("peerDisconnected", (peerId) => {
+      this.failPending(peerId);
+      void this.refresh();
+    });
+  }
+  async start() {
+    await this.node.start();
+    this.timer = setInterval(() => void this.refresh(), 2e3);
+    this.timer.unref?.();
+  }
+  async close() {
+    this.closed = true;
+    if (this.timer) clearInterval(this.timer);
+    for (const p of this.pending.values()) {
+      clearTimeout(p.timer);
+      p.resolve(null);
+    }
+    this.pending.clear();
+    await this.node.destroy().catch(() => {
+    });
+  }
+  on(listener) {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+  /** Keep this room: link to its closest servers, and hear of changes to it. */
+  keep(room) {
+    if (!this.rooms.has(room)) this.rooms.set(room, []);
+    void this.refresh();
+  }
+  /** The linked servers that keep this room, closest first. */
+  serversFor(room) {
+    return this.rooms.get(room) ?? [];
+  }
+  /** Every server listed in the servers' scope. */
+  async knownServers() {
+    const ids = /* @__PURE__ */ new Set();
+    for (const id of [...this.node.getDiscoveredPeers(), ...this.node.getConnectedPeers()]) {
+      if (this.node.getPeerRole(id) === STORAGE_SERVER_ROLE) ids.add(id);
+    }
+    for (const id of ids) if (!this.hashed.has(id)) this.hashed.set(id, await sha256Hex(id));
+    return [...ids];
+  }
+  /** Looks again at the servers; one asked for while a look is under way runs after it. */
+  refresh() {
+    if (this.refreshing) {
+      this.refreshAgain = true;
+      return this.refreshing;
+    }
+    return this.refreshing = (async () => {
+      do {
+        this.refreshAgain = false;
+        await this.refreshNow().catch(() => {
+        });
+      } while (this.refreshAgain && !this.closed);
+    })().finally(() => {
+      this.refreshing = null;
+    });
+  }
+  async refreshNow() {
+    if (this.closed) return;
+    const known = await this.knownServers();
+    const linked = new Set(this.node.getConnectedPeers());
+    const wanted = /* @__PURE__ */ new Set();
+    for (const [room, before] of this.rooms) {
+      const closest = closestIds(room, known, this.hashed);
+      for (const id of closest) {
+        wanted.add(id);
+        if (!linked.has(id)) this.node.connectToPeer(id);
+      }
+      const now = closest.filter((id) => linked.has(id));
+      const fresh = now.filter((id) => !before.includes(id));
+      this.rooms.set(room, now);
+      for (const id of fresh) this.send(id, { pp: PP, t: "watch", room });
+      if (fresh.length || now.length !== before.length) this.emit({ type: "servers", room, servers: now });
+    }
+  }
+  emit(event) {
+    for (const l of this.listeners) {
+      try {
+        l(event);
+      } catch {
+      }
+    }
+  }
+  send(peerId, msg) {
+    return this.node.sendDirect(peerId, msg) !== null;
+  }
+  ask(peerId, msg) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(msg.req);
+        this.listings.delete(msg.req);
+        resolve(null);
+      }, REQUEST_TIMEOUT_MS);
+      this.pending.set(msg.req, { resolve, timer, from: peerId });
+      if (!this.send(peerId, msg)) {
+        clearTimeout(timer);
+        this.pending.delete(msg.req);
+        resolve(null);
+      }
+    });
+  }
+  failPending(peerId) {
+    for (const [req, p] of this.pending) if (p.from === peerId) {
+      clearTimeout(p.timer);
+      this.pending.delete(req);
+      this.listings.delete(req);
+      p.resolve(null);
+    }
+  }
+  onMessage(from, data) {
+    if (!isMsg(data)) return;
+    if (data.t === "changed") {
+      if (validRecord(data.rec)) this.emit({ type: "changed", rec: data.rec });
+      return;
+    }
+    if (data.t === "listed") {
+      const got = this.listings.get(data.req) ?? [];
+      got.push(...Array.isArray(data.recs) ? data.recs.filter(validRecord) : []);
+      if (data.more) {
+        this.listings.set(data.req, got);
+        return;
+      }
+      this.listings.delete(data.req);
+      const p = this.pending.get(data.req);
+      if (p && p.from === from) {
+        clearTimeout(p.timer);
+        this.pending.delete(data.req);
+        p.resolve({ ...data, recs: got });
+      }
+      return;
+    }
+    if (data.t === "ack" || data.t === "got") {
+      const p = this.pending.get(data.req);
+      if (p && p.from === from) {
+        clearTimeout(p.timer);
+        this.pending.delete(data.req);
+        p.resolve(data);
+      }
+    }
+  }
+  /** Writes a record to the room's servers; resolves with how many took it. */
+  async put(rec, write) {
+    const servers = this.serversFor(rec.room);
+    const acks = await Promise.all(servers.map((id) => this.ask(id, { pp: PP, t: "put", req: newReq(), rec, write })));
+    return acks.filter((a) => a?.t === "ack" && a.ok).length;
+  }
+  /** The newest copy of a record the room's servers hold, or null. */
+  async get(room, slot) {
+    const answers = await Promise.all(this.serversFor(room).map((id) => this.ask(id, { pp: PP, t: "get", req: newReq(), room, slot })));
+    let best = null;
+    for (const a of answers) if (a?.t === "got" && a.rec && validRecord(a.rec) && a.rec.slot === slot && (!best || a.rec.at > best.at)) best = a.rec;
+    return best;
+  }
+  /** Every record the room's servers hold (of one space, with `tag`), the newest copy of each. */
+  async list(room, tag) {
+    const answers = await Promise.all(this.serversFor(room).map((id) => {
+      const req = newReq();
+      this.listings.set(req, []);
+      return this.ask(id, { pp: PP, t: "list", req, room, ...tag ? { tag } : {} });
+    }));
+    const best = /* @__PURE__ */ new Map();
+    for (const a of answers) {
+      if (a?.t !== "listed") continue;
+      for (const r of a.recs) if (r.room === room && (!tag || r.tag === tag) && (best.get(r.slot)?.at ?? -1) < r.at) best.set(r.slot, r);
+    }
+    return [...best.values()];
+  }
+};
+var MemoryServerRecordStore = class {
+  constructor() {
+    this.byRoom = /* @__PURE__ */ new Map();
+  }
+  async get(room, slot) {
+    return this.byRoom.get(room)?.get(slot) ?? null;
+  }
+  async put(rec) {
+    let m = this.byRoom.get(rec.room);
+    if (!m) this.byRoom.set(rec.room, m = /* @__PURE__ */ new Map());
+    m.set(rec.slot, rec);
+  }
+  async list(room, tag) {
+    return [...this.byRoom.get(room)?.values() ?? []].filter((r) => !tag || r.tag === tag);
+  }
+  async rooms() {
+    return [...this.byRoom.keys()];
+  }
+};
+var StorageServer = class {
+  constructor(node, store = new MemoryServerRecordStore()) {
+    this.node = node;
+    this.store = store;
+    this.hashed = /* @__PURE__ */ new Map();
+    this.watchers = /* @__PURE__ */ new Map();
+    /** For each room: the servers last given its records. */
+    this.placed = /* @__PURE__ */ new Map();
+    this.selfHash = "";
+    this.timer = null;
+    this.onChange = null;
+    this.rebalancing = null;
+    this.rebalanceAgain = false;
+    node.on("message", (m) => {
+      if (m.kind === "direct" && m.fromPeerId) void this.onMessage(m.fromPeerId, m.data).catch(() => {
+      });
+    });
+    node.on("peerConnected", () => void this.rebalance());
+    node.on("peerDisconnected", (peerId) => {
+      for (const w of this.watchers.values()) w.delete(peerId);
+      void this.rebalance();
+    });
+  }
+  /** Called with each record this server takes (a write, or one handed to it). */
+  onRecord(listener) {
+    this.onChange = listener;
+  }
+  async start() {
+    await this.node.start();
+    this.timer = setInterval(() => void this.rebalance(), 1e4);
+    this.timer.unref?.();
+  }
+  async close() {
+    if (this.timer) clearInterval(this.timer);
+    await this.node.destroy().catch(() => {
+    });
+  }
+  async stats() {
+    const rooms = await this.store.rooms();
+    let records = 0;
+    for (const room of rooms) records += (await this.store.list(room)).length;
+    const linked = this.node.getConnectedPeers();
+    const servers = linked.filter((id) => this.node.getPeerRole(id) === STORAGE_SERVER_ROLE).length;
+    return { rooms: rooms.length, records, servers, clients: linked.length - servers };
+  }
+  async self() {
+    const id = this.node.getClientId() ?? "";
+    if (id && !this.hashed.has(id)) this.hashed.set(id, await sha256Hex(id));
+    this.selfHash = this.hashed.get(id) ?? "";
+    return id;
+  }
+  /** Every server known in the scope, this one included. */
+  async servers() {
+    const ids = /* @__PURE__ */ new Set();
+    const selfId = await this.self();
+    if (selfId) ids.add(selfId);
+    for (const id of [...this.node.getDiscoveredPeers(), ...this.node.getConnectedPeers()]) {
+      if (this.node.getPeerRole(id) === STORAGE_SERVER_ROLE) ids.add(id);
+    }
+    for (const id of ids) if (!this.hashed.has(id)) this.hashed.set(id, await sha256Hex(id));
+    return [...ids];
+  }
+  send(peerId, msg) {
+    return this.node.sendDirect(peerId, msg) !== null;
+  }
+  /** Takes a record if it is new or newer, and its write token (or hash) is the slot's. */
+  async take(rec) {
+    const have = await this.store.get(rec.room, rec.slot);
+    if (have) {
+      if (have.wh !== rec.wh) return { ok: false, why: "not-yours" };
+      if (have.once) return { ok: have.at === rec.at, ...have.at === rec.at ? {} : { why: "frozen" } };
+      if (have.at >= rec.at) return { ok: true };
+    }
+    await this.store.put(rec);
+    this.onChange?.(rec);
+    return { ok: true };
+  }
+  async onMessage(from, data) {
+    if (!isMsg(data)) return;
+    switch (data.t) {
+      case "put": {
+        if (!validRecord(data.rec) || !validId(data.write)) return void this.send(from, { pp: PP, t: "ack", req: data.req, ok: false, why: "bad" });
+        const rec = { room: data.rec.room, slot: data.rec.slot, tag: data.rec.tag, at: data.rec.at, blob: data.rec.blob, wh: await sha256Hex(data.write), ...data.rec.once ? { once: true } : {} };
+        const before = await this.store.get(rec.room, rec.slot);
+        const result = await this.take(rec);
+        this.send(from, { pp: PP, t: "ack", req: data.req, ...result, at: rec.at });
+        if (result.ok && (!before || before.at < rec.at)) {
+          for (const peer of this.watchers.get(rec.room) ?? []) if (peer !== from) this.send(peer, { pp: PP, t: "changed", rec: strip(rec) });
+          const closest = closestIds(rec.room, await this.servers(), this.hashed).filter((id) => id !== this.node.getClientId());
+          for (const id of closest) this.send(id, { pp: PP, t: "sync", recs: [rec] });
+        }
+        return;
+      }
+      case "get": {
+        const rec = validId(data.room) && validId(data.slot) ? await this.store.get(data.room, data.slot) : null;
+        this.send(from, { pp: PP, t: "got", req: data.req, rec: rec ? strip(rec) : null });
+        return;
+      }
+      case "list": {
+        const recs = validId(data.room) ? (await this.store.list(data.room, typeof data.tag === "string" ? data.tag : void 0)).map(strip) : [];
+        const parts = batches(recs);
+        if (!parts.length) parts.push([]);
+        parts.forEach((part, i) => this.send(from, { pp: PP, t: "listed", req: data.req, recs: part, more: i < parts.length - 1 }));
+        return;
+      }
+      case "watch": {
+        if (!validId(data.room)) return;
+        let w = this.watchers.get(data.room);
+        if (!w) this.watchers.set(data.room, w = /* @__PURE__ */ new Set());
+        w.add(from);
+        return;
+      }
+      case "sync": {
+        if (this.node.getPeerRole(from) !== STORAGE_SERVER_ROLE || !Array.isArray(data.recs)) return;
+        for (const rec of data.recs) {
+          if (!validRecord(rec) || !validId(rec.wh)) continue;
+          const before = await this.store.get(rec.room, rec.slot);
+          const result = await this.take(rec);
+          if (result.ok && (!before || before.at < rec.at)) {
+            for (const peer of this.watchers.get(rec.room) ?? []) this.send(peer, { pp: PP, t: "changed", rec: strip(rec) });
+          }
+        }
+        return;
+      }
+    }
+  }
+  rebalance() {
+    if (this.rebalancing) {
+      this.rebalanceAgain = true;
+      return this.rebalancing;
+    }
+    return this.rebalancing = (async () => {
+      do {
+        this.rebalanceAgain = false;
+        await this.rebalanceNow().catch(() => {
+        });
+      } while (this.rebalanceAgain);
+    })().finally(() => {
+      this.rebalancing = null;
+    });
+  }
+  /**
+   * Hands each room's records to the servers now closest to it that were not
+   * given them yet: a server that joins gets the rooms it is now closest for,
+   * and when one leaves, the next closest gets its rooms.
+   */
+  async rebalanceNow() {
+    const servers = await this.servers();
+    const selfId = this.node.getClientId();
+    const linked = new Set(this.node.getConnectedPeers());
+    for (const room of await this.store.rooms()) {
+      const closest = closestIds(room, servers, this.hashed).filter((id) => id !== selfId);
+      const given = this.placed.get(room) ?? [];
+      const todo = closest.filter((id) => !given.includes(id));
+      if (!todo.length) continue;
+      const recs = await this.store.list(room);
+      const done = [];
+      for (const id of todo) {
+        if (!linked.has(id)) {
+          this.node.connectToPeer(id);
+          continue;
+        }
+        for (const part of batches(recs)) this.send(id, { pp: PP, t: "sync", recs: part });
+        done.push(id);
+      }
+      this.placed.set(room, [...given.filter((id) => closest.includes(id)), ...done]);
+    }
+  }
+};
+
 // src/storage.ts
 var MemoryStorageDriver = class {
   constructor() {
@@ -3245,6 +3681,11 @@ var PeerPigeonStorage = class {
     this.retrieveAnswerTimes = [];
     this.pendingRetrieveRequests = /* @__PURE__ */ new Map();
     this.closed = false;
+    // Storage servers, when there are any (see storage-servers.ts).
+    this.servers = null;
+    this.serverIds = null;
+    this.serversReady = false;
+    this.migrating = null;
     this.instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
     this.crossTabChannel = null;
     this.crossTabSeenNoticeIds = /* @__PURE__ */ new Set();
@@ -3260,6 +3701,7 @@ var PeerPigeonStorage = class {
     this.dbName = String(options.dbName ?? "peerpigeon-storage-v1").trim() || "peerpigeon-storage-v1";
     this.syncFilter = typeof options.syncFilter === "function" ? options.syncFilter : null;
     this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
+    this.moveToServers = options.moveToServers !== false;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
       });
@@ -3341,6 +3783,7 @@ var PeerPigeonStorage = class {
     if (space !== "private" && !options.silent) {
       await this.broadcastMutation(mutation);
     }
+    if (space !== "private") void this.pushToServers(mutation);
     return await this.get(space, key);
   }
   async putSystem(space, key, value, options = {}) {
@@ -3349,12 +3792,16 @@ var PeerPigeonStorage = class {
     }
     const mutation = await this.applyLocalUpsert(space, key, value, options, true);
     await this.broadcastMutation(mutation);
+    void this.pushToServers(mutation);
     return await this.get(space, key);
   }
   async get(space, key) {
     const driver = this.requireDriver();
     const pk = this.makePk(space, key);
-    const persisted = await driver.get(pk);
+    let persisted = await driver.get(pk);
+    if (!persisted && space !== "private" && this.serversReady) {
+      if (await this.readFromServers(space, this.normalizeKey(key))) persisted = await driver.get(pk);
+    }
     if (!persisted) return null;
     let value;
     try {
@@ -3442,6 +3889,7 @@ var PeerPigeonStorage = class {
     if (!mutation) return false;
     if (space !== "private") {
       await this.broadcastMutation(mutation);
+      void this.pushToServers(mutation);
     }
     return true;
   }
@@ -3452,11 +3900,16 @@ var PeerPigeonStorage = class {
     const mutation = await this.applyLocalDelete(space, key, true);
     if (!mutation) return false;
     await this.broadcastMutation(mutation);
+    void this.pushToServers(mutation);
     return true;
   }
   async list(space) {
     const driver = this.requireDriver();
     const persisted = await driver.listBySpace(space);
+    if (space !== "private" && this.serversReady) {
+      const here = new Set(persisted.map((r) => r.key));
+      for (const record of await this.listFromServers(space)) if (!here.has(record.key)) persisted.push(record);
+    }
     const out = [];
     for (const record of persisted) {
       let value;
@@ -3483,6 +3936,8 @@ var PeerPigeonStorage = class {
   async close() {
     if (this.closed) return;
     this.closed = true;
+    this.servers = null;
+    this.serversReady = false;
     if (this.gossip) {
       this.gossip.off("messageReceived", this.onGossipMessageBound);
       this.gossip.off("directMessageReceived", this.onDirectMessageBound);
@@ -3499,6 +3954,121 @@ var PeerPigeonStorage = class {
       pending.resolve(null);
     }
     this.pendingRetrieveRequests.clear();
+  }
+  // ---------------------------------------------------------------- servers
+  /**
+   * Uses storage servers (a link from storage-servers.ts) for this room: its
+   * records go to the room's closest servers, the ones already here are moved
+   * to them once they are there, and changes others make arrive from them.
+   */
+  async attachServers(link) {
+    const seed = `peerpigeon:storage-servers:v1:${this.sessionId}:${this.syncSecret}`;
+    const room = await sha256Hex(`${seed}:room`);
+    this.servers = link;
+    this.serverIds = { room, seed };
+    link.on((event) => {
+      if (this.closed || this.servers !== link) return;
+      if (event.type === "servers" && event.room === room) {
+        const ready = event.servers.length > 0;
+        const cameUp = ready && !this.serversReady;
+        this.serversReady = ready;
+        if (cameUp) void this.migrateToServers().catch(() => {
+        });
+      } else if (event.type === "changed" && event.rec.room === room) {
+        void this.applyServerRecord(event.rec, false).catch(() => {
+        });
+      }
+    });
+    link.keep(room);
+  }
+  /** Whether the room's servers are linked now, and how many. */
+  serverCount() {
+    return this.servers && this.serverIds ? this.servers.serversFor(this.serverIds.room).length : 0;
+  }
+  async slotOf(space, key) {
+    const seed = this.serverIds.seed;
+    const slot = await sha256Hex(`${seed}:slot:${space}:${key}`);
+    return { slot, tag: (await sha256Hex(`${seed}:space:${space}`)).slice(0, 16), write: await sha256Hex(`${seed}:write:${slot}`) };
+  }
+  /** Sends one change to the room's servers; resolves with how many took it. */
+  async pushToServers(mutation) {
+    if (!this.servers || !this.serverIds || !this.serversReady || mutation.space === "private") return 0;
+    try {
+      const { slot, tag, write } = await this.slotOf(mutation.space, mutation.key);
+      const blob = await this.encryptSyncPayload(mutation);
+      return await this.servers.put({ room: this.serverIds.room, slot, tag, at: mutation.timestamp, blob, ...mutation.space === "frozen" ? { once: true } : {} }, write);
+    } catch {
+      return 0;
+    }
+  }
+  /** A record from a server: decrypted, checked like any change from the mesh, and kept here. */
+  async applyServerRecord(rec, asked) {
+    const mutation = await this.decryptSyncEnvelope(rec.blob);
+    if (!this.isStorageMutation(mutation) || mutation.space === "private") return false;
+    if (!asked && !this.shouldAcceptRemoteSync(mutation.space, mutation.key, { kind: "mutation", actorId: mutation.actorId })) return false;
+    return await this.applyRemoteMutation(mutation);
+  }
+  async readFromServers(space, key) {
+    if (!this.servers || !this.serverIds) return false;
+    try {
+      const { slot } = await this.slotOf(space, key);
+      const rec = await this.servers.get(this.serverIds.room, slot);
+      return rec ? await this.applyServerRecord(rec, true) : false;
+    } catch {
+      return false;
+    }
+  }
+  /** The records of a space the room's servers keep, decrypted (not kept here). */
+  async listFromServers(space) {
+    if (!this.servers || !this.serverIds) return [];
+    try {
+      const { tag } = await this.slotOf(space, "");
+      const out = [];
+      for (const rec of await this.servers.list(this.serverIds.room, tag)) {
+        const mutation = await this.decryptSyncEnvelope(rec.blob);
+        if (this.isStorageMutation(mutation) && mutation.op === "upsert" && mutation.record && mutation.space === space) {
+          out.push({ ...mutation.record, pk: this.makePk(space, mutation.key), updatedAt: mutation.timestamp });
+        }
+      }
+      return out;
+    } catch {
+      return [];
+    }
+  }
+  /**
+   * The room's servers came up: everything kept here (but private) goes to
+   * them, and, once they hold it, what this node does not use is dropped here.
+   */
+  migrateToServers() {
+    return this.migrating ?? (this.migrating = (async () => {
+      const driver = this.requireDriver();
+      for (const space of ["public", "user", "frozen", "epublic"]) {
+        for (const record of await driver.listBySpace(space)) {
+          if (this.closed || !this.serversReady) return;
+          const mutation = {
+            __ppType: "pp-storage-op-v1",
+            opId: this.makeMutationId(this.userId),
+            op: "upsert",
+            space,
+            key: record.key,
+            // A user record is created by its owner: whoever receives it checks that.
+            actorId: space === "user" ? record.ownerId ?? this.userId : this.userId,
+            timestamp: record.updatedAt,
+            record
+          };
+          const took = await this.pushToServers(mutation);
+          if (took > 0 && this.moveToServers && !this.usesLocally(space, record.key)) {
+            await driver.delete(record.pk);
+          }
+        }
+      }
+    })().finally(() => {
+      this.migrating = null;
+    }));
+  }
+  /** Whether this node keeps a record here even when servers hold it: one it subscribes to or replicates. */
+  usesLocally(space, key) {
+    return this.isSubscribed(space, key) || (space === "public" || space === "user") && this.replicates(key);
   }
   async applyLocalUpsert(space, key, value, options, allowSystemWrite = false) {
     const normalizedKey = this.normalizeKey(key);
@@ -5158,6 +5728,8 @@ var PartialMesh = class {
     const bootstrapServer = String(config.signalingServer || DEFAULT_SIGNALING_SERVERS[0]).trim();
     const configuredSignalingServers = Array.from(new Set((config.signalingServers != null ? [bootstrapServer, ...config.signalingServers] : automaticSignalingServer ? DEFAULT_SIGNALING_SERVERS : [bootstrapServer]).map((url) => String(url || "").trim()).filter(Boolean)));
     const signalingServers = configuredSignalingServers.length > 0 ? configuredSignalingServers : [...DEFAULT_SIGNALING_SERVERS];
+    this.role = typeof config.role === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(config.role) ? config.role : null;
+    this.dialRoles = Array.isArray(config.dialRoles) ? new Set(config.dialRoles.map(String)) : null;
     this.config = {
       minPeers: config.minPeers ?? 2,
       maxPeers: config.maxPeers ?? 10,
@@ -5970,6 +6542,7 @@ var PartialMesh = class {
       retiredPeerIds,
       iceServers: this.config.iceServers,
       trickleIce: this.config.trickleIce,
+      role: this.role,
       // Stay reachable on the relay while a coordinate neighbour is not yet
       // linked. That neighbour may sit in another part of the mesh, where
       // only the relay can carry the offer; both ends hold until it forms.
@@ -6566,8 +7139,18 @@ var PartialMesh = class {
       }
     }
     return Array.from(candidates).filter(
-      (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId) && !this.hasLeft(peerId)
+      (peerId) => !this.isSelfAlias(peerId) && !this.retiredPeerIds.has(peerId) && !this.hasLeft(peerId) && this.dialsRole(peerId)
     );
+  }
+  /** The role a relay listed this peer with (its announce's capabilities.role), or null. */
+  getPeerRole(peerId) {
+    return this.signalingClient?.getPeerRole?.(this.normalizePeerId(peerId)) ?? null;
+  }
+  /** Whether this peer dials that one on its own (dialRoles). */
+  dialsRole(peerId) {
+    if (!this.dialRoles) return true;
+    const role = this.getPeerRole(peerId);
+    return role !== null && this.dialRoles.has(role);
   }
   maintainPeerConnections() {
     const now = Date.now();
@@ -6647,11 +7230,12 @@ var PartialMesh = class {
    * Connect to a specific peer
    */
   connectToPeer(peerId) {
-    this.connectToPeerInternal(peerId, false);
+    this.connectToPeerInternal(peerId, false, true);
   }
-  connectToPeerInternal(peerId, allowTemporaryOverflow) {
+  connectToPeerInternal(peerId, allowTemporaryOverflow, asked = false) {
     const selfId = this.normalizePeerId(this.clientId);
     const normalizedPeerId = this.normalizePeerId(peerId);
+    if (!asked && normalizedPeerId && !this.dialsRole(normalizedPeerId)) return;
     const signalingConnected = this.signalingClient?.isConnected?.() ?? true;
     const emergencyIsolated = this.getConnectedPeerCount() === 0 && this.dialCandidatePeerIds(true).length > 0;
     if (!signalingConnected && !this.meshCanSignal(peerId)) {
@@ -6825,7 +7409,9 @@ var PartialMesh = class {
     return {
       ...this.config,
       signalingServers: [...this.config.signalingServers],
-      iceServers: this.config.iceServers ? this.config.iceServers.map((server) => ({ ...server })) : null
+      iceServers: this.config.iceServers ? this.config.iceServers.map((server) => ({ ...server })) : null,
+      role: this.role,
+      dialRoles: this.dialRoles ? [...this.dialRoles] : null
     };
   }
   /**
@@ -7483,9 +8069,10 @@ var PartialMesh = class {
 };
 var RELAY_SCORES_PAYLOAD_TYPE = "pp-relay-scores";
 var RELAY_SCORE_SHARE_MS = 10 * 6e4;
-var PeerPigeonNode = class {
+var PeerPigeonNode = class _PeerPigeonNode {
   constructor(options = {}) {
     this.storage = null;
+    this.serverLink = null;
     this.callbacks = {};
     this.started = false;
     this.relayScoreTimer = null;
@@ -7493,6 +8080,8 @@ var PeerPigeonNode = class {
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
     this.storageOptions = storage;
+    const { signalingServer, signalingServers, automaticSignalingServer, relayDirectory, iceServers } = meshOptions;
+    this.signalingOptions = { signalingServer, signalingServers, automaticSignalingServer, relayDirectory, iceServers };
     const meshReaches = (peerId) => {
       if (!this.gossip.canRouteDirect(peerId)) return false;
       if (this.mesh.getConnectedPeers().includes(peerId)) return true;
@@ -7532,7 +8121,7 @@ var PeerPigeonNode = class {
           this.storageOptions.userId ?? (this.crypto ? this.crypto.getKeyPair().epub : "")
         ).trim();
         if (!userId) throw new Error("storage.userId is required when crypto is disabled");
-        const { userId: _ignoredUserId, ...storageOptions } = this.storageOptions;
+        const { userId: _ignoredUserId, servers: useServers = true, ...storageOptions } = this.storageOptions;
         const config = this.mesh.getConfig();
         this.storage = new PeerPigeonStorage({
           ...storageOptions,
@@ -7542,6 +8131,12 @@ var PeerPigeonNode = class {
           gossip: this.gossip
         });
         await this.storage.init();
+        if (useServers) {
+          this.serverLink = new StorageServerLink(_PeerPigeonNode.serverScopeNode(this.signalingOptions, { dialRoles: [] }));
+          await this.storage.attachServers(this.serverLink);
+          void this.serverLink.start().catch(() => {
+          });
+        }
       }
       await this.mesh.init();
     } catch (error) {
@@ -7587,6 +8182,14 @@ var PeerPigeonNode = class {
   }
   getDiscoveredPeers() {
     return this.mesh.getDiscoveredPeers();
+  }
+  /** The role a relay listed this peer with, or null. */
+  getPeerRole(peerId) {
+    return this.mesh.getPeerRole(peerId);
+  }
+  /** Dial this peer now, whatever its role. */
+  connectToPeer(peerId) {
+    this.mesh.connectToPeer(peerId);
   }
   getActiveSignalingPeers() {
     return this.mesh.getActiveSignalingPeers();
@@ -7649,10 +8252,39 @@ var PeerPigeonNode = class {
   off(event, callback) {
     this.callbacks[event]?.delete(callback);
   }
+  /**
+   * A node in the storage servers' scope, on the same relays as this one: for
+   * a server (role 'storage', dialing other servers) or a peer's link to them.
+   */
+  static serverScopeNode(signaling, options = {}) {
+    const defined = Object.fromEntries(Object.entries(signaling).filter(([, v]) => v !== void 0));
+    return new _PeerPigeonNode({
+      ...defined,
+      networkId: STORAGE_SERVER_NETWORK,
+      sessionId: STORAGE_SERVER_ROOM,
+      minPeers: options.minPeers ?? 0,
+      maxPeers: options.maxPeers ?? 8,
+      role: options.role ?? null,
+      dialRoles: options.dialRoles ?? [],
+      crypto: false,
+      storage: false
+    });
+  }
+  /** A storage server on the same relays as this node's settings (see storage-servers.ts). */
+  static storageServer(signaling = {}, store) {
+    return new StorageServer(
+      _PeerPigeonNode.serverScopeNode(signaling, { role: STORAGE_SERVER_ROLE, dialRoles: [STORAGE_SERVER_ROLE], maxPeers: 32, minPeers: 0 }),
+      store
+    );
+  }
   async destroy() {
     if (this.relayScoreTimer) {
       clearInterval(this.relayScoreTimer);
       this.relayScoreTimer = null;
+    }
+    if (this.serverLink) {
+      await this.serverLink.close();
+      this.serverLink = null;
     }
     if (this.storage) await this.storage.close();
     this.storage = null;
@@ -7777,6 +8409,7 @@ export {
   DEFAULT_SIGNALING_SERVERS,
   GossipProtocol,
   MESH_SIGNAL_PAYLOAD_TYPE,
+  MemoryServerRecordStore,
   NEGOTIATION_ACTIVE_ICE_DEADLINE_MS,
   NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS,
   NEGOTIATION_OFFER_DEADLINE_MS,
@@ -7789,6 +8422,12 @@ export {
   RELAY_SWITCH_MARGIN,
   RELAY_VIRTUAL_IDS,
   RelayScoreBook,
+  STORAGE_REPLICAS,
+  STORAGE_SERVER_NETWORK,
+  STORAGE_SERVER_ROLE,
+  STORAGE_SERVER_ROOM,
+  StorageServer,
+  StorageServerLink,
   chooseRelays,
   index_default as default,
   directRelaySupported,
