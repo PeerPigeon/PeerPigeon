@@ -504,7 +504,7 @@ export class FreeRTCClientAdapter {
       }
       this.nudgeTokens -= 1;
     }
-    this.client?.advertise?.({});
+    this.client?.advertise?.(this.role ? { role: this.role } : {});
     this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
 

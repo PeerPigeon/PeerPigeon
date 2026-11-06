@@ -135,6 +135,8 @@ export class StorageServerLink {
     node.on('message', (m) => { if (m.kind === 'direct' && m.fromPeerId) this.onMessage(m.fromPeerId, m.data); });
     node.on('peerConnected', () => void this.refresh());
     node.on('peerDisconnected', (peerId) => { this.failPending(peerId); void this.refresh(); });
+    // A server listed by the relay is dialled at once, not at the next look.
+    (node as { mesh?: { on?: (e: string, cb: () => void) => void } }).mesh?.on?.('peer:discovered', () => void this.refresh());
   }
 
   async start(): Promise<void> {
@@ -325,6 +327,7 @@ export class StorageServer {
     node.on('message', (m) => { if (m.kind === 'direct' && m.fromPeerId) void this.onMessage(m.fromPeerId, m.data).catch(() => {}); });
     node.on('peerConnected', () => void this.rebalance());
     node.on('peerDisconnected', (peerId) => { for (const w of this.watchers.values()) w.delete(peerId); void this.rebalance(); });
+    (node as { mesh?: { on?: (e: string, cb: () => void) => void } }).mesh?.on?.('peer:discovered', () => void this.rebalance());
   }
 
   /** Called with each record this server takes (a write, or one handed to it). */

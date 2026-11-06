@@ -390,7 +390,7 @@ var FreeRTCClientAdapter = class {
       }
       this.nudgeTokens -= 1;
     }
-    this.client?.advertise?.({});
+    this.client?.advertise?.(this.role ? { role: this.role } : {});
     this.client?.requestBootstrap?.(Array.from(this.selfAliases));
   }
   /**
@@ -3219,6 +3219,7 @@ var StorageServerLink = class {
       this.failPending(peerId);
       void this.refresh();
     });
+    node.mesh?.on?.("peer:discovered", () => void this.refresh());
   }
   async start() {
     await this.node.start();
@@ -3426,6 +3427,7 @@ var StorageServer = class {
       for (const w of this.watchers.values()) w.delete(peerId);
       void this.rebalance();
     });
+    node.mesh?.on?.("peer:discovered", () => void this.rebalance());
   }
   /** Called with each record this server takes (a write, or one handed to it). */
   onRecord(listener) {
@@ -7274,7 +7276,7 @@ var PartialMesh = class {
     }
     const discoveredAt = this.discoveredAtMs.get(normalizedPeerId) ?? Date.now();
     const preferredInitiator = selfId.localeCompare(normalizedPeerId) < 0;
-    if (!preferredInitiator && Date.now() - discoveredAt < PREFERRED_INITIATOR_GRACE_MS) {
+    if (!asked && !preferredInitiator && Date.now() - discoveredAt < PREFERRED_INITIATOR_GRACE_MS) {
       return;
     }
     this.connecting.add(normalizedPeerId);

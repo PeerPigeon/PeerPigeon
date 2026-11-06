@@ -2908,7 +2908,8 @@ export class PartialMesh {
 
     const discoveredAt = this.discoveredAtMs.get(normalizedPeerId) ?? Date.now();
     const preferredInitiator = selfId.localeCompare(normalizedPeerId) < 0;
-    if (!preferredInitiator && Date.now() - discoveredAt < PREFERRED_INITIATOR_GRACE_MS) {
+    // A dial asked for (connectToPeer) goes at once: the other side may not dial this one at all (dialRoles).
+    if (!asked && !preferredInitiator && Date.now() - discoveredAt < PREFERRED_INITIATOR_GRACE_MS) {
       return;
     }
 
