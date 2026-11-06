@@ -198,6 +198,31 @@ test('a node that replicates a namespace is caught up on link with every record 
   }
 });
 
+test('a digest that cannot be sent at once (a link just up, no route yet) is sent again', async () => {
+  const a = makeGossip('peer-a');
+  const b = makeGossip('peer-b');
+  a.other = b; b.other = a;
+  const options = { sessionId: 'retry-test', syncSecret: 'retry-test-secret' };
+  const storageA = new PeerPigeonStorage({ ...options, userId: 'user-a', peerId: 'peer-a', gossip: a });
+  const storageB = new PeerPigeonStorage({ ...options, userId: 'user-b', peerId: 'peer-b', gossip: b, replicate: ['holds/'] });
+  await storageA.init();
+  await storageB.init();
+  try {
+    a.broadcastsDelivered = false;
+    await storageA.put('user', 'holds/user-a', { files: 2 });
+    // B's first two sends find no route.
+    let refusals = 2;
+    const send = b.sendDirect.bind(b);
+    b.sendDirect = (to, data) => (refusals-- > 0 ? null : send(to, data));
+    b.emit('peerConnected', { peerId: 'peer-a' });
+    await settle(1600);
+    assert.equal((await storageB.get('user', 'holds/user-a'))?.value?.files, 2, 'the catch-up came after the retries');
+  } finally {
+    await storageA.close();
+    await storageB.close();
+  }
+});
+
 test('a replicating node is not pushed what it already holds as new', async () => {
   const a = makeGossip('peer-a');
   const b = makeGossip('peer-b');

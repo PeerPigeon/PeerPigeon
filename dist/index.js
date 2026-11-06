@@ -3230,6 +3230,8 @@ var RETRIEVE_FIRST_WAIT_MS = 1500;
 var RETRIEVE_MIN_WAIT_MS = 600;
 var DIGEST_MAX_ENTRIES = 4e3;
 var DIGEST_MAX_PUSHES = 1e3;
+var DIGEST_SEND_ATTEMPTS = 6;
+var DIGEST_RETRY_MS = 500;
 var REPLICATED_SPACES = ["public", "user"];
 var PeerPigeonStorage = class {
   constructor(options) {
@@ -4195,9 +4197,13 @@ var PeerPigeonStorage = class {
       entries,
       ...this.replicate.length ? { prefixes: this.replicate } : {}
     };
-    try {
-      this.gossip.sendDirect(target, await this.syncEnvelope(digest));
-    } catch {
+    const envelope = await this.syncEnvelope(digest);
+    for (let attempt = 0; attempt < DIGEST_SEND_ATTEMPTS && !this.closed; attempt++) {
+      try {
+        if (this.gossip.sendDirect(target, envelope)) return;
+      } catch {
+      }
+      await new Promise((resolve) => setTimeout(resolve, DIGEST_RETRY_MS));
     }
   }
   /**

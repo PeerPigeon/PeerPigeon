@@ -336,6 +336,9 @@ const RETRIEVE_MIN_WAIT_MS = 600;
 // Bounds on a connect-time digest and on what one digest may push back.
 const DIGEST_MAX_ENTRIES = 4_000;
 const DIGEST_MAX_PUSHES = 1_000;
+/** A digest that cannot be sent yet (a link just up, no route) is tried again this many times, this far apart. */
+const DIGEST_SEND_ATTEMPTS = 6;
+const DIGEST_RETRY_MS = 500;
 /** The spaces a `replicate` prefix covers (frozen records are content-addressed and fetched on demand). */
 const REPLICATED_SPACES: StorageSpace[] = ['public', 'user'];
 
@@ -1543,10 +1546,16 @@ export class PeerPigeonStorage {
       entries,
       ...(this.replicate.length ? { prefixes: this.replicate } : {}),
     };
-    try {
-      this.gossip.sendDirect(target, await this.syncEnvelope(digest));
-    } catch {
-      // no route yet; the peer's own digest still reaches us
+    // A link that has just come up may not carry messages yet (no route): try again a few times,
+    // or a newcomer would miss the whole catch-up and see records only as they next change.
+    const envelope = await this.syncEnvelope(digest);
+    for (let attempt = 0; attempt < DIGEST_SEND_ATTEMPTS && !this.closed; attempt++) {
+      try {
+        if (this.gossip.sendDirect(target, envelope)) return;
+      } catch {
+        // no route yet
+      }
+      await new Promise((resolve) => setTimeout(resolve, DIGEST_RETRY_MS));
     }
   }
 
