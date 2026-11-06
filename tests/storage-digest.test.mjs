@@ -156,6 +156,73 @@ test('a node that declares a namespace is pushed its records without subscribing
   }
 });
 
+test('a node that replicates a namespace is caught up on link with every record under it, keys it never knew', async () => {
+  const a = makeGossip('peer-a');
+  const b = makeGossip('peer-b');
+  a.other = b; b.other = a;
+  const options = { sessionId: 'replicate-test', syncSecret: 'replicate-test-secret' };
+  const storageA = new PeerPigeonStorage({ ...options, userId: 'user-a', peerId: 'peer-a', gossip: a, replicate: ['holds/'] });
+  const storageB = new PeerPigeonStorage({ ...options, userId: 'user-b', peerId: 'peer-b', gossip: b, replicate: ['holds/'] });
+  await storageA.init();
+  await storageB.init();
+  try {
+    // Written while the two were apart (B had not joined): no broadcast crosses.
+    a.broadcastsDelivered = false;
+    b.broadcastsDelivered = false;
+    await storageA.put('user', 'holds/user-a', { files: 3 });
+    await storageA.put('public', 'holds/shared-index', { n: 1 });
+    await storageA.put('public', 'elsewhere/other', { n: 1 });
+    await storageB.put('user', 'holds/user-b', { files: 1 });
+    assert.equal(await storageB.get('user', 'holds/user-a'), null);
+
+    // The link comes up: B never subscribed to any of A's keys, and does not know they exist.
+    a.emit('peerConnected', { peerId: 'peer-b' });
+    b.emit('peerConnected', { peerId: 'peer-a' });
+    await settle();
+    assert.equal((await storageB.get('user', 'holds/user-a'))?.value?.files, 3, 'A\'s record under the namespace reached B');
+    assert.equal((await storageB.get('public', 'holds/shared-index'))?.value?.n, 1);
+    assert.equal(await storageB.get('public', 'elsewhere/other'), null, 'nothing outside the namespace is sent');
+    assert.equal((await storageA.get('user', 'holds/user-b'))?.value?.files, 1, 'and the other way round');
+    assert.equal((await storageB.get('user', 'holds/user-a'))?.ownerId, 'user-a', 'the owner is kept');
+
+    // From then on, changes arrive as they happen.
+    a.broadcastsDelivered = true;
+    await storageA.put('user', 'holds/user-a', { files: 4 });
+    await settle();
+    assert.equal((await storageB.get('user', 'holds/user-a'))?.value?.files, 4);
+    // Only its owner can change a user record, replicated or not.
+    await assert.rejects(storageB.put('user', 'holds/user-a', { files: 0 }), /denied/i);
+  } finally {
+    await storageA.close();
+    await storageB.close();
+  }
+});
+
+test('a replicating node is not pushed what it already holds as new', async () => {
+  const a = makeGossip('peer-a');
+  const b = makeGossip('peer-b');
+  a.other = b; b.other = a;
+  const options = { sessionId: 'replicate-test-2', syncSecret: 'replicate-test-secret' };
+  const storageA = new PeerPigeonStorage({ ...options, userId: 'user-a', peerId: 'peer-a', gossip: a });
+  const storageB = new PeerPigeonStorage({ ...options, userId: 'user-b', peerId: 'peer-b', gossip: b, replicate: ['ns/'] });
+  await storageA.init();
+  await storageB.init();
+  try {
+    await storageA.put('public', 'ns/k', { n: 1 });
+    await settle();
+    assert.equal((await storageB.get('public', 'ns/k'))?.value?.n, 1, 'heard as it happened');
+    let pushes = 0;
+    const send = a.sendDirect.bind(a);
+    a.sendDirect = (to, data) => { pushes += 1; return send(to, data); };
+    b.emit('peerConnected', { peerId: 'peer-a' });
+    await settle();
+    assert.equal(pushes, 0, 'B listed its copy, as new as A\'s: nothing to send');
+  } finally {
+    await storageA.close();
+    await storageB.close();
+  }
+});
+
 test('a node that declares no namespace still takes only what it subscribed to', async () => {
   const { storageA, storageB, close } = await pair();
   try {

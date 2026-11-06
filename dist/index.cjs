@@ -3283,6 +3283,7 @@ var RETRIEVE_FIRST_WAIT_MS = 1500;
 var RETRIEVE_MIN_WAIT_MS = 600;
 var DIGEST_MAX_ENTRIES = 4e3;
 var DIGEST_MAX_PUSHES = 1e3;
+var REPLICATED_SPACES = ["public", "user"];
 var PeerPigeonStorage = class {
   constructor(options) {
     this.storeName = "records";
@@ -3309,6 +3310,7 @@ var PeerPigeonStorage = class {
     this.syncSecret = String(options.syncSecret ?? "").trim();
     this.dbName = String(options.dbName ?? "peerpigeon-storage-v1").trim() || "peerpigeon-storage-v1";
     this.syncFilter = typeof options.syncFilter === "function" ? options.syncFilter : null;
+    this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
       });
@@ -4014,6 +4016,7 @@ var PeerPigeonStorage = class {
     const filtered = this.syncFilterAccepts(space, key, context);
     if (filtered === false) return false;
     if (context.kind === "retrieve-request") return true;
+    if ((space === "public" || space === "user") && this.replicates(key)) return true;
     return filtered === true || this.isSubscribed(space, key);
   }
   async createDriver() {
@@ -4219,19 +4222,31 @@ var PeerPigeonStorage = class {
     const target = String(targetPeerId ?? "").trim();
     if (!target) return;
     const entries = [];
+    const listed = /* @__PURE__ */ new Set();
     for (const [pk, { space, key }] of this.subscribedEntries) {
       if (space === "private" || space === "frozen") continue;
       const existing = await this.driver.get(pk);
       entries.push([space, key, existing?.version ?? null]);
+      listed.add(pk);
       if (entries.length >= DIGEST_MAX_ENTRIES) break;
     }
-    if (entries.length === 0 || this.closed) return;
+    for (const space of REPLICATED_SPACES) {
+      if (!this.replicate.length || entries.length >= DIGEST_MAX_ENTRIES) break;
+      for (const record of await this.driver.listBySpace(space)) {
+        if (!this.replicates(record.key) || listed.has(record.pk)) continue;
+        entries.push([space, record.key, record.version]);
+        listed.add(record.pk);
+        if (entries.length >= DIGEST_MAX_ENTRIES) break;
+      }
+    }
+    if (entries.length === 0 && !this.replicate.length || this.closed) return;
     const digest = {
       __ppType: "pp-storage-digest-v1",
       actorId: this.userId,
       timestamp: Date.now(),
       ...this.peerId ? { origin: this.peerId } : {},
-      entries
+      entries,
+      ...this.replicate.length ? { prefixes: this.replicate } : {}
     };
     try {
       this.gossip.sendDirect(target, await this.syncEnvelope(digest));
@@ -4295,6 +4310,37 @@ var PeerPigeonStorage = class {
       } catch {
       }
     }
+    const prefixes = Array.isArray(digest.prefixes) ? digest.prefixes.filter((p) => typeof p === "string" && p.length > 0).slice(0, 32) : [];
+    if (!prefixes.length) return;
+    const theirs = /* @__PURE__ */ new Set();
+    for (const entry of digest.entries.slice(0, DIGEST_MAX_ENTRIES)) {
+      if (Array.isArray(entry) && typeof entry[1] === "string") theirs.add(this.makePk(entry[0], entry[1].trim()));
+    }
+    for (const space of REPLICATED_SPACES) {
+      for (const record of await driver.listBySpace(space)) {
+        if (this.closed || pushed >= DIGEST_MAX_PUSHES) return;
+        if (theirs.has(record.pk) || !prefixes.some((p) => record.key.startsWith(p))) continue;
+        pushed += 1;
+        const mutation = {
+          __ppType: "pp-storage-op-v1",
+          opId: `digest-${this.makeMutationId(this.userId)}`,
+          op: "upsert",
+          space,
+          key: record.key,
+          actorId: this.userId,
+          timestamp: record.updatedAt,
+          record
+        };
+        try {
+          this.gossip.sendDirect(target, await this.syncEnvelope(mutation));
+        } catch {
+        }
+      }
+    }
+  }
+  /** Whether this node replicates a key in full (a `replicate` prefix). */
+  replicates(key) {
+    return this.replicate.some((p) => key.startsWith(p));
   }
   isCrossTabNotice(value) {
     const maybe = value;

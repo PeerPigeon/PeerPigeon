@@ -606,6 +606,14 @@ interface StorageOptions extends StorageSyncOptions {
      * Returning false drops remote storage updates for the given key.
      */
     syncFilter?: (space: StorageSpace, key: string, context: StorageSyncFilterContext) => boolean;
+    /**
+     * Key prefixes this node replicates in full (public and user spaces): it
+     * keeps every change to a key under them without subscribing to the key,
+     * and a neighbour that links up sends it every such record it holds (not
+     * only the keys this node already knew of), so a newcomer has the whole
+     * namespace at once.
+     */
+    replicate?: string[];
 }
 type StorageEvents = {
     change: (event: {
@@ -652,6 +660,7 @@ declare class PeerPigeonStorage {
     private readonly syncSecret;
     private readonly dbName;
     private readonly syncFilter;
+    private readonly replicate;
     private readonly storeName;
     private driver;
     private readonly listeners;
@@ -770,6 +779,8 @@ declare class PeerPigeonStorage {
      * the neighbour holds newer than ours.
      */
     private handleDigest;
+    /** Whether this node replicates a key in full (a `replicate` prefix). */
+    private replicates;
     private isCrossTabNotice;
     private isCipherPayload;
     private encryptSyncPayload;

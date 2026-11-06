@@ -70,6 +70,14 @@ export interface StorageOptions extends StorageSyncOptions {
    * Returning false drops remote storage updates for the given key.
    */
   syncFilter?: (space: StorageSpace, key: string, context: StorageSyncFilterContext) => boolean;
+  /**
+   * Key prefixes this node replicates in full (public and user spaces): it
+   * keeps every change to a key under them without subscribing to the key,
+   * and a neighbour that links up sends it every such record it holds (not
+   * only the keys this node already knew of), so a newcomer has the whole
+   * namespace at once.
+   */
+  replicate?: string[];
 }
 
 export type StorageEvents = {
@@ -163,6 +171,8 @@ type StorageDigest = {
   /** The sender's mesh peer id, so the answers go straight back to it. */
   origin?: string;
   entries: StorageDigestEntry[];
+  /** Key prefixes the sender replicates in full: the receiver also sends every record it holds under them. */
+  prefixes?: string[];
 };
 
 type StorageSyncPayload = StorageMutation | StorageRetrieveRequest | StorageRetrieveResponse | StorageDigest;
@@ -326,6 +336,8 @@ const RETRIEVE_MIN_WAIT_MS = 600;
 // Bounds on a connect-time digest and on what one digest may push back.
 const DIGEST_MAX_ENTRIES = 4_000;
 const DIGEST_MAX_PUSHES = 1_000;
+/** The spaces a `replicate` prefix covers (frozen records are content-addressed and fetched on demand). */
+const REPLICATED_SPACES: StorageSpace[] = ['public', 'user'];
 
 export class PeerPigeonStorage {
   private readonly userId: string;
@@ -335,6 +347,7 @@ export class PeerPigeonStorage {
   private readonly syncSecret: string;
   private readonly dbName: string;
   private readonly syncFilter: ((space: StorageSpace, key: string, context: StorageSyncFilterContext) => boolean) | null;
+  private readonly replicate: string[];
   private readonly storeName = 'records';
   private driver: StorageDriver | null = null;
   private readonly listeners = new Set<ChangeListener>();
@@ -367,6 +380,7 @@ export class PeerPigeonStorage {
     this.syncSecret = String(options.syncSecret ?? '').trim();
     this.dbName = String(options.dbName ?? 'peerpigeon-storage-v1').trim() || 'peerpigeon-storage-v1';
     this.syncFilter = typeof options.syncFilter === 'function' ? options.syncFilter : null;
+    this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
         // ignore malformed or undecryptable sync messages
@@ -1219,6 +1233,7 @@ export class PeerPigeonStorage {
     // A retrieve request carries no stored value and must reach holders so
     // they can answer an explicitly interested requester.
     if (context.kind === 'retrieve-request') return true;
+    if ((space === 'public' || space === 'user') && this.replicates(key)) return true;
     return filtered === true || this.isSubscribed(space, key);
   }
 
@@ -1501,19 +1516,32 @@ export class PeerPigeonStorage {
     const target = String(targetPeerId ?? '').trim();
     if (!target) return;
     const entries: StorageDigestEntry[] = [];
+    const listed = new Set<string>();
     for (const [pk, { space, key }] of this.subscribedEntries) {
       if (space === 'private' || space === 'frozen') continue;
       const existing = await this.driver.get(pk);
       entries.push([space, key, existing?.version ?? null]);
+      listed.add(pk);
       if (entries.length >= DIGEST_MAX_ENTRIES) break;
     }
-    if (entries.length === 0 || this.closed) return;
+    // What this node holds of the namespaces it replicates, so the neighbour pushes only what is newer.
+    for (const space of REPLICATED_SPACES) {
+      if (!this.replicate.length || entries.length >= DIGEST_MAX_ENTRIES) break;
+      for (const record of await this.driver.listBySpace(space)) {
+        if (!this.replicates(record.key) || listed.has(record.pk)) continue;
+        entries.push([space, record.key, record.version]);
+        listed.add(record.pk);
+        if (entries.length >= DIGEST_MAX_ENTRIES) break;
+      }
+    }
+    if ((entries.length === 0 && !this.replicate.length) || this.closed) return;
     const digest: StorageDigest = {
       __ppType: 'pp-storage-digest-v1',
       actorId: this.userId,
       timestamp: Date.now(),
       ...(this.peerId ? { origin: this.peerId } : {}),
       entries,
+      ...(this.replicate.length ? { prefixes: this.replicate } : {}),
     };
     try {
       this.gossip.sendDirect(target, await this.syncEnvelope(digest));
@@ -1581,6 +1609,41 @@ export class PeerPigeonStorage {
         // best effort
       }
     }
+    // The neighbour replicates some namespaces in full: send it every record held here under them that
+    // it did not list (it may not know those keys exist), as the mutations it would have heard.
+    const prefixes = Array.isArray(digest.prefixes) ? digest.prefixes.filter((p): p is string => typeof p === 'string' && p.length > 0).slice(0, 32) : [];
+    if (!prefixes.length) return;
+    const theirs = new Set<string>();
+    for (const entry of digest.entries.slice(0, DIGEST_MAX_ENTRIES)) {
+      if (Array.isArray(entry) && typeof entry[1] === 'string') theirs.add(this.makePk(entry[0] as StorageSpace, entry[1].trim()));
+    }
+    for (const space of REPLICATED_SPACES) {
+      for (const record of await driver.listBySpace(space)) {
+        if (this.closed || pushed >= DIGEST_MAX_PUSHES) return;
+        if (theirs.has(record.pk) || !prefixes.some((p) => record.key.startsWith(p))) continue;
+        pushed += 1;
+        const mutation: StorageMutation = {
+          __ppType: 'pp-storage-op-v1',
+          opId: `digest-${this.makeMutationId(this.userId)}`,
+          op: 'upsert',
+          space,
+          key: record.key,
+          actorId: this.userId,
+          timestamp: record.updatedAt,
+          record,
+        };
+        try {
+          this.gossip.sendDirect(target, await this.syncEnvelope(mutation));
+        } catch {
+          // best effort
+        }
+      }
+    }
+  }
+
+  /** Whether this node replicates a key in full (a `replicate` prefix). */
+  private replicates(key: string): boolean {
+    return this.replicate.some((p) => key.startsWith(p));
   }
 
   private isCrossTabNotice(value: unknown): value is StorageCrossTabNotice {
