@@ -16,6 +16,7 @@
  * writes to the slot only with it, so nobody outside the room can overwrite a
  * slot, and a frozen slot is never overwritten at all.
  */
+import { verifyMessage } from 'unsea';
 import type { PeerPigeonNode } from './index.js';
 
 export const STORAGE_SERVER_NETWORK = 'peerpigeon-storage';
@@ -46,6 +47,22 @@ export interface ServerRecord {
   wh: string;
   /** Write-once (frozen). */
   once?: boolean;
+  /** A user record's owner (its signing key): only writes it signs replace it. */
+  owner?: string;
+  /** The owner's signature of ownerText(this record). */
+  osig?: string;
+}
+
+/** What an owner signs for a server: the record's place, time and ciphertext, nothing it could read. */
+export async function ownerText(rec: Pick<ServerRecord, 'room' | 'slot' | 'at' | 'blob'>): Promise<string> {
+  return `pp-ss-owner-v1:${rec.room}:${rec.slot}:${rec.at}:${await sha256Hex(JSON.stringify(rec.blob))}`;
+}
+
+/** Whether a record's owner signature holds (a record without an owner needs none). */
+async function ownerSigned(rec: Omit<ServerRecord, 'wh'>): Promise<boolean> {
+  if (rec.owner === undefined && rec.osig === undefined) return true;
+  if (typeof rec.owner !== 'string' || typeof rec.osig !== 'string') return false;
+  try { return await verifyMessage(await ownerText(rec), rec.osig, rec.owner); } catch { return false; }
 }
 
 type Msg =
@@ -378,9 +395,12 @@ export class StorageServer {
 
   /** Takes a record if it is new or newer, and its write token (or hash) is the slot's. */
   private async take(rec: ServerRecord): Promise<{ ok: boolean; why?: string }> {
+    if (!(await ownerSigned(rec))) return { ok: false, why: 'bad-signature' };
     const have = await this.store.get(rec.room, rec.slot);
     if (have) {
       if (have.wh !== rec.wh) return { ok: false, why: 'not-yours' };
+      // A user record's owner is whoever wrote it first; only that key replaces it.
+      if (have.owner !== undefined && have.owner !== rec.owner) return { ok: false, why: 'not-owner' };
       if (have.once) return { ok: have.at === rec.at, ...(have.at === rec.at ? {} : { why: 'frozen' }) };
       if (have.at >= rec.at) return { ok: true }; // as new already: nothing to do
     }
@@ -394,7 +414,11 @@ export class StorageServer {
     switch (data.t) {
       case 'put': {
         if (!validRecord(data.rec) || !validId(data.write)) return void this.send(from, { pp: PP, t: 'ack', req: data.req, ok: false, why: 'bad' });
-        const rec: ServerRecord = { room: data.rec.room, slot: data.rec.slot, tag: data.rec.tag, at: data.rec.at, blob: data.rec.blob, wh: await sha256Hex(data.write), ...(data.rec.once ? { once: true } : {}) };
+        const rec: ServerRecord = {
+          room: data.rec.room, slot: data.rec.slot, tag: data.rec.tag, at: data.rec.at, blob: data.rec.blob, wh: await sha256Hex(data.write),
+          ...(data.rec.once ? { once: true } : {}),
+          ...(typeof data.rec.owner === 'string' ? { owner: data.rec.owner, osig: String(data.rec.osig ?? '') } : {}),
+        };
         const before = await this.store.get(rec.room, rec.slot);
         const result = await this.take(rec);
         this.send(from, { pp: PP, t: 'ack', req: data.req, ...result, at: rec.at });

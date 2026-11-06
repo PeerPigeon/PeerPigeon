@@ -1,22 +1,3 @@
-/**
- * Storage servers: PeerPigeon peers that keep a room's storage for it, the way
- * relays keep its signaling. A server announces the role 'storage' in one
- * well-known scope; relays list it with that role, so every peer, in any app
- * or room, finds the servers there (its own relay's first, as with relays) and
- * links to them over WebRTC. Relays carry signaling only.
- *
- * Placement is Kademlia's: a room's records live on the STORAGE_REPLICAS
- * servers whose ids are closest (XOR of SHA-256) to the room's id, and a
- * server that joins or leaves moves them to whichever servers are now closest.
- *
- * A server learns nothing of what it keeps. The room's id, each record's slot
- * and space tag are hashes of the room's sync secret; each record is the
- * room-encrypted storage mutation itself. A write carries a token derived from
- * that secret: the server keeps its hash on the first write and takes later
- * writes to the slot only with it, so nobody outside the room can overwrite a
- * slot, and a frozen slot is never overwritten at all.
- */
-
 declare const STORAGE_SERVER_NETWORK = "peerpigeon-storage";
 declare const STORAGE_SERVER_ROOM = "servers";
 declare const STORAGE_SERVER_ROLE = "storage";
@@ -38,6 +19,10 @@ interface ServerRecord {
     wh: string;
     /** Write-once (frozen). */
     once?: boolean;
+    /** A user record's owner (its signing key): only writes it signs replace it. */
+    owner?: string;
+    /** The owner's signature of ownerText(this record). */
+    osig?: string;
 }
 type LinkListener = (event: {
     type: 'servers';
@@ -770,6 +755,15 @@ interface StorageOptions extends StorageSyncOptions {
      * and read it from the servers when asked. Default: true.
      */
     moveToServers?: boolean;
+    /**
+     * Signs every change this node makes, and accepts only signed changes from
+     * others: a record's signer is who made it, and a user record's owner is
+     * its signer's key (its ownerId). PeerPigeonNode passes its key pair.
+     */
+    signingKeys?: {
+        pub: string;
+        priv: string;
+    } | null;
 }
 type StorageEvents = {
     change: (event: {
@@ -829,6 +823,7 @@ declare class PeerPigeonStorage {
     private readonly pendingRetrieveRequests;
     private closed;
     private readonly moveToServers;
+    private readonly signingKeys;
     private servers;
     private serverIds;
     private serversReady;
@@ -863,6 +858,14 @@ declare class PeerPigeonStorage {
     deleteSystem(space: StorageSpace, key: string): Promise<boolean>;
     list(space: StorageSpace): Promise<StorageRecord[]>;
     close(): Promise<void>;
+    /** Who this node acts as in a space: its signing key when it signs (a user record's owner), else its user id. */
+    private actorFor;
+    /** The id records this node owns carry: its signing key when it signs, else its user id. */
+    ownerIdentity(): string;
+    /** What a signature covers: everything a record says, but where it is kept. */
+    private signedText;
+    /** The key that signed a change, if its signature holds (and an upsert's time is its record's); else null. */
+    private verifiedSigner;
     /**
      * Uses storage servers (a link from storage-servers.ts) for this room: its
      * records go to the room's closest servers, the ones already here are moved

@@ -4021,6 +4021,8 @@ export class PeerPigeonNode {
           userId,
           peerId: this.mesh.getClientId() ?? '',
           sessionId: storageOptions.sessionId ?? `${config.networkId}:${config.sessionId}`,
+          // Every change this node makes is signed with its key pair, and only signed changes are taken.
+          signingKeys: storageOptions.signingKeys !== undefined ? storageOptions.signingKeys : (this.crypto ? { pub: this.crypto.getKeyPair().pub, priv: this.crypto.getKeyPair().priv } : null),
           gossip: this.gossip,
         });
         await this.storage.init();

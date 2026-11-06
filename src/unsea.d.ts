@@ -19,5 +19,7 @@ declare module 'unsea' {
     plaintext: string,
     recipient: { epub: string; kpub?: string }
   ): Promise<unknown>;
+  export function signMessage(message: string, privOrPair: string | { priv: string; qpriv?: string }): Promise<string>;
+  export function verifyMessage(message: string, signature: string, pubOrKeys: string | { pub: string; qpub?: string }): Promise<boolean>;
   export function decryptMessageWithMeta(cipher: unknown, privOrPair: string | { epriv: string; kpriv?: string }): Promise<string>;
 }

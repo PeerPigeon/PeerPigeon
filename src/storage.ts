@@ -1,4 +1,5 @@
-import { sha256Hex, type ServerRecord, type StorageServerLink } from './storage-servers.js';
+import { signMessage, verifyMessage } from 'unsea';
+import { ownerText, sha256Hex, type ServerRecord, type StorageServerLink } from './storage-servers.js';
 
 export type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
 export type StorageVersion = string | number;
@@ -86,6 +87,12 @@ export interface StorageOptions extends StorageSyncOptions {
    * and read it from the servers when asked. Default: true.
    */
   moveToServers?: boolean;
+  /**
+   * Signs every change this node makes, and accepts only signed changes from
+   * others: a record's signer is who made it, and a user record's owner is
+   * its signer's key (its ownerId). PeerPigeonNode passes its key pair.
+   */
+  signingKeys?: { pub: string; priv: string } | null;
 }
 
 export type StorageEvents = {
@@ -127,6 +134,9 @@ type PersistedRecord = {
   createdAt: number;
   updatedAt: number;
   version: StorageVersion;
+  /** The public key that signed this record, and its signature (see signedText). */
+  signer?: string | null;
+  sig?: string | null;
 };
 
 type StorageMutation = {
@@ -138,6 +148,9 @@ type StorageMutation = {
   actorId: string;
   timestamp: number;
   record: PersistedRecord | null;
+  /** A delete's signer and signature (an upsert's are on its record). */
+  signer?: string | null;
+  sig?: string | null;
 };
 
 type StorageRetrieveRequest = {
@@ -372,6 +385,7 @@ export class PeerPigeonStorage {
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
   private readonly moveToServers: boolean;
+  private readonly signingKeys: { pub: string; priv: string } | null;
   // Storage servers, when there are any (see storage-servers.ts).
   private servers: StorageServerLink | null = null;
   private serverIds: { room: string; seed: string } | null = null;
@@ -399,6 +413,7 @@ export class PeerPigeonStorage {
     this.syncFilter = typeof options.syncFilter === 'function' ? options.syncFilter : null;
     this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
     this.moveToServers = options.moveToServers !== false;
+    this.signingKeys = options.signingKeys?.pub && options.signingKeys?.priv ? { pub: options.signingKeys.pub, priv: options.signingKeys.priv } : null;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
         // ignore malformed or undecryptable sync messages
@@ -707,6 +722,41 @@ export class PeerPigeonStorage {
     this.pendingRetrieveRequests.clear();
   }
 
+  // ---------------------------------------------------------------- signing
+
+  /** Who this node acts as in a space: its signing key when it signs (a user record's owner), else its user id. */
+  private actorFor(space: StorageSpace): string {
+    return this.signingKeys && space !== 'private' ? this.signingKeys.pub : this.userId;
+  }
+
+  /** The id records this node owns carry: its signing key when it signs, else its user id. */
+  ownerIdentity(): string {
+    return this.signingKeys?.pub ?? this.userId;
+  }
+
+  /** What a signature covers: everything a record says, but where it is kept. */
+  private signedText(op: 'upsert' | 'delete', r: Pick<PersistedRecord, 'space' | 'key' | 'ownerId' | 'value' | 'version' | 'updatedAt'>): string {
+    return JSON.stringify(['pp-storage-signed-v1', op, r.space, r.key, r.ownerId ?? null, r.value ?? null, r.version, r.updatedAt]);
+  }
+
+  /** The key that signed a change, if its signature holds (and an upsert's time is its record's); else null. */
+  private async verifiedSigner(mutation: StorageMutation): Promise<string | null> {
+    try {
+      if (mutation.op === 'delete') {
+        if (typeof mutation.signer !== 'string' || typeof mutation.sig !== 'string') return null;
+        const existing = await this.requireDriver().get(this.makePk(mutation.space, mutation.key));
+        const text = this.signedText('delete', { space: mutation.space, key: mutation.key, ownerId: existing?.ownerId ?? null, value: null, version: 0, updatedAt: mutation.timestamp });
+        return (await verifyMessage(text, mutation.sig, mutation.signer)) ? mutation.signer : null;
+      }
+      const r = mutation.record;
+      if (!r || typeof r.signer !== 'string' || typeof r.sig !== 'string') return null;
+      if (r.updatedAt !== mutation.timestamp || r.space !== mutation.space || r.key !== mutation.key) return null;
+      return (await verifyMessage(this.signedText('upsert', r), r.sig, r.signer)) ? r.signer : null;
+    } catch {
+      return null;
+    }
+  }
+
   // ---------------------------------------------------------------- servers
 
   /**
@@ -750,7 +800,15 @@ export class PeerPigeonStorage {
     try {
       const { slot, tag, write } = await this.slotOf(mutation.space, mutation.key);
       const blob = await this.encryptSyncPayload(mutation);
-      return await this.servers.put({ room: this.serverIds.room, slot, tag, at: mutation.timestamp, blob, ...(mutation.space === 'frozen' ? { once: true } : {}) }, write);
+      const rec: Omit<ServerRecord, 'wh'> = { room: this.serverIds.room, slot, tag, at: mutation.timestamp, blob, ...(mutation.space === 'frozen' ? { once: true } : {}) };
+      if (mutation.space === 'user' && this.signingKeys) {
+        // A user record goes to the servers from its owner only, signed: the server takes later writes only from that key.
+        const signer = mutation.op === 'delete' ? mutation.signer : mutation.record?.signer;
+        if (signer !== this.signingKeys.pub) return 0;
+        rec.owner = this.signingKeys.pub;
+        rec.osig = await signMessage(await ownerText(rec), this.signingKeys.priv);
+      }
+      return await this.servers.put(rec, write);
     } catch {
       return 0;
     }
@@ -811,7 +869,7 @@ export class PeerPigeonStorage {
             space,
             key: record.key,
             // A user record is created by its owner: whoever receives it checks that.
-            actorId: space === 'user' ? (record.ownerId ?? this.userId) : this.userId,
+            actorId: space === 'user' ? (record.ownerId ?? this.userId) : this.actorFor(space),
             timestamp: record.updatedAt,
             record,
           };
@@ -831,13 +889,13 @@ export class PeerPigeonStorage {
 
   private async applyLocalUpsert(space: StorageSpace, key: string, value: unknown, options: StoragePutOptions, allowSystemWrite = false): Promise<StorageMutation> {
     const normalizedKey = this.normalizeKey(key);
-    const actorId = this.userId;
+    const actorId = this.actorFor(space);
     const driver = this.requireDriver();
     const pk = this.makePk(space, normalizedKey);
     const existing = await driver.get(pk);
     const now = Date.now();
 
-    this.assertCanWrite(space, existing, actorId, options.ownerId, allowSystemWrite);
+    this.assertCanWrite(space, existing, actorId, this.signingKeys ? undefined : options.ownerId, allowSystemWrite);
 
     const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
     const modifiedBy = this.peerId || null;
@@ -856,6 +914,10 @@ export class PeerPigeonStorage {
       updatedAt: now,
       version: nextVersion,
     };
+    if (this.signingKeys && space !== 'private') {
+      persisted.signer = this.signingKeys.pub;
+      persisted.sig = await signMessage(this.signedText('upsert', persisted), this.signingKeys.priv);
+    }
 
     await driver.put(persisted);
 
@@ -905,7 +967,7 @@ export class PeerPigeonStorage {
 
   private async applyLocalDelete(space: StorageSpace, key: string, allowSystemWrite = false): Promise<StorageMutation | null> {
     const normalizedKey = this.normalizeKey(key);
-    const actorId = this.userId;
+    const actorId = this.actorFor(space);
     const driver = this.requireDriver();
     const pk = this.makePk(space, normalizedKey);
     const existing = await driver.get(pk);
@@ -925,6 +987,10 @@ export class PeerPigeonStorage {
       timestamp: Date.now(),
       record: null,
     };
+    if (this.signingKeys && space !== 'private') {
+      mutation.signer = this.signingKeys.pub;
+      mutation.sig = await signMessage(this.signedText('delete', { space, key: normalizedKey, ownerId: existing.ownerId, value: null, version: 0, updatedAt: mutation.timestamp }), this.signingKeys.priv);
+    }
 
     this.emitChange({
       origin: 'local',
@@ -996,6 +1062,12 @@ export class PeerPigeonStorage {
   private async applyRemoteMutation(mutation: StorageMutation): Promise<boolean> {
     const driver = this.requireDriver();
     const pk = this.makePk(mutation.space, mutation.key);
+    // A signed node takes only signed changes, and the signer is who made one.
+    if (this.signingKeys) {
+      const signer = await this.verifiedSigner(mutation);
+      if (!signer) return false;
+      mutation = { ...mutation, actorId: signer };
+    }
     const existing = await driver.get(pk);
 
     if (mutation.op === 'delete') {
@@ -1521,7 +1593,7 @@ export class PeerPigeonStorage {
     if (space === 'user') {
       if (existing?.ownerId) {
         // If migrating from peer ID format to epub format, take ownership.
-        if (this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
+        if (!this.signingKeys && this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
           return actorId;
         }
         return existing.ownerId;
@@ -1552,7 +1624,7 @@ export class PeerPigeonStorage {
       // Auto-allow migration from old peer ID format to new epub format:
       // if existing owner is 64-char hex (peer ID) and current actor is not hex format (epub),
       // allow the write as an implicit identity migration.
-      if (this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
+      if (!this.signingKeys && this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
         return true;
       }
       return false;

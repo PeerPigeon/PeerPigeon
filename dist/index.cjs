@@ -3211,7 +3211,11 @@ var RelayScoreBook = class _RelayScoreBook {
   }
 };
 
+// src/storage.ts
+var import_unsea2 = require("unsea");
+
 // src/storage-servers.ts
+var import_unsea = require("unsea");
 var STORAGE_SERVER_NETWORK = "peerpigeon-storage";
 var STORAGE_SERVER_ROOM = "servers";
 var STORAGE_SERVER_ROLE = "storage";
@@ -3220,6 +3224,18 @@ var REQUEST_TIMEOUT_MS = 4e3;
 var BATCH_RECORDS = 64;
 var BATCH_BYTES = 96 * 1024;
 var PP = "pp-ss-v1";
+async function ownerText(rec) {
+  return `pp-ss-owner-v1:${rec.room}:${rec.slot}:${rec.at}:${await sha256Hex(JSON.stringify(rec.blob))}`;
+}
+async function ownerSigned(rec) {
+  if (rec.owner === void 0 && rec.osig === void 0) return true;
+  if (typeof rec.owner !== "string" || typeof rec.osig !== "string") return false;
+  try {
+    return await (0, import_unsea.verifyMessage)(await ownerText(rec), rec.osig, rec.owner);
+  } catch {
+    return false;
+  }
+}
 async function sha256Hex(text) {
   const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -3533,9 +3549,11 @@ var StorageServer = class {
   }
   /** Takes a record if it is new or newer, and its write token (or hash) is the slot's. */
   async take(rec) {
+    if (!await ownerSigned(rec)) return { ok: false, why: "bad-signature" };
     const have = await this.store.get(rec.room, rec.slot);
     if (have) {
       if (have.wh !== rec.wh) return { ok: false, why: "not-yours" };
+      if (have.owner !== void 0 && have.owner !== rec.owner) return { ok: false, why: "not-owner" };
       if (have.once) return { ok: have.at === rec.at, ...have.at === rec.at ? {} : { why: "frozen" } };
       if (have.at >= rec.at) return { ok: true };
     }
@@ -3548,7 +3566,16 @@ var StorageServer = class {
     switch (data.t) {
       case "put": {
         if (!validRecord(data.rec) || !validId(data.write)) return void this.send(from, { pp: PP, t: "ack", req: data.req, ok: false, why: "bad" });
-        const rec = { room: data.rec.room, slot: data.rec.slot, tag: data.rec.tag, at: data.rec.at, blob: data.rec.blob, wh: await sha256Hex(data.write), ...data.rec.once ? { once: true } : {} };
+        const rec = {
+          room: data.rec.room,
+          slot: data.rec.slot,
+          tag: data.rec.tag,
+          at: data.rec.at,
+          blob: data.rec.blob,
+          wh: await sha256Hex(data.write),
+          ...data.rec.once ? { once: true } : {},
+          ...typeof data.rec.owner === "string" ? { owner: data.rec.owner, osig: String(data.rec.osig ?? "") } : {}
+        };
         const before = await this.store.get(rec.room, rec.slot);
         const result = await this.take(rec);
         this.send(from, { pp: PP, t: "ack", req: data.req, ...result, at: rec.at });
@@ -3764,6 +3791,7 @@ var PeerPigeonStorage = class {
     this.syncFilter = typeof options.syncFilter === "function" ? options.syncFilter : null;
     this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
     this.moveToServers = options.moveToServers !== false;
+    this.signingKeys = options.signingKeys?.pub && options.signingKeys?.priv ? { pub: options.signingKeys.pub, priv: options.signingKeys.priv } : null;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
       });
@@ -4017,6 +4045,36 @@ var PeerPigeonStorage = class {
     }
     this.pendingRetrieveRequests.clear();
   }
+  // ---------------------------------------------------------------- signing
+  /** Who this node acts as in a space: its signing key when it signs (a user record's owner), else its user id. */
+  actorFor(space) {
+    return this.signingKeys && space !== "private" ? this.signingKeys.pub : this.userId;
+  }
+  /** The id records this node owns carry: its signing key when it signs, else its user id. */
+  ownerIdentity() {
+    return this.signingKeys?.pub ?? this.userId;
+  }
+  /** What a signature covers: everything a record says, but where it is kept. */
+  signedText(op, r) {
+    return JSON.stringify(["pp-storage-signed-v1", op, r.space, r.key, r.ownerId ?? null, r.value ?? null, r.version, r.updatedAt]);
+  }
+  /** The key that signed a change, if its signature holds (and an upsert's time is its record's); else null. */
+  async verifiedSigner(mutation) {
+    try {
+      if (mutation.op === "delete") {
+        if (typeof mutation.signer !== "string" || typeof mutation.sig !== "string") return null;
+        const existing = await this.requireDriver().get(this.makePk(mutation.space, mutation.key));
+        const text = this.signedText("delete", { space: mutation.space, key: mutation.key, ownerId: existing?.ownerId ?? null, value: null, version: 0, updatedAt: mutation.timestamp });
+        return await (0, import_unsea2.verifyMessage)(text, mutation.sig, mutation.signer) ? mutation.signer : null;
+      }
+      const r = mutation.record;
+      if (!r || typeof r.signer !== "string" || typeof r.sig !== "string") return null;
+      if (r.updatedAt !== mutation.timestamp || r.space !== mutation.space || r.key !== mutation.key) return null;
+      return await (0, import_unsea2.verifyMessage)(this.signedText("upsert", r), r.sig, r.signer) ? r.signer : null;
+    } catch {
+      return null;
+    }
+  }
   // ---------------------------------------------------------------- servers
   /**
    * Uses storage servers (a link from storage-servers.ts) for this room: its
@@ -4058,7 +4116,14 @@ var PeerPigeonStorage = class {
     try {
       const { slot, tag, write } = await this.slotOf(mutation.space, mutation.key);
       const blob = await this.encryptSyncPayload(mutation);
-      return await this.servers.put({ room: this.serverIds.room, slot, tag, at: mutation.timestamp, blob, ...mutation.space === "frozen" ? { once: true } : {} }, write);
+      const rec = { room: this.serverIds.room, slot, tag, at: mutation.timestamp, blob, ...mutation.space === "frozen" ? { once: true } : {} };
+      if (mutation.space === "user" && this.signingKeys) {
+        const signer = mutation.op === "delete" ? mutation.signer : mutation.record?.signer;
+        if (signer !== this.signingKeys.pub) return 0;
+        rec.owner = this.signingKeys.pub;
+        rec.osig = await (0, import_unsea2.signMessage)(await ownerText(rec), this.signingKeys.priv);
+      }
+      return await this.servers.put(rec, write);
     } catch {
       return 0;
     }
@@ -4114,7 +4179,7 @@ var PeerPigeonStorage = class {
             space,
             key: record.key,
             // A user record is created by its owner: whoever receives it checks that.
-            actorId: space === "user" ? record.ownerId ?? this.userId : this.userId,
+            actorId: space === "user" ? record.ownerId ?? this.userId : this.actorFor(space),
             timestamp: record.updatedAt,
             record
           };
@@ -4134,12 +4199,12 @@ var PeerPigeonStorage = class {
   }
   async applyLocalUpsert(space, key, value, options, allowSystemWrite = false) {
     const normalizedKey = this.normalizeKey(key);
-    const actorId = this.userId;
+    const actorId = this.actorFor(space);
     const driver = this.requireDriver();
     const pk = this.makePk(space, normalizedKey);
     const existing = await driver.get(pk);
     const now = Date.now();
-    this.assertCanWrite(space, existing, actorId, options.ownerId, allowSystemWrite);
+    this.assertCanWrite(space, existing, actorId, this.signingKeys ? void 0 : options.ownerId, allowSystemWrite);
     const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
     const modifiedBy = this.peerId || null;
     const nextVersion = this.nextStorageVersion(existing?.version, modifiedBy || ownerId || actorId);
@@ -4156,6 +4221,10 @@ var PeerPigeonStorage = class {
       updatedAt: now,
       version: nextVersion
     };
+    if (this.signingKeys && space !== "private") {
+      persisted.signer = this.signingKeys.pub;
+      persisted.sig = await (0, import_unsea2.signMessage)(this.signedText("upsert", persisted), this.signingKeys.priv);
+    }
     await driver.put(persisted);
     const opId = this.makeMutationId(actorId);
     const mutation = {
@@ -4199,7 +4268,7 @@ var PeerPigeonStorage = class {
   }
   async applyLocalDelete(space, key, allowSystemWrite = false) {
     const normalizedKey = this.normalizeKey(key);
-    const actorId = this.userId;
+    const actorId = this.actorFor(space);
     const driver = this.requireDriver();
     const pk = this.makePk(space, normalizedKey);
     const existing = await driver.get(pk);
@@ -4217,6 +4286,10 @@ var PeerPigeonStorage = class {
       timestamp: Date.now(),
       record: null
     };
+    if (this.signingKeys && space !== "private") {
+      mutation.signer = this.signingKeys.pub;
+      mutation.sig = await (0, import_unsea2.signMessage)(this.signedText("delete", { space, key: normalizedKey, ownerId: existing.ownerId, value: null, version: 0, updatedAt: mutation.timestamp }), this.signingKeys.priv);
+    }
     this.emitChange({
       origin: "local",
       op: "delete",
@@ -4275,6 +4348,11 @@ var PeerPigeonStorage = class {
   async applyRemoteMutation(mutation) {
     const driver = this.requireDriver();
     const pk = this.makePk(mutation.space, mutation.key);
+    if (this.signingKeys) {
+      const signer = await this.verifiedSigner(mutation);
+      if (!signer) return false;
+      mutation = { ...mutation, actorId: signer };
+    }
     const existing = await driver.get(pk);
     if (mutation.op === "delete") {
       if (!existing) return false;
@@ -4702,7 +4780,7 @@ var PeerPigeonStorage = class {
   resolveOwnerId(space, existing, actorId, ownerOverride) {
     if (space === "user") {
       if (existing?.ownerId) {
-        if (this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
+        if (!this.signingKeys && this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
           return actorId;
         }
         return existing.ownerId;
@@ -4726,7 +4804,7 @@ var PeerPigeonStorage = class {
       if (!existing) return true;
       if (existing.ownerId === actorId) return true;
       if (ownerOverride && String(ownerOverride).trim()) return true;
-      if (this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
+      if (!this.signingKeys && this.isPeerIdFormat(existing.ownerId) && !this.isPeerIdFormat(actorId)) {
         return true;
       }
       return false;
@@ -5026,7 +5104,7 @@ var PeerPigeonStorage = class {
 };
 
 // src/crypto.ts
-var import_unsea = require("unsea");
+var import_unsea3 = require("unsea");
 var CRYPTO_PUBLIC_INFO_TYPE = "pp-crypto-public-info-v1";
 var CRYPTO_PUBLIC_REQUEST_TYPE = "pp-crypto-public-request-v1";
 var KEY_REQUEST_MIN_INTERVAL_MS = 5e3;
@@ -5074,9 +5152,9 @@ var PeerPigeonCryptoProtocol = class {
   }
   async init() {
     if (this.initialized) return;
-    const pair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await (0, import_unsea.generateRandomPair)();
+    const pair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await (0, import_unsea3.generateRandomPair)();
     this.validateKeyPair(pair);
-    this.keyPair = (0, import_unsea.hasPostQuantumKeys)(pair) && pair.kpriv ? pair : (0, import_unsea.upgradePair)(pair);
+    this.keyPair = (0, import_unsea3.hasPostQuantumKeys)(pair) && pair.kpriv ? pair : (0, import_unsea3.upgradePair)(pair);
     this.persistKeyPair(this.keyPair);
     this.initialized = true;
     this.gossip.on("messageReceived", this.onGossipMessageBound);
@@ -5183,7 +5261,7 @@ var PeerPigeonCryptoProtocol = class {
       __ppType: ENCRYPTED_DIRECT_TYPE,
       from: String(this.mesh.getClientId() ?? "").trim(),
       to: target,
-      cipher: await (0, import_unsea.encryptMessageWithMeta)(
+      cipher: await (0, import_unsea3.encryptMessageWithMeta)(
         String(plaintext),
         recipient.kpub ? { epub: recipient.epub, kpub: recipient.kpub } : { epub: recipient.epub }
       ),
@@ -5206,7 +5284,7 @@ var PeerPigeonCryptoProtocol = class {
   }
   async decryptEncryptedDirect(payload) {
     if (!this.keyPair) throw new Error("Crypto protocol has not been initialized");
-    return await (0, import_unsea.decryptMessageWithMeta)(payload.cipher, this.keyPair);
+    return await (0, import_unsea3.decryptMessageWithMeta)(payload.cipher, this.keyPair);
   }
   on(event, callback) {
     const callbacks = this.callbacks[event];
@@ -8190,6 +8268,8 @@ var PeerPigeonNode = class _PeerPigeonNode {
           userId,
           peerId: this.mesh.getClientId() ?? "",
           sessionId: storageOptions.sessionId ?? `${config.networkId}:${config.sessionId}`,
+          // Every change this node makes is signed with its key pair, and only signed changes are taken.
+          signingKeys: storageOptions.signingKeys !== void 0 ? storageOptions.signingKeys : this.crypto ? { pub: this.crypto.getKeyPair().pub, priv: this.crypto.getKeyPair().priv } : null,
           gossip: this.gossip
         });
         await this.storage.init();
