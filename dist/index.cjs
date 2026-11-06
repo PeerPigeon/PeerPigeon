@@ -3225,6 +3225,7 @@ var STORAGE_SERVER_ROOM = "servers";
 var STORAGE_SERVER_ROLE = "storage";
 var STORAGE_REPLICAS = 3;
 var REQUEST_TIMEOUT_MS = 4e3;
+var BLOB_TIMEOUT_MS = 2e4;
 var BATCH_RECORDS = 64;
 var BATCH_BYTES = 96 * 1024;
 var PP = "pp-ss-v1";
@@ -3315,6 +3316,14 @@ function batches(items) {
   }
   if (cur.length) out.push(cur);
   return out;
+}
+async function sendLater(node, peerId, msg) {
+  for (let wait = 50, spent = 0; spent < 15e3; spent += wait, wait = Math.min(500, wait * 2)) {
+    await new Promise((r) => setTimeout(r, wait));
+    if (!node.getConnectedPeers().includes(peerId)) return false;
+    if (node.sendDirect(peerId, msg) !== null) return true;
+  }
+  return false;
 }
 var reqCounter = 0;
 var newReq = () => `${Date.now().toString(36)}-${(reqCounter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -3421,15 +3430,17 @@ var StorageServerLink = class {
     }
   }
   send(peerId, msg) {
-    return this.node.sendDirect(peerId, msg) !== null;
+    if (this.node.sendDirect(peerId, msg) !== null) return true;
+    void sendLater(this.node, peerId, msg);
+    return true;
   }
-  ask(peerId, msg) {
+  ask(peerId, msg, timeoutMs = REQUEST_TIMEOUT_MS) {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(msg.req);
         this.listings.delete(msg.req);
         resolve(null);
-      }, REQUEST_TIMEOUT_MS);
+      }, timeoutMs);
       this.pending.set(msg.req, { resolve, timer, from: peerId });
       if (!this.send(peerId, msg)) {
         clearTimeout(timer);
@@ -3508,14 +3519,14 @@ var StorageServerLink = class {
     if (bytes.length > MAX_BLOB_BYTES) throw new Error(`a blob is at most ${MAX_BLOB_BYTES} bytes`);
     const { address, sealed } = await sealBlob(bytes);
     const d = toB64(sealed);
-    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => this.ask(id, { pp: PP, t: "bput", req: newReq(), addr: address, d })));
+    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => this.ask(id, { pp: PP, t: "bput", req: newReq(), addr: address, d }, BLOB_TIMEOUT_MS)));
     return acks.filter((a) => a?.t === "back" && a.ok).length;
   }
   /** Content by its SHA-256 from the servers, checked; null if none has it. */
   async getBlob(hash) {
     const address = await blobAddress(hash);
     for (const id of await this.serversForBlob(address)) {
-      const a = await this.ask(id, { pp: PP, t: "bget", req: newReq(), addr: address });
+      const a = await this.ask(id, { pp: PP, t: "bget", req: newReq(), addr: address }, BLOB_TIMEOUT_MS);
       if (a?.t === "bgot" && typeof a.d === "string") {
         const bytes = await openBlob(hash, fromB64(a.d));
         if (bytes) return bytes;
@@ -3639,7 +3650,9 @@ var StorageServer = class {
     return [...ids];
   }
   send(peerId, msg) {
-    return this.node.sendDirect(peerId, msg) !== null;
+    if (this.node.sendDirect(peerId, msg) !== null) return true;
+    void sendLater(this.node, peerId, msg);
+    return true;
   }
   /** Takes a record if it is new or newer, and its write token (or hash) is the slot's. */
   async take(rec) {

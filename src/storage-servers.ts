@@ -26,6 +26,8 @@ export const STORAGE_SERVER_ROLE = 'storage';
 export const STORAGE_REPLICAS = 3;
 
 const REQUEST_TIMEOUT_MS = 4_000;
+/** A blob is larger: allow for a busy link. */
+const BLOB_TIMEOUT_MS = 20_000;
 /** Records per message, and roughly bytes, so one stays well under a data channel's limit. */
 const BATCH_RECORDS = 64;
 const BATCH_BYTES = 96 * 1024;
@@ -188,6 +190,16 @@ function batches<T>(items: T[]): T[][] {
   return out;
 }
 
+/** Sends again until the channel takes it (its buffer drains) or the peer is gone; up to 15 s. */
+async function sendLater(node: PeerPigeonNode, peerId: string, msg: unknown): Promise<boolean> {
+  for (let wait = 50, spent = 0; spent < 15_000; spent += wait, wait = Math.min(500, wait * 2)) {
+    await new Promise((r) => setTimeout(r, wait));
+    if (!node.getConnectedPeers().includes(peerId)) return false;
+    if (node.sendDirect(peerId, msg) !== null) return true;
+  }
+  return false;
+}
+
 let reqCounter = 0;
 const newReq = () => `${Date.now().toString(36)}-${(reqCounter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -290,12 +302,15 @@ export class StorageServerLink {
   }
 
   private send(peerId: string, msg: Msg): boolean {
-    return this.node.sendDirect(peerId, msg) !== null;
+    if (this.node.sendDirect(peerId, msg) !== null) return true;
+    // Refused now (most often a full send buffer: blobs are large): again shortly, for a while.
+    void sendLater(this.node, peerId, msg);
+    return true;
   }
 
-  private ask(peerId: string, msg: Msg & { req: string }): Promise<Msg | null> {
+  private ask(peerId: string, msg: Msg & { req: string }, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Msg | null> {
     return new Promise((resolve) => {
-      const timer = setTimeout(() => { this.pending.delete(msg.req); this.listings.delete(msg.req); resolve(null); }, REQUEST_TIMEOUT_MS);
+      const timer = setTimeout(() => { this.pending.delete(msg.req); this.listings.delete(msg.req); resolve(null); }, timeoutMs);
       this.pending.set(msg.req, { resolve, timer, from: peerId });
       if (!this.send(peerId, msg)) { clearTimeout(timer); this.pending.delete(msg.req); resolve(null); }
     });
@@ -361,7 +376,7 @@ export class StorageServerLink {
     if (bytes.length > MAX_BLOB_BYTES) throw new Error(`a blob is at most ${MAX_BLOB_BYTES} bytes`);
     const { address, sealed } = await sealBlob(bytes);
     const d = toB64(sealed);
-    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => this.ask(id, { pp: PP, t: 'bput', req: newReq(), addr: address, d })));
+    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => this.ask(id, { pp: PP, t: 'bput', req: newReq(), addr: address, d }, BLOB_TIMEOUT_MS)));
     return acks.filter((a) => a?.t === 'back' && a.ok).length;
   }
 
@@ -369,7 +384,7 @@ export class StorageServerLink {
   async getBlob(hash: string): Promise<Uint8Array | null> {
     const address = await blobAddress(hash);
     for (const id of await this.serversForBlob(address)) {
-      const a = await this.ask(id, { pp: PP, t: 'bget', req: newReq(), addr: address });
+      const a = await this.ask(id, { pp: PP, t: 'bget', req: newReq(), addr: address }, BLOB_TIMEOUT_MS);
       if (a?.t === 'bgot' && typeof a.d === 'string') {
         const bytes = await openBlob(hash, fromB64(a.d));
         if (bytes) return bytes;
@@ -505,7 +520,10 @@ export class StorageServer {
   }
 
   private send(peerId: string, msg: Msg): boolean {
-    return this.node.sendDirect(peerId, msg) !== null;
+    if (this.node.sendDirect(peerId, msg) !== null) return true;
+    // Refused now (most often a full send buffer: blobs are large): again shortly, for a while.
+    void sendLater(this.node, peerId, msg);
+    return true;
   }
 
   /** Takes a record if it is new or newer, and its write token (or hash) is the slot's. */
