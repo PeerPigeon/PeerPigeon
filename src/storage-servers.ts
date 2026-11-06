@@ -65,6 +65,65 @@ async function ownerSigned(rec: Omit<ServerRecord, 'wh'>): Promise<boolean> {
   try { return await verifyMessage(await ownerText(rec), rec.osig, rec.owner); } catch { return false; }
 }
 
+// ---------------------------------------------------------------------------
+// Blobs: content kept on servers by what it is (a file's chunk, a model's
+// part), sealed so that a server cannot read it and identical content is kept
+// once wherever it comes from. Whoever knows a blob's SHA-256 (from a manifest
+// it was given) can find it, open it and check it; nobody else can.
+// ---------------------------------------------------------------------------
+
+/** Largest blob: one message, base64, under a data channel's limit. */
+export const MAX_BLOB_BYTES = 160 * 1024;
+
+const hexBytes = (hex: string) => Uint8Array.from(hex.match(/../g)!, (h) => parseInt(h, 16));
+
+async function sha256Bytes(bytes: Uint8Array): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function blobKey(hash: string): Promise<{ key: CryptoKey; iv: Uint8Array }> {
+  const key = await globalThis.crypto.subtle.importKey('raw', hexBytes(await sha256Hex(`pp-blob-key-v1:${hash}`)) as Uint8Array<ArrayBuffer>, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  return { key, iv: hexBytes(await sha256Hex(`pp-blob-iv-v1:${hash}`)).slice(0, 12) };
+}
+
+/** Where a blob with this SHA-256 is kept (what servers see). */
+export function blobAddress(hash: string): Promise<string> {
+  return sha256Hex(`pp-blob-addr-v1:${hash}`);
+}
+
+/** Seals content for the servers: its address, and the bytes a server keeps. */
+export async function sealBlob(bytes: Uint8Array): Promise<{ hash: string; address: string; sealed: Uint8Array }> {
+  const hash = await sha256Bytes(bytes);
+  const { key, iv } = await blobKey(hash);
+  const sealed = new Uint8Array(await globalThis.crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer> }, key, bytes as Uint8Array<ArrayBuffer>));
+  return { hash, address: await blobAddress(hash), sealed };
+}
+
+/** Opens a sealed blob; null unless it is the content with that SHA-256. */
+export async function openBlob(hash: string, sealed: Uint8Array): Promise<Uint8Array | null> {
+  try {
+    const { key, iv } = await blobKey(hash);
+    const bytes = new Uint8Array(await globalThis.crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer> }, key, sealed as Uint8Array<ArrayBuffer>));
+    return (await sha256Bytes(bytes)) === hash ? bytes : null;
+  } catch {
+    return null;
+  }
+}
+
+function toB64(bytes: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+function fromB64(text: string): Uint8Array {
+  const s = atob(text);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+
 type Msg =
   | { pp: typeof PP; t: 'put'; req: string; rec: Omit<ServerRecord, 'wh'>; write: string }
   | { pp: typeof PP; t: 'ack'; req: string; ok: boolean; at?: number; why?: string }
@@ -74,7 +133,11 @@ type Msg =
   | { pp: typeof PP; t: 'listed'; req: string; recs: Omit<ServerRecord, 'wh'>[]; more: boolean }
   | { pp: typeof PP; t: 'watch'; room: string }
   | { pp: typeof PP; t: 'changed'; rec: Omit<ServerRecord, 'wh'> }
-  | { pp: typeof PP; t: 'sync'; recs: ServerRecord[] };
+  | { pp: typeof PP; t: 'sync'; recs: ServerRecord[] }
+  | { pp: typeof PP; t: 'bput'; req?: string; addr: string; d: string }
+  | { pp: typeof PP; t: 'back'; req: string; ok: boolean }
+  | { pp: typeof PP; t: 'bget'; req: string; addr: string }
+  | { pp: typeof PP; t: 'bgot'; req: string; d: string | null };
 
 export async function sha256Hex(text: string): Promise<string> {
   const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -257,7 +320,7 @@ export class StorageServerLink {
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve({ ...data, recs: got }); }
       return;
     }
-    if (data.t === 'ack' || data.t === 'got') {
+    if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot') {
       const p = this.pending.get(data.req);
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve(data); }
     }
@@ -276,6 +339,43 @@ export class StorageServerLink {
     let best: Omit<ServerRecord, 'wh'> | null = null;
     for (const a of answers) if (a?.t === 'got' && a.rec && validRecord(a.rec) && a.rec.slot === slot && (!best || a.rec.at > best.at)) best = a.rec;
     return best;
+  }
+
+  /** The servers closest to a blob's address, linked (waits up to `waitMs` for new links). */
+  private async serversForBlob(address: string, waitMs = 4_000): Promise<string[]> {
+    const closest = closestIds(address, await this.knownServers(), this.hashed);
+    const linked = () => closest.filter((id) => this.node.getConnectedPeers().includes(id));
+    for (const id of closest) if (!this.node.getConnectedPeers().includes(id)) this.node.connectToPeer(id);
+    const until = Date.now() + waitMs;
+    while (!linked().length && closest.length && Date.now() < until) await new Promise((r) => setTimeout(r, 100));
+    return linked();
+  }
+
+  /** Whether any server is known in the scope (linked or not). */
+  async hasServers(): Promise<boolean> {
+    return (await this.knownServers()).length > 0;
+  }
+
+  /** Keeps content on the servers closest to it; resolves with how many took it. */
+  async putBlob(bytes: Uint8Array): Promise<number> {
+    if (bytes.length > MAX_BLOB_BYTES) throw new Error(`a blob is at most ${MAX_BLOB_BYTES} bytes`);
+    const { address, sealed } = await sealBlob(bytes);
+    const d = toB64(sealed);
+    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => this.ask(id, { pp: PP, t: 'bput', req: newReq(), addr: address, d })));
+    return acks.filter((a) => a?.t === 'back' && a.ok).length;
+  }
+
+  /** Content by its SHA-256 from the servers, checked; null if none has it. */
+  async getBlob(hash: string): Promise<Uint8Array | null> {
+    const address = await blobAddress(hash);
+    for (const id of await this.serversForBlob(address)) {
+      const a = await this.ask(id, { pp: PP, t: 'bget', req: newReq(), addr: address });
+      if (a?.t === 'bgot' && typeof a.d === 'string') {
+        const bytes = await openBlob(hash, fromB64(a.d));
+        if (bytes) return bytes;
+      }
+    }
+    return null;
   }
 
   /** Every record the room's servers hold (of one space, with `tag`), the newest copy of each. */
@@ -304,6 +404,11 @@ export interface ServerRecordStore {
   put(rec: ServerRecord): Promise<void>;
   list(room: string, tag?: string): Promise<ServerRecord[]>;
   rooms(): Promise<string[]>;
+  /** Sealed blobs by address (a store without them keeps records only). */
+  getBlob?(address: string): Promise<Uint8Array | null>;
+  putBlob?(address: string, sealed: Uint8Array): Promise<void>;
+  blobs?(): Promise<string[]>;
+  blobUsage?(): Promise<{ count: number; bytes: number }>;
 }
 
 export class MemoryServerRecordStore implements ServerRecordStore {
@@ -316,11 +421,18 @@ export class MemoryServerRecordStore implements ServerRecordStore {
   }
   async list(room: string, tag?: string) { return [...(this.byRoom.get(room)?.values() ?? [])].filter((r) => !tag || r.tag === tag); }
   async rooms() { return [...this.byRoom.keys()]; }
+  private readonly blobMap = new Map<string, Uint8Array>();
+  async getBlob(address: string) { return this.blobMap.get(address) ?? null; }
+  async putBlob(address: string, sealed: Uint8Array) { this.blobMap.set(address, sealed); }
+  async blobs() { return [...this.blobMap.keys()]; }
+  async blobUsage() { let bytes = 0; for (const b of this.blobMap.values()) bytes += b.length; return { count: this.blobMap.size, bytes }; }
 }
 
 export interface StorageServerStats {
   rooms: number;
   records: number;
+  blobs: number;
+  blobBytes: number;
   servers: number;
   clients: number;
 }
@@ -336,6 +448,8 @@ export class StorageServer {
   private readonly watchers = new Map<string, Set<string>>();
   /** For each room: the servers last given its records. */
   private readonly placed = new Map<string, string[]>();
+  /** For each blob: the servers last given it. */
+  private readonly placedBlobs = new Map<string, string[]>();
   private selfHash = '';
   private timer: ReturnType<typeof setInterval> | null = null;
   private onChange: ((rec: ServerRecord) => void) | null = null;
@@ -367,7 +481,8 @@ export class StorageServer {
     for (const room of rooms) records += (await this.store.list(room)).length;
     const linked = this.node.getConnectedPeers();
     const servers = linked.filter((id) => this.node.getPeerRole(id) === STORAGE_SERVER_ROLE).length;
-    return { rooms: rooms.length, records, servers, clients: linked.length - servers };
+    const b = (await this.store.blobUsage?.()) ?? { count: 0, bytes: 0 };
+    return { rooms: rooms.length, records, blobs: b.count, blobBytes: b.bytes, servers, clients: linked.length - servers };
   }
 
   private async self(): Promise<string> {
@@ -449,6 +564,29 @@ export class StorageServer {
         w.add(from);
         return;
       }
+      case 'bput': {
+        // A blob, from a peer or another server: kept if it fits, and passed to the other closest servers.
+        const ok = !!this.store.putBlob && validId(data.addr) && typeof data.d === 'string' && data.d.length <= Math.ceil(MAX_BLOB_BYTES / 3) * 4 + 64;
+        if (ok) {
+          const have = await this.store.getBlob!(data.addr);
+          if (!have) {
+            await this.store.putBlob!(data.addr, fromB64(data.d));
+            if (this.node.getPeerRole(from) !== STORAGE_SERVER_ROLE) {
+              const selfId = this.node.getClientId();
+              for (const id of closestIds(data.addr, await this.servers(), this.hashed)) {
+                if (id !== selfId && id !== from && this.node.getConnectedPeers().includes(id)) this.send(id, { pp: PP, t: 'bput', addr: data.addr, d: data.d });
+              }
+            }
+          }
+        }
+        if (data.req) this.send(from, { pp: PP, t: 'back', req: data.req, ok });
+        return;
+      }
+      case 'bget': {
+        const sealed = validId(data.addr) && this.store.getBlob ? await this.store.getBlob(data.addr) : null;
+        this.send(from, { pp: PP, t: 'bgot', req: data.req, d: sealed ? toB64(sealed) : null });
+        return;
+      }
       case 'sync': {
         // Only from another server, of records it holds.
         if (this.node.getPeerRole(from) !== STORAGE_SERVER_ROLE || !Array.isArray(data.recs)) return;
@@ -496,6 +634,20 @@ export class StorageServer {
         done.push(id);
       }
       this.placed.set(room, [...given.filter((id) => closest.includes(id)), ...done]);
+    }
+    // Blobs: each to the closest servers it was not given yet.
+    if (this.store.blobs && this.store.getBlob) {
+      for (const addr of await this.store.blobs()) {
+        const closest = closestIds(addr, servers, this.hashed).filter((id) => id !== selfId);
+        const given = this.placedBlobs.get(addr) ?? [];
+        const todo = closest.filter((id) => !given.includes(id) && linked.has(id));
+        if (!todo.length) continue;
+        const sealed = await this.store.getBlob(addr);
+        if (!sealed) continue;
+        const d = toB64(sealed);
+        for (const id of todo) this.send(id, { pp: PP, t: 'bput', addr, d });
+        this.placedBlobs.set(addr, [...given.filter((id) => closest.includes(id)), ...todo]);
+      }
     }
   }
 }

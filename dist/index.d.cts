@@ -24,6 +24,18 @@ interface ServerRecord {
     /** The owner's signature of ownerText(this record). */
     osig?: string;
 }
+/** Largest blob: one message, base64, under a data channel's limit. */
+declare const MAX_BLOB_BYTES: number;
+/** Where a blob with this SHA-256 is kept (what servers see). */
+declare function blobAddress(hash: string): Promise<string>;
+/** Seals content for the servers: its address, and the bytes a server keeps. */
+declare function sealBlob(bytes: Uint8Array): Promise<{
+    hash: string;
+    address: string;
+    sealed: Uint8Array;
+}>;
+/** Opens a sealed blob; null unless it is the content with that SHA-256. */
+declare function openBlob(hash: string, sealed: Uint8Array): Promise<Uint8Array | null>;
 type LinkListener = (event: {
     type: 'servers';
     room: string;
@@ -70,6 +82,14 @@ declare class StorageServerLink {
     put(rec: Omit<ServerRecord, 'wh'>, write: string): Promise<number>;
     /** The newest copy of a record the room's servers hold, or null. */
     get(room: string, slot: string): Promise<Omit<ServerRecord, 'wh'> | null>;
+    /** The servers closest to a blob's address, linked (waits up to `waitMs` for new links). */
+    private serversForBlob;
+    /** Whether any server is known in the scope (linked or not). */
+    hasServers(): Promise<boolean>;
+    /** Keeps content on the servers closest to it; resolves with how many took it. */
+    putBlob(bytes: Uint8Array): Promise<number>;
+    /** Content by its SHA-256 from the servers, checked; null if none has it. */
+    getBlob(hash: string): Promise<Uint8Array | null>;
     /** Every record the room's servers hold (of one space, with `tag`), the newest copy of each. */
     list(room: string, tag?: string): Promise<Omit<ServerRecord, 'wh'>[]>;
 }
@@ -79,6 +99,14 @@ interface ServerRecordStore {
     put(rec: ServerRecord): Promise<void>;
     list(room: string, tag?: string): Promise<ServerRecord[]>;
     rooms(): Promise<string[]>;
+    /** Sealed blobs by address (a store without them keeps records only). */
+    getBlob?(address: string): Promise<Uint8Array | null>;
+    putBlob?(address: string, sealed: Uint8Array): Promise<void>;
+    blobs?(): Promise<string[]>;
+    blobUsage?(): Promise<{
+        count: number;
+        bytes: number;
+    }>;
 }
 declare class MemoryServerRecordStore implements ServerRecordStore {
     private readonly byRoom;
@@ -86,10 +114,20 @@ declare class MemoryServerRecordStore implements ServerRecordStore {
     put(rec: ServerRecord): Promise<void>;
     list(room: string, tag?: string): Promise<ServerRecord[]>;
     rooms(): Promise<string[]>;
+    private readonly blobMap;
+    getBlob(address: string): Promise<Uint8Array<ArrayBufferLike> | null>;
+    putBlob(address: string, sealed: Uint8Array): Promise<void>;
+    blobs(): Promise<string[]>;
+    blobUsage(): Promise<{
+        count: number;
+        bytes: number;
+    }>;
 }
 interface StorageServerStats {
     rooms: number;
     records: number;
+    blobs: number;
+    blobBytes: number;
     servers: number;
     clients: number;
 }
@@ -106,6 +144,8 @@ declare class StorageServer {
     private readonly watchers;
     /** For each room: the servers last given its records. */
     private readonly placed;
+    /** For each blob: the servers last given it. */
+    private readonly placedBlobs;
     private selfHash;
     private timer;
     private onChange;
@@ -1851,6 +1891,8 @@ declare class PeerPigeonNode {
     recoverAfterInactivity(reason?: string): void;
     on<K extends keyof PeerPigeonNodeEvents>(event: K, callback: PeerPigeonNodeEvents[K]): void;
     off<K extends keyof PeerPigeonNodeEvents>(event: K, callback: PeerPigeonNodeEvents[K]): void;
+    /** This node's link to the storage servers (null with storage off, or storage.servers false). */
+    get storageServers(): StorageServerLink | null;
     /**
      * A node in the storage servers' scope, on the same relays as this one: for
      * a server (role 'storage', dialing other servers) or a peer's link to them.
@@ -1865,4 +1907,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MESH_SIGNAL_PAYLOAD_TYPE, MemoryServerRecordStore, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, rankSignalingServersByDistance, reachableFromThisPage, relayScore, roomRoutingKey, selectClosestSignalingServer, sha1Hex };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryServerRecordStore, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, openBlob, rankSignalingServersByDistance, reachableFromThisPage, relayScore, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex };

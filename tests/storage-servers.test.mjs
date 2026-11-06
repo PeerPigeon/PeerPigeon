@@ -151,3 +151,22 @@ test('a room\'s records reach the servers closest to it, and move when a closer 
   assert.equal((await b.storage.get('public', 'k'))?.value, 'v');
   await a.link.close(); await b.link.close();
 });
+
+test('a blob kept on the servers is found by its hash, sealed, and copied to the closest three', async () => {
+  const scope = makeScope();
+  const servers = [await server(scope, '1'), await server(scope, '2'), await server(scope, '3'), await server(scope, '4')];
+  const a = await peer(scope, 'a');
+  const b = await peer(scope, 'b');
+  await settle();
+  const bytes = new TextEncoder().encode('a chunk of a file, or a part of a model');
+  assert.ok(await a.link.putBlob(bytes) >= 1);
+  await settle(100);
+  const counts = await Promise.all(servers.map(async (s) => (await s.stats()).blobs));
+  assert.equal(counts.reduce((x, y) => x + y, 0), 3, 'on three servers');
+  const { createHash } = await import('node:crypto');
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  const got = await b.link.getBlob(hash);
+  assert.equal(new TextDecoder().decode(got), 'a chunk of a file, or a part of a model');
+  assert.equal(await b.link.getBlob('0'.repeat(64)), null);
+  await a.link.close(); await b.link.close();
+});

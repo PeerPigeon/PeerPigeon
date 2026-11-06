@@ -26,7 +26,7 @@ import type {
 } from './gossip.js';
 import { PeerPigeonStorage } from './storage.js';
 import { StorageServerLink, StorageServer, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE } from './storage-servers.js';
-export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS } from './storage-servers.js';
+export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS, MAX_BLOB_BYTES, sealBlob, openBlob, blobAddress } from './storage-servers.js';
 export type { ServerRecord, ServerRecordStore, StorageServerStats } from './storage-servers.js';
 import type { StorageOptions } from './storage.js';
 import { PeerPigeonCryptoProtocol } from './crypto.js';
@@ -4172,6 +4172,9 @@ export class PeerPigeonNode {
   off<K extends keyof PeerPigeonNodeEvents>(event: K, callback: PeerPigeonNodeEvents[K]): void {
     this.callbacks[event]?.delete(callback);
   }
+
+  /** This node's link to the storage servers (null with storage off, or storage.servers false). */
+  get storageServers(): StorageServerLink | null { return this.serverLink; }
 
   /**
    * A node in the storage servers' scope, on the same relays as this one: for

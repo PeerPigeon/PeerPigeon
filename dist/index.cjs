@@ -23,6 +23,7 @@ __export(index_exports, {
   DEFAULT_CLOSE_SIGNALING_RELAY_COUNT: () => DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
   DEFAULT_SIGNALING_SERVERS: () => DEFAULT_SIGNALING_SERVERS,
   GossipProtocol: () => GossipProtocol,
+  MAX_BLOB_BYTES: () => MAX_BLOB_BYTES,
   MESH_SIGNAL_PAYLOAD_TYPE: () => MESH_SIGNAL_PAYLOAD_TYPE,
   MemoryServerRecordStore: () => MemoryServerRecordStore,
   NEGOTIATION_ACTIVE_ICE_DEADLINE_MS: () => NEGOTIATION_ACTIVE_ICE_DEADLINE_MS,
@@ -43,6 +44,7 @@ __export(index_exports, {
   STORAGE_SERVER_ROOM: () => STORAGE_SERVER_ROOM,
   StorageServer: () => StorageServer,
   StorageServerLink: () => StorageServerLink,
+  blobAddress: () => blobAddress,
   chooseRelays: () => chooseRelays,
   default: () => index_default,
   directRelaySupported: () => directRelaySupported,
@@ -51,10 +53,12 @@ __export(index_exports, {
   discoverSignalingRelays: () => discoverSignalingRelays,
   isHealthy: () => isHealthy,
   isMeshSignalPayload: () => isMeshSignalPayload,
+  openBlob: () => openBlob,
   rankSignalingServersByDistance: () => rankSignalingServersByDistance,
   reachableFromThisPage: () => reachableFromThisPage,
   relayScore: () => relayScore,
   roomRoutingKey: () => roomRoutingKey,
+  sealBlob: () => sealBlob,
   selectClosestSignalingServer: () => selectClosestSignalingServer,
   sha1Hex: () => sha1Hex
 });
@@ -3236,6 +3240,45 @@ async function ownerSigned(rec) {
     return false;
   }
 }
+var MAX_BLOB_BYTES = 160 * 1024;
+var hexBytes2 = (hex) => Uint8Array.from(hex.match(/../g), (h) => parseInt(h, 16));
+async function sha256Bytes2(bytes) {
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+async function blobKey(hash) {
+  const key = await globalThis.crypto.subtle.importKey("raw", hexBytes2(await sha256Hex(`pp-blob-key-v1:${hash}`)), "AES-GCM", false, ["encrypt", "decrypt"]);
+  return { key, iv: hexBytes2(await sha256Hex(`pp-blob-iv-v1:${hash}`)).slice(0, 12) };
+}
+function blobAddress(hash) {
+  return sha256Hex(`pp-blob-addr-v1:${hash}`);
+}
+async function sealBlob(bytes) {
+  const hash = await sha256Bytes2(bytes);
+  const { key, iv } = await blobKey(hash);
+  const sealed = new Uint8Array(await globalThis.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, bytes));
+  return { hash, address: await blobAddress(hash), sealed };
+}
+async function openBlob(hash, sealed) {
+  try {
+    const { key, iv } = await blobKey(hash);
+    const bytes = new Uint8Array(await globalThis.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, sealed));
+    return await sha256Bytes2(bytes) === hash ? bytes : null;
+  } catch {
+    return null;
+  }
+}
+function toB64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 32768) s += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  return btoa(s);
+}
+function fromB64(text) {
+  const s = atob(text);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
 async function sha256Hex(text) {
   const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -3425,7 +3468,7 @@ var StorageServerLink = class {
       }
       return;
     }
-    if (data.t === "ack" || data.t === "got") {
+    if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot") {
       const p = this.pending.get(data.req);
       if (p && p.from === from) {
         clearTimeout(p.timer);
@@ -3447,6 +3490,39 @@ var StorageServerLink = class {
     for (const a of answers) if (a?.t === "got" && a.rec && validRecord(a.rec) && a.rec.slot === slot && (!best || a.rec.at > best.at)) best = a.rec;
     return best;
   }
+  /** The servers closest to a blob's address, linked (waits up to `waitMs` for new links). */
+  async serversForBlob(address, waitMs = 4e3) {
+    const closest = closestIds(address, await this.knownServers(), this.hashed);
+    const linked = () => closest.filter((id) => this.node.getConnectedPeers().includes(id));
+    for (const id of closest) if (!this.node.getConnectedPeers().includes(id)) this.node.connectToPeer(id);
+    const until = Date.now() + waitMs;
+    while (!linked().length && closest.length && Date.now() < until) await new Promise((r) => setTimeout(r, 100));
+    return linked();
+  }
+  /** Whether any server is known in the scope (linked or not). */
+  async hasServers() {
+    return (await this.knownServers()).length > 0;
+  }
+  /** Keeps content on the servers closest to it; resolves with how many took it. */
+  async putBlob(bytes) {
+    if (bytes.length > MAX_BLOB_BYTES) throw new Error(`a blob is at most ${MAX_BLOB_BYTES} bytes`);
+    const { address, sealed } = await sealBlob(bytes);
+    const d = toB64(sealed);
+    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => this.ask(id, { pp: PP, t: "bput", req: newReq(), addr: address, d })));
+    return acks.filter((a) => a?.t === "back" && a.ok).length;
+  }
+  /** Content by its SHA-256 from the servers, checked; null if none has it. */
+  async getBlob(hash) {
+    const address = await blobAddress(hash);
+    for (const id of await this.serversForBlob(address)) {
+      const a = await this.ask(id, { pp: PP, t: "bget", req: newReq(), addr: address });
+      if (a?.t === "bgot" && typeof a.d === "string") {
+        const bytes = await openBlob(hash, fromB64(a.d));
+        if (bytes) return bytes;
+      }
+    }
+    return null;
+  }
   /** Every record the room's servers hold (of one space, with `tag`), the newest copy of each. */
   async list(room, tag) {
     const answers = await Promise.all(this.serversFor(room).map((id) => {
@@ -3465,6 +3541,7 @@ var StorageServerLink = class {
 var MemoryServerRecordStore = class {
   constructor() {
     this.byRoom = /* @__PURE__ */ new Map();
+    this.blobMap = /* @__PURE__ */ new Map();
   }
   async get(room, slot) {
     return this.byRoom.get(room)?.get(slot) ?? null;
@@ -3480,6 +3557,20 @@ var MemoryServerRecordStore = class {
   async rooms() {
     return [...this.byRoom.keys()];
   }
+  async getBlob(address) {
+    return this.blobMap.get(address) ?? null;
+  }
+  async putBlob(address, sealed) {
+    this.blobMap.set(address, sealed);
+  }
+  async blobs() {
+    return [...this.blobMap.keys()];
+  }
+  async blobUsage() {
+    let bytes = 0;
+    for (const b of this.blobMap.values()) bytes += b.length;
+    return { count: this.blobMap.size, bytes };
+  }
 };
 var StorageServer = class {
   constructor(node, store = new MemoryServerRecordStore()) {
@@ -3489,6 +3580,8 @@ var StorageServer = class {
     this.watchers = /* @__PURE__ */ new Map();
     /** For each room: the servers last given its records. */
     this.placed = /* @__PURE__ */ new Map();
+    /** For each blob: the servers last given it. */
+    this.placedBlobs = /* @__PURE__ */ new Map();
     this.selfHash = "";
     this.timer = null;
     this.onChange = null;
@@ -3525,7 +3618,8 @@ var StorageServer = class {
     for (const room of rooms) records += (await this.store.list(room)).length;
     const linked = this.node.getConnectedPeers();
     const servers = linked.filter((id) => this.node.getPeerRole(id) === STORAGE_SERVER_ROLE).length;
-    return { rooms: rooms.length, records, servers, clients: linked.length - servers };
+    const b = await this.store.blobUsage?.() ?? { count: 0, bytes: 0 };
+    return { rooms: rooms.length, records, blobs: b.count, blobBytes: b.bytes, servers, clients: linked.length - servers };
   }
   async self() {
     const id = this.node.getClientId() ?? "";
@@ -3605,6 +3699,28 @@ var StorageServer = class {
         w.add(from);
         return;
       }
+      case "bput": {
+        const ok = !!this.store.putBlob && validId(data.addr) && typeof data.d === "string" && data.d.length <= Math.ceil(MAX_BLOB_BYTES / 3) * 4 + 64;
+        if (ok) {
+          const have = await this.store.getBlob(data.addr);
+          if (!have) {
+            await this.store.putBlob(data.addr, fromB64(data.d));
+            if (this.node.getPeerRole(from) !== STORAGE_SERVER_ROLE) {
+              const selfId = this.node.getClientId();
+              for (const id of closestIds(data.addr, await this.servers(), this.hashed)) {
+                if (id !== selfId && id !== from && this.node.getConnectedPeers().includes(id)) this.send(id, { pp: PP, t: "bput", addr: data.addr, d: data.d });
+              }
+            }
+          }
+        }
+        if (data.req) this.send(from, { pp: PP, t: "back", req: data.req, ok });
+        return;
+      }
+      case "bget": {
+        const sealed = validId(data.addr) && this.store.getBlob ? await this.store.getBlob(data.addr) : null;
+        this.send(from, { pp: PP, t: "bgot", req: data.req, d: sealed ? toB64(sealed) : null });
+        return;
+      }
       case "sync": {
         if (this.node.getPeerRole(from) !== STORAGE_SERVER_ROLE || !Array.isArray(data.recs)) return;
         for (const rec of data.recs) {
@@ -3659,6 +3775,19 @@ var StorageServer = class {
         done.push(id);
       }
       this.placed.set(room, [...given.filter((id) => closest.includes(id)), ...done]);
+    }
+    if (this.store.blobs && this.store.getBlob) {
+      for (const addr of await this.store.blobs()) {
+        const closest = closestIds(addr, servers, this.hashed).filter((id) => id !== selfId);
+        const given = this.placedBlobs.get(addr) ?? [];
+        const todo = closest.filter((id) => !given.includes(id) && linked.has(id));
+        if (!todo.length) continue;
+        const sealed = await this.store.getBlob(addr);
+        if (!sealed) continue;
+        const d = toB64(sealed);
+        for (const id of todo) this.send(id, { pp: PP, t: "bput", addr, d });
+        this.placedBlobs.set(addr, [...given.filter((id) => closest.includes(id)), ...todo]);
+      }
     }
   }
 };
@@ -8394,6 +8523,10 @@ var PeerPigeonNode = class _PeerPigeonNode {
   off(event, callback) {
     this.callbacks[event]?.delete(callback);
   }
+  /** This node's link to the storage servers (null with storage off, or storage.servers false). */
+  get storageServers() {
+    return this.serverLink;
+  }
   /**
    * A node in the storage servers' scope, on the same relays as this one: for
    * a server (role 'storage', dialing other servers) or a peer's link to them.
@@ -8551,6 +8684,7 @@ var index_default = PartialMesh;
   DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
   DEFAULT_SIGNALING_SERVERS,
   GossipProtocol,
+  MAX_BLOB_BYTES,
   MESH_SIGNAL_PAYLOAD_TYPE,
   MemoryServerRecordStore,
   NEGOTIATION_ACTIVE_ICE_DEADLINE_MS,
@@ -8571,6 +8705,7 @@ var index_default = PartialMesh;
   STORAGE_SERVER_ROOM,
   StorageServer,
   StorageServerLink,
+  blobAddress,
   chooseRelays,
   directRelaySupported,
   discoverClosestSignalingServer,
@@ -8578,10 +8713,12 @@ var index_default = PartialMesh;
   discoverSignalingRelays,
   isHealthy,
   isMeshSignalPayload,
+  openBlob,
   rankSignalingServersByDistance,
   reachableFromThisPage,
   relayScore,
   roomRoutingKey,
+  sealBlob,
   selectClosestSignalingServer,
   sha1Hex
 });
