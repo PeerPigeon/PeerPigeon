@@ -8400,6 +8400,9 @@ var PeerPigeonNode = class _PeerPigeonNode {
   constructor(options = {}) {
     this.storage = null;
     this.serverLink = null;
+    this.linking = null;
+    this.storageUserId = "";
+    this.openedStorages = /* @__PURE__ */ new Set();
     this.callbacks = {};
     this.started = false;
     this.relayScoreTimer = null;
@@ -8450,6 +8453,7 @@ var PeerPigeonNode = class _PeerPigeonNode {
         ).trim();
         if (!userId) throw new Error("storage.userId is required when crypto is disabled");
         const { userId: _ignoredUserId, servers: useServers = true, ...storageOptions } = this.storageOptions;
+        this.storageUserId = userId;
         const config = this.mesh.getConfig();
         this.storage = new PeerPigeonStorage({
           ...storageOptions,
@@ -8465,7 +8469,7 @@ var PeerPigeonNode = class _PeerPigeonNode {
         if (useServers) this.storage.expectServers();
       }
       await this.mesh.init();
-      if (this.storage && this.useServers) void this.linkServers().catch(() => {
+      if (this.storage && this.useServers) this.linking = this.linkServers().catch(() => {
       });
     } catch (error) {
       this.started = false;
@@ -8480,6 +8484,38 @@ var PeerPigeonNode = class _PeerPigeonNode {
   /** The relay this node uses, as a person reads it (a direct relay by its name). */
   currentRelayName() {
     return relayDisplayName(this.currentRelay());
+  }
+  /**
+   * A storage room of its own (one person's records, say: name it after their key), kept on the
+   * same storage servers as this node's room. Listing it reads only what is in it, however much
+   * the node's room holds. Only the servers keep it: the mesh does not sync it.
+   * signingKeys: whose changes these are (an account's, after sign-in); by default this node's.
+   * Close it with storage.close() when done (the node closes those still open when it stops).
+   */
+  async openStorage(sessionId, options = {}) {
+    if (this.storageOptions === false || !this.storage) throw new Error("Storage is off, or the node has not started");
+    const name = String(sessionId ?? "").trim();
+    if (!name) throw new Error("openStorage needs a room name");
+    const { userId: _u, servers: _s, gossip: _g, sessionId: _n, dbName, signingKeys: _k, ...base } = this.storageOptions;
+    const own = this.crypto ? { pub: this.crypto.getKeyPair().pub, priv: this.crypto.getKeyPair().priv } : null;
+    const storage = new PeerPigeonStorage({
+      ...base,
+      userId: this.storageUserId,
+      peerId: this.mesh.getClientId() ?? "",
+      sessionId: name,
+      dbName: `${String(dbName ?? "peerpigeon-storage-v1")}:${name}`,
+      signingKeys: options.signingKeys !== void 0 ? options.signingKeys : own
+    });
+    await storage.init();
+    this.openedStorages.add(storage);
+    if (this.useServers) {
+      storage.expectServers();
+      void (this.linking ?? Promise.resolve()).then(() => {
+        if (this.serverLink) return storage.attachServers(this.serverLink);
+      }).catch(() => {
+      });
+    }
+    return storage;
   }
   async linkServers() {
     const until = Date.now() + 2e4;
@@ -8638,6 +8674,9 @@ var PeerPigeonNode = class _PeerPigeonNode {
       clearInterval(this.relayScoreTimer);
       this.relayScoreTimer = null;
     }
+    for (const opened of this.openedStorages) await opened.close().catch(() => {
+    });
+    this.openedStorages.clear();
     if (this.serverLink) {
       await this.serverLink.close();
       this.serverLink = null;

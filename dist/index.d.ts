@@ -1902,6 +1902,9 @@ declare class PeerPigeonNode {
     private readonly storageOptions;
     private readonly signalingOptions;
     private serverLink;
+    private linking;
+    private storageUserId;
+    private readonly openedStorages;
     private readonly callbacks;
     private started;
     private relayScoreTimer;
@@ -1913,6 +1916,19 @@ declare class PeerPigeonNode {
     currentRelay(): string;
     /** The relay this node uses, as a person reads it (a direct relay by its name). */
     currentRelayName(): string;
+    /**
+     * A storage room of its own (one person's records, say: name it after their key), kept on the
+     * same storage servers as this node's room. Listing it reads only what is in it, however much
+     * the node's room holds. Only the servers keep it: the mesh does not sync it.
+     * signingKeys: whose changes these are (an account's, after sign-in); by default this node's.
+     * Close it with storage.close() when done (the node closes those still open when it stops).
+     */
+    openStorage(sessionId: string, options?: {
+        signingKeys?: {
+            pub: string;
+            priv: string;
+        } | null;
+    }): Promise<PeerPigeonStorage>;
     private linkServers;
     getConfig(): Readonly<Required<PartialMeshConfig>>;
     updateConfig(patch: Partial<PartialMeshRuntimeConfig>): Readonly<Required<PartialMeshConfig>>;

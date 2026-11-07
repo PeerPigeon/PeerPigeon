@@ -3979,6 +3979,9 @@ export class PeerPigeonNode {
   private readonly storageOptions: false | PeerPigeonNodeStorageOptions;
   private readonly signalingOptions: Pick<PartialMeshConfig, 'signalingServer' | 'signalingServers' | 'automaticSignalingServer' | 'relayDirectory' | 'iceServers'>;
   private serverLink: StorageServerLink | null = null;
+  private linking: Promise<void> | null = null;
+  private storageUserId = '';
+  private readonly openedStorages = new Set<PeerPigeonStorage>();
   private readonly callbacks: Partial<Record<keyof PeerPigeonNodeEvents, Set<Function>>> = {};
   private started = false;
   private relayScoreTimer: ReturnType<typeof setInterval> | null = null;
@@ -4042,6 +4045,7 @@ export class PeerPigeonNode {
         ).trim();
         if (!userId) throw new Error('storage.userId is required when crypto is disabled');
         const { userId: _ignoredUserId, servers: useServers = true, ...storageOptions } = this.storageOptions;
+        this.storageUserId = userId;
         const config = this.mesh.getConfig();
         this.storage = new PeerPigeonStorage({
           ...storageOptions,
@@ -4062,7 +4066,7 @@ export class PeerPigeonNode {
       // its own, only the servers closest to this room. It joins the relay this
       // node chose, so it finds the servers this node's relay knows (a local
       // relay first), rather than choosing a relay of its own.
-      if (this.storage && this.useServers) void this.linkServers().catch(() => {});
+      if (this.storage && this.useServers) this.linking = this.linkServers().catch(() => {});
     } catch (error) {
       this.started = false;
       throw error;
@@ -4080,6 +4084,37 @@ export class PeerPigeonNode {
   /** The relay this node uses, as a person reads it (a direct relay by its name). */
   currentRelayName(): string {
     return relayDisplayName(this.currentRelay());
+  }
+
+  /**
+   * A storage room of its own (one person's records, say: name it after their key), kept on the
+   * same storage servers as this node's room. Listing it reads only what is in it, however much
+   * the node's room holds. Only the servers keep it: the mesh does not sync it.
+   * signingKeys: whose changes these are (an account's, after sign-in); by default this node's.
+   * Close it with storage.close() when done (the node closes those still open when it stops).
+   */
+  async openStorage(sessionId: string, options: { signingKeys?: { pub: string; priv: string } | null } = {}): Promise<PeerPigeonStorage> {
+    if (this.storageOptions === false || !this.storage) throw new Error('Storage is off, or the node has not started');
+    const name = String(sessionId ?? '').trim();
+    if (!name) throw new Error('openStorage needs a room name');
+    const { userId: _u, servers: _s, gossip: _g, sessionId: _n, dbName, signingKeys: _k, ...base } = this.storageOptions as PeerPigeonNodeStorageOptions & Record<string, unknown>;
+    const own = this.crypto ? { pub: this.crypto.getKeyPair().pub, priv: this.crypto.getKeyPair().priv } : null;
+    const storage = new PeerPigeonStorage({
+      ...base,
+      userId: this.storageUserId,
+      peerId: this.mesh.getClientId() ?? '',
+      sessionId: name,
+      dbName: `${String(dbName ?? 'peerpigeon-storage-v1')}:${name}`,
+      signingKeys: options.signingKeys !== undefined ? options.signingKeys : own,
+    });
+    await storage.init();
+    this.openedStorages.add(storage);
+    if (this.useServers) {
+      // Reads wait for the servers a moment; it joins the node's link once that is there.
+      storage.expectServers();
+      void (this.linking ?? Promise.resolve()).then(() => { if (this.serverLink) return storage.attachServers(this.serverLink); }).catch(() => {});
+    }
+    return storage;
   }
 
   private async linkServers(): Promise<void> {
@@ -4270,6 +4305,8 @@ export class PeerPigeonNode {
 
   async destroy(): Promise<void> {
     if (this.relayScoreTimer) { clearInterval(this.relayScoreTimer); this.relayScoreTimer = null; }
+    for (const opened of this.openedStorages) await opened.close().catch(() => {});
+    this.openedStorages.clear();
     if (this.serverLink) { await this.serverLink.close(); this.serverLink = null; }
     if (this.storage) await this.storage.close();
     this.storage = null;

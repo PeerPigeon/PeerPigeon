@@ -235,3 +235,34 @@ test('an account signs its frozen records on any device, and nobody can change t
   assert.deepEqual(again?.value, { result: 'win' });
   await leave(other);
 });
+
+test("a person's own room lists only their records, on the same link as the shared room", async () => {
+  const scope = makeScope();
+  await server(scope, '1');
+  const account = await generateRandomPair();
+  const p = await join(scope, 'a', account);
+  await p.link.start();
+  await settle();
+  // Lots in the shared room, two in the person's own.
+  for (let i = 0; i < 30; i++) await p.storage.put('frozen', `game:other:${i}`, i);
+  const own = new PeerPigeonStorage({ ...options, sessionId: `games:${account.pub}`, userId: account.epub, peerId: 'peer-a', signingKeys: account });
+  await own.init();
+  await own.attachServers(p.link);
+  await own.put('frozen', 'g1', { result: 'win' });
+  await own.put('frozen', 'g2', { result: 'loss' });
+  await settle();
+  const mine = await p.link.list((await own.slotOf('frozen', 'g1')) && own.serverIds.room);
+  assert.equal(mine.length, 2, 'the server holds two records in that room');
+  await own.close();
+
+  // Another device, same account, nobody else online: it reads its two, and nothing of the 30.
+  const q = await join(scope, 'b', await generateRandomPair());
+  const again = new PeerPigeonStorage({ ...options, sessionId: `games:${account.pub}`, userId: 'other', peerId: 'peer-b', signingKeys: account });
+  await again.init();
+  await again.attachServers(q.link);
+  await q.link.start();
+  const games = await again.list('frozen');
+  assert.deepEqual(games.map((g) => g.key).sort(), ['g1', 'g2']);
+  assert.ok(games.every((g) => g.signer === account.pub));
+  await again.close(); await leave(q); await leave(p);
+});
