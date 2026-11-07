@@ -3852,6 +3852,9 @@ var PeerPigeonStorage = class {
     this.servers = null;
     this.serverIds = null;
     this.serversReady = false;
+    // Settles when the room's servers are first linked, or when the wait for them runs out.
+    this.serversWait = null;
+    this.serversWaitDone = null;
     this.migrating = null;
     this.instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
     this.crossTabChannel = null;
@@ -3869,6 +3872,7 @@ var PeerPigeonStorage = class {
     this.syncFilter = typeof options.syncFilter === "function" ? options.syncFilter : null;
     this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
     this.moveToServers = options.moveToServers !== false;
+    this.serverWaitMs = Math.max(0, Number(options.serverWaitMs ?? 8e3));
     this.signingKeys = options.signingKeys?.pub && options.signingKeys?.priv ? { pub: options.signingKeys.pub, priv: options.signingKeys.priv } : null;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
@@ -3967,7 +3971,7 @@ var PeerPigeonStorage = class {
     const driver = this.requireDriver();
     const pk = this.makePk(space, key);
     let persisted = await driver.get(pk);
-    if (!persisted && space !== "private" && this.serversReady) {
+    if (!persisted && space !== "private" && await this.serversLinked()) {
       if (await this.readFromServers(space, this.normalizeKey(key))) persisted = await driver.get(pk);
     }
     if (!persisted) return null;
@@ -4074,7 +4078,7 @@ var PeerPigeonStorage = class {
   async list(space) {
     const driver = this.requireDriver();
     const persisted = await driver.listBySpace(space);
-    if (space !== "private" && this.serversReady) {
+    if (space !== "private" && await this.serversLinked()) {
       const here = new Set(persisted.map((r) => r.key));
       for (const record of await this.listFromServers(space)) if (!here.has(record.key)) persisted.push(record);
     }
@@ -4106,6 +4110,7 @@ var PeerPigeonStorage = class {
     this.closed = true;
     this.servers = null;
     this.serversReady = false;
+    this.serversWaitDone?.();
     if (this.gossip) {
       this.gossip.off("messageReceived", this.onGossipMessageBound);
       this.gossip.off("directMessageReceived", this.onDirectMessageBound);
@@ -4160,6 +4165,7 @@ var PeerPigeonStorage = class {
    * to them once they are there, and changes others make arrive from them.
    */
   async attachServers(link) {
+    this.expectServers();
     const seed = `peerpigeon:storage-servers:v1:${this.sessionId}:${this.syncSecret}`;
     const room = await sha256Hex(`${seed}:room`);
     this.servers = link;
@@ -4170,6 +4176,7 @@ var PeerPigeonStorage = class {
         const ready = event.servers.length > 0;
         const cameUp = ready && !this.serversReady;
         this.serversReady = ready;
+        if (ready) this.serversWaitDone?.();
         if (cameUp) void this.migrateToServers().catch(() => {
         });
       } else if (event.type === "changed" && event.rec.room === room) {
@@ -4178,6 +4185,29 @@ var PeerPigeonStorage = class {
       }
     });
     link.keep(room);
+  }
+  /**
+   * Storage servers are on their way (the node is linking to them): until they
+   * are linked, or serverWaitMs has passed, a read of a record not kept here
+   * waits for them rather than finding nothing. A peer that comes back to a
+   * room where no other peer is online reads what it left on the servers.
+   */
+  expectServers() {
+    if (this.serversWait || this.serversReady) return;
+    this.serversWait = new Promise((resolve) => {
+      const timer = setTimeout(() => done(), this.serverWaitMs);
+      const done = () => {
+        clearTimeout(timer);
+        this.serversWaitDone = null;
+        resolve();
+      };
+      this.serversWaitDone = done;
+    });
+  }
+  /** Whether the room's servers are linked, after waiting for them right after joining. */
+  async serversLinked() {
+    if (!this.serversReady && this.serversWait && !this.closed) await this.serversWait;
+    return this.serversReady;
   }
   /** Whether the room's servers are linked now, and how many. */
   serverCount() {
@@ -4654,7 +4684,7 @@ var PeerPigeonStorage = class {
     this.gossip.broadcast(await this.syncEnvelope(payload));
   }
   async handleRetrieveRequest(request) {
-    if (request.actorId === this.userId) return;
+    if (this.fromSelf(request)) return;
     if (request.space === "private") return;
     const driver = this.requireDriver();
     const pk = this.makePk(request.space, request.key);
@@ -4710,7 +4740,8 @@ var PeerPigeonStorage = class {
         space: response.space,
         key: response.key,
         actorId: response.actorId,
-        timestamp: response.timestamp,
+        // The record's own time: a signed record is checked against it (the answer's time would fail that).
+        timestamp: typeof response.record.updatedAt === "number" ? response.record.updatedAt : response.timestamp,
         record: response.record
       };
       await this.applyRemoteMutation(mutation);
@@ -4790,6 +4821,15 @@ var PeerPigeonStorage = class {
       return `${space}:${this.userId}:${key}`;
     }
     return `${space}:${key}`;
+  }
+  /**
+   * Whether a request or digest is this node's own. By mesh peer id when both
+   * sides have one: two tabs (or devices) of the same person share an identity,
+   * and each must still answer the other.
+   */
+  fromSelf(message) {
+    if (message.origin && this.peerId) return message.origin === this.peerId;
+    return message.actorId === this.userId;
   }
   makeMutationId(actorId) {
     return `${actorId}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
@@ -5000,7 +5040,7 @@ var PeerPigeonStorage = class {
    * the neighbour holds newer than ours.
    */
   async handleDigest(digest, fromPeerId) {
-    if (digest.actorId === this.userId) return;
+    if (this.fromSelf(digest)) return;
     const target = typeof digest.origin === "string" && digest.origin.trim() || String(fromPeerId ?? "").trim();
     if (!target || !this.gossip?.sendDirect) return;
     const driver = this.requireDriver();
@@ -5222,7 +5262,7 @@ var PeerPigeonCryptoProtocol = class {
       roomId,
       roomSecret: String(options.roomSecret ?? ""),
       keyPair: options.keyPair,
-      persistKeyPair: options.persistKeyPair ?? true,
+      persistKeyPair: options.persistKeyPair === void 0 || options.persistKeyPair === true ? "local" : options.persistKeyPair,
       storageKey: String(options.storageKey ?? "peerpigeon:crypto-keys:v1"),
       announceIntervalMs: options.announceIntervalMs ?? 1e4,
       keyDiscoveryTimeoutMs: options.keyDiscoveryTimeoutMs ?? 8e3
@@ -5397,22 +5437,37 @@ var PeerPigeonCryptoProtocol = class {
       throw new Error("Invalid PeerPigeon key pair");
     }
   }
+  keyStores() {
+    const mode = this.options.persistKeyPair;
+    if (!mode) return [];
+    const pick = (name) => {
+      try {
+        return globalThis[name] ?? null;
+      } catch {
+        return null;
+      }
+    };
+    const local = pick("localStorage"), session = pick("sessionStorage");
+    return (mode === "local" ? [local, session] : [session]).filter((s) => !!s);
+  }
   loadStoredKeyPair() {
-    if (!this.options.persistKeyPair) return null;
-    try {
-      const raw = globalThis.sessionStorage?.getItem(`${this.options.storageKey}:${this.options.roomId}`);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      this.validateKeyPair(parsed);
-      return parsed;
-    } catch {
-      return null;
+    for (const store of this.keyStores()) {
+      try {
+        const raw = store.getItem(`${this.options.storageKey}:${this.options.roomId}`);
+        if (!raw) continue;
+        const parsed = JSON.parse(raw);
+        this.validateKeyPair(parsed);
+        return parsed;
+      } catch {
+      }
     }
+    return null;
   }
   persistKeyPair(value) {
-    if (!this.options.persistKeyPair) return;
+    const store = this.keyStores()[0];
+    if (!store) return;
     try {
-      globalThis.sessionStorage?.setItem(`${this.options.storageKey}:${this.options.roomId}`, JSON.stringify(value));
+      store.setItem(`${this.options.storageKey}:${this.options.roomId}`, JSON.stringify(value));
     } catch {
     }
   }
@@ -8371,6 +8426,7 @@ var PeerPigeonNode = class _PeerPigeonNode {
         });
         await this.storage.init();
         this.useServers = useServers;
+        if (useServers) this.storage.expectServers();
       }
       await this.mesh.init();
       if (this.storage && this.useServers) void this.linkServers().catch(() => {
@@ -8478,6 +8534,11 @@ var PeerPigeonNode = class _PeerPigeonNode {
     if (!this.crypto) throw new Error("Crypto is disabled for this node");
     return await this.crypto.sendEncryptedDirect(peerId, plaintext, timeoutMs);
   }
+  /**
+   * This peer's identity, secret keys included: what makes it the owner of its
+   * records. Kept in this browser between visits; give it as crypto.keyPair on
+   * another device (or after clearing the browser) to be the same person there.
+   */
   getKeyPair() {
     if (!this.crypto) throw new Error("Crypto is disabled for this node");
     return this.crypto.getKeyPair();

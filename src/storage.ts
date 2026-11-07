@@ -88,6 +88,12 @@ export interface StorageOptions extends StorageSyncOptions {
    */
   moveToServers?: boolean;
   /**
+   * With storage servers: how long a read of a record not kept here waits for
+   * the room's servers to be linked, right after joining (ms). Default 8000.
+   * Once they are linked, or the wait has run out once, reads do not wait.
+   */
+  serverWaitMs?: number;
+  /**
    * Signs every change this node makes, and accepts only signed changes from
    * others: a record's signer is who made it, and a user record's owner is
    * its signer's key (its ownerId). PeerPigeonNode passes its key pair.
@@ -390,6 +396,10 @@ export class PeerPigeonStorage {
   private servers: StorageServerLink | null = null;
   private serverIds: { room: string; seed: string } | null = null;
   private serversReady = false;
+  private readonly serverWaitMs: number;
+  // Settles when the room's servers are first linked, or when the wait for them runs out.
+  private serversWait: Promise<void> | null = null;
+  private serversWaitDone: (() => void) | null = null;
   private migrating: Promise<void> | null = null;
   private readonly onGossipMessageBound: (data: { message: { data: unknown }; local: boolean; fromPeer?: string }) => void;
   private readonly instanceId = `storage-${Math.random().toString(36).slice(2, 11)}`;
@@ -413,6 +423,7 @@ export class PeerPigeonStorage {
     this.syncFilter = typeof options.syncFilter === 'function' ? options.syncFilter : null;
     this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
     this.moveToServers = options.moveToServers !== false;
+    this.serverWaitMs = Math.max(0, Number(options.serverWaitMs ?? 8000));
     this.signingKeys = options.signingKeys?.pub && options.signingKeys?.priv ? { pub: options.signingKeys.pub, priv: options.signingKeys.priv } : null;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
@@ -532,7 +543,7 @@ export class PeerPigeonStorage {
     const driver = this.requireDriver();
     const pk = this.makePk(space, key);
     let persisted = await driver.get(pk);
-    if (!persisted && space !== 'private' && this.serversReady) {
+    if (!persisted && space !== 'private' && await this.serversLinked()) {
       // Kept on the room's servers rather than here: read it from them.
       if (await this.readFromServers(space, this.normalizeKey(key))) persisted = await driver.get(pk);
     }
@@ -664,7 +675,7 @@ export class PeerPigeonStorage {
   async list(space: StorageSpace): Promise<StorageRecord[]> {
     const driver = this.requireDriver();
     const persisted = await driver.listBySpace(space);
-    if (space !== 'private' && this.serversReady) {
+    if (space !== 'private' && await this.serversLinked()) {
       // And what the room's servers keep that is not here (records moved to them).
       const here = new Set(persisted.map((r) => r.key));
       for (const record of await this.listFromServers(space)) if (!here.has(record.key)) persisted.push(record);
@@ -702,6 +713,7 @@ export class PeerPigeonStorage {
     this.closed = true;
     this.servers = null;
     this.serversReady = false;
+    this.serversWaitDone?.();
 
     if (this.gossip) {
       this.gossip.off('messageReceived', this.onGossipMessageBound);
@@ -765,6 +777,7 @@ export class PeerPigeonStorage {
    * to them once they are there, and changes others make arrive from them.
    */
   async attachServers(link: StorageServerLink): Promise<void> {
+    this.expectServers();
     const seed = `peerpigeon:storage-servers:v1:${this.sessionId}:${this.syncSecret}`;
     const room = await sha256Hex(`${seed}:room`);
     this.servers = link;
@@ -775,12 +788,34 @@ export class PeerPigeonStorage {
         const ready = event.servers.length > 0;
         const cameUp = ready && !this.serversReady;
         this.serversReady = ready;
+        if (ready) this.serversWaitDone?.();
         if (cameUp) void this.migrateToServers().catch(() => {});
       } else if (event.type === 'changed' && event.rec.room === room) {
         void this.applyServerRecord(event.rec, false).catch(() => {});
       }
     });
     link.keep(room);
+  }
+
+  /**
+   * Storage servers are on their way (the node is linking to them): until they
+   * are linked, or serverWaitMs has passed, a read of a record not kept here
+   * waits for them rather than finding nothing. A peer that comes back to a
+   * room where no other peer is online reads what it left on the servers.
+   */
+  expectServers(): void {
+    if (this.serversWait || this.serversReady) return;
+    this.serversWait = new Promise<void>((resolve) => {
+      const timer = setTimeout(() => done(), this.serverWaitMs);
+      const done = () => { clearTimeout(timer); this.serversWaitDone = null; resolve(); };
+      this.serversWaitDone = done;
+    });
+  }
+
+  /** Whether the room's servers are linked, after waiting for them right after joining. */
+  private async serversLinked(): Promise<boolean> {
+    if (!this.serversReady && this.serversWait && !this.closed) await this.serversWait;
+    return this.serversReady;
   }
 
   /** Whether the room's servers are linked now, and how many. */
@@ -1337,7 +1372,7 @@ export class PeerPigeonStorage {
   }
 
   private async handleRetrieveRequest(request: StorageRetrieveRequest): Promise<void> {
-    if (request.actorId === this.userId) return;
+    if (this.fromSelf(request)) return;
     if (request.space === 'private') return;
 
     const driver = this.requireDriver();
@@ -1412,7 +1447,8 @@ export class PeerPigeonStorage {
         space: response.space,
         key: response.key,
         actorId: response.actorId,
-        timestamp: response.timestamp,
+        // The record's own time: a signed record is checked against it (the answer's time would fail that).
+        timestamp: typeof response.record.updatedAt === 'number' ? response.record.updatedAt : response.timestamp,
         record: response.record,
       };
       await this.applyRemoteMutation(mutation);
@@ -1506,6 +1542,16 @@ export class PeerPigeonStorage {
       return `${space}:${this.userId}:${key}`;
     }
     return `${space}:${key}`;
+  }
+
+  /**
+   * Whether a request or digest is this node's own. By mesh peer id when both
+   * sides have one: two tabs (or devices) of the same person share an identity,
+   * and each must still answer the other.
+   */
+  private fromSelf(message: { actorId: string; origin?: string }): boolean {
+    if (message.origin && this.peerId) return message.origin === this.peerId;
+    return message.actorId === this.userId;
   }
 
   private makeMutationId(actorId: string): string {
@@ -1789,7 +1835,7 @@ export class PeerPigeonStorage {
    * the neighbour holds newer than ours.
    */
   private async handleDigest(digest: StorageDigest, fromPeerId?: string): Promise<void> {
-    if (digest.actorId === this.userId) return;
+    if (this.fromSelf(digest)) return;
     const target = (typeof digest.origin === 'string' && digest.origin.trim()) || String(fromPeerId ?? '').trim();
     if (!target || !this.gossip?.sendDirect) return;
     const driver = this.requireDriver();

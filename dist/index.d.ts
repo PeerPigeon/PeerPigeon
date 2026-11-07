@@ -796,6 +796,12 @@ interface StorageOptions extends StorageSyncOptions {
      */
     moveToServers?: boolean;
     /**
+     * With storage servers: how long a read of a record not kept here waits for
+     * the room's servers to be linked, right after joining (ms). Default 8000.
+     * Once they are linked, or the wait has run out once, reads do not wait.
+     */
+    serverWaitMs?: number;
+    /**
      * Signs every change this node makes, and accepts only signed changes from
      * others: a record's signer is who made it, and a user record's owner is
      * its signer's key (its ownerId). PeerPigeonNode passes its key pair.
@@ -867,6 +873,9 @@ declare class PeerPigeonStorage {
     private servers;
     private serverIds;
     private serversReady;
+    private readonly serverWaitMs;
+    private serversWait;
+    private serversWaitDone;
     private migrating;
     private readonly onGossipMessageBound;
     private readonly instanceId;
@@ -912,6 +921,15 @@ declare class PeerPigeonStorage {
      * to them once they are there, and changes others make arrive from them.
      */
     attachServers(link: StorageServerLink): Promise<void>;
+    /**
+     * Storage servers are on their way (the node is linking to them): until they
+     * are linked, or serverWaitMs has passed, a read of a record not kept here
+     * waits for them rather than finding nothing. A peer that comes back to a
+     * room where no other peer is online reads what it left on the servers.
+     */
+    expectServers(): void;
+    /** Whether the room's servers are linked, after waiting for them right after joining. */
+    private serversLinked;
     /** Whether the room's servers are linked now, and how many. */
     serverCount(): number;
     private slotOf;
@@ -975,6 +993,12 @@ declare class PeerPigeonStorage {
     private requireDriver;
     private normalizeKey;
     private makePk;
+    /**
+     * Whether a request or digest is this node's own. By mesh peer id when both
+     * sides have one: two tabs (or devices) of the same person share an identity,
+     * and each must still answer the other.
+     */
+    private fromSelf;
     private makeMutationId;
     private parseStorageVersion;
     private versionSourceToken;
@@ -1065,11 +1089,17 @@ type PeerPigeonCryptoOptions = {
     roomId: string;
     /** Optional shared secret mixed into the room key. */
     roomSecret?: string;
-    /** Supply an identity instead of generating/loading a tab-scoped identity. */
+    /** Supply an identity (from exportIdentity() on another device) instead of the one kept here. */
     keyPair?: PeerPigeonKeyPair;
-    /** Persist generated keys in sessionStorage when available. Default true. */
-    persistKeyPair?: boolean;
-    /** sessionStorage key prefix. */
+    /**
+     * Where the identity is kept, so a peer is the same person when it comes back:
+     * 'local' (or true, the default) keeps it in localStorage, for every tab and
+     * visit of this browser; 'session' keeps it for this tab only; false keeps none.
+     * The records a peer owns (its user space, its private space) stay its own
+     * only while it keeps this identity.
+     */
+    persistKeyPair?: boolean | 'local' | 'session';
+    /** Storage key prefix for the kept identity. */
     storageKey?: string;
     /** Key advertisement interval. Default 10 seconds; 0 disables it. */
     announceIntervalMs?: number;
@@ -1170,6 +1200,7 @@ declare class PeerPigeonCryptoProtocol {
     destroy(): void;
     static isProtocolPayload(value: unknown): boolean;
     private validateKeyPair;
+    private keyStores;
     private loadStoredKeyPair;
     private persistKeyPair;
     private registerLocalKey;
@@ -1895,6 +1926,11 @@ declare class PeerPigeonNode {
     broadcastEncrypted(plaintext: string, metadata?: Record<string, unknown>, options?: GossipBroadcastOptions): Promise<string>;
     broadcastEncryptedReliable(plaintext: string, metadata?: Record<string, unknown>, options?: Omit<GossipBroadcastOptions, 'trackDelivery'>): Promise<string>;
     sendEncryptedDirect(peerId: string, plaintext: string, timeoutMs?: number): Promise<string>;
+    /**
+     * This peer's identity, secret keys included: what makes it the owner of its
+     * records. Kept in this browser between visits; give it as crypto.keyPair on
+     * another device (or after clearing the browser) to be the same person there.
+     */
     getKeyPair(): Readonly<PeerPigeonKeyPair>;
     getPublicKey(peerId: string): PeerPublicKey | null;
     getKnownPeerKeys(): PeerPublicKey[];

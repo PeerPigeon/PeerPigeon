@@ -4054,6 +4054,8 @@ export class PeerPigeonNode {
         });
         await this.storage.init();
         this.useServers = useServers;
+        // Reads right after joining wait for the room's servers, rather than find nothing.
+        if (useServers) this.storage.expectServers();
       }
       await this.mesh.init();
       // A second, small node in the storage servers' scope: it dials no one on
@@ -4186,6 +4188,11 @@ export class PeerPigeonNode {
     return await this.crypto.sendEncryptedDirect(peerId, plaintext, timeoutMs);
   }
 
+  /**
+   * This peer's identity, secret keys included: what makes it the owner of its
+   * records. Kept in this browser between visits; give it as crypto.keyPair on
+   * another device (or after clearing the browser) to be the same person there.
+   */
   getKeyPair(): Readonly<PeerPigeonKeyPair> {
     if (!this.crypto) throw new Error('Crypto is disabled for this node');
     return this.crypto.getKeyPair();

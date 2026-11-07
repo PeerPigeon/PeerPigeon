@@ -63,11 +63,17 @@ export type PeerPigeonCryptoOptions = {
   roomId: string;
   /** Optional shared secret mixed into the room key. */
   roomSecret?: string;
-  /** Supply an identity instead of generating/loading a tab-scoped identity. */
+  /** Supply an identity (from exportIdentity() on another device) instead of the one kept here. */
   keyPair?: PeerPigeonKeyPair;
-  /** Persist generated keys in sessionStorage when available. Default true. */
-  persistKeyPair?: boolean;
-  /** sessionStorage key prefix. */
+  /**
+   * Where the identity is kept, so a peer is the same person when it comes back:
+   * 'local' (or true, the default) keeps it in localStorage, for every tab and
+   * visit of this browser; 'session' keeps it for this tab only; false keeps none.
+   * The records a peer owns (its user space, its private space) stay its own
+   * only while it keeps this identity.
+   */
+  persistKeyPair?: boolean | 'local' | 'session';
+  /** Storage key prefix for the kept identity. */
   storageKey?: string;
   /** Key advertisement interval. Default 10 seconds; 0 disables it. */
   announceIntervalMs?: number;
@@ -131,7 +137,7 @@ type CryptoPublicRequestPayload = {
 export class PeerPigeonCryptoProtocol {
   private readonly mesh: CryptoMeshLike;
   private readonly gossip: CryptoGossipLike;
-  private readonly options: Required<Omit<PeerPigeonCryptoOptions, 'keyPair'>> & { keyPair?: PeerPigeonKeyPair };
+  private readonly options: Required<Omit<PeerPigeonCryptoOptions, 'keyPair' | 'persistKeyPair'>> & { keyPair?: PeerPigeonKeyPair; persistKeyPair: false | 'local' | 'session' };
   private keyPair: PeerPigeonKeyPair | null = null;
   private readonly publicKeys = new Map<string, PeerPublicKey>();
   private readonly callbacks: Partial<Record<keyof PeerPigeonCryptoEvents, Set<Function>>> = {};
@@ -164,7 +170,7 @@ export class PeerPigeonCryptoProtocol {
       roomId,
       roomSecret: String(options.roomSecret ?? ''),
       keyPair: options.keyPair,
-      persistKeyPair: options.persistKeyPair ?? true,
+      persistKeyPair: options.persistKeyPair === undefined || options.persistKeyPair === true ? 'local' : options.persistKeyPair,
       storageKey: String(options.storageKey ?? 'peerpigeon:crypto-keys:v1'),
       announceIntervalMs: options.announceIntervalMs ?? 10_000,
       keyDiscoveryTimeoutMs: options.keyDiscoveryTimeoutMs ?? 8_000,
@@ -379,25 +385,39 @@ export class PeerPigeonCryptoProtocol {
     }
   }
 
+  private keyStores(): Storage[] {
+    const mode = this.options.persistKeyPair;
+    if (!mode) return [];
+    const pick = (name: 'localStorage' | 'sessionStorage'): Storage | null => {
+      try { return (globalThis as unknown as Record<string, Storage | undefined>)[name] ?? null; } catch { return null; }
+    };
+    const local = pick('localStorage'), session = pick('sessionStorage');
+    // A tab that kept its identity for itself only (before it was kept for the browser) carries it over.
+    return (mode === 'local' ? [local, session] : [session]).filter((s): s is Storage => !!s);
+  }
+
   private loadStoredKeyPair(): PeerPigeonKeyPair | null {
-    if (!this.options.persistKeyPair) return null;
-    try {
-      const raw = globalThis.sessionStorage?.getItem(`${this.options.storageKey}:${this.options.roomId}`);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw) as PeerPigeonKeyPair;
-      this.validateKeyPair(parsed);
-      return parsed;
-    } catch {
-      return null;
+    for (const store of this.keyStores()) {
+      try {
+        const raw = store.getItem(`${this.options.storageKey}:${this.options.roomId}`);
+        if (!raw) continue;
+        const parsed = JSON.parse(raw) as PeerPigeonKeyPair;
+        this.validateKeyPair(parsed);
+        return parsed;
+      } catch {
+        // unreadable here: try the next
+      }
     }
+    return null;
   }
 
   private persistKeyPair(value: PeerPigeonKeyPair): void {
-    if (!this.options.persistKeyPair) return;
+    const store = this.keyStores()[0];
+    if (!store) return;
     try {
-      globalThis.sessionStorage?.setItem(`${this.options.storageKey}:${this.options.roomId}`, JSON.stringify(value));
+      store.setItem(`${this.options.storageKey}:${this.options.roomId}`, JSON.stringify(value));
     } catch {
-      // sessionStorage can be unavailable in restricted contexts.
+      // storage can be unavailable in restricted contexts.
     }
   }
 
