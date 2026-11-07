@@ -726,6 +726,11 @@ interface StorageRecord<T = unknown> {
     ownerId: string | null;
     /** Mesh peer ID that most recently changed this record. */
     modifiedBy: string | null;
+    /**
+     * The key that signed this record (checked before it was taken), with signed storage.
+     * For a frozen record it is who wrote it: an account's key, when it was written after signAs.
+     */
+    signer?: string | null;
     createdAt: number;
     updatedAt: number;
     version: StorageVersion;
@@ -869,7 +874,8 @@ declare class PeerPigeonStorage {
     private readonly pendingRetrieveRequests;
     private closed;
     private readonly moveToServers;
-    private readonly signingKeys;
+    private signingKeys;
+    private readonly ownSigningKeys;
     private servers;
     private serverIds;
     private serversReady;
@@ -921,6 +927,17 @@ declare class PeerPigeonStorage {
      * to them once they are there, and changes others make arrive from them.
      */
     attachServers(link: StorageServerLink): Promise<void>;
+    /**
+     * Sign this peer's changes as an account from now on: its keys (after the
+     * person signs in), so what they write is theirs on every device they sign
+     * in from. null goes back to the keys this storage started with (signing out).
+     */
+    signAs(keys: {
+        pub: string;
+        priv: string;
+    } | null): void;
+    /** Who signs this peer's changes now (an account's key after signAs), or null when unsigned. */
+    signer(): string | null;
     /**
      * Storage servers are on their way (the node is linking to them): until they
      * are linked, or serverWaitMs has passed, a read of a record not kept here

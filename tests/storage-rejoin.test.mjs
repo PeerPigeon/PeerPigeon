@@ -195,3 +195,43 @@ test('a storage made again on a link that has already found the servers reads fr
   assert.deepEqual((await again.list('public')).map((r) => r.key), ['test']);
   await first.link.close(); await again.close();
 });
+
+test('an account signs its frozen records on any device, and nobody can change them', async () => {
+  const scope = makeScope();
+  await server(scope, '1');
+  const account = await generateRandomPair();
+  // Device 1: the page's own keys, then the person signs in.
+  const one = await join(scope, 'd1', await generateRandomPair());
+  await one.link.start();
+  await settle();
+  one.storage.signAs(account);
+  assert.equal(one.storage.signer(), account.pub);
+  await one.storage.put('frozen', `game:${account.pub}:g1`, { result: 'win' });
+  await assert.rejects(() => one.storage.put('frozen', `game:${account.pub}:g1`, { result: 'loss' }), 'frozen: not even its owner changes it');
+  await settle();
+  await leave(one);
+
+  // Device 2, alone in the room, signs in too: the record is there, and it is the account's.
+  const two = await join(scope, 'd2', await generateRandomPair());
+  two.storage.signAs(account);
+  const reading = two.storage.get('frozen', `game:${account.pub}:g1`);
+  await two.link.start();
+  const rec = await reading;
+  assert.deepEqual(rec?.value, { result: 'win' });
+  assert.equal(rec?.signer, account.pub);
+  const mine = (await two.storage.list('frozen')).filter((r) => r.key.startsWith(`game:${account.pub}:`) && r.signer === account.pub);
+  assert.deepEqual(mine.map((r) => r.key), [`game:${account.pub}:g1`]);
+  // Signing out goes back to the page's own keys.
+  two.storage.signAs(null);
+  assert.notEqual(two.storage.signer(), account.pub);
+  await leave(two);
+
+  // Someone else cannot replace it, here or on the servers.
+  const other = await join(scope, 'x', await generateRandomPair());
+  await other.link.start();
+  await settle();
+  await assert.rejects(() => other.storage.put('frozen', `game:${account.pub}:g1`, { result: 'loss' }));
+  const again = await other.storage.get('frozen', `game:${account.pub}:g1`);
+  assert.deepEqual(again?.value, { result: 'win' });
+  await leave(other);
+});

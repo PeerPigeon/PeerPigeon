@@ -13,6 +13,11 @@ export interface StorageRecord<T = unknown> {
   ownerId: string | null;
   /** Mesh peer ID that most recently changed this record. */
   modifiedBy: string | null;
+  /**
+   * The key that signed this record (checked before it was taken), with signed storage.
+   * For a frozen record it is who wrote it: an account's key, when it was written after signAs.
+   */
+  signer?: string | null;
   createdAt: number;
   updatedAt: number;
   version: StorageVersion;
@@ -391,7 +396,8 @@ export class PeerPigeonStorage {
   private readonly pendingRetrieveRequests = new Map<string, { resolve: (value: StorageRecord | null) => void; timeout: ReturnType<typeof setTimeout> }>();
   private closed = false;
   private readonly moveToServers: boolean;
-  private readonly signingKeys: { pub: string; priv: string } | null;
+  private signingKeys: { pub: string; priv: string } | null;
+  private readonly ownSigningKeys: { pub: string; priv: string } | null;
   // Storage servers, when there are any (see storage-servers.ts).
   private servers: StorageServerLink | null = null;
   private serverIds: { room: string; seed: string } | null = null;
@@ -425,6 +431,7 @@ export class PeerPigeonStorage {
     this.moveToServers = options.moveToServers !== false;
     this.serverWaitMs = Math.max(0, Number(options.serverWaitMs ?? 8000));
     this.signingKeys = options.signingKeys?.pub && options.signingKeys?.priv ? { pub: options.signingKeys.pub, priv: options.signingKeys.priv } : null;
+    this.ownSigningKeys = this.signingKeys;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
         // ignore malformed or undecryptable sync messages
@@ -520,6 +527,11 @@ export class PeerPigeonStorage {
   }
 
   async put<T = unknown>(space: StorageSpace, key: string, value: T, options: StoragePutOptions = {}): Promise<StorageRecord<T>> {
+    // A user or frozen record kept on the servers rather than here is fetched first, so its owner
+    // (or that it is frozen) is known here and a write that may not change it is refused here.
+    if ((space === 'user' || space === 'frozen') && !(await this.requireDriver().get(this.makePk(space, key))) && await this.serversLinked()) {
+      await this.readFromServers(space, key);
+    }
     const mutation = await this.applyLocalUpsert(space, key, value, options, false);
     if (space !== 'private' && !options.silent) {
       await this.broadcastMutation(mutation);
@@ -565,6 +577,7 @@ export class PeerPigeonStorage {
       value: value as T,
       ownerId: persisted.ownerId,
       modifiedBy: persisted.modifiedBy ?? null,
+      signer: persisted.signer ?? null,
       createdAt: persisted.createdAt,
       updatedAt: persisted.updatedAt,
       version: this.normalizeStorageVersion(persisted.version, this.versionSourceToken(persisted.ownerId ?? this.userId)),
@@ -698,6 +711,7 @@ export class PeerPigeonStorage {
         value,
         ownerId: record.ownerId,
         modifiedBy: record.modifiedBy ?? null,
+        signer: record.signer ?? null,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
         version: this.normalizeStorageVersion(record.version, this.versionSourceToken(record.ownerId ?? this.userId)),
@@ -802,6 +816,20 @@ export class PeerPigeonStorage {
       this.serversWaitDone?.();
       void this.migrateToServers().catch(() => {});
     }
+  }
+
+  /**
+   * Sign this peer's changes as an account from now on: its keys (after the
+   * person signs in), so what they write is theirs on every device they sign
+   * in from. null goes back to the keys this storage started with (signing out).
+   */
+  signAs(keys: { pub: string; priv: string } | null): void {
+    this.signingKeys = keys?.pub && keys?.priv ? { pub: keys.pub, priv: keys.priv } : this.ownSigningKeys;
+  }
+
+  /** Who signs this peer's changes now (an account's key after signAs), or null when unsigned. */
+  signer(): string | null {
+    return this.signingKeys?.pub ?? null;
   }
 
   /**
@@ -1346,6 +1374,7 @@ export class PeerPigeonStorage {
         value,
         ownerId: persisted.ownerId,
         modifiedBy: persisted.modifiedBy ?? null,
+        signer: persisted.signer ?? null,
         createdAt: persisted.createdAt,
         updatedAt: persisted.updatedAt,
         version: persisted.version,

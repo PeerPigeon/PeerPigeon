@@ -3874,6 +3874,7 @@ var PeerPigeonStorage = class {
     this.moveToServers = options.moveToServers !== false;
     this.serverWaitMs = Math.max(0, Number(options.serverWaitMs ?? 8e3));
     this.signingKeys = options.signingKeys?.pub && options.signingKeys?.priv ? { pub: options.signingKeys.pub, priv: options.signingKeys.priv } : null;
+    this.ownSigningKeys = this.signingKeys;
     this.onGossipMessageBound = (data) => {
       this.handleGossipMessage(data).catch(() => {
       });
@@ -3951,6 +3952,9 @@ var PeerPigeonStorage = class {
     this.listeners.delete(listener);
   }
   async put(space, key, value, options = {}) {
+    if ((space === "user" || space === "frozen") && !await this.requireDriver().get(this.makePk(space, key)) && await this.serversLinked()) {
+      await this.readFromServers(space, key);
+    }
     const mutation = await this.applyLocalUpsert(space, key, value, options, false);
     if (space !== "private" && !options.silent) {
       await this.broadcastMutation(mutation);
@@ -3988,6 +3992,7 @@ var PeerPigeonStorage = class {
       value,
       ownerId: persisted.ownerId,
       modifiedBy: persisted.modifiedBy ?? null,
+      signer: persisted.signer ?? null,
       createdAt: persisted.createdAt,
       updatedAt: persisted.updatedAt,
       version: this.normalizeStorageVersion(persisted.version, this.versionSourceToken(persisted.ownerId ?? this.userId))
@@ -4097,6 +4102,7 @@ var PeerPigeonStorage = class {
         value,
         ownerId: record.ownerId,
         modifiedBy: record.modifiedBy ?? null,
+        signer: record.signer ?? null,
         createdAt: record.createdAt,
         updatedAt: record.updatedAt,
         version: this.normalizeStorageVersion(record.version, this.versionSourceToken(record.ownerId ?? this.userId))
@@ -4191,6 +4197,18 @@ var PeerPigeonStorage = class {
       void this.migrateToServers().catch(() => {
       });
     }
+  }
+  /**
+   * Sign this peer's changes as an account from now on: its keys (after the
+   * person signs in), so what they write is theirs on every device they sign
+   * in from. null goes back to the keys this storage started with (signing out).
+   */
+  signAs(keys) {
+    this.signingKeys = keys?.pub && keys?.priv ? { pub: keys.pub, priv: keys.priv } : this.ownSigningKeys;
+  }
+  /** Who signs this peer's changes now (an account's key after signAs), or null when unsigned. */
+  signer() {
+    return this.signingKeys?.pub ?? null;
   }
   /**
    * Storage servers are on their way (the node is linking to them): until they
@@ -4664,6 +4682,7 @@ var PeerPigeonStorage = class {
         value,
         ownerId: persisted.ownerId,
         modifiedBy: persisted.modifiedBy ?? null,
+        signer: persisted.signer ?? null,
         createdAt: persisted.createdAt,
         updatedAt: persisted.updatedAt,
         version: persisted.version

@@ -115,7 +115,15 @@ test('a server takes a user record only from its owner', async () => {
   // B (another member of the room) writes the same key from scratch: the server keeps A's.
   const reader = await peer('c', await generateRandomPair());
   await settle();
-  await b.put('user', 'card', 'from B'); // B has no copy, so locally it is B's own new record
-  await settle();
+  // B has no copy, but asks the servers before writing: refused here.
+  await assert.rejects(() => b.put('user', 'card', 'from B'));
+  // A B that wrote it before it could ask (offline, then linked): the server still keeps A's.
+  const offline = new PeerPigeonStorage({ ...opts, userId: 'user-b2', peerId: 'b2', signingKeys: kb });
+  await offline.init();
+  await offline.put('user', 'card', 'from B');
+  const link = new StorageServerLink(mk('d'.repeat(64)));
+  await offline.attachServers(link);
+  await link.start();
+  await settle(200);
   assert.equal((await reader.get('user', 'card'))?.value, 'from A');
 });
