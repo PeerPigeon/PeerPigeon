@@ -5679,9 +5679,26 @@ async function selectClosestSignalingServer(peerId, relayUrls) {
   if (ranked.length === 0) throw new Error("No valid FreeRTC relays are available");
   return ranked[0];
 }
+var directRelayNames = /* @__PURE__ */ new Map();
+function noteRelayName(url, record) {
+  if (url && typeof record?.name === "string" && record.name) directRelayNames.set(url, record.name);
+  return url;
+}
+function relayDisplayName(url) {
+  if (!url) return "";
+  const named = directRelayNames.get(canonicalSignalingUrl(url) ?? url) ?? directRelayNames.get(url);
+  const shown = named || url;
+  try {
+    const u = new URL(shown.replace(/^webrtc-direct:/, "https:"));
+    const usual = Boolean(named) || !u.port || u.port === "443" || u.port === "80";
+    return usual ? u.hostname : `${u.hostname}:${u.port}`;
+  } catch {
+    return shown;
+  }
+}
 async function discoverSignalingRelays(options) {
   const directLookup = options.directory === false || !directRelaySupported() ? Promise.resolve([]) : lookupDirectRelays({ name: options.directory || DEFAULT_DIRECTORY_NAME, fetchImpl: options.fetchImpl }).then((records) => records.map((record) => ({
-    url: canonicalSignalingUrl(directoryRecordUrl(record)),
+    url: noteRelayName(canonicalSignalingUrl(directoryRecordUrl(record)), record),
     nodeId: record.node_id,
     kind: "local",
     connections: 0,
@@ -6443,6 +6460,7 @@ var PartialMesh = class {
       });
       for (const record of records.slice(0, 2)) {
         const url = canonicalSignalingUrl(directoryRecordUrl(record));
+        if (url) noteRelayName(url, record);
         if (!url) continue;
         try {
           const { pc } = await directRelayChannel(url, { timeoutMs: 5e3 });
@@ -8367,6 +8385,10 @@ var PeerPigeonNode = class _PeerPigeonNode {
     const client = this.mesh.signalingClient;
     return String(client?.currentSignalUrl ?? "");
   }
+  /** The relay this node uses, as a person reads it (a direct relay by its name). */
+  currentRelayName() {
+    return relayDisplayName(this.currentRelay());
+  }
   async linkServers() {
     const until = Date.now() + 2e4;
     while (!this.currentRelay() && Date.now() < until && this.storage) await new Promise((r) => setTimeout(r, 200));
@@ -8678,6 +8700,7 @@ export {
   openBlob,
   rankSignalingServersByDistance,
   reachableFromThisPage,
+  relayDisplayName,
   relayScore,
   roomRoutingKey,
   sealBlob,

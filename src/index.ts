@@ -263,6 +263,32 @@ type RegistryRelayRecord = {
   capacity?: number;
 };
 
+/** The name each direct relay goes by (its directory record's wss:// name), by its direct URL. */
+const directRelayNames = new Map<string, string>();
+
+function noteRelayName(url: string, record: { name?: unknown }): string {
+  if (url && typeof record?.name === 'string' && record.name) directRelayNames.set(url, record.name);
+  return url;
+}
+
+/**
+ * A relay as a person reads it: the name a direct relay goes by when it has
+ * one (ef0d4c0a988ec0d2.decentralize.ooo), else the host of its URL, with its
+ * port when it is not the usual one.
+ */
+export function relayDisplayName(url: string): string {
+  if (!url) return '';
+  const named = directRelayNames.get(canonicalSignalingUrl(url) ?? url) ?? directRelayNames.get(url);
+  const shown = named || url;
+  try {
+    const u = new URL(shown.replace(/^webrtc-direct:/, 'https:'));
+    const usual = Boolean(named) || !u.port || u.port === '443' || u.port === '80';
+    return usual ? u.hostname : `${u.hostname}:${u.port}`;
+  } catch {
+    return shown;
+  }
+}
+
 /**
  * Every relay a bootstrap's registry (/api/v1/relays) lists, plus the
  * bootstrap and fallbacks, with what each says about itself: node ID, kind
@@ -284,7 +310,7 @@ export async function discoverSignalingRelays(options: {
     ? Promise.resolve([])
     : lookupDirectRelays({ name: options.directory || DEFAULT_DIRECTORY_NAME, fetchImpl: options.fetchImpl })
       .then((records) => records.map((record) => ({
-        url: canonicalSignalingUrl(directoryRecordUrl(record)) as string,
+        url: noteRelayName(canonicalSignalingUrl(directoryRecordUrl(record)) as string, record),
         nodeId: record.node_id,
         kind: 'local' as RelayKind,
         connections: 0,
@@ -1424,6 +1450,7 @@ export class PartialMesh {
       });
       for (const record of records.slice(0, 2)) {
         const url = canonicalSignalingUrl(directoryRecordUrl(record));
+        if (url) noteRelayName(url, record);
         if (!url) continue;
         try {
           const { pc } = await directRelayChannel(url, { timeoutMs: 5_000 });
@@ -4046,6 +4073,11 @@ export class PeerPigeonNode {
   currentRelay(): string {
     const client = (this.mesh as unknown as { signalingClient?: { currentSignalUrl?: string } }).signalingClient;
     return String(client?.currentSignalUrl ?? '');
+  }
+
+  /** The relay this node uses, as a person reads it (a direct relay by its name). */
+  currentRelayName(): string {
+    return relayDisplayName(this.currentRelay());
   }
 
   private async linkServers(): Promise<void> {
