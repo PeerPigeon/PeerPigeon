@@ -930,6 +930,11 @@ declare class PeerPigeonStorage {
     expectServers(): void;
     /** Whether the room's servers are linked, after waiting for them right after joining. */
     private serversLinked;
+    /**
+     * Whether the room's servers are linked, as the link has it now. Asked each time rather than
+     * kept from the link's events, so a storage never goes on believing there are none.
+     */
+    private serversUp;
     /** Whether the room's servers are linked now, and how many. */
     serverCount(): number;
     private slotOf;

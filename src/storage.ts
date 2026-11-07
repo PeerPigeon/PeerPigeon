@@ -811,18 +811,27 @@ export class PeerPigeonStorage {
    * room where no other peer is online reads what it left on the servers.
    */
   expectServers(): void {
-    if (this.serversWait || this.serversReady) return;
+    if (this.serversWait || this.serversUp()) return;
     this.serversWait = new Promise<void>((resolve) => {
       const timer = setTimeout(() => done(), this.serverWaitMs);
-      const done = () => { clearTimeout(timer); this.serversWaitDone = null; resolve(); };
+      const poll = setInterval(() => { if (this.serversUp() || this.closed) done(); }, 200);
+      const done = () => { clearTimeout(timer); clearInterval(poll); this.serversWaitDone = null; resolve(); };
       this.serversWaitDone = done;
     });
   }
 
   /** Whether the room's servers are linked, after waiting for them right after joining. */
   private async serversLinked(): Promise<boolean> {
-    if (!this.serversReady && this.serversWait && !this.closed) await this.serversWait;
-    return this.serversReady;
+    if (!this.serversUp() && this.serversWait && !this.closed) await this.serversWait;
+    return this.serversUp();
+  }
+
+  /**
+   * Whether the room's servers are linked, as the link has it now. Asked each time rather than
+   * kept from the link's events, so a storage never goes on believing there are none.
+   */
+  private serversUp(): boolean {
+    return !this.closed && this.serverCount() > 0;
   }
 
   /** Whether the room's servers are linked now, and how many. */
@@ -838,7 +847,7 @@ export class PeerPigeonStorage {
 
   /** Sends one change to the room's servers; resolves with how many took it. */
   private async pushToServers(mutation: StorageMutation): Promise<number> {
-    if (!this.servers || !this.serverIds || !this.serversReady || mutation.space === 'private') return 0;
+    if (!this.servers || !this.serverIds || !this.serversUp() || mutation.space === 'private') return 0;
     try {
       const { slot, tag, write } = await this.slotOf(mutation.space, mutation.key);
       const blob = await this.encryptSyncPayload(mutation);
@@ -903,7 +912,7 @@ export class PeerPigeonStorage {
       const driver = this.requireDriver();
       for (const space of ['public', 'user', 'frozen', 'epublic'] as StorageSpace[]) {
         for (const record of await driver.listBySpace(space)) {
-          if (this.closed || !this.serversReady) return;
+          if (this.closed || !this.serversUp()) return;
           const mutation: StorageMutation = {
             __ppType: 'pp-storage-op-v1',
             opId: this.makeMutationId(this.userId),

@@ -4199,11 +4199,15 @@ var PeerPigeonStorage = class {
    * room where no other peer is online reads what it left on the servers.
    */
   expectServers() {
-    if (this.serversWait || this.serversReady) return;
+    if (this.serversWait || this.serversUp()) return;
     this.serversWait = new Promise((resolve) => {
       const timer = setTimeout(() => done(), this.serverWaitMs);
+      const poll = setInterval(() => {
+        if (this.serversUp() || this.closed) done();
+      }, 200);
       const done = () => {
         clearTimeout(timer);
+        clearInterval(poll);
         this.serversWaitDone = null;
         resolve();
       };
@@ -4212,8 +4216,15 @@ var PeerPigeonStorage = class {
   }
   /** Whether the room's servers are linked, after waiting for them right after joining. */
   async serversLinked() {
-    if (!this.serversReady && this.serversWait && !this.closed) await this.serversWait;
-    return this.serversReady;
+    if (!this.serversUp() && this.serversWait && !this.closed) await this.serversWait;
+    return this.serversUp();
+  }
+  /**
+   * Whether the room's servers are linked, as the link has it now. Asked each time rather than
+   * kept from the link's events, so a storage never goes on believing there are none.
+   */
+  serversUp() {
+    return !this.closed && this.serverCount() > 0;
   }
   /** Whether the room's servers are linked now, and how many. */
   serverCount() {
@@ -4226,7 +4237,7 @@ var PeerPigeonStorage = class {
   }
   /** Sends one change to the room's servers; resolves with how many took it. */
   async pushToServers(mutation) {
-    if (!this.servers || !this.serverIds || !this.serversReady || mutation.space === "private") return 0;
+    if (!this.servers || !this.serverIds || !this.serversUp() || mutation.space === "private") return 0;
     try {
       const { slot, tag, write } = await this.slotOf(mutation.space, mutation.key);
       const blob = await this.encryptSyncPayload(mutation);
@@ -4285,7 +4296,7 @@ var PeerPigeonStorage = class {
       const driver = this.requireDriver();
       for (const space of ["public", "user", "frozen", "epublic"]) {
         for (const record of await driver.listBySpace(space)) {
-          if (this.closed || !this.serversReady) return;
+          if (this.closed || !this.serversUp()) return;
           const mutation = {
             __ppType: "pp-storage-op-v1",
             opId: this.makeMutationId(this.userId),
