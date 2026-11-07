@@ -36,6 +36,14 @@ declare function sealBlob(bytes: Uint8Array): Promise<{
 }>;
 /** Opens a sealed blob; null unless it is the content with that SHA-256. */
 declare function openBlob(hash: string, sealed: Uint8Array): Promise<Uint8Array | null>;
+/**
+ * A room only one key writes to (a person's own records): 'o' and the hash of that key. A server
+ * takes a record for it only when the record carries that key as its owner, signed by it; so
+ * nobody else, knowing the key or not, can put anything in it.
+ */
+declare function ownedRoomOf(owner: string): Promise<string>;
+/** A room id: 64 hex (a shared room), or 'o' and 64 hex (an owned room). */
+declare function validRoom(v: unknown): v is string;
 type LinkListener = (event: {
     type: 'servers';
     room: string;
@@ -807,6 +815,12 @@ interface StorageOptions extends StorageSyncOptions {
      */
     serverWaitMs?: number;
     /**
+     * A room of one key's own (a person's records): on the storage servers it takes only records
+     * that key signs, so nobody else can put anything in it. Writes here must be signed by it
+     * (signingKeys, or signAs). Give the room a sessionId of its own too.
+     */
+    owner?: string;
+    /**
      * Signs every change this node makes, and accepts only signed changes from
      * others: a record's signer is who made it, and a user record's owner is
      * its signer's key (its ownerId). PeerPigeonNode passes its key pair.
@@ -880,6 +894,7 @@ declare class PeerPigeonStorage {
     private serverIds;
     private serversReady;
     private readonly serverWaitMs;
+    private readonly owner;
     private serversWait;
     private serversWaitDone;
     private migrating;
@@ -1921,6 +1936,8 @@ declare class PeerPigeonNode {
      * same storage servers as this node's room. Listing it reads only what is in it, however much
      * the node's room holds. Only the servers keep it: the mesh does not sync it.
      * signingKeys: whose changes these are (an account's, after sign-in); by default this node's.
+     * owner: a key, for a room only that key writes to (the storage servers take nothing else in it);
+     * writes here must then be signed by it.
      * Close it with storage.close() when done (the node closes those still open when it stops).
      */
     openStorage(sessionId: string, options?: {
@@ -1928,6 +1945,7 @@ declare class PeerPigeonNode {
             pub: string;
             priv: string;
         } | null;
+        owner?: string;
     }): Promise<PeerPigeonStorage>;
     private linkServers;
     getConfig(): Readonly<Required<PartialMeshConfig>>;
@@ -1993,4 +2011,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryServerRecordStore, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, openBlob, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayScore, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryServerRecordStore, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayScore, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, validRoom };

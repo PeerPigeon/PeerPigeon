@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { generateRandomPair } from 'unsea';
-import { PeerPigeonStorage, PeerPigeonCryptoProtocol, StorageServerLink, StorageServer, STORAGE_SERVER_ROLE } from '../dist/index.js';
+import { generateRandomPair, signMessage } from 'unsea';
+import { createHash } from 'node:crypto';
+import { PeerPigeonStorage, PeerPigeonCryptoProtocol, StorageServerLink, StorageServer, STORAGE_SERVER_ROLE, ownedRoomOf } from '../dist/index.js';
+// What an owner signs for a server (storage-servers.ts ownerText).
+const ownerText = async (r) => `pp-ss-owner-v1:${r.room}:${r.slot}:${r.at}:${createHash('sha256').update(JSON.stringify(r.blob)).digest('hex')}`;
 
 // A peer stores in its own space, leaves, and comes back to a room where no
 // other peer is online: the storage servers have what it left, it reads it at
@@ -265,4 +268,42 @@ test("a person's own room lists only their records, on the same link as the shar
   assert.deepEqual(games.map((g) => g.key).sort(), ['g1', 'g2']);
   assert.ok(games.every((g) => g.signer === account.pub));
   await again.close(); await leave(q); await leave(p);
+});
+
+test("nobody but its owner puts anything in an owned room, knowing the key or not", async () => {
+  const scope = makeScope();
+  await server(scope, '1');
+  const account = await generateRandomPair(), stranger = await generateRandomPair();
+  const room = { ...options, sessionId: `games:${account.pub}`, owner: account.pub };
+
+  const p = await join(scope, 'a', account);
+  await p.link.start();
+  await settle();
+  const own = new PeerPigeonStorage({ ...room, userId: account.epub, peerId: 'peer-a', signingKeys: account });
+  await own.init();
+  await own.attachServers(p.link);
+  await own.put('frozen', 'g1', { result: 'win' });
+  await settle();
+  assert.equal(own.serverIds.room, await ownedRoomOf(account.pub));
+  await own.close();
+
+  // A stranger opens the same room: refused here...
+  const q = await join(scope, 'b', stranger);
+  await q.link.start();
+  await settle();
+  const theirs = new PeerPigeonStorage({ ...room, userId: stranger.epub, peerId: 'peer-b', signingKeys: stranger });
+  await theirs.init();
+  await theirs.attachServers(q.link);
+  await assert.rejects(() => theirs.put('frozen', 'g2', { result: 'loss' }), /owner/);
+  // ...and by the server, sent straight to it: unsigned, or signed as themselves.
+  const ownedRoom = await ownedRoomOf(account.pub);
+  const base = { room: ownedRoom, slot: 'a'.repeat(64), tag: 'b'.repeat(16), at: Date.now(), blob: { junk: true }, once: true };
+  assert.equal(await q.link.put(base, 'c'.repeat(64)), 0, 'unsigned: refused');
+  const signedAsStranger = { ...base, slot: 'd'.repeat(64), owner: stranger.pub };
+  signedAsStranger.osig = await signMessage(await ownerText(signedAsStranger), stranger.priv);
+  assert.equal(await q.link.put(signedAsStranger, 'e'.repeat(64)), 0, 'signed by someone else: refused');
+  const held = await q.link.list(ownedRoom);
+  assert.equal(held.length, 1, 'the room holds only the owner\'s record');
+  assert.deepEqual((await theirs.list('frozen')).map((r) => r.key), ['g1']);
+  await theirs.close(); await leave(q); await leave(p);
 });

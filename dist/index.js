@@ -3221,7 +3221,15 @@ async function sha256Hex(text) {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 function xorDistance(a, b) {
-  return BigInt(`0x${a}`) ^ BigInt(`0x${b}`);
+  return BigInt(`0x${a.startsWith("o") ? a.slice(1) : a}`) ^ BigInt(`0x${b.startsWith("o") ? b.slice(1) : b}`);
+}
+async function ownedRoomOf(owner) {
+  return `o${await sha256Hex(`pp-ss-owned-room-v1:${owner}`)}`;
+}
+function validRoom(v) {
+  if (typeof v !== "string") return false;
+  const id = v;
+  return /^o?[0-9a-f]{64}$/.test(id);
 }
 function closestIds(target, ids, hashed, count = STORAGE_REPLICAS) {
   return [...ids].filter((id) => hashed.has(id)).map((id) => ({ id, d: xorDistance(hashed.get(id), target) })).sort((x, y) => x.d < y.d ? -1 : x.d > y.d ? 1 : 0).slice(0, count).map((x) => x.id);
@@ -3235,7 +3243,7 @@ function validId(v, len = 64) {
 }
 function validRecord(rec) {
   const r = rec;
-  return !!r && validId(r.room) && validId(r.slot) && validId(r.tag, 16) && Number.isFinite(r.at) && r.blob !== void 0;
+  return !!r && validRoom(r.room) && validId(r.slot) && validId(r.tag, 16) && Number.isFinite(r.at) && r.blob !== void 0;
 }
 function batches(items) {
   const out = [];
@@ -3593,6 +3601,7 @@ var StorageServer = class {
   /** Takes a record if it is new or newer, and its write token (or hash) is the slot's. */
   async take(rec) {
     if (!await ownerSigned(rec)) return { ok: false, why: "bad-signature" };
+    if (rec.room.startsWith("o") && (typeof rec.owner !== "string" || await ownedRoomOf(rec.owner) !== rec.room)) return { ok: false, why: "not-owner" };
     const have = await this.store.get(rec.room, rec.slot);
     if (have) {
       if (have.wh !== rec.wh) return { ok: false, why: "not-yours" };
@@ -3630,19 +3639,19 @@ var StorageServer = class {
         return;
       }
       case "get": {
-        const rec = validId(data.room) && validId(data.slot) ? await this.store.get(data.room, data.slot) : null;
+        const rec = validRoom(data.room) && validId(data.slot) ? await this.store.get(data.room, data.slot) : null;
         this.send(from, { pp: PP, t: "got", req: data.req, rec: rec ? strip(rec) : null });
         return;
       }
       case "list": {
-        const recs = validId(data.room) ? (await this.store.list(data.room, typeof data.tag === "string" ? data.tag : void 0)).map(strip) : [];
+        const recs = validRoom(data.room) ? (await this.store.list(data.room, typeof data.tag === "string" ? data.tag : void 0)).map(strip) : [];
         const parts = batches(recs);
         if (!parts.length) parts.push([]);
         parts.forEach((part, i) => this.send(from, { pp: PP, t: "listed", req: data.req, recs: part, more: i < parts.length - 1 }));
         return;
       }
       case "watch": {
-        if (!validId(data.room)) return;
+        if (!validRoom(data.room)) return;
         let w = this.watchers.get(data.room);
         if (!w) this.watchers.set(data.room, w = /* @__PURE__ */ new Set());
         w.add(from);
@@ -3873,6 +3882,7 @@ var PeerPigeonStorage = class {
     this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
     this.moveToServers = options.moveToServers !== false;
     this.serverWaitMs = Math.max(0, Number(options.serverWaitMs ?? 8e3));
+    this.owner = String(options.owner ?? "").trim() || null;
     this.signingKeys = options.signingKeys?.pub && options.signingKeys?.priv ? { pub: options.signingKeys.pub, priv: options.signingKeys.priv } : null;
     this.ownSigningKeys = this.signingKeys;
     this.onGossipMessageBound = (data) => {
@@ -3952,6 +3962,7 @@ var PeerPigeonStorage = class {
     this.listeners.delete(listener);
   }
   async put(space, key, value, options = {}) {
+    if (this.owner && this.signingKeys?.pub !== this.owner) throw new Error("Only its owner writes to this room");
     if ((space === "user" || space === "frozen") && !await this.requireDriver().get(this.makePk(space, key)) && await this.serversLinked()) {
       await this.readFromServers(space, key);
     }
@@ -4062,6 +4073,7 @@ var PeerPigeonStorage = class {
     if (this.retrieveAnswerTimes.length > 8) this.retrieveAnswerTimes.shift();
   }
   async delete(space, key) {
+    if (this.owner && this.signingKeys?.pub !== this.owner) throw new Error("Only its owner writes to this room");
     const mutation = await this.applyLocalDelete(space, key, false);
     if (!mutation) return false;
     if (space !== "private") {
@@ -4173,7 +4185,7 @@ var PeerPigeonStorage = class {
   async attachServers(link) {
     this.expectServers();
     const seed = `peerpigeon:storage-servers:v1:${this.sessionId}:${this.syncSecret}`;
-    const room = await sha256Hex(`${seed}:room`);
+    const room = this.owner ? await ownedRoomOf(this.owner) : await sha256Hex(`${seed}:room`);
     this.servers = link;
     this.serverIds = { room, seed };
     link.on((event) => {
@@ -4260,7 +4272,12 @@ var PeerPigeonStorage = class {
       const { slot, tag, write } = await this.slotOf(mutation.space, mutation.key);
       const blob = await this.encryptSyncPayload(mutation);
       const rec = { room: this.serverIds.room, slot, tag, at: mutation.timestamp, blob, ...mutation.space === "frozen" ? { once: true } : {} };
-      if (mutation.space === "user" && this.signingKeys) {
+      if (this.owner) {
+        const signer = mutation.op === "delete" ? mutation.signer : mutation.record?.signer;
+        if (!this.signingKeys || this.signingKeys.pub !== this.owner || signer !== this.owner) return 0;
+        rec.owner = this.owner;
+        rec.osig = await signMessage(await ownerText(rec), this.signingKeys.priv);
+      } else if (mutation.space === "user" && this.signingKeys) {
         const signer = mutation.op === "delete" ? mutation.signer : mutation.record?.signer;
         if (signer !== this.signingKeys.pub) return 0;
         rec.owner = this.signingKeys.pub;
@@ -8490,6 +8507,8 @@ var PeerPigeonNode = class _PeerPigeonNode {
    * same storage servers as this node's room. Listing it reads only what is in it, however much
    * the node's room holds. Only the servers keep it: the mesh does not sync it.
    * signingKeys: whose changes these are (an account's, after sign-in); by default this node's.
+   * owner: a key, for a room only that key writes to (the storage servers take nothing else in it);
+   * writes here must then be signed by it.
    * Close it with storage.close() when done (the node closes those still open when it stops).
    */
   async openStorage(sessionId, options = {}) {
@@ -8504,7 +8523,8 @@ var PeerPigeonNode = class _PeerPigeonNode {
       peerId: this.mesh.getClientId() ?? "",
       sessionId: name,
       dbName: `${String(dbName ?? "peerpigeon-storage-v1")}:${name}`,
-      signingKeys: options.signingKeys !== void 0 ? options.signingKeys : own
+      signingKeys: options.signingKeys !== void 0 ? options.signingKeys : own,
+      ...options.owner ? { owner: options.owner } : {}
     });
     await storage.init();
     this.openedStorages.add(storage);
@@ -8834,6 +8854,7 @@ export {
   isHealthy,
   isMeshSignalPayload,
   openBlob,
+  ownedRoomOf,
   rankSignalingServersByDistance,
   reachableFromThisPage,
   relayDisplayName,
@@ -8841,5 +8862,6 @@ export {
   roomRoutingKey,
   sealBlob,
   selectClosestSignalingServer,
-  sha1Hex
+  sha1Hex,
+  validRoom
 };

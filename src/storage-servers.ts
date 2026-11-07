@@ -148,7 +148,23 @@ export async function sha256Hex(text: string): Promise<string> {
 
 /** XOR distance between two hex ids, as a bigint. */
 export function xorDistance(a: string, b: string): bigint {
-  return BigInt(`0x${a}`) ^ BigInt(`0x${b}`);
+  return BigInt(`0x${a.startsWith('o') ? a.slice(1) : a}`) ^ BigInt(`0x${b.startsWith('o') ? b.slice(1) : b}`);
+}
+
+/**
+ * A room only one key writes to (a person's own records): 'o' and the hash of that key. A server
+ * takes a record for it only when the record carries that key as its owner, signed by it; so
+ * nobody else, knowing the key or not, can put anything in it.
+ */
+export async function ownedRoomOf(owner: string): Promise<string> {
+  return `o${await sha256Hex(`pp-ss-owned-room-v1:${owner}`)}`;
+}
+
+/** A room id: 64 hex (a shared room), or 'o' and 64 hex (an owned room). */
+export function validRoom(v: unknown): v is string {
+  if (typeof v !== 'string') return false;
+  const id: string = v;
+  return /^o?[0-9a-f]{64}$/.test(id);
 }
 
 /** The `count` ids (of `ids`, by their sha256 `hashed`) closest to `target`. */
@@ -173,7 +189,7 @@ function validId(v: unknown, len = 64): v is string {
 
 function validRecord(rec: unknown): rec is Omit<ServerRecord, 'wh'> {
   const r = rec as ServerRecord;
-  return !!r && validId(r.room) && validId(r.slot) && validId(r.tag, 16) && Number.isFinite(r.at) && r.blob !== undefined;
+  return !!r && validRoom(r.room) && validId(r.slot) && validId(r.tag, 16) && Number.isFinite(r.at) && r.blob !== undefined;
 }
 
 /** Splits records into batches small enough for one message each. */
@@ -529,6 +545,8 @@ export class StorageServer {
   /** Takes a record if it is new or newer, and its write token (or hash) is the slot's. */
   private async take(rec: ServerRecord): Promise<{ ok: boolean; why?: string }> {
     if (!(await ownerSigned(rec))) return { ok: false, why: 'bad-signature' };
+    // An owned room takes only its owner's records (signed: checked just above).
+    if (rec.room.startsWith('o') && (typeof rec.owner !== 'string' || (await ownedRoomOf(rec.owner)) !== rec.room)) return { ok: false, why: 'not-owner' };
     const have = await this.store.get(rec.room, rec.slot);
     if (have) {
       if (have.wh !== rec.wh) return { ok: false, why: 'not-yours' };
@@ -564,19 +582,19 @@ export class StorageServer {
         return;
       }
       case 'get': {
-        const rec = validId(data.room) && validId(data.slot) ? await this.store.get(data.room, data.slot) : null;
+        const rec = validRoom(data.room) && validId(data.slot) ? await this.store.get(data.room, data.slot) : null;
         this.send(from, { pp: PP, t: 'got', req: data.req, rec: rec ? strip(rec) : null });
         return;
       }
       case 'list': {
-        const recs = validId(data.room) ? (await this.store.list(data.room, typeof data.tag === 'string' ? data.tag : undefined)).map(strip) : [];
+        const recs = validRoom(data.room) ? (await this.store.list(data.room, typeof data.tag === 'string' ? data.tag : undefined)).map(strip) : [];
         const parts = batches(recs);
         if (!parts.length) parts.push([]);
         parts.forEach((part, i) => this.send(from, { pp: PP, t: 'listed', req: data.req, recs: part, more: i < parts.length - 1 }));
         return;
       }
       case 'watch': {
-        if (!validId(data.room)) return;
+        if (!validRoom(data.room)) return;
         let w = this.watchers.get(data.room);
         if (!w) this.watchers.set(data.room, (w = new Set()));
         w.add(from);

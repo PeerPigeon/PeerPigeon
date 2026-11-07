@@ -26,7 +26,7 @@ import type {
 } from './gossip.js';
 import { PeerPigeonStorage } from './storage.js';
 import { StorageServerLink, StorageServer, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE } from './storage-servers.js';
-export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS, MAX_BLOB_BYTES, sealBlob, openBlob, blobAddress } from './storage-servers.js';
+export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS, MAX_BLOB_BYTES, sealBlob, openBlob, blobAddress, ownedRoomOf, validRoom } from './storage-servers.js';
 export type { ServerRecord, ServerRecordStore, StorageServerStats } from './storage-servers.js';
 import type { StorageOptions } from './storage.js';
 import { PeerPigeonCryptoProtocol } from './crypto.js';
@@ -4091,9 +4091,11 @@ export class PeerPigeonNode {
    * same storage servers as this node's room. Listing it reads only what is in it, however much
    * the node's room holds. Only the servers keep it: the mesh does not sync it.
    * signingKeys: whose changes these are (an account's, after sign-in); by default this node's.
+   * owner: a key, for a room only that key writes to (the storage servers take nothing else in it);
+   * writes here must then be signed by it.
    * Close it with storage.close() when done (the node closes those still open when it stops).
    */
-  async openStorage(sessionId: string, options: { signingKeys?: { pub: string; priv: string } | null } = {}): Promise<PeerPigeonStorage> {
+  async openStorage(sessionId: string, options: { signingKeys?: { pub: string; priv: string } | null; owner?: string } = {}): Promise<PeerPigeonStorage> {
     if (this.storageOptions === false || !this.storage) throw new Error('Storage is off, or the node has not started');
     const name = String(sessionId ?? '').trim();
     if (!name) throw new Error('openStorage needs a room name');
@@ -4106,6 +4108,7 @@ export class PeerPigeonNode {
       sessionId: name,
       dbName: `${String(dbName ?? 'peerpigeon-storage-v1')}:${name}`,
       signingKeys: options.signingKeys !== undefined ? options.signingKeys : own,
+      ...(options.owner ? { owner: options.owner } : {}),
     });
     await storage.init();
     this.openedStorages.add(storage);

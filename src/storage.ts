@@ -1,5 +1,5 @@
 import { signMessage, verifyMessage } from 'unsea';
-import { ownerText, sha256Hex, type ServerRecord, type StorageServerLink } from './storage-servers.js';
+import { ownedRoomOf, ownerText, sha256Hex, type ServerRecord, type StorageServerLink } from './storage-servers.js';
 
 export type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
 export type StorageVersion = string | number;
@@ -98,6 +98,12 @@ export interface StorageOptions extends StorageSyncOptions {
    * Once they are linked, or the wait has run out once, reads do not wait.
    */
   serverWaitMs?: number;
+  /**
+   * A room of one key's own (a person's records): on the storage servers it takes only records
+   * that key signs, so nobody else can put anything in it. Writes here must be signed by it
+   * (signingKeys, or signAs). Give the room a sessionId of its own too.
+   */
+  owner?: string;
   /**
    * Signs every change this node makes, and accepts only signed changes from
    * others: a record's signer is who made it, and a user record's owner is
@@ -403,6 +409,7 @@ export class PeerPigeonStorage {
   private serverIds: { room: string; seed: string } | null = null;
   private serversReady = false;
   private readonly serverWaitMs: number;
+  private readonly owner: string | null;
   // Settles when the room's servers are first linked, or when the wait for them runs out.
   private serversWait: Promise<void> | null = null;
   private serversWaitDone: (() => void) | null = null;
@@ -430,6 +437,7 @@ export class PeerPigeonStorage {
     this.replicate = (Array.isArray(options.replicate) ? options.replicate : []).map((p) => String(p)).filter(Boolean);
     this.moveToServers = options.moveToServers !== false;
     this.serverWaitMs = Math.max(0, Number(options.serverWaitMs ?? 8000));
+    this.owner = String(options.owner ?? '').trim() || null;
     this.signingKeys = options.signingKeys?.pub && options.signingKeys?.priv ? { pub: options.signingKeys.pub, priv: options.signingKeys.priv } : null;
     this.ownSigningKeys = this.signingKeys;
     this.onGossipMessageBound = (data) => {
@@ -527,6 +535,7 @@ export class PeerPigeonStorage {
   }
 
   async put<T = unknown>(space: StorageSpace, key: string, value: T, options: StoragePutOptions = {}): Promise<StorageRecord<T>> {
+    if (this.owner && this.signingKeys?.pub !== this.owner) throw new Error('Only its owner writes to this room');
     // A user or frozen record kept on the servers rather than here is fetched first, so its owner
     // (or that it is frozen) is known here and a write that may not change it is refused here.
     if ((space === 'user' || space === 'frozen') && !(await this.requireDriver().get(this.makePk(space, key))) && await this.serversLinked()) {
@@ -662,6 +671,7 @@ export class PeerPigeonStorage {
   }
 
   async delete(space: StorageSpace, key: string): Promise<boolean> {
+    if (this.owner && this.signingKeys?.pub !== this.owner) throw new Error('Only its owner writes to this room');
     const mutation = await this.applyLocalDelete(space, key, false);
     if (!mutation) return false;
 
@@ -793,7 +803,7 @@ export class PeerPigeonStorage {
   async attachServers(link: StorageServerLink): Promise<void> {
     this.expectServers();
     const seed = `peerpigeon:storage-servers:v1:${this.sessionId}:${this.syncSecret}`;
-    const room = await sha256Hex(`${seed}:room`);
+    const room = this.owner ? await ownedRoomOf(this.owner) : await sha256Hex(`${seed}:room`);
     this.servers = link;
     this.serverIds = { room, seed };
     link.on((event) => {
@@ -880,7 +890,13 @@ export class PeerPigeonStorage {
       const { slot, tag, write } = await this.slotOf(mutation.space, mutation.key);
       const blob = await this.encryptSyncPayload(mutation);
       const rec: Omit<ServerRecord, 'wh'> = { room: this.serverIds.room, slot, tag, at: mutation.timestamp, blob, ...(mutation.space === 'frozen' ? { once: true } : {}) };
-      if (mutation.space === 'user' && this.signingKeys) {
+      if (this.owner) {
+        // An owned room: every record goes up signed by its owner, and only by its owner.
+        const signer = mutation.op === 'delete' ? mutation.signer : mutation.record?.signer;
+        if (!this.signingKeys || this.signingKeys.pub !== this.owner || signer !== this.owner) return 0;
+        rec.owner = this.owner;
+        rec.osig = await signMessage(await ownerText(rec), this.signingKeys.priv);
+      } else if (mutation.space === 'user' && this.signingKeys) {
         // A user record goes to the servers from its owner only, signed: the server takes later writes only from that key.
         const signer = mutation.op === 'delete' ? mutation.signer : mutation.record?.signer;
         if (signer !== this.signingKeys.pub) return 0;
