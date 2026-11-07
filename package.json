@@ -32,7 +32,6 @@
     "dev:tls:generate": "node scripts/dev-with-mdns.mjs --generate-tls",
     "dev": "node scripts/dev-with-mdns.mjs",
     "dev:raw": "cd examples/vue3 && npm run dev:raw --",
-    "prepare": "npm run build",
     "prepack": "npm run build",
     "prepublishOnly": "npm run build",
     "example:basic": "cd examples/basic && npm run dev",
