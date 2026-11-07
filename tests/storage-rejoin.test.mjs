@@ -168,3 +168,30 @@ async function server(scope, id) {
   await s.start();
   return s;
 }
+
+test('a storage made again on a link that has already found the servers reads from them at once', async () => {
+  // The demo does this: its storage is made again once the peer's keys arrive, on the link it kept.
+  const scope = makeScope();
+  await server(scope, '1');
+  const writer = await join(scope, 'w', await generateRandomPair());
+  await writer.link.start();
+  await settle();
+  await writer.storage.put('public', 'test', 'saved before leaving');
+  await settle();
+  await leave(writer);
+
+  const first = await join(scope, 'r', null, { serverWaitMs: 300 });
+  await first.link.start();
+  await settle();
+  assert.equal(first.storage.serverCount(), 1);
+  await first.storage.close();
+  // Made again, on the same link: no new "servers" event comes.
+  const again = new PeerPigeonStorage({ ...options, userId: 'user-r2', peerId: 'peer-r', serverWaitMs: 300 });
+  await again.init();
+  await again.attachServers(first.link);
+  const t = Date.now();
+  assert.equal((await again.get('public', 'test'))?.value, 'saved before leaving');
+  assert.ok(Date.now() - t < 250, 'read without waiting out serverWaitMs');
+  assert.deepEqual((await again.list('public')).map((r) => r.key), ['test']);
+  await first.link.close(); await again.close();
+});

@@ -4185,6 +4185,12 @@ var PeerPigeonStorage = class {
       }
     });
     link.keep(room);
+    if (link.serversFor(room).length > 0 && !this.serversReady) {
+      this.serversReady = true;
+      this.serversWaitDone?.();
+      void this.migrateToServers().catch(() => {
+      });
+    }
   }
   /**
    * Storage servers are on their way (the node is linking to them): until they

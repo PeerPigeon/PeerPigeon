@@ -795,6 +795,13 @@ export class PeerPigeonStorage {
       }
     });
     link.keep(room);
+    // The link may have found the room's servers already (a storage made again, on a link kept from
+    // before): the event that said so has passed, so take them as they are now.
+    if (link.serversFor(room).length > 0 && !this.serversReady) {
+      this.serversReady = true;
+      this.serversWaitDone?.();
+      void this.migrateToServers().catch(() => {});
+    }
   }
 
   /**
