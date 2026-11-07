@@ -8294,6 +8294,7 @@ var PeerPigeonNode = class _PeerPigeonNode {
     this.callbacks = {};
     this.started = false;
     this.relayScoreTimer = null;
+    this.useServers = false;
     const { gossip = {}, crypto = {}, storage = false, ...meshOptions } = options;
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
@@ -8351,18 +8352,30 @@ var PeerPigeonNode = class _PeerPigeonNode {
           gossip: this.gossip
         });
         await this.storage.init();
-        if (useServers) {
-          this.serverLink = new StorageServerLink(_PeerPigeonNode.serverScopeNode(this.signalingOptions, { dialRoles: [] }));
-          await this.storage.attachServers(this.serverLink);
-          void this.serverLink.start().catch(() => {
-          });
-        }
+        this.useServers = useServers;
       }
       await this.mesh.init();
+      if (this.storage && this.useServers) void this.linkServers().catch(() => {
+      });
     } catch (error) {
       this.started = false;
       throw error;
     }
+  }
+  /** The relay this node is signalling through now ('' until it has one). */
+  currentRelay() {
+    const client = this.mesh.signalingClient;
+    return String(client?.currentSignalUrl ?? "");
+  }
+  async linkServers() {
+    const until = Date.now() + 2e4;
+    while (!this.currentRelay() && Date.now() < until && this.storage) await new Promise((r) => setTimeout(r, 200));
+    if (!this.storage || this.serverLink) return;
+    const relay = this.currentRelay();
+    const signaling = relay ? { ...this.signalingOptions, signalingServer: relay, signalingServers: [relay], automaticSignalingServer: false } : this.signalingOptions;
+    this.serverLink = new StorageServerLink(_PeerPigeonNode.serverScopeNode(signaling, { dialRoles: [] }));
+    await this.storage.attachServers(this.serverLink);
+    await this.serverLink.start();
   }
   getConfig() {
     return this.mesh.getConfig();

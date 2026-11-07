@@ -4026,19 +4026,39 @@ export class PeerPigeonNode {
           gossip: this.gossip,
         });
         await this.storage.init();
-        if (useServers) {
-          // A second, small node in the storage servers' scope: it dials no one
-          // on its own, only the servers closest to this room.
-          this.serverLink = new StorageServerLink(PeerPigeonNode.serverScopeNode(this.signalingOptions, { dialRoles: [] }));
-          await this.storage.attachServers(this.serverLink);
-          void this.serverLink.start().catch(() => {});
-        }
+        this.useServers = useServers;
       }
       await this.mesh.init();
+      // A second, small node in the storage servers' scope: it dials no one on
+      // its own, only the servers closest to this room. It joins the relay this
+      // node chose, so it finds the servers this node's relay knows (a local
+      // relay first), rather than choosing a relay of its own.
+      if (this.storage && this.useServers) void this.linkServers().catch(() => {});
     } catch (error) {
       this.started = false;
       throw error;
     }
+  }
+
+  private useServers = false;
+
+  /** The relay this node is signalling through now ('' until it has one). */
+  currentRelay(): string {
+    const client = (this.mesh as unknown as { signalingClient?: { currentSignalUrl?: string } }).signalingClient;
+    return String(client?.currentSignalUrl ?? '');
+  }
+
+  private async linkServers(): Promise<void> {
+    const until = Date.now() + 20_000;
+    while (!this.currentRelay() && Date.now() < until && this.storage) await new Promise((r) => setTimeout(r, 200));
+    if (!this.storage || this.serverLink) return;
+    const relay = this.currentRelay();
+    const signaling = relay
+      ? { ...this.signalingOptions, signalingServer: relay, signalingServers: [relay], automaticSignalingServer: false }
+      : this.signalingOptions;
+    this.serverLink = new StorageServerLink(PeerPigeonNode.serverScopeNode(signaling, { dialRoles: [] }));
+    await this.storage.attachServers(this.serverLink);
+    await this.serverLink.start();
   }
 
   getConfig(): Readonly<Required<PartialMeshConfig>> {

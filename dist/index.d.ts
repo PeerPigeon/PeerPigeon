@@ -1849,6 +1849,10 @@ declare class PeerPigeonNode {
     constructor(options?: PeerPigeonNodeOptions);
     init(): Promise<void>;
     start(): Promise<void>;
+    private useServers;
+    /** The relay this node is signalling through now ('' until it has one). */
+    currentRelay(): string;
+    private linkServers;
     getConfig(): Readonly<Required<PartialMeshConfig>>;
     updateConfig(patch: Partial<PartialMeshRuntimeConfig>): Readonly<Required<PartialMeshConfig>>;
     getGraphSnapshot(): PeerGraphSnapshot;
