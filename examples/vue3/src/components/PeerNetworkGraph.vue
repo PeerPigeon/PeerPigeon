@@ -1409,7 +1409,7 @@ export default {
 
 .peer-network-steer input {
   margin: 0;
-  accent-color: #56b09c;
+  accent-color: #7fd8a6;
   cursor: pointer;
 }
 
@@ -1440,7 +1440,7 @@ export default {
 .peer-network-rotation-toggle:focus-visible {
   border-color: rgba(86, 176, 156, 0.72);
   background: rgba(30, 41, 59, 0.82);
-  color: #56b09c;
+  color: #7fd8a6;
   outline: none;
 }
 
@@ -1488,7 +1488,7 @@ export default {
 
 .peer-network-status-icon {
   width: 1em;
-  color: #56b09c;
+  color: #7fd8a6;
   flex: 0 0 auto;
 }
 
@@ -1544,7 +1544,7 @@ export default {
 }
 
 .peer-network-tooltip small {
-  color: #56b09c;
+  color: #7fd8a6;
   font-size: 10px;
 }
 

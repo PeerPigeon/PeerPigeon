@@ -4488,23 +4488,24 @@ export default {
   The one loud thing is the network itself, drawn on a night sky.
 */
 #app {
-  --paper: #e9ecee;
-  --surface: #f6f7f8;
-  --ink: #1c2126;
-  --ink-2: #56616b;
-  --line: #c6ced4;
-  --line-strong: #9aa6af;
-  --wing: #d6dce0;
-  --slate: #6e7f8d;
-  --sheen: #2e7d6f;
-  --sheen-deep: #24665a;
-  --sheen-wash: #d3e6e1;
-  --mark: #d6b234;
-  --stop: #a8473d;
-  --stop-wash: #f1dcd8;
-  --night: #1b2228;
+  --paper: #e8f6f9;
+  --surface: #f5fbfc;
+  --ink: #2a3747;
+  --ink-2: #46586e;
+  --line: #bee6ee;
+  --line-strong: #8aa7b3;
+  --wing: #bee6ee;
+  --slate: #5a7187;
+  --sheen: #237a50;
+  --sheen-deep: #1b6140;
+  --sheen-wash: #d4f0e0;
+  --mark: #d9a93a;
+  --stop: #b4493d;
+  --stop-wash: #f6dcd8;
+  --night: #1b2430;
+  --on-sheen: #ffffff;
   --zebra: rgba(214, 220, 224, 0.35);
-  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2356616b' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2346586e' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   --radius: 6px;
   --font: 'Archivo', system-ui, sans-serif;
   --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
@@ -4522,33 +4523,34 @@ export default {
 :global(body) {
   margin: 0;
   padding: 0;
-  background: #e9ecee;
+  background: #e8f6f9;
 }
 
 :global(html[data-theme='dark']),
 :global(html[data-theme='dark'] body) {
-  background: #14191d;
+  background: #1b2430;
 }
 
-/* Night slate: the same feathers after dark. */
+/* Pickled Bluewood (deepened) and Cruise after dark, as PigeonAI, PigeonFS, PigeonChess and FreeRTC. */
 #app[data-theme='dark'] {
-  --paper: #14191d;
-  --surface: #1c2328;
-  --ink: #e3e8eb;
-  --ink-2: #98a4ad;
-  --line: #2b343b;
-  --line-strong: #44505a;
-  --wing: #252d33;
-  --slate: #8796a3;
-  --sheen: #3f9c88;
-  --sheen-deep: #4fb39f;
-  --sheen-wash: #1d3732;
-  --mark: #d6b234;
-  --stop: #e07a6d;
-  --stop-wash: #3a2522;
-  --night: #0e1215;
+  --paper: #1b2430;
+  --surface: #151d27;
+  --ink: #e8f6f9;
+  --ink-2: #9dbfc8;
+  --line: #2c394a;
+  --line-strong: #3d4c5f;
+  --wing: #151d27;
+  --slate: #8aa7b3;
+  --sheen: #7fd8a6;
+  --sheen-deep: #9ae3b9;
+  --sheen-wash: #1d3a30;
+  --mark: #f2c879;
+  --stop: #f29b91;
+  --stop-wash: #3d2a2e;
+  --night: #10161e;
+  --on-sheen: #1e2a37;
   --zebra: rgba(255, 255, 255, 0.025);
-  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2398a4ad' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239dbfc8' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 #app[data-theme='dark'] .msg-note.partial {
@@ -4699,7 +4701,7 @@ export default {
 .btn-go {
   border-color: var(--sheen);
   background: var(--sheen);
-  color: #fff;
+  color: var(--on-sheen);
 }
 
 .btn-go:hover:not(:disabled) {
