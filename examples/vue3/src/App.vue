@@ -316,6 +316,16 @@
               Saved here first. Get a key to fetch it from peers and keep following its changes.
               <span class="storage-state" :class="storageReady ? 'ready' : 'idle'">{{ storageReady ? 'Ready' : 'Waiting for this peer’s keys' }}</span>
             </p>
+            <p class="note storage-meta">
+              <span class="storage-servers" :class="storageServerCount ? 'ready' : 'idle'">
+                {{ storageServerCount ? `Kept on ${storageServerCount} storage server${storageServerCount === 1 ? '' : 's'}` : (storageServerLink ? 'Looking for storage servers…' : 'No storage servers yet') }}
+              </span>
+              <span class="storage-identity">
+                {{ tabIdentity ? 'This tab’s own identity' : 'This browser’s identity' }}
+                <button v-if="tabIdentity" type="button" class="link-button" @click="useBrowserIdentity">Use this browser’s</button>
+                <button v-else type="button" class="link-button" @click="useNewTabIdentity">New identity for this tab</button>
+              </span>
+            </p>
 
             <div class="storage-form">
               <label class="field">
@@ -527,7 +537,7 @@
 </template>
 
 <script>
-import { DEFAULT_SIGNALING_SERVERS, PartialMesh } from 'peerpigeon';
+import { DEFAULT_SIGNALING_SERVERS, PartialMesh, PeerPigeonNode, StorageServerLink } from 'peerpigeon';
 import { GossipProtocol } from 'peerpigeon';
 import { PeerPigeonStorage } from 'peerpigeon';
 import { PeerPigeonCryptoProtocol } from 'peerpigeon';
@@ -756,6 +766,10 @@ export default {
       storageIdentity: '',
       storagePeerScopeId: getOrCreateStoragePeerScopeId(),
       storageReady: false,
+      storageServerLink: null,
+      storageServerLinking: false,
+      storageServerCount: 0,
+      tabIdentity: false,
       storageBusy: false,
       storageError: '',
       storageActiveSpace: 'user',
@@ -1271,7 +1285,7 @@ export default {
       if (!normalizedSpace || !normalizedKey) return '';
       if (normalizedSpace !== 'user') return normalizedKey;
 
-      const owner = String(ownerId ?? this.storageUserId() ?? '').trim();
+      const owner = String(ownerId ?? this.storageOwnerId() ?? '').trim();
       if (!owner) return '';
       return `${owner}::${normalizedKey}`;
     },
@@ -1279,7 +1293,7 @@ export default {
     storageLookupUserId() {
       const lookup = String(this.storageLookupOwnerId || '').trim();
       if (lookup) return lookup;
-      return this.storageUserId();
+      return this.storageOwnerId();
     },
 
     inferInterestedUserOwner() {
@@ -1651,6 +1665,11 @@ export default {
       return this.normalizeStorageVersion(version);
     },
 
+    // Who owns this peer's user records: its signing key, once it has one (records are signed with it).
+    storageOwnerId() {
+      return String(this.cryptoKeys?.pub || this.storageUserId() || '').trim();
+    },
+
     storageUserId() {
       // Prefer epub (ECDH public key) as stable storage identity, but fall
       // back to mesh client ID so storage can come up before crypto identity
@@ -1826,8 +1845,18 @@ export default {
         gossip: this.gossip || undefined,
         sessionId: this.effectiveSessionId,
         dbName,
+        // Every change is signed with this peer's key: its user records stay its own.
+        signingKeys: this.cryptoKeys?.pub && this.cryptoKeys?.priv ? { pub: this.cryptoKeys.pub, priv: this.cryptoKeys.priv } : null,
       });
       await this.storage.init();
+      // The PigeonFS storage servers keep the room's records: a peer that comes back finds what it left,
+      // even with nobody else online. Reads wait for them a moment after joining.
+      this.storage.expectServers();
+      if (this.storageServerLink) {
+        await this.storage.attachServers(this.storageServerLink);
+        this.storageServerCount = this.storage.serverCount();
+      }
+      else this.linkStorageServers();
       for (const space of ['public', 'user', 'frozen', 'private', 'epublic']) {
         for (const interest of this.interestedKeysForSpace(space)) {
           const ownerId = space === 'user'
@@ -1862,6 +1891,62 @@ export default {
       await this.refreshStorageList({ silent: true, syncInterested: false });
 
       this.requestInterestedKeySync('storage-ready-init');
+    },
+
+    /**
+     * Finds the storage servers (PigeonFS servers announce the role 'storage' to the relays) through
+     * the relay this page uses, and links this room's storage to the closest ones.
+     */
+    async linkStorageServers() {
+      if (this.storageServerLink || this.storageServerLinking) return;
+      this.storageServerLinking = true;
+      try {
+        const mesh = this.mesh;
+        const until = Date.now() + 20_000;
+        const relayOf = () => String(mesh?.signalingClient?.currentSignalUrl || '');
+        while (!relayOf() && Date.now() < until && this.mesh === mesh) await new Promise((r) => setTimeout(r, 200));
+        const relay = relayOf();
+        if (!relay || this.mesh !== mesh) return;
+        const link = new StorageServerLink(PeerPigeonNode.serverScopeNode(
+          { signalingServer: relay, signalingServers: [relay], automaticSignalingServer: false },
+          { dialRoles: [] },
+        ));
+        this.storageServerLink = link;
+        link.on((event) => { if (event?.type === 'servers') this.storageServerCount = this.storage?.serverCount?.() ?? 0; });
+        if (this.storage) await this.storage.attachServers(link);
+        await link.start();
+      } catch (error) {
+        if (this.diagnosticLoggingEnabled) console.warn('Storage servers:', error);
+      } finally {
+        this.storageServerLinking = false;
+      }
+    },
+
+    closeStorageServerLink() {
+      const link = this.storageServerLink;
+      this.storageServerLink = null;
+      this.storageServerCount = 0;
+      if (link) link.close().catch(() => {});
+    },
+
+    // A new identity for this tab only (to be another person here); this browser's identity stays as it is.
+    async useNewTabIdentity() {
+      try {
+        sessionStorage.setItem(this.tabCryptoKey(), JSON.stringify(await generateRandomPair()));
+      } catch {
+        // without sessionStorage there is no per-tab identity to keep
+      }
+      location.reload();
+    },
+
+    // Back to the identity this browser keeps, after a tab identity.
+    useBrowserIdentity() {
+      try { sessionStorage.removeItem(this.tabCryptoKey()); } catch { /* nothing kept */ }
+      location.reload();
+    },
+
+    tabCryptoKey() {
+      return `${this.cryptoStorageKey}:tab:${this.effectiveSessionId}`;
     },
 
     teardownStorage() {
@@ -1908,7 +1993,7 @@ export default {
         }
 
         const allRecords = await this.storage.list(this.storageActiveSpace);
-        const selfOwner = this.storageUserId();
+        const selfOwner = this.storageOwnerId();
         const lookupOwner = this.storageActiveSpace === 'user' ? this.storageLookupUserId() : '';
         const userOwner = lookupOwner;
         const isRemoteUserLookup = this.storageActiveSpace === 'user'
@@ -2026,7 +2111,7 @@ export default {
       }
       const initialKey = String(this.storageFormKey || '').trim();
       const key = this.storageActiveSpace === 'user'
-        ? this.storageNormalizeUserKey(this.storageUserId(), initialKey)
+        ? this.storageNormalizeUserKey(this.storageOwnerId(), initialKey)
         : initialKey;
       if (!key) return;
 
@@ -2035,7 +2120,7 @@ export default {
       try {
         const value = this.parseStorageInput(this.storageFormValue);
         const space = this.storageActiveSpace;
-        const ownerId = this.storageUserId() || null;
+        const ownerId = this.storageOwnerId() || null;
         const storeKey = this.storageWireKey(space, key, ownerId);
         if (!storeKey) {
           throw new Error('missing owner public key for user space record');
@@ -2067,7 +2152,7 @@ export default {
       }
       const initialKey = String(this.storageFormKey || '').trim();
       const key = this.storageActiveSpace === 'user'
-        ? this.storageNormalizeUserKey(this.storageUserId(), initialKey)
+        ? this.storageNormalizeUserKey(this.storageOwnerId(), initialKey)
         : initialKey;
       if (!key) return;
 
@@ -2075,7 +2160,7 @@ export default {
       this.storageError = '';
       try {
         const space = this.storageActiveSpace;
-        const ownerId = this.storageUserId() || null;
+        const ownerId = this.storageOwnerId() || null;
         const storeKey = this.storageWireKey(space, key, ownerId);
         if (!storeKey) {
           throw new Error('missing owner public key for user space record');
@@ -2482,6 +2567,7 @@ export default {
       clearTimeout(this.meshConnectWarnTimer);
       this.meshConnectWarnTimer = null;
       this.teardownStorage();
+      this.closeStorageServerLink();
       const stoppedMesh = this.mesh;
       const stoppedGossip = this.gossip;
       if (this.cryptoProtocol) {
@@ -2595,13 +2681,17 @@ export default {
         }
       };
 
-      const sessionCryptoKey = `${this.cryptoStorageKey}:${this.effectiveSessionId}`;
-      // Keep identity tab-scoped: same tab survives reloads, separate tabs stay distinct peers.
-      let keys = parseStored(sessionStorage.getItem(sessionCryptoKey));
+      // The identity is this browser's, so a peer that comes back is the same person (and still owns
+      // its user records). A tab can take an identity of its own instead ("New identity for this tab").
+      const browserCryptoKey = `${this.cryptoStorageKey}:${this.effectiveSessionId}`;
+      const read = (store, key) => { try { return parseStored(store.getItem(key)); } catch { return null; } };
+      let keys = read(sessionStorage, this.tabCryptoKey());
+      this.tabIdentity = !!keys;
       if (!keys) {
-        keys = await generateRandomPair();
+        // A tab's identity from before (when every tab had its own) becomes the browser's, if it has none.
+        keys = read(localStorage, browserCryptoKey) ?? read(sessionStorage, browserCryptoKey) ?? await generateRandomPair();
         try {
-          sessionStorage.setItem(sessionCryptoKey, JSON.stringify(keys));
+          localStorage.setItem(browserCryptoKey, JSON.stringify(keys));
         } catch {
           // ignore storage failures
         }
@@ -5253,6 +5343,29 @@ select.input {
 
 .storage-state.ready {
   color: var(--sheen-deep);
+}
+
+.storage-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.35rem 1rem;
+}
+
+.storage-servers.ready {
+  color: var(--sheen-deep);
+  font-weight: 600;
+}
+
+.link-button {
+  margin-left: 0.35rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 .storage-form {
