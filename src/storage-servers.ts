@@ -218,6 +218,20 @@ async function sendLater(node: PeerPigeonNode, peerId: string, msg: unknown): Pr
   return false;
 }
 
+/**
+ * Bytes to a linked peer (sendBytes), now or, while its send buffer is full (many blobs at once), as soon
+ * as it drains: still as bytes. False when the peer is not linked (send base64 instead) or it never drains.
+ */
+async function sendBytesSoon(node: PeerPigeonNode, peerId: string, meta: Record<string, unknown>, bytes: Uint8Array): Promise<boolean> {
+  if (node.sendBytes(peerId, meta, bytes)) return true;
+  for (let wait = 10, spent = 0; spent < 15_000; spent += wait, wait = Math.min(200, wait * 2)) {
+    await new Promise((r) => setTimeout(r, wait));
+    if (!node.getConnectedPeers().includes(peerId)) return false;
+    if (node.sendBytes(peerId, meta, bytes)) return true;
+  }
+  return false;
+}
+
 let reqCounter = 0;
 const newReq = () => `${Date.now().toString(36)}-${(reqCounter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -332,10 +346,13 @@ export class StorageServerLink {
     return new Promise((resolve) => {
       const timer = setTimeout(() => { this.pending.delete(msg.req); this.listings.delete(msg.req); resolve(null); }, timeoutMs);
       this.pending.set(msg.req, { resolve, timer, from: peerId });
-      // With bytes: as one binary frame to the (linked) server; not linked or refused, as base64 instead.
-      if (bytes && this.node.sendBytes(peerId, msg, bytes)) return;
-      const sent = bytes ? this.send(peerId, { ...msg, d: toB64(bytes) } as Msg) : this.send(peerId, msg);
-      if (!sent) { clearTimeout(timer); this.pending.delete(msg.req); resolve(null); }
+      // With bytes: as one binary frame to the (linked) server, waiting for a full send buffer to drain;
+      // not linked, as base64 instead.
+      if (bytes) {
+        void sendBytesSoon(this.node, peerId, msg, bytes).then((ok) => { if (!ok) this.send(peerId, { ...msg, d: toB64(bytes) } as Msg); });
+        return;
+      }
+      if (!this.send(peerId, msg)) { clearTimeout(timer); this.pending.delete(msg.req); resolve(null); }
     });
   }
 
@@ -638,7 +655,7 @@ export class StorageServer {
       case 'bget': {
         const sealed = validId(data.addr) && this.store.getBlob ? await this.store.getBlob(data.addr) : null;
         // Asked by one that reads bytes (bin): as bytes, in one binary frame; else (or not linked) base64.
-        if (sealed && data.bin && this.node.sendBytes(from, { pp: PP, t: 'bgot', req: data.req }, sealed)) return;
+        if (sealed && data.bin && await sendBytesSoon(this.node, from, { pp: PP, t: 'bgot', req: data.req }, sealed)) return;
         this.send(from, { pp: PP, t: 'bgot', req: data.req, d: sealed ? toB64(sealed) : null });
         return;
       }

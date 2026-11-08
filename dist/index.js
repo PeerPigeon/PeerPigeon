@@ -3269,6 +3269,15 @@ async function sendLater(node, peerId, msg) {
   }
   return false;
 }
+async function sendBytesSoon(node, peerId, meta, bytes) {
+  if (node.sendBytes(peerId, meta, bytes)) return true;
+  for (let wait = 10, spent = 0; spent < 15e3; spent += wait, wait = Math.min(200, wait * 2)) {
+    await new Promise((r) => setTimeout(r, wait));
+    if (!node.getConnectedPeers().includes(peerId)) return false;
+    if (node.sendBytes(peerId, meta, bytes)) return true;
+  }
+  return false;
+}
 var reqCounter = 0;
 var newReq = () => `${Date.now().toString(36)}-${(reqCounter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 var StorageServerLink = class {
@@ -3388,9 +3397,13 @@ var StorageServerLink = class {
         resolve(null);
       }, timeoutMs);
       this.pending.set(msg.req, { resolve, timer, from: peerId });
-      if (bytes && this.node.sendBytes(peerId, msg, bytes)) return;
-      const sent = bytes ? this.send(peerId, { ...msg, d: toB64(bytes) }) : this.send(peerId, msg);
-      if (!sent) {
+      if (bytes) {
+        void sendBytesSoon(this.node, peerId, msg, bytes).then((ok) => {
+          if (!ok) this.send(peerId, { ...msg, d: toB64(bytes) });
+        });
+        return;
+      }
+      if (!this.send(peerId, msg)) {
         clearTimeout(timer);
         this.pending.delete(msg.req);
         resolve(null);
@@ -3687,7 +3700,7 @@ var StorageServer = class {
       }
       case "bget": {
         const sealed = validId(data.addr) && this.store.getBlob ? await this.store.getBlob(data.addr) : null;
-        if (sealed && data.bin && this.node.sendBytes(from, { pp: PP, t: "bgot", req: data.req }, sealed)) return;
+        if (sealed && data.bin && await sendBytesSoon(this.node, from, { pp: PP, t: "bgot", req: data.req }, sealed)) return;
         this.send(from, { pp: PP, t: "bgot", req: data.req, d: sealed ? toB64(sealed) : null });
         return;
       }
