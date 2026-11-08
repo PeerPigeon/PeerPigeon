@@ -136,10 +136,12 @@ type Msg =
   | { pp: typeof PP; t: 'watch'; room: string }
   | { pp: typeof PP; t: 'changed'; rec: Omit<ServerRecord, 'wh'> }
   | { pp: typeof PP; t: 'sync'; recs: ServerRecord[] }
-  | { pp: typeof PP; t: 'bput'; req?: string; addr: string; d: string }
-  | { pp: typeof PP; t: 'back'; req: string; ok: boolean }
-  | { pp: typeof PP; t: 'bget'; req: string; addr: string }
-  | { pp: typeof PP; t: 'bgot'; req: string; d: string | null };
+  // A blob goes as base64 ('d'), or as bytes ('bytes': sent by sendBytes, to one that reads them).
+  | { pp: typeof PP; t: 'bput'; req?: string; addr: string; d?: string; bytes?: Uint8Array }
+  | { pp: typeof PP; t: 'back'; req: string; ok: boolean; bytes?: Uint8Array }
+  // bin: the asker reads bytes (the answer may come as bytes).
+  | { pp: typeof PP; t: 'bget'; req: string; addr: string; bin?: 1 }
+  | { pp: typeof PP; t: 'bgot'; req: string; d?: string | null; bytes?: Uint8Array };
 
 export async function sha256Hex(text: string): Promise<string> {
   const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -233,6 +235,8 @@ type LinkListener = (event: { type: 'servers'; room: string; servers: string[] }
 export class StorageServerLink {
   private readonly hashed = new Map<string, string>();
   private readonly pending = new Map<string, { resolve: (m: Msg | null) => void; timer: ReturnType<typeof setTimeout>; from: string }>();
+  /** Servers that have sent us bytes (a blob, as bytes): they read them too. */
+  private readonly readsBytes = new Set<string>();
   private readonly listings = new Map<string, Omit<ServerRecord, 'wh'>[]>();
   private readonly rooms = new Map<string, string[]>();
   private readonly listeners = new Set<LinkListener>();
@@ -324,11 +328,14 @@ export class StorageServerLink {
     return true;
   }
 
-  private ask(peerId: string, msg: Msg & { req: string }, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Msg | null> {
+  private ask(peerId: string, msg: Msg & { req: string }, timeoutMs = REQUEST_TIMEOUT_MS, bytes?: Uint8Array): Promise<Msg | null> {
     return new Promise((resolve) => {
       const timer = setTimeout(() => { this.pending.delete(msg.req); this.listings.delete(msg.req); resolve(null); }, timeoutMs);
       this.pending.set(msg.req, { resolve, timer, from: peerId });
-      if (!this.send(peerId, msg)) { clearTimeout(timer); this.pending.delete(msg.req); resolve(null); }
+      // With bytes: as one binary frame to the (linked) server; not linked or refused, as base64 instead.
+      if (bytes && this.node.sendBytes(peerId, msg, bytes)) return;
+      const sent = bytes ? this.send(peerId, { ...msg, d: toB64(bytes) } as Msg) : this.send(peerId, msg);
+      if (!sent) { clearTimeout(timer); this.pending.delete(msg.req); resolve(null); }
     });
   }
 
@@ -352,6 +359,7 @@ export class StorageServerLink {
       return;
     }
     if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot') {
+      if ('bytes' in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve(data); }
     }
@@ -391,8 +399,13 @@ export class StorageServerLink {
   async putBlob(bytes: Uint8Array): Promise<number> {
     if (bytes.length > MAX_BLOB_BYTES) throw new Error(`a blob is at most ${MAX_BLOB_BYTES} bytes`);
     const { address, sealed } = await sealBlob(bytes);
-    const d = toB64(sealed);
-    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => this.ask(id, { pp: PP, t: 'bput', req: newReq(), addr: address, d }, BLOB_TIMEOUT_MS)));
+    let d: string | null = null;
+    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => {
+      const req = newReq();
+      // A server that has sent us bytes reads them too: the blob as bytes (no base64).
+      if (this.readsBytes.has(id)) return this.ask(id, { pp: PP, t: 'bput', req, addr: address }, BLOB_TIMEOUT_MS, sealed);
+      return this.ask(id, { pp: PP, t: 'bput', req, addr: address, d: (d ??= toB64(sealed)) }, BLOB_TIMEOUT_MS);
+    }));
     return acks.filter((a) => a?.t === 'back' && a.ok).length;
   }
 
@@ -400,9 +413,11 @@ export class StorageServerLink {
   async getBlob(hash: string): Promise<Uint8Array | null> {
     const address = await blobAddress(hash);
     for (const id of await this.serversForBlob(address)) {
-      const a = await this.ask(id, { pp: PP, t: 'bget', req: newReq(), addr: address }, BLOB_TIMEOUT_MS);
-      if (a?.t === 'bgot' && typeof a.d === 'string') {
-        const bytes = await openBlob(hash, fromB64(a.d));
+      // bin: we read bytes; a server that does answers with them, one that doesn't with base64 ('d').
+      const a = await this.ask(id, { pp: PP, t: 'bget', req: newReq(), addr: address, bin: 1 }, BLOB_TIMEOUT_MS);
+      const sealed = a?.t !== 'bgot' ? null : a.bytes instanceof Uint8Array ? a.bytes : typeof a.d === 'string' ? fromB64(a.d) : null;
+      if (sealed) {
+        const bytes = await openBlob(hash, sealed);
         if (bytes) return bytes;
       }
     }
@@ -601,16 +616,18 @@ export class StorageServer {
         return;
       }
       case 'bput': {
-        // A blob, from a peer or another server: kept if it fits, and passed to the other closest servers.
-        const ok = !!this.store.putBlob && validId(data.addr) && typeof data.d === 'string' && data.d.length <= Math.ceil(MAX_BLOB_BYTES / 3) * 4 + 64;
+        // A blob, from a peer or another server (as bytes, or base64 in 'd'): kept if it fits, and passed
+        // to the other closest servers.
+        const sealed = data.bytes instanceof Uint8Array ? data.bytes : typeof data.d === 'string' && data.d.length <= Math.ceil(MAX_BLOB_BYTES / 3) * 4 + 64 ? fromB64(data.d) : null;
+        const ok = !!this.store.putBlob && validId(data.addr) && !!sealed && sealed.length <= MAX_BLOB_BYTES + 64;
         if (ok) {
           const have = await this.store.getBlob!(data.addr);
           if (!have) {
-            await this.store.putBlob!(data.addr, fromB64(data.d));
+            await this.store.putBlob!(data.addr, sealed!);
             if (this.node.getPeerRole(from) !== STORAGE_SERVER_ROLE) {
               const selfId = this.node.getClientId();
               for (const id of closestIds(data.addr, await this.servers(), this.hashed)) {
-                if (id !== selfId && id !== from && this.node.getConnectedPeers().includes(id)) this.send(id, { pp: PP, t: 'bput', addr: data.addr, d: data.d });
+                if (id !== selfId && id !== from && this.node.getConnectedPeers().includes(id)) this.send(id, { pp: PP, t: 'bput', addr: data.addr, d: typeof data.d === 'string' ? data.d : toB64(sealed!) });
               }
             }
           }
@@ -620,6 +637,8 @@ export class StorageServer {
       }
       case 'bget': {
         const sealed = validId(data.addr) && this.store.getBlob ? await this.store.getBlob(data.addr) : null;
+        // Asked by one that reads bytes (bin): as bytes, in one binary frame; else (or not linked) base64.
+        if (sealed && data.bin && this.node.sendBytes(from, { pp: PP, t: 'bgot', req: data.req }, sealed)) return;
         this.send(from, { pp: PP, t: 'bgot', req: data.req, d: sealed ? toB64(sealed) : null });
         return;
       }

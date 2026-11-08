@@ -31,6 +31,15 @@ function makeScope() {
         queueMicrotask(() => nodes.get(to)?.emit('message', { kind: 'direct', fromPeerId: id, data: copy }));
         return 'ok';
       },
+      // Bytes (one binary frame): only to a linked node made to read them (bytesOk), as a real node's are.
+      sent: { bytes: 0, text: 0 },
+      sendBytes(to, meta, bytes) {
+        if (!n.links.has(to) || !n.bytesOk) return false;
+        n.sent.bytes++;
+        const copy = { ...JSON.parse(JSON.stringify(meta)), bytes: bytes.slice() };
+        queueMicrotask(() => nodes.get(to)?.emit('message', { kind: 'direct', fromPeerId: id, data: copy }));
+        return true;
+      },
     };
     nodes.set(id, n);
     return n;
@@ -169,4 +178,34 @@ test('a blob kept on the servers is found by its hash, sealed, and copied to the
   assert.equal(new TextDecoder().decode(got), 'a chunk of a file, or a part of a model');
   assert.equal(await b.link.getBlob('0'.repeat(64)), null);
   await a.link.close(); await b.link.close();
+});
+
+test('blobs go as bytes between nodes that read them (no base64), and as base64 to one that does not', async () => {
+  const scope = makeScope();
+  const srv = await server(scope, '1');
+  const a = await peer(scope, 'a');
+  await settle();
+  const srvNode = srv.node, aNode = a.link.node;
+  srvNode.bytesOk = true; aNode.bytesOk = true;
+  const bytes = new Uint8Array(131072).map((_, i) => (i * 13) & 255);
+  const { createHash } = await import('node:crypto');
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  // The first put: the server is not known to read bytes yet (base64); the get asks for bytes.
+  assert.equal(await a.link.putBlob(bytes), 1);
+  const got = await a.link.getBlob(hash);
+  assert.deepEqual(got, bytes);
+  assert.equal(srvNode.sent.bytes, 1, 'the server answered with bytes');
+  // Known now to read bytes: the next put goes as bytes too.
+  const more = bytes.map((x) => x ^ 1);
+  assert.equal(await a.link.putBlob(more), 1);
+  assert.equal(aNode.sent.bytes, 1, 'the peer put it as bytes');
+  assert.deepEqual(await a.link.getBlob(createHash('sha256').update(more).digest('hex')), more);
+  // A peer that does not read bytes (an older one): asked without bin, it gets base64.
+  const b = await peer(scope, 'b');
+  await settle();
+  const before = srvNode.sent.bytes;
+  b.link.node.bytesOk = false;
+  assert.deepEqual(await b.link.getBlob(hash), bytes);
+  await a.link.close(); await b.link.close();
+  assert.ok(srvNode.sent.bytes >= before);
 });

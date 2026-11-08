@@ -3276,6 +3276,8 @@ var StorageServerLink = class {
     this.node = node;
     this.hashed = /* @__PURE__ */ new Map();
     this.pending = /* @__PURE__ */ new Map();
+    /** Servers that have sent us bytes (a blob, as bytes): they read them too. */
+    this.readsBytes = /* @__PURE__ */ new Set();
     this.listings = /* @__PURE__ */ new Map();
     this.rooms = /* @__PURE__ */ new Map();
     this.listeners = /* @__PURE__ */ new Set();
@@ -3378,7 +3380,7 @@ var StorageServerLink = class {
     void sendLater(this.node, peerId, msg);
     return true;
   }
-  ask(peerId, msg, timeoutMs = REQUEST_TIMEOUT_MS) {
+  ask(peerId, msg, timeoutMs = REQUEST_TIMEOUT_MS, bytes) {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         this.pending.delete(msg.req);
@@ -3386,7 +3388,9 @@ var StorageServerLink = class {
         resolve(null);
       }, timeoutMs);
       this.pending.set(msg.req, { resolve, timer, from: peerId });
-      if (!this.send(peerId, msg)) {
+      if (bytes && this.node.sendBytes(peerId, msg, bytes)) return;
+      const sent = bytes ? this.send(peerId, { ...msg, d: toB64(bytes) }) : this.send(peerId, msg);
+      if (!sent) {
         clearTimeout(timer);
         this.pending.delete(msg.req);
         resolve(null);
@@ -3424,6 +3428,7 @@ var StorageServerLink = class {
       return;
     }
     if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot") {
+      if ("bytes" in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) {
         clearTimeout(p.timer);
@@ -3462,17 +3467,22 @@ var StorageServerLink = class {
   async putBlob(bytes) {
     if (bytes.length > MAX_BLOB_BYTES) throw new Error(`a blob is at most ${MAX_BLOB_BYTES} bytes`);
     const { address, sealed } = await sealBlob(bytes);
-    const d = toB64(sealed);
-    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => this.ask(id, { pp: PP, t: "bput", req: newReq(), addr: address, d }, BLOB_TIMEOUT_MS)));
+    let d = null;
+    const acks = await Promise.all((await this.serversForBlob(address)).map((id) => {
+      const req = newReq();
+      if (this.readsBytes.has(id)) return this.ask(id, { pp: PP, t: "bput", req, addr: address }, BLOB_TIMEOUT_MS, sealed);
+      return this.ask(id, { pp: PP, t: "bput", req, addr: address, d: d ?? (d = toB64(sealed)) }, BLOB_TIMEOUT_MS);
+    }));
     return acks.filter((a) => a?.t === "back" && a.ok).length;
   }
   /** Content by its SHA-256 from the servers, checked; null if none has it. */
   async getBlob(hash) {
     const address = await blobAddress(hash);
     for (const id of await this.serversForBlob(address)) {
-      const a = await this.ask(id, { pp: PP, t: "bget", req: newReq(), addr: address }, BLOB_TIMEOUT_MS);
-      if (a?.t === "bgot" && typeof a.d === "string") {
-        const bytes = await openBlob(hash, fromB64(a.d));
+      const a = await this.ask(id, { pp: PP, t: "bget", req: newReq(), addr: address, bin: 1 }, BLOB_TIMEOUT_MS);
+      const sealed = a?.t !== "bgot" ? null : a.bytes instanceof Uint8Array ? a.bytes : typeof a.d === "string" ? fromB64(a.d) : null;
+      if (sealed) {
+        const bytes = await openBlob(hash, sealed);
         if (bytes) return bytes;
       }
     }
@@ -3658,15 +3668,16 @@ var StorageServer = class {
         return;
       }
       case "bput": {
-        const ok = !!this.store.putBlob && validId(data.addr) && typeof data.d === "string" && data.d.length <= Math.ceil(MAX_BLOB_BYTES / 3) * 4 + 64;
+        const sealed = data.bytes instanceof Uint8Array ? data.bytes : typeof data.d === "string" && data.d.length <= Math.ceil(MAX_BLOB_BYTES / 3) * 4 + 64 ? fromB64(data.d) : null;
+        const ok = !!this.store.putBlob && validId(data.addr) && !!sealed && sealed.length <= MAX_BLOB_BYTES + 64;
         if (ok) {
           const have = await this.store.getBlob(data.addr);
           if (!have) {
-            await this.store.putBlob(data.addr, fromB64(data.d));
+            await this.store.putBlob(data.addr, sealed);
             if (this.node.getPeerRole(from) !== STORAGE_SERVER_ROLE) {
               const selfId = this.node.getClientId();
               for (const id of closestIds(data.addr, await this.servers(), this.hashed)) {
-                if (id !== selfId && id !== from && this.node.getConnectedPeers().includes(id)) this.send(id, { pp: PP, t: "bput", addr: data.addr, d: data.d });
+                if (id !== selfId && id !== from && this.node.getConnectedPeers().includes(id)) this.send(id, { pp: PP, t: "bput", addr: data.addr, d: typeof data.d === "string" ? data.d : toB64(sealed) });
               }
             }
           }
@@ -3676,6 +3687,7 @@ var StorageServer = class {
       }
       case "bget": {
         const sealed = validId(data.addr) && this.store.getBlob ? await this.store.getBlob(data.addr) : null;
+        if (sealed && data.bin && this.node.sendBytes(from, { pp: PP, t: "bgot", req: data.req }, sealed)) return;
         this.send(from, { pp: PP, t: "bgot", req: data.req, d: sealed ? toB64(sealed) : null });
         return;
       }
@@ -5982,6 +5994,28 @@ async function discoverClosestSignalingServer(options) {
   if (ranked.length === 0) throw new Error("No valid FreeRTC relays are available");
   return ranked[0];
 }
+var BYTES_MAGIC = [80, 80, 66, 49];
+function encodeBytesFrame(meta, bytes) {
+  const m = new TextEncoder().encode(JSON.stringify(meta));
+  const out = new Uint8Array(8 + m.length + bytes.length);
+  out.set(BYTES_MAGIC, 0);
+  new DataView(out.buffer).setUint32(4, m.length);
+  out.set(m, 8);
+  out.set(bytes, 8 + m.length);
+  return out;
+}
+function decodeBytesFrame(frame) {
+  if (frame.length < 8 || BYTES_MAGIC.some((b, i) => frame[i] !== b)) return null;
+  const n = new DataView(frame.buffer, frame.byteOffset, frame.byteLength).getUint32(4);
+  if (8 + n > frame.length) return null;
+  try {
+    const meta = JSON.parse(new TextDecoder().decode(frame.subarray(8, 8 + n)));
+    if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null;
+    return { meta, bytes: frame.subarray(8 + n) };
+  } catch {
+    return null;
+  }
+}
 var PartialMesh = class {
   constructor(config = {}) {
     this.peers = /* @__PURE__ */ new Map();
@@ -6124,6 +6158,7 @@ var PartialMesh = class {
       "peer:connected",
       "peer:disconnected",
       "peer:data",
+      "peer:bytes",
       "peer:error",
       "peer:discovered",
       "mesh:ready",
@@ -7073,6 +7108,11 @@ var PartialMesh = class {
       this.emit("signaling:log", { message: `[signal] ${peerId.slice(0, 12)} is on no relay: no longer dialling it` });
     });
     this.signalingClient.on("rtc:data", (data) => {
+      if (data.data instanceof Uint8Array) {
+        const decoded = decodeBytesFrame(data.data);
+        if (decoded) this.emit("peer:bytes", { peerId: data.peerId, meta: decoded.meta, bytes: decoded.bytes });
+        return;
+      }
       const msg = this.tryParseMembership(data.data);
       if (msg) {
         this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, msg.topology, data.peerId, msg.records);
@@ -7680,6 +7720,20 @@ var PartialMesh = class {
       this.signalingClient.send(peerId, data);
     } else {
       throw new Error(`Peer ${peerId} is not connected`);
+    }
+  }
+  /**
+   * A message with bytes to a linked neighbour, as one binary frame (no base64, no JSON escaping):
+   * false when the peer is not linked or the frame is refused. The receiver must read them (it said so).
+   */
+  sendBytes(peerId, meta, bytes) {
+    const peerConnection = this.peers.get(peerId);
+    if (!peerConnection?.connected) return false;
+    try {
+      this.signalingClient.send(peerId, encodeBytesFrame(meta, bytes));
+      return true;
+    } catch {
+      return false;
     }
   }
   /**
@@ -8580,6 +8634,14 @@ var PeerPigeonNode = class _PeerPigeonNode {
   getConnectedPeers() {
     return this.mesh.getConnectedPeers();
   }
+  /**
+   * A direct message with bytes to a linked neighbour, in one binary frame: it arrives as a 'message'
+   * (kind 'direct') whose data is `meta` with `bytes` added. Only to a peer that reads them (one that
+   * asked for bytes); false when it can't go (not linked: send without bytes instead).
+   */
+  sendBytes(peerId, meta, bytes) {
+    return this.mesh.sendBytes(peerId, meta, bytes);
+  }
   getLinkLog() {
     return this.mesh.getLinkLog();
   }
@@ -8766,6 +8828,9 @@ var PeerPigeonNode = class _PeerPigeonNode {
         hops: message.hops,
         message
       });
+    });
+    this.mesh.on("peer:bytes", ({ peerId, meta, bytes }) => {
+      this.emit("message", { kind: "direct", data: { ...meta, bytes }, encrypted: false, local: false, fromPeerId: peerId, messageId: "", hops: 0, message: null });
     });
     this.gossip.on("deliveryProgress", (status) => this.emit("deliveryProgress", status));
     this.gossip.on("deliveryComplete", (status) => this.emit("deliveryComplete", status));

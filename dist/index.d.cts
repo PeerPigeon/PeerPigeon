@@ -61,6 +61,8 @@ declare class StorageServerLink {
     private readonly node;
     private readonly hashed;
     private readonly pending;
+    /** Servers that have sent us bytes (a blob, as bytes): they read them too. */
+    private readonly readsBytes;
     private readonly listings;
     private readonly rooms;
     private readonly listeners;
@@ -1523,6 +1525,11 @@ type PartialMeshEvents = {
         peerId: string;
         data: any;
     }) => void;
+    'peer:bytes': (data: {
+        peerId: string;
+        meta: Record<string, unknown>;
+        bytes: Uint8Array;
+    }) => void;
     'peer:error': (data: {
         peerId: string;
         error: any;
@@ -1533,11 +1540,6 @@ type PartialMeshEvents = {
     'mesh:capacity': (capacities: PeerCapacitySnapshot[]) => void;
     'mesh:graph': (snapshot: PeerGraphSnapshot) => void;
 };
-/**
- * PartialMesh - WebRTC peer-to-peer partial mesh networking library
- *
- * Uses FreeRTC for signaling and maintains a configurable number of peer connections.
- */
 declare class PartialMesh {
     private config;
     private readonly role;
@@ -1756,6 +1758,11 @@ declare class PartialMesh {
      */
     send(peerId: string, data: string | ArrayBuffer | ArrayBufferView): void;
     /**
+     * A message with bytes to a linked neighbour, as one binary frame (no base64, no JSON escaping):
+     * false when the peer is not linked or the frame is refused. The receiver must read them (it said so).
+     */
+    sendBytes(peerId: string, meta: Record<string, unknown>, bytes: Uint8Array): boolean;
+    /**
      * Broadcast data to all connected peers
      */
     broadcast(data: string | ArrayBuffer | ArrayBufferView): void;
@@ -1959,6 +1966,12 @@ declare class PeerPigeonNode {
     getCecrState(): CecrStateSnapshot;
     getClientId(): string | null;
     getConnectedPeers(): string[];
+    /**
+     * A direct message with bytes to a linked neighbour, in one binary frame: it arrives as a 'message'
+     * (kind 'direct') whose data is `meta` with `bytes` added. Only to a peer that reads them (one that
+     * asked for bytes); false when it can't go (not linked: send without bytes instead).
+     */
+    sendBytes(peerId: string, meta: Record<string, unknown>, bytes: Uint8Array): boolean;
     getLinkLog(): {
         at: number;
         peer: string;

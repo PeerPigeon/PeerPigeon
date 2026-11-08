@@ -745,6 +745,7 @@ export type PartialMeshEvents = {
   'peer:connected': (peerId: string) => void;
   'peer:disconnected': (peerId: string) => void;
   'peer:data': (data: { peerId: string; data: any }) => void;
+  'peer:bytes': (data: { peerId: string; meta: Record<string, unknown>; bytes: Uint8Array }) => void;
   'peer:error': (data: { peerId: string; error: any }) => void;
   'peer:discovered': (peerId: string) => void;
   'mesh:ready': () => void;
@@ -758,6 +759,29 @@ export type PartialMeshEvents = {
  * 
  * Uses FreeRTC for signaling and maintains a configurable number of peer connections.
  */
+// A message with bytes, as one binary frame: 'PPB1', the message's length (u32, big-endian), the message
+// (JSON), then the bytes.
+const BYTES_MAGIC = [0x50, 0x50, 0x42, 0x31];
+function encodeBytesFrame(meta: Record<string, unknown>, bytes: Uint8Array): Uint8Array {
+  const m = new TextEncoder().encode(JSON.stringify(meta));
+  const out = new Uint8Array(8 + m.length + bytes.length);
+  out.set(BYTES_MAGIC, 0);
+  new DataView(out.buffer).setUint32(4, m.length);
+  out.set(m, 8);
+  out.set(bytes, 8 + m.length);
+  return out;
+}
+function decodeBytesFrame(frame: Uint8Array): { meta: Record<string, unknown>; bytes: Uint8Array } | null {
+  if (frame.length < 8 || BYTES_MAGIC.some((b, i) => frame[i] !== b)) return null;
+  const n = new DataView(frame.buffer, frame.byteOffset, frame.byteLength).getUint32(4);
+  if (8 + n > frame.length) return null;
+  try {
+    const meta = JSON.parse(new TextDecoder().decode(frame.subarray(8, 8 + n)));
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return null;
+    return { meta, bytes: frame.subarray(8 + n) };
+  } catch { return null; }
+}
+
 export class PartialMesh {
   private config: Required<Omit<PartialMeshConfig, 'role' | 'dialRoles'>>;
   private readonly role: string | null;
@@ -902,6 +926,7 @@ export class PartialMesh {
       'peer:connected',
       'peer:disconnected',
       'peer:data',
+      'peer:bytes',
       'peer:error',
       'peer:discovered',
       'mesh:ready',
@@ -2107,6 +2132,12 @@ export class PartialMesh {
     });
 
     this.signalingClient.on('rtc:data', (data: { peerId: string; data: any }) => {
+      // Bytes with a message (sendBytes): handed on as such, not parsed as text.
+      if (data.data instanceof Uint8Array) {
+        const decoded = decodeBytesFrame(data.data);
+        if (decoded) this.emit('peer:bytes', { peerId: data.peerId, meta: decoded.meta, bytes: decoded.bytes });
+        return;
+      }
       const msg = this.tryParseMembership(data.data);
       if (msg) {
         this.mergeMembership(msg.peers, msg.retiredPeers, msg.capacities, msg.topology, data.peerId, msg.records);
@@ -3014,6 +3045,16 @@ export class PartialMesh {
     } else {
       throw new Error(`Peer ${peerId} is not connected`);
     }
+  }
+
+  /**
+   * A message with bytes to a linked neighbour, as one binary frame (no base64, no JSON escaping):
+   * false when the peer is not linked or the frame is refused. The receiver must read them (it said so).
+   */
+  public sendBytes(peerId: string, meta: Record<string, unknown>, bytes: Uint8Array): boolean {
+    const peerConnection = this.peers.get(peerId);
+    if (!peerConnection?.connected) return false;
+    try { this.signalingClient.send(peerId, encodeBytesFrame(meta, bytes)); return true; } catch { return false; }
   }
 
   /**
@@ -4171,6 +4212,15 @@ export class PeerPigeonNode {
 
   getClientId(): string | null { return this.mesh.getClientId(); }
   getConnectedPeers(): string[] { return this.mesh.getConnectedPeers(); }
+
+  /**
+   * A direct message with bytes to a linked neighbour, in one binary frame: it arrives as a 'message'
+   * (kind 'direct') whose data is `meta` with `bytes` added. Only to a peer that reads them (one that
+   * asked for bytes); false when it can't go (not linked: send without bytes instead).
+   */
+  sendBytes(peerId: string, meta: Record<string, unknown>, bytes: Uint8Array): boolean {
+    return this.mesh.sendBytes(peerId, meta, bytes);
+  }
   getLinkLog() { return this.mesh.getLinkLog(); }
   getDiscoveredPeers(): string[] { return this.mesh.getDiscoveredPeers(); }
   /** The role a relay listed this peer with, or null. */
@@ -4384,6 +4434,10 @@ export class PeerPigeonNode {
         hops: message.hops,
         message,
       });
+    });
+    // Bytes from a neighbour (sendBytes): a direct message whose data carries them.
+    this.mesh.on('peer:bytes', ({ peerId, meta, bytes }) => {
+      this.emit('message', { kind: 'direct', data: { ...meta, bytes }, encrypted: false, local: false, fromPeerId: peerId, messageId: '', hops: 0, message: null as never });
     });
     this.gossip.on('deliveryProgress', (status) => this.emit('deliveryProgress', status));
     this.gossip.on('deliveryComplete', (status) => this.emit('deliveryComplete', status));
