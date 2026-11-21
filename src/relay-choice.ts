@@ -21,6 +21,7 @@
 // Scores come from this peer's own joins and from what its neighbours share
 // (RelayScoreBook); this peer's own measurements count three times as much.
 
+import { subtle } from './subtle.js';
 export type RelayKind = 'cloud' | 'local';
 
 export interface RelayInfo {
@@ -61,7 +62,7 @@ function hexBytes(hex: string): Uint8Array {
 }
 
 async function sha256Bytes(text: string): Promise<Uint8Array> {
-  return new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
+  return new Uint8Array(await subtle().digest('SHA-256', new TextEncoder().encode(text)));
 }
 
 function compareDistance(a: Uint8Array, b: Uint8Array, target: Uint8Array): number {

@@ -1,3 +1,4 @@
+import { subtle } from './subtle.js';
 import { decryptMessageWithMeta, encryptMessageWithMeta, generateRandomPair, hasPostQuantumKeys, upgradePair } from 'unsea';
 import type { DirectMessage, GossipBroadcastOptions, GossipMessage } from './gossip.js';
 
@@ -273,7 +274,7 @@ export class PeerPigeonCryptoProtocol {
     const cryptoApi = this.cryptoApi();
     const key = await this.deriveRoomKey();
     const iv = cryptoApi.getRandomValues(new Uint8Array(12));
-    const cipher = await cryptoApi.subtle.encrypt(
+    const cipher = await subtle().encrypt(
       { name: 'AES-GCM', iv },
       key,
       new TextEncoder().encode(String(plaintext))
@@ -283,8 +284,7 @@ export class PeerPigeonCryptoProtocol {
 
   async decryptRoom(cipher: RoomCipher): Promise<string> {
     if (!cipher || cipher.alg !== 'A256GCM') throw new Error('Unsupported room cipher');
-    const cryptoApi = this.cryptoApi();
-    const plaintext = await cryptoApi.subtle.decrypt(
+    const plaintext = await subtle().decrypt(
       { name: 'AES-GCM', iv: this.fromBase64Url(cipher.iv) as BufferSource },
       await this.deriveRoomKey(),
       this.fromBase64Url(cipher.ct) as BufferSource
@@ -550,19 +550,18 @@ export class PeerPigeonCryptoProtocol {
   }
 
   private async deriveRoomKey(): Promise<CryptoKey> {
-    const cryptoApi = this.cryptoApi();
     const roomScope = this.options.roomSecret
       ? `${this.options.roomId}:${this.options.roomSecret}`
       : this.options.roomId;
     const seed = new TextEncoder().encode(
       `peerpigeon:room-broadcast:v1:${roomScope}`
     );
-    const hash = await cryptoApi.subtle.digest('SHA-256', seed);
-    return await cryptoApi.subtle.importKey('raw', hash, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const hash = await subtle().digest('SHA-256', seed);
+    return await subtle().importKey('raw', hash, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
   }
 
   private cryptoApi(): Crypto {
-    if (!globalThis.crypto?.subtle) throw new Error('WebCrypto is unavailable');
+    if (!globalThis.crypto?.getRandomValues) throw new Error('WebCrypto is unavailable');
     return globalThis.crypto;
   }
 

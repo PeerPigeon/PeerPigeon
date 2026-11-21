@@ -2954,6 +2954,10 @@ _GossipProtocol.MAX_REPLAYS_PER_PEER = 3;
 _GossipProtocol.ANTI_ENTROPY_RESEND_MS = 3e4;
 var GossipProtocol = _GossipProtocol;
 
+// src/subtle.ts
+var import_unsea = require("unsea");
+var subtle = () => (0, import_unsea.getSubtle)();
+
 // src/relay-choice.ts
 var RELAY_CANDIDATES = 5;
 var RELAY_VIRTUAL_IDS = 4;
@@ -2971,7 +2975,7 @@ function hexBytes(hex) {
   return Uint8Array.from({ length: hex.length / 2 }, (_, i) => Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16));
 }
 async function sha256Bytes(text) {
-  return new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  return new Uint8Array(await subtle().digest("SHA-256", new TextEncoder().encode(text)));
 }
 function compareDistance(a, b, target) {
   for (let i = 0; i < target.length; i += 1) {
@@ -3219,10 +3223,10 @@ var RelayScoreBook = class _RelayScoreBook {
 };
 
 // src/storage.ts
-var import_unsea2 = require("unsea");
+var import_unsea3 = require("unsea");
 
 // src/storage-servers.ts
-var import_unsea = require("unsea");
+var import_unsea2 = require("unsea");
 var STORAGE_SERVER_NETWORK = "peerpigeon-storage";
 var STORAGE_SERVER_ROOM = "servers";
 var STORAGE_SERVER_ROLE = "storage";
@@ -3239,7 +3243,7 @@ async function ownerSigned(rec) {
   if (rec.owner === void 0 && rec.osig === void 0) return true;
   if (typeof rec.owner !== "string" || typeof rec.osig !== "string") return false;
   try {
-    return await (0, import_unsea.verifyMessage)(await ownerText(rec), rec.osig, rec.owner);
+    return await (0, import_unsea2.verifyMessage)(await ownerText(rec), rec.osig, rec.owner);
   } catch {
     return false;
   }
@@ -3247,11 +3251,11 @@ async function ownerSigned(rec) {
 var MAX_BLOB_BYTES = 160 * 1024;
 var hexBytes2 = (hex) => Uint8Array.from(hex.match(/../g), (h) => parseInt(h, 16));
 async function sha256Bytes2(bytes) {
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  const digest = await subtle().digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 async function blobKey(hash) {
-  const key = await globalThis.crypto.subtle.importKey("raw", hexBytes2(await sha256Hex(`pp-blob-key-v1:${hash}`)), "AES-GCM", false, ["encrypt", "decrypt"]);
+  const key = await subtle().importKey("raw", hexBytes2(await sha256Hex(`pp-blob-key-v1:${hash}`)), "AES-GCM", false, ["encrypt", "decrypt"]);
   return { key, iv: hexBytes2(await sha256Hex(`pp-blob-iv-v1:${hash}`)).slice(0, 12) };
 }
 function blobAddress(hash) {
@@ -3260,13 +3264,13 @@ function blobAddress(hash) {
 async function sealBlob(bytes) {
   const hash = await sha256Bytes2(bytes);
   const { key, iv } = await blobKey(hash);
-  const sealed = new Uint8Array(await globalThis.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, bytes));
+  const sealed = new Uint8Array(await subtle().encrypt({ name: "AES-GCM", iv }, key, bytes));
   return { hash, address: await blobAddress(hash), sealed };
 }
 async function openBlob(hash, sealed) {
   try {
     const { key, iv } = await blobKey(hash);
-    const bytes = new Uint8Array(await globalThis.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, sealed));
+    const bytes = new Uint8Array(await subtle().decrypt({ name: "AES-GCM", iv }, key, sealed));
     return await sha256Bytes2(bytes) === hash ? bytes : null;
   } catch {
     return null;
@@ -3284,7 +3288,7 @@ function fromB64(text) {
   return out;
 }
 async function sha256Hex(text) {
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  const digest = await subtle().digest("SHA-256", new TextEncoder().encode(text));
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 function xorDistance(a, b) {
@@ -4258,12 +4262,12 @@ var PeerPigeonStorage = class {
         if (typeof mutation.signer !== "string" || typeof mutation.sig !== "string") return null;
         const existing = await this.requireDriver().get(this.makePk(mutation.space, mutation.key));
         const text = this.signedText("delete", { space: mutation.space, key: mutation.key, ownerId: existing?.ownerId ?? null, value: null, version: 0, updatedAt: mutation.timestamp });
-        return await (0, import_unsea2.verifyMessage)(text, mutation.sig, mutation.signer) ? mutation.signer : null;
+        return await (0, import_unsea3.verifyMessage)(text, mutation.sig, mutation.signer) ? mutation.signer : null;
       }
       const r = mutation.record;
       if (!r || typeof r.signer !== "string" || typeof r.sig !== "string") return null;
       if (r.updatedAt !== mutation.timestamp || r.space !== mutation.space || r.key !== mutation.key) return null;
-      return await (0, import_unsea2.verifyMessage)(this.signedText("upsert", r), r.sig, r.signer) ? r.signer : null;
+      return await (0, import_unsea3.verifyMessage)(this.signedText("upsert", r), r.sig, r.signer) ? r.signer : null;
     } catch {
       return null;
     }
@@ -4368,12 +4372,12 @@ var PeerPigeonStorage = class {
         const signer = mutation.op === "delete" ? mutation.signer : mutation.record?.signer;
         if (!this.signingKeys || this.signingKeys.pub !== this.owner || signer !== this.owner) return 0;
         rec.owner = this.owner;
-        rec.osig = await (0, import_unsea2.signMessage)(await ownerText(rec), this.signingKeys.priv);
+        rec.osig = await (0, import_unsea3.signMessage)(await ownerText(rec), this.signingKeys.priv);
       } else if (mutation.space === "user" && this.signingKeys) {
         const signer = mutation.op === "delete" ? mutation.signer : mutation.record?.signer;
         if (signer !== this.signingKeys.pub) return 0;
         rec.owner = this.signingKeys.pub;
-        rec.osig = await (0, import_unsea2.signMessage)(await ownerText(rec), this.signingKeys.priv);
+        rec.osig = await (0, import_unsea3.signMessage)(await ownerText(rec), this.signingKeys.priv);
       }
       return await this.servers.put(rec, write);
     } catch {
@@ -4475,7 +4479,7 @@ var PeerPigeonStorage = class {
     };
     if (this.signingKeys && space !== "private") {
       persisted.signer = this.signingKeys.pub;
-      persisted.sig = await (0, import_unsea2.signMessage)(this.signedText("upsert", persisted), this.signingKeys.priv);
+      persisted.sig = await (0, import_unsea3.signMessage)(this.signedText("upsert", persisted), this.signingKeys.priv);
     }
     await driver.put(persisted);
     const opId = this.makeMutationId(actorId);
@@ -4540,7 +4544,7 @@ var PeerPigeonStorage = class {
     };
     if (this.signingKeys && space !== "private") {
       mutation.signer = this.signingKeys.pub;
-      mutation.sig = await (0, import_unsea2.signMessage)(this.signedText("delete", { space, key: normalizedKey, ownerId: existing.ownerId, value: null, version: 0, updatedAt: mutation.timestamp }), this.signingKeys.priv);
+      mutation.sig = await (0, import_unsea3.signMessage)(this.signedText("delete", { space, key: normalizedKey, ownerId: existing.ownerId, value: null, version: 0, updatedAt: mutation.timestamp }), this.signingKeys.priv);
     }
     this.emitChange({
       origin: "local",
@@ -5297,12 +5301,9 @@ var PeerPigeonStorage = class {
     return await this.decryptJson(cipher, key);
   }
   async deriveAesKey(seed) {
-    if (!globalThis.crypto?.subtle) {
-      throw new Error("WebCrypto subtle API is required for encrypted storage sync");
-    }
     const seedBytes = new TextEncoder().encode(seed);
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", seedBytes);
-    return await globalThis.crypto.subtle.importKey(
+    const digest = await subtle().digest("SHA-256", seedBytes);
+    return await subtle().importKey(
       "raw",
       digest,
       { name: "AES-GCM", length: 256 },
@@ -5315,7 +5316,7 @@ var PeerPigeonStorage = class {
     const ivView = new Uint8Array(ivBuffer);
     globalThis.crypto.getRandomValues(ivView);
     const plainBytes = new TextEncoder().encode(JSON.stringify(value));
-    const cipherBuffer = await globalThis.crypto.subtle.encrypt(
+    const cipherBuffer = await subtle().encrypt(
       { name: "AES-GCM", iv: ivBuffer },
       key,
       plainBytes
@@ -5333,7 +5334,7 @@ var PeerPigeonStorage = class {
     const data = this.fromBase64Url(cipher.ct);
     const cipherCopy = new Uint8Array(new ArrayBuffer(data.byteLength));
     cipherCopy.set(data);
-    const plainBuffer = await globalThis.crypto.subtle.decrypt(
+    const plainBuffer = await subtle().decrypt(
       { name: "AES-GCM", iv: ivCopy },
       key,
       cipherCopy
@@ -5367,7 +5368,7 @@ var PeerPigeonStorage = class {
 };
 
 // src/crypto.ts
-var import_unsea3 = require("unsea");
+var import_unsea4 = require("unsea");
 var CRYPTO_PUBLIC_INFO_TYPE = "pp-crypto-public-info-v1";
 var CRYPTO_PUBLIC_REQUEST_TYPE = "pp-crypto-public-request-v1";
 var KEY_REQUEST_MIN_INTERVAL_MS = 5e3;
@@ -5415,9 +5416,9 @@ var PeerPigeonCryptoProtocol = class {
   }
   async init() {
     if (this.initialized) return;
-    const pair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await (0, import_unsea3.generateRandomPair)();
+    const pair = this.options.keyPair ?? this.loadStoredKeyPair() ?? await (0, import_unsea4.generateRandomPair)();
     this.validateKeyPair(pair);
-    this.keyPair = (0, import_unsea3.hasPostQuantumKeys)(pair) && pair.kpriv ? pair : (0, import_unsea3.upgradePair)(pair);
+    this.keyPair = (0, import_unsea4.hasPostQuantumKeys)(pair) && pair.kpriv ? pair : (0, import_unsea4.upgradePair)(pair);
     this.persistKeyPair(this.keyPair);
     this.initialized = true;
     this.gossip.on("messageReceived", this.onGossipMessageBound);
@@ -5491,7 +5492,7 @@ var PeerPigeonCryptoProtocol = class {
     const cryptoApi = this.cryptoApi();
     const key = await this.deriveRoomKey();
     const iv = cryptoApi.getRandomValues(new Uint8Array(12));
-    const cipher = await cryptoApi.subtle.encrypt(
+    const cipher = await subtle().encrypt(
       { name: "AES-GCM", iv },
       key,
       new TextEncoder().encode(String(plaintext))
@@ -5500,8 +5501,7 @@ var PeerPigeonCryptoProtocol = class {
   }
   async decryptRoom(cipher) {
     if (!cipher || cipher.alg !== "A256GCM") throw new Error("Unsupported room cipher");
-    const cryptoApi = this.cryptoApi();
-    const plaintext = await cryptoApi.subtle.decrypt(
+    const plaintext = await subtle().decrypt(
       { name: "AES-GCM", iv: this.fromBase64Url(cipher.iv) },
       await this.deriveRoomKey(),
       this.fromBase64Url(cipher.ct)
@@ -5524,7 +5524,7 @@ var PeerPigeonCryptoProtocol = class {
       __ppType: ENCRYPTED_DIRECT_TYPE,
       from: String(this.mesh.getClientId() ?? "").trim(),
       to: target,
-      cipher: await (0, import_unsea3.encryptMessageWithMeta)(
+      cipher: await (0, import_unsea4.encryptMessageWithMeta)(
         String(plaintext),
         recipient.kpub ? { epub: recipient.epub, kpub: recipient.kpub } : { epub: recipient.epub }
       ),
@@ -5547,7 +5547,7 @@ var PeerPigeonCryptoProtocol = class {
   }
   async decryptEncryptedDirect(payload) {
     if (!this.keyPair) throw new Error("Crypto protocol has not been initialized");
-    return await (0, import_unsea3.decryptMessageWithMeta)(payload.cipher, this.keyPair);
+    return await (0, import_unsea4.decryptMessageWithMeta)(payload.cipher, this.keyPair);
   }
   on(event, callback) {
     const callbacks = this.callbacks[event];
@@ -5722,16 +5722,15 @@ var PeerPigeonCryptoProtocol = class {
     this.emit("encryptedDirectReceived", { plaintext, payload, message });
   }
   async deriveRoomKey() {
-    const cryptoApi = this.cryptoApi();
     const roomScope = this.options.roomSecret ? `${this.options.roomId}:${this.options.roomSecret}` : this.options.roomId;
     const seed = new TextEncoder().encode(
       `peerpigeon:room-broadcast:v1:${roomScope}`
     );
-    const hash = await cryptoApi.subtle.digest("SHA-256", seed);
-    return await cryptoApi.subtle.importKey("raw", hash, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    const hash = await subtle().digest("SHA-256", seed);
+    return await subtle().importKey("raw", hash, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
   }
   cryptoApi() {
-    if (!globalThis.crypto?.subtle) throw new Error("WebCrypto is unavailable");
+    if (!globalThis.crypto?.getRandomValues) throw new Error("WebCrypto is unavailable");
     return globalThis.crypto;
   }
   toBase64Url(bytes) {
@@ -5857,7 +5856,7 @@ async function relayRankingId(url, nodeId) {
   const id = NODE_ID_RE2.test(known) ? known : fromPath;
   if (id) return hexIdBytes(id);
   const hostname = new URL(url).hostname.toLowerCase();
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(hostname));
+  const digest = await subtle().digest("SHA-256", new TextEncoder().encode(hostname));
   return new Uint8Array(digest);
 }
 async function rankSignalingServersByDistance(peerId, relays) {

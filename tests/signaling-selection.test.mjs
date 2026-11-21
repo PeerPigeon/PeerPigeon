@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { webcrypto } from 'node:crypto';
 
 import {
   DEFAULT_SIGNALING_SERVERS,
@@ -12,7 +13,8 @@ import {
 
 async function hostnameId(url) {
   const hostname = new URL(url).hostname.toLowerCase();
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hostname));
+  // Node's own WebCrypto as the reference, so this also runs with crypto.subtle taken away (tests/without-webcrypto.mjs).
+  const digest = await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(hostname));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 

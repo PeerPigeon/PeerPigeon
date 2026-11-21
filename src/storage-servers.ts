@@ -17,6 +17,7 @@
  * slot, and a frozen slot is never overwritten at all.
  */
 import { verifyMessage } from 'unsea';
+import { subtle } from './subtle.js';
 import type { PeerPigeonNode } from './index.js';
 
 export const STORAGE_SERVER_NETWORK = 'peerpigeon-storage';
@@ -80,12 +81,12 @@ export const MAX_BLOB_BYTES = 160 * 1024;
 const hexBytes = (hex: string) => Uint8Array.from(hex.match(/../g)!, (h) => parseInt(h, 16));
 
 async function sha256Bytes(bytes: Uint8Array): Promise<string> {
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>);
+  const digest = await subtle().digest('SHA-256', bytes as Uint8Array<ArrayBuffer>);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function blobKey(hash: string): Promise<{ key: CryptoKey; iv: Uint8Array }> {
-  const key = await globalThis.crypto.subtle.importKey('raw', hexBytes(await sha256Hex(`pp-blob-key-v1:${hash}`)) as Uint8Array<ArrayBuffer>, 'AES-GCM', false, ['encrypt', 'decrypt']);
+  const key = await subtle().importKey('raw', hexBytes(await sha256Hex(`pp-blob-key-v1:${hash}`)) as Uint8Array<ArrayBuffer>, 'AES-GCM', false, ['encrypt', 'decrypt']);
   return { key, iv: hexBytes(await sha256Hex(`pp-blob-iv-v1:${hash}`)).slice(0, 12) };
 }
 
@@ -98,7 +99,7 @@ export function blobAddress(hash: string): Promise<string> {
 export async function sealBlob(bytes: Uint8Array): Promise<{ hash: string; address: string; sealed: Uint8Array }> {
   const hash = await sha256Bytes(bytes);
   const { key, iv } = await blobKey(hash);
-  const sealed = new Uint8Array(await globalThis.crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer> }, key, bytes as Uint8Array<ArrayBuffer>));
+  const sealed = new Uint8Array(await subtle().encrypt({ name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer> }, key, bytes as Uint8Array<ArrayBuffer>));
   return { hash, address: await blobAddress(hash), sealed };
 }
 
@@ -106,7 +107,7 @@ export async function sealBlob(bytes: Uint8Array): Promise<{ hash: string; addre
 export async function openBlob(hash: string, sealed: Uint8Array): Promise<Uint8Array | null> {
   try {
     const { key, iv } = await blobKey(hash);
-    const bytes = new Uint8Array(await globalThis.crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer> }, key, sealed as Uint8Array<ArrayBuffer>));
+    const bytes = new Uint8Array(await subtle().decrypt({ name: 'AES-GCM', iv: iv as Uint8Array<ArrayBuffer> }, key, sealed as Uint8Array<ArrayBuffer>));
     return (await sha256Bytes(bytes)) === hash ? bytes : null;
   } catch {
     return null;
@@ -144,7 +145,7 @@ type Msg =
   | { pp: typeof PP; t: 'bgot'; req: string; d?: string | null; bytes?: Uint8Array };
 
 export async function sha256Hex(text: string): Promise<string> {
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  const digest = await subtle().digest('SHA-256', new TextEncoder().encode(text));
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 

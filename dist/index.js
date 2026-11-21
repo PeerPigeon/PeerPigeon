@@ -2887,6 +2887,10 @@ _GossipProtocol.MAX_REPLAYS_PER_PEER = 3;
 _GossipProtocol.ANTI_ENTROPY_RESEND_MS = 3e4;
 var GossipProtocol = _GossipProtocol;
 
+// src/subtle.ts
+import { getSubtle } from "unsea";
+var subtle = () => getSubtle();
+
 // src/relay-choice.ts
 var RELAY_CANDIDATES = 5;
 var RELAY_VIRTUAL_IDS = 4;
@@ -2904,7 +2908,7 @@ function hexBytes(hex) {
   return Uint8Array.from({ length: hex.length / 2 }, (_, i) => Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16));
 }
 async function sha256Bytes(text) {
-  return new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+  return new Uint8Array(await subtle().digest("SHA-256", new TextEncoder().encode(text)));
 }
 function compareDistance(a, b, target) {
   for (let i = 0; i < target.length; i += 1) {
@@ -3180,11 +3184,11 @@ async function ownerSigned(rec) {
 var MAX_BLOB_BYTES = 160 * 1024;
 var hexBytes2 = (hex) => Uint8Array.from(hex.match(/../g), (h) => parseInt(h, 16));
 async function sha256Bytes2(bytes) {
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  const digest = await subtle().digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 async function blobKey(hash) {
-  const key = await globalThis.crypto.subtle.importKey("raw", hexBytes2(await sha256Hex(`pp-blob-key-v1:${hash}`)), "AES-GCM", false, ["encrypt", "decrypt"]);
+  const key = await subtle().importKey("raw", hexBytes2(await sha256Hex(`pp-blob-key-v1:${hash}`)), "AES-GCM", false, ["encrypt", "decrypt"]);
   return { key, iv: hexBytes2(await sha256Hex(`pp-blob-iv-v1:${hash}`)).slice(0, 12) };
 }
 function blobAddress(hash) {
@@ -3193,13 +3197,13 @@ function blobAddress(hash) {
 async function sealBlob(bytes) {
   const hash = await sha256Bytes2(bytes);
   const { key, iv } = await blobKey(hash);
-  const sealed = new Uint8Array(await globalThis.crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, bytes));
+  const sealed = new Uint8Array(await subtle().encrypt({ name: "AES-GCM", iv }, key, bytes));
   return { hash, address: await blobAddress(hash), sealed };
 }
 async function openBlob(hash, sealed) {
   try {
     const { key, iv } = await blobKey(hash);
-    const bytes = new Uint8Array(await globalThis.crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, sealed));
+    const bytes = new Uint8Array(await subtle().decrypt({ name: "AES-GCM", iv }, key, sealed));
     return await sha256Bytes2(bytes) === hash ? bytes : null;
   } catch {
     return null;
@@ -3217,7 +3221,7 @@ function fromB64(text) {
   return out;
 }
 async function sha256Hex(text) {
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  const digest = await subtle().digest("SHA-256", new TextEncoder().encode(text));
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
 function xorDistance(a, b) {
@@ -5230,12 +5234,9 @@ var PeerPigeonStorage = class {
     return await this.decryptJson(cipher, key);
   }
   async deriveAesKey(seed) {
-    if (!globalThis.crypto?.subtle) {
-      throw new Error("WebCrypto subtle API is required for encrypted storage sync");
-    }
     const seedBytes = new TextEncoder().encode(seed);
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", seedBytes);
-    return await globalThis.crypto.subtle.importKey(
+    const digest = await subtle().digest("SHA-256", seedBytes);
+    return await subtle().importKey(
       "raw",
       digest,
       { name: "AES-GCM", length: 256 },
@@ -5248,7 +5249,7 @@ var PeerPigeonStorage = class {
     const ivView = new Uint8Array(ivBuffer);
     globalThis.crypto.getRandomValues(ivView);
     const plainBytes = new TextEncoder().encode(JSON.stringify(value));
-    const cipherBuffer = await globalThis.crypto.subtle.encrypt(
+    const cipherBuffer = await subtle().encrypt(
       { name: "AES-GCM", iv: ivBuffer },
       key,
       plainBytes
@@ -5266,7 +5267,7 @@ var PeerPigeonStorage = class {
     const data = this.fromBase64Url(cipher.ct);
     const cipherCopy = new Uint8Array(new ArrayBuffer(data.byteLength));
     cipherCopy.set(data);
-    const plainBuffer = await globalThis.crypto.subtle.decrypt(
+    const plainBuffer = await subtle().decrypt(
       { name: "AES-GCM", iv: ivCopy },
       key,
       cipherCopy
@@ -5424,7 +5425,7 @@ var PeerPigeonCryptoProtocol = class {
     const cryptoApi = this.cryptoApi();
     const key = await this.deriveRoomKey();
     const iv = cryptoApi.getRandomValues(new Uint8Array(12));
-    const cipher = await cryptoApi.subtle.encrypt(
+    const cipher = await subtle().encrypt(
       { name: "AES-GCM", iv },
       key,
       new TextEncoder().encode(String(plaintext))
@@ -5433,8 +5434,7 @@ var PeerPigeonCryptoProtocol = class {
   }
   async decryptRoom(cipher) {
     if (!cipher || cipher.alg !== "A256GCM") throw new Error("Unsupported room cipher");
-    const cryptoApi = this.cryptoApi();
-    const plaintext = await cryptoApi.subtle.decrypt(
+    const plaintext = await subtle().decrypt(
       { name: "AES-GCM", iv: this.fromBase64Url(cipher.iv) },
       await this.deriveRoomKey(),
       this.fromBase64Url(cipher.ct)
@@ -5655,16 +5655,15 @@ var PeerPigeonCryptoProtocol = class {
     this.emit("encryptedDirectReceived", { plaintext, payload, message });
   }
   async deriveRoomKey() {
-    const cryptoApi = this.cryptoApi();
     const roomScope = this.options.roomSecret ? `${this.options.roomId}:${this.options.roomSecret}` : this.options.roomId;
     const seed = new TextEncoder().encode(
       `peerpigeon:room-broadcast:v1:${roomScope}`
     );
-    const hash = await cryptoApi.subtle.digest("SHA-256", seed);
-    return await cryptoApi.subtle.importKey("raw", hash, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    const hash = await subtle().digest("SHA-256", seed);
+    return await subtle().importKey("raw", hash, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
   }
   cryptoApi() {
-    if (!globalThis.crypto?.subtle) throw new Error("WebCrypto is unavailable");
+    if (!globalThis.crypto?.getRandomValues) throw new Error("WebCrypto is unavailable");
     return globalThis.crypto;
   }
   toBase64Url(bytes) {
@@ -5790,7 +5789,7 @@ async function relayRankingId(url, nodeId) {
   const id = NODE_ID_RE2.test(known) ? known : fromPath;
   if (id) return hexIdBytes(id);
   const hostname = new URL(url).hostname.toLowerCase();
-  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(hostname));
+  const digest = await subtle().digest("SHA-256", new TextEncoder().encode(hostname));
   return new Uint8Array(digest);
 }
 async function rankSignalingServersByDistance(peerId, relays) {

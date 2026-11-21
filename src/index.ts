@@ -25,6 +25,7 @@ import type {
   GossipProtocolOptions,
 } from './gossip.js';
 import { PeerPigeonStorage } from './storage.js';
+import { subtle } from './subtle.js';
 import { StorageServerLink, StorageServer, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE } from './storage-servers.js';
 export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS, MAX_BLOB_BYTES, sealBlob, openBlob, blobAddress, ownedRoomOf, validRoom } from './storage-servers.js';
 export type { ServerRecord, ServerRecordStore, StorageServerStats } from './storage-servers.js';
@@ -215,7 +216,7 @@ async function relayRankingId(url: string, nodeId: string | null | undefined): P
   const id = NODE_ID_RE.test(known) ? known : fromPath;
   if (id) return hexIdBytes(id);
   const hostname = new URL(url).hostname.toLowerCase();
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(hostname));
+  const digest = await subtle().digest('SHA-256', new TextEncoder().encode(hostname));
   return new Uint8Array(digest);
 }
 

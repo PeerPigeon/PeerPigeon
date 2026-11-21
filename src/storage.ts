@@ -1,4 +1,5 @@
 import { signMessage, verifyMessage } from 'unsea';
+import { subtle } from './subtle.js';
 import { ownedRoomOf, ownerText, sha256Hex, type ServerRecord, type StorageServerLink } from './storage-servers.js';
 
 export type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
@@ -2033,13 +2034,9 @@ export class PeerPigeonStorage {
   }
 
   private async deriveAesKey(seed: string): Promise<CryptoKey> {
-    if (!globalThis.crypto?.subtle) {
-      throw new Error('WebCrypto subtle API is required for encrypted storage sync');
-    }
-
     const seedBytes = new TextEncoder().encode(seed);
-    const digest = await globalThis.crypto.subtle.digest('SHA-256', seedBytes);
-    return await globalThis.crypto.subtle.importKey(
+    const digest = await subtle().digest('SHA-256', seedBytes);
+    return await subtle().importKey(
       'raw',
       digest,
       { name: 'AES-GCM', length: 256 },
@@ -2053,7 +2050,7 @@ export class PeerPigeonStorage {
     const ivView = new Uint8Array(ivBuffer);
     globalThis.crypto.getRandomValues(ivView);
     const plainBytes = new TextEncoder().encode(JSON.stringify(value));
-    const cipherBuffer = await globalThis.crypto.subtle.encrypt(
+    const cipherBuffer = await subtle().encrypt(
       { name: 'AES-GCM', iv: ivBuffer },
       key,
       plainBytes
@@ -2073,7 +2070,7 @@ export class PeerPigeonStorage {
     const data = this.fromBase64Url(cipher.ct);
     const cipherCopy = new Uint8Array(new ArrayBuffer(data.byteLength));
     cipherCopy.set(data);
-    const plainBuffer = await globalThis.crypto.subtle.decrypt(
+    const plainBuffer = await subtle().decrypt(
       { name: 'AES-GCM', iv: ivCopy },
       key,
       cipherCopy

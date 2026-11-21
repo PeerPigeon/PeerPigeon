@@ -22,4 +22,7 @@ declare module 'unsea' {
   export function signMessage(message: string, privOrPair: string | { priv: string; qpriv?: string }): Promise<string>;
   export function verifyMessage(message: string, signature: string, pubOrKeys: string | { pub: string; qpub?: string }): Promise<boolean>;
   export function decryptMessageWithMeta(cipher: unknown, privOrPair: string | { epriv: string; kpriv?: string }): Promise<string>;
+  /** WebCrypto's SubtleCrypto, or unsea's noble stand-in on a page without one (plain http). */
+  export function getSubtle(): SubtleCrypto;
+  export function hasNativeSubtle(): boolean;
 }
