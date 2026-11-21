@@ -1049,6 +1049,17 @@ declare class PeerPigeonStorage {
     private canWrite;
     private isPeerIdFormat;
     private assertCanDelete;
+    private tombstonePk;
+    private tombstoneOf;
+    /** Keeps a delete (newer than any kept for the key) as the key's tombstone. */
+    private keepTombstone;
+    /** The delete a tombstone keeps, as it was sent (signed), to pass on. */
+    private tombstoneMutation;
+    /**
+     * Whether an arriving record was deleted after it was written: its key has a tombstone newer than
+     * it, by someone who may delete it (its owner, for a user record).
+     */
+    private deletedSince;
     private canDelete;
     private encodeValueForStore;
     private decodeValueForRead;

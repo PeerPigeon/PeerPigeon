@@ -3780,6 +3780,8 @@ var StorageServer = class {
 };
 
 // src/storage.ts
+var TOMBSTONE_SPACE = "~deleted";
+var TOMBSTONE_KEEP_MS = 180 * 24 * 60 * 60 * 1e3;
 var MemoryStorageDriver = class {
   constructor() {
     this.map = /* @__PURE__ */ new Map();
@@ -4194,7 +4196,7 @@ var PeerPigeonStorage = class {
       if (mutation.op === "delete") {
         if (typeof mutation.signer !== "string" || typeof mutation.sig !== "string") return null;
         const existing = await this.requireDriver().get(this.makePk(mutation.space, mutation.key));
-        const text = this.signedText("delete", { space: mutation.space, key: mutation.key, ownerId: existing?.ownerId ?? null, value: null, version: 0, updatedAt: mutation.timestamp });
+        const text = this.signedText("delete", { space: mutation.space, key: mutation.key, ownerId: existing?.ownerId ?? mutation.ownerId ?? null, value: null, version: 0, updatedAt: mutation.timestamp });
         return await verifyMessage2(text, mutation.sig, mutation.signer) ? mutation.signer : null;
       }
       const r = mutation.record;
@@ -4415,6 +4417,7 @@ var PeerPigeonStorage = class {
       persisted.sig = await signMessage(this.signedText("upsert", persisted), this.signingKeys.priv);
     }
     await driver.put(persisted);
+    if (space !== "private") await driver.delete(this.tombstonePk(space, normalizedKey));
     const opId = this.makeMutationId(actorId);
     const mutation = {
       __ppType: "pp-storage-op-v1",
@@ -4473,12 +4476,14 @@ var PeerPigeonStorage = class {
       key: normalizedKey,
       actorId,
       timestamp: Date.now(),
-      record: null
+      record: null,
+      ownerId: existing.ownerId ?? null
     };
     if (this.signingKeys && space !== "private") {
       mutation.signer = this.signingKeys.pub;
       mutation.sig = await signMessage(this.signedText("delete", { space, key: normalizedKey, ownerId: existing.ownerId, value: null, version: 0, updatedAt: mutation.timestamp }), this.signingKeys.priv);
     }
+    if (space !== "private") await this.keepTombstone(mutation, existing.ownerId ?? null);
     this.emitChange({
       origin: "local",
       op: "delete",
@@ -4544,10 +4549,17 @@ var PeerPigeonStorage = class {
     }
     const existing = await driver.get(pk);
     if (mutation.op === "delete") {
-      if (!existing) return false;
+      if (!existing) {
+        const owner = typeof mutation.ownerId === "string" ? mutation.ownerId : null;
+        if (mutation.space === "user" && owner !== mutation.actorId) return false;
+        if (mutation.space !== "user" && mutation.space !== "public") return false;
+        await this.keepTombstone(mutation, owner);
+        return false;
+      }
       if (mutation.timestamp <= existing.updatedAt) return false;
       if (!this.canDelete(mutation.space, existing, mutation.actorId, mutation.space === "epublic")) return false;
       await driver.delete(pk);
+      await this.keepTombstone(mutation, existing.ownerId ?? null);
       this.emitChange({
         origin: "remote",
         op: "delete",
@@ -4569,6 +4581,7 @@ var PeerPigeonStorage = class {
       return true;
     }
     if (!mutation.record) return false;
+    if (await this.deletedSince(mutation)) return false;
     if (existing) {
       const existingVersion = existing.version;
       const incomingVersion = mutation.record.version;
@@ -5024,6 +5037,68 @@ var PeerPigeonStorage = class {
       throw new Error(`Delete denied for ${space} space key`);
     }
   }
+  tombstonePk(space, key) {
+    return `${TOMBSTONE_SPACE}:${this.makePk(space, key)}`;
+  }
+  async tombstoneOf(space, key) {
+    const held = await this.requireDriver().get(this.tombstonePk(space, key));
+    const t = held?.value;
+    if (!t || typeof t.at !== "number") return null;
+    if (Date.now() - t.at > TOMBSTONE_KEEP_MS) {
+      await this.requireDriver().delete(held.pk);
+      return null;
+    }
+    return t;
+  }
+  /** Keeps a delete (newer than any kept for the key) as the key's tombstone. */
+  async keepTombstone(mutation, ownerId) {
+    if (mutation.space === "private") return;
+    const had = await this.tombstoneOf(mutation.space, mutation.key);
+    if (had && had.at >= mutation.timestamp) return;
+    const t = { space: mutation.space, key: mutation.key, ownerId, actorId: mutation.actorId, at: mutation.timestamp, signer: mutation.signer ?? null, sig: mutation.sig ?? null };
+    await this.requireDriver().put({
+      pk: this.tombstonePk(mutation.space, mutation.key),
+      space: TOMBSTONE_SPACE,
+      key: mutation.key,
+      ownerId,
+      modifiedBy: null,
+      value: t,
+      valueCipher: null,
+      createdAt: t.at,
+      updatedAt: t.at,
+      version: 0
+    });
+  }
+  /** The delete a tombstone keeps, as it was sent (signed), to pass on. */
+  tombstoneMutation(t) {
+    return {
+      __ppType: "pp-storage-op-v1",
+      opId: `tomb-${this.makeMutationId(this.userId)}`,
+      op: "delete",
+      space: t.space,
+      key: t.key,
+      actorId: t.actorId,
+      timestamp: t.at,
+      record: null,
+      ownerId: t.ownerId,
+      ...t.signer ? { signer: t.signer, sig: t.sig } : {}
+    };
+  }
+  /**
+   * Whether an arriving record was deleted after it was written: its key has a tombstone newer than
+   * it, by someone who may delete it (its owner, for a user record).
+   */
+  async deletedSince(mutation) {
+    const t = await this.tombstoneOf(mutation.space, mutation.key);
+    if (!t) return false;
+    const at = Number(mutation.timestamp ?? mutation.record?.updatedAt ?? 0);
+    if (at > t.at) return false;
+    if (mutation.space === "user") {
+      const owner = mutation.record?.ownerId ?? mutation.actorId;
+      return !t.ownerId || t.ownerId === owner;
+    }
+    return mutation.space === "public";
+  }
   canDelete(space, existing, actorId, allowSystemWrite = false) {
     if (space === "public") return true;
     if (space === "epublic") return allowSystemWrite === true;
@@ -5137,6 +5212,17 @@ var PeerPigeonStorage = class {
       if (!key || key.length > 2048) continue;
       const theirVersion = typeof rawVersion === "string" || typeof rawVersion === "number" ? rawVersion : null;
       const existing = await driver.get(this.makePk(space, key));
+      if (!existing && theirVersion != null && pushed < DIGEST_MAX_PUSHES) {
+        const t = await this.tombstoneOf(space, key);
+        if (t) {
+          pushed += 1;
+          try {
+            this.gossip.sendDirect(target, await this.syncEnvelope(this.tombstoneMutation(t)));
+          } catch {
+          }
+          continue;
+        }
+      }
       if (existing) {
         const cmp = theirVersion == null ? 1 : this.compareStorageVersions(existing.version, theirVersion);
         if (cmp > 0 && pushed < DIGEST_MAX_PUSHES) {
@@ -5198,6 +5284,17 @@ var PeerPigeonStorage = class {
           this.gossip.sendDirect(target, await this.syncEnvelope(mutation));
         } catch {
         }
+      }
+    }
+    for (const held of await driver.listBySpace(TOMBSTONE_SPACE)) {
+      if (this.closed || pushed >= DIGEST_MAX_PUSHES) return;
+      const t = held.value;
+      if (!t || typeof t.at !== "number" || Date.now() - t.at > TOMBSTONE_KEEP_MS) continue;
+      if (!prefixes.some((p) => t.key.startsWith(p))) continue;
+      pushed += 1;
+      try {
+        this.gossip.sendDirect(target, await this.syncEnvelope(this.tombstoneMutation(t)));
+      } catch {
       }
     }
   }
