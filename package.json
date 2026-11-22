@@ -54,7 +54,7 @@
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "https://github.com/draeder/peerpigeon.git"
+    "url": "git+https://github.com/PeerPigeon/PeerPigeon.git"
   },
   "dependencies": {
     "freertc": "git+https://github.com/draeder/freertc.git#main",
@@ -72,5 +72,9 @@
     "tsup": {
       "esbuild": "^0.28.2"
     }
+  },
+  "homepage": "https://github.com/PeerPigeon/PeerPigeon#readme",
+  "bugs": {
+    "url": "https://github.com/PeerPigeon/PeerPigeon/issues"
   }
 }
