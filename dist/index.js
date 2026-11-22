@@ -3166,6 +3166,7 @@ var STORAGE_SERVER_ROLE = "storage";
 var STORAGE_REPLICAS = 3;
 var REQUEST_TIMEOUT_MS = 4e3;
 var BLOB_TIMEOUT_MS = 2e4;
+var BYTES_WAIT_MS = 1500;
 var BATCH_RECORDS = 64;
 var BATCH_BYTES = 96 * 1024;
 var PP = "pp-ss-v1";
@@ -3274,14 +3275,24 @@ async function sendLater(node, peerId, msg) {
   return false;
 }
 async function sendBytesSoon(node, peerId, meta, bytes) {
-  if (node.sendBytes(peerId, meta, bytes)) return true;
-  for (let wait = 10, spent = 0; spent < 15e3; spent += wait, wait = Math.min(200, wait * 2)) {
+  if (node.sendBytes(peerId, meta, bytes)) {
+    noBytesTo.get(node)?.delete(peerId);
+    return true;
+  }
+  const until = noBytesTo.get(node)?.get(peerId) ?? 0;
+  if (until > Date.now()) return false;
+  for (let wait = 10, spent = 0; spent < BYTES_WAIT_MS; spent += wait, wait = Math.min(200, wait * 2)) {
     await new Promise((r) => setTimeout(r, wait));
     if (!node.getConnectedPeers().includes(peerId)) return false;
     if (node.sendBytes(peerId, meta, bytes)) return true;
   }
+  let peers = noBytesTo.get(node);
+  if (!peers) noBytesTo.set(node, peers = /* @__PURE__ */ new Map());
+  peers.set(peerId, Date.now() + NO_BYTES_MS);
   return false;
 }
+var noBytesTo = /* @__PURE__ */ new WeakMap();
+var NO_BYTES_MS = 3e4;
 var reqCounter = 0;
 var newReq = () => `${Date.now().toString(36)}-${(reqCounter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 var StorageServerLink = class {
@@ -3298,6 +3309,8 @@ var StorageServerLink = class {
     this.closed = false;
     this.refreshing = null;
     this.refreshAgain = false;
+    /** Servers that answered this page's recent blob reads, newest first. */
+    this.blobHolders = [];
     node.on("message", (m) => {
       if (m.kind === "direct" && m.fromPeerId) this.onMessage(m.fromPeerId, m.data);
     });
@@ -3492,6 +3505,14 @@ var StorageServerLink = class {
     }));
     return acks.filter((a) => a?.t === "back" && a.ok).length;
   }
+  heldBy(id) {
+    const at = this.blobHolders.indexOf(id);
+    if (at !== 0) {
+      if (at > 0) this.blobHolders.splice(at, 1);
+      this.blobHolders.unshift(id);
+      this.blobHolders.length = Math.min(this.blobHolders.length, 4);
+    }
+  }
   /** Content by its SHA-256 from the servers, checked; null if none has it. */
   async getBlob(hash) {
     const address = await blobAddress(hash);
@@ -3505,23 +3526,45 @@ var StorageServerLink = class {
       const sealed = a?.t !== "bgot" ? null : a.bytes instanceof Uint8Array ? a.bytes : typeof a.d === "string" ? fromB64(a.d) : null;
       return sealed ? await openBlob(hash, sealed) : null;
     };
-    for (const id of await this.serversForBlob(address)) {
+    const linkedNow = () => new Set(this.node.getConnectedPeers());
+    for (const id of [...this.blobHolders].filter((id2) => linkedNow().has(id2))) {
       const bytes = await tryOn(id);
-      if (bytes) return bytes;
-    }
-    for (const id of await this.knownServers()) {
-      if (asked.has(id)) continue;
-      if (!this.node.getConnectedPeers().includes(id)) {
-        this.node.connectToPeer(id);
-        for (const until = Date.now() + 4e3; !this.node.getConnectedPeers().includes(id) && Date.now() < until; ) {
-          await new Promise((r) => setTimeout(r, 100));
-        }
-        if (!this.node.getConnectedPeers().includes(id)) continue;
+      if (bytes) {
+        this.heldBy(id);
+        return bytes;
       }
-      const bytes = await tryOn(id);
-      if (bytes) return bytes;
     }
-    return null;
+    for (const id of await this.serversForBlob(address)) {
+      if (asked.has(id)) continue;
+      const bytes = await tryOn(id);
+      if (bytes) {
+        this.heldBy(id);
+        return bytes;
+      }
+    }
+    const rest = (await this.knownServers()).filter((id) => !asked.has(id));
+    if (!rest.length) return null;
+    for (const id of rest) if (!linkedNow().has(id)) this.node.connectToPeer(id);
+    return await new Promise((resolve) => {
+      let open = rest.length, done = false;
+      const finish = (bytes) => {
+        if (!done && (bytes || --open === 0)) {
+          done = true;
+          resolve(bytes);
+        }
+      };
+      for (const id of rest) {
+        void (async () => {
+          for (const until = Date.now() + 6e3; !linkedNow().has(id) && Date.now() < until && !done; ) {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          if (done || !linkedNow().has(id)) return finish(null);
+          const bytes = await tryOn(id).catch(() => null);
+          if (bytes) this.heldBy(id);
+          finish(bytes);
+        })();
+      }
+    });
   }
   /** Every record the room's servers hold (of one space, with `tag`), the newest copy of each. */
   async list(room, tag) {

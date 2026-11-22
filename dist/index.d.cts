@@ -98,6 +98,9 @@ declare class StorageServerLink {
     hasServers(): Promise<boolean>;
     /** Keeps content on the servers closest to it; resolves with how many took it. */
     putBlob(bytes: Uint8Array): Promise<number>;
+    /** Servers that answered this page's recent blob reads, newest first. */
+    private readonly blobHolders;
+    private heldBy;
     /** Content by its SHA-256 from the servers, checked; null if none has it. */
     getBlob(hash: string): Promise<Uint8Array | null>;
     /** Every record the room's servers hold (of one space, with `tag`), the newest copy of each. */

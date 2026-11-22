@@ -29,6 +29,8 @@ export const STORAGE_REPLICAS = 3;
 const REQUEST_TIMEOUT_MS = 4_000;
 /** A blob is larger: allow for a busy link. */
 const BLOB_TIMEOUT_MS = 20_000;
+/** How long a server keeps trying to send a blob as bytes before it sends it as base64. */
+const BYTES_WAIT_MS = 1_500;
 /** Records per message, and roughly bytes, so one stays well under a data channel's limit. */
 const BATCH_RECORDS = 64;
 const BATCH_BYTES = 96 * 1024;
@@ -221,17 +223,29 @@ async function sendLater(node: PeerPigeonNode, peerId: string, msg: unknown): Pr
 
 /**
  * Bytes to a linked peer (sendBytes), now or, while its send buffer is full (many blobs at once), as soon
- * as it drains: still as bytes. False when the peer is not linked (send base64 instead) or it never drains.
+ * as it drains: still as bytes. False when the peer is not linked or bytes still can't go after a moment
+ * (no data channel just now: a hidden tab, a link waiting on its keepalive, a peer reached through the
+ * relay): the caller sends base64 then, which goes however the peer is reachable. Waiting longer here
+ * held up every piece of a picture by as much.
  */
 async function sendBytesSoon(node: PeerPigeonNode, peerId: string, meta: Record<string, unknown>, bytes: Uint8Array): Promise<boolean> {
-  if (node.sendBytes(peerId, meta, bytes)) return true;
-  for (let wait = 10, spent = 0; spent < 15_000; spent += wait, wait = Math.min(200, wait * 2)) {
+  if (node.sendBytes(peerId, meta, bytes)) { noBytesTo.get(node)?.delete(peerId); return true; }
+  // Bytes did not go to this peer a moment ago: base64 now, not another wait (the rest of a file's pieces).
+  const until = noBytesTo.get(node)?.get(peerId) ?? 0;
+  if (until > Date.now()) return false;
+  for (let wait = 10, spent = 0; spent < BYTES_WAIT_MS; spent += wait, wait = Math.min(200, wait * 2)) {
     await new Promise((r) => setTimeout(r, wait));
     if (!node.getConnectedPeers().includes(peerId)) return false;
     if (node.sendBytes(peerId, meta, bytes)) return true;
   }
+  let peers = noBytesTo.get(node);
+  if (!peers) noBytesTo.set(node, (peers = new Map()));
+  peers.set(peerId, Date.now() + NO_BYTES_MS);
   return false;
 }
+/** For each node: peers bytes could not be sent to lately, and until when to send them base64. */
+const noBytesTo = new WeakMap<PeerPigeonNode, Map<string, number>>();
+const NO_BYTES_MS = 30_000;
 
 let reqCounter = 0;
 const newReq = () => `${Date.now().toString(36)}-${(reqCounter++).toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -427,6 +441,13 @@ export class StorageServerLink {
     return acks.filter((a) => a?.t === 'back' && a.ok).length;
   }
 
+  /** Servers that answered this page's recent blob reads, newest first. */
+  private readonly blobHolders: string[] = [];
+  private heldBy(id: string): void {
+    const at = this.blobHolders.indexOf(id);
+    if (at !== 0) { if (at > 0) this.blobHolders.splice(at, 1); this.blobHolders.unshift(id); this.blobHolders.length = Math.min(this.blobHolders.length, 4); }
+  }
+
   /** Content by its SHA-256 from the servers, checked; null if none has it. */
   async getBlob(hash: string): Promise<Uint8Array | null> {
     const address = await blobAddress(hash);
@@ -442,25 +463,39 @@ export class StorageServerLink {
       const sealed = a?.t !== 'bgot' ? null : a.bytes instanceof Uint8Array ? a.bytes : typeof a.d === 'string' ? fromB64(a.d) : null;
       return sealed ? await openBlob(hash, sealed) : null;
     };
+    // The servers that had this page's last blobs first (a file's pieces were kept together), then
+    // the closest ones linked.
+    const linkedNow = () => new Set(this.node.getConnectedPeers());
+    for (const id of [...this.blobHolders].filter((id) => linkedNow().has(id))) {
+      const bytes = await tryOn(id);
+      if (bytes) { this.heldBy(id); return bytes; }
+    }
     for (const id of await this.serversForBlob(address)) {
-      const bytes = await tryOn(id);
-      if (bytes) return bytes;
-    }
-    // Not on the closest servers this page knows of (it may know fewer than the writer did, or they
-    // have not been given it yet): every other server known, linked to as needed.
-    for (const id of await this.knownServers()) {
       if (asked.has(id)) continue;
-      if (!this.node.getConnectedPeers().includes(id)) {
-        this.node.connectToPeer(id);
-        for (const until = Date.now() + 4_000; !this.node.getConnectedPeers().includes(id) && Date.now() < until;) {
-          await new Promise((r) => setTimeout(r, 100));
-        }
-        if (!this.node.getConnectedPeers().includes(id)) continue;
-      }
       const bytes = await tryOn(id);
-      if (bytes) return bytes;
+      if (bytes) { this.heldBy(id); return bytes; }
     }
-    return null;
+    // Not on those (this page may know other servers than the writer did, or they have not been
+    // given it yet): every other known server at once, each asked as soon as it is linked; the
+    // first that has it answers.
+    const rest = (await this.knownServers()).filter((id) => !asked.has(id));
+    if (!rest.length) return null;
+    for (const id of rest) if (!linkedNow().has(id)) this.node.connectToPeer(id);
+    return await new Promise<Uint8Array | null>((resolve) => {
+      let open = rest.length, done = false;
+      const finish = (bytes: Uint8Array | null) => { if (!done && (bytes || --open === 0)) { done = true; resolve(bytes); } };
+      for (const id of rest) {
+        void (async () => {
+          for (const until = Date.now() + 6_000; !linkedNow().has(id) && Date.now() < until && !done;) {
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          if (done || !linkedNow().has(id)) return finish(null);
+          const bytes = await tryOn(id).catch(() => null);
+          if (bytes) this.heldBy(id);
+          finish(bytes);
+        })();
+      }
+    });
   }
 
   /** Every record the room's servers hold (of one space, with `tag`), the newest copy of each. */

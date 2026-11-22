@@ -255,3 +255,37 @@ test('a blob is found when the reader knows other servers than the writer did', 
   assert.equal(new TextDecoder().decode(got), 'a picture in a post');
   await b.link.close();
 });
+
+test('a blob on a server the reader is slow to reach is found in about one link\'s time, and the next goes straight there', async () => {
+  const scope = makeScope();
+  await server(scope, '1');
+  const a = await peer(scope, 'a');
+  await settle();
+  const one = new TextEncoder().encode('first piece of a picture');
+  const two = new TextEncoder().encode('second piece of a picture');
+  assert.equal(await a.link.putBlob(one), 1);
+  assert.equal(await a.link.putBlob(two), 1);
+  await a.link.close();
+  for (const id of ['2', '3', '4', '5', '6', '7']) await server(scope, id);
+  // A reader whose every new link takes 700 ms (WebRTC over the internet).
+  const storage = new PeerPigeonStorage({ ...options, userId: 'user-r', peerId: 'r' });
+  await storage.init();
+  const n = scope.node(hex('r'));
+  const connect = n.connectToPeer;
+  const pending = new Set();
+  n.connectToPeer = (id) => { if (pending.has(id) || n.links.has(id)) return; pending.add(id); setTimeout(() => { pending.delete(id); connect(id); }, 700); };
+  const link = new StorageServerLink(n);
+  await storage.attachServers(link);
+  await link.start();
+  const { createHash } = await import('node:crypto');
+  const h = (b) => createHash('sha256').update(b).digest('hex');
+  let t = Date.now();
+  assert.equal(new TextDecoder().decode(await link.getBlob(h(one))), 'first piece of a picture');
+  const firstMs = Date.now() - t;
+  t = Date.now();
+  assert.equal(new TextDecoder().decode(await link.getBlob(h(two))), 'second piece of a picture');
+  const secondMs = Date.now() - t;
+  assert.ok(firstMs < 3_000, `first piece in ${firstMs} ms`);
+  assert.ok(secondMs < 300, `second piece in ${secondMs} ms (straight to the server that had the first)`);
+  await link.close();
+});
