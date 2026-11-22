@@ -825,7 +825,10 @@ export class PeerPigeonStorage {
         const cameUp = ready && !this.serversReady;
         this.serversReady = ready;
         if (ready) this.serversWaitDone?.();
-        if (cameUp) void this.migrateToServers().catch(() => {});
+        if (cameUp) {
+          void this.migrateToServers().catch(() => {});
+          void this.pullFromServers().catch(() => {});
+        }
       } else if (event.type === 'changed' && event.rec.room === room) {
         void this.applyServerRecord(event.rec, false).catch(() => {});
       }
@@ -837,6 +840,27 @@ export class PeerPigeonStorage {
       this.serversReady = true;
       this.serversWaitDone?.();
       void this.migrateToServers().catch(() => {});
+      void this.pullFromServers().catch(() => {});
+    }
+  }
+
+  /**
+   * The room's servers came up: what they keep under the prefixes this node
+   * replicates, or of keys it watches, comes here (as changes, so a page
+   * showing them updates). A peer whose servers linked only after its first
+   * read (a new browser, slow to reach them) gets the room's records all the same.
+   */
+  private async pullFromServers(): Promise<void> {
+    if (!this.servers || !this.serverIds) return;
+    for (const space of ['public', 'user'] as StorageSpace[]) {
+      const { tag } = await this.slotOf(space, '');
+      for (const rec of await this.servers.list(this.serverIds.room, tag)) {
+        if (this.closed) return;
+        const mutation = await this.decryptSyncEnvelope(rec.blob as CipherPayload).catch(() => null);
+        if (!this.isStorageMutation(mutation) || mutation.space !== space) continue;
+        if (!this.usesLocally(space, mutation.key)) continue;
+        await this.applyRemoteMutation(mutation).catch(() => false);
+      }
     }
   }
 

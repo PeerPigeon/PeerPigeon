@@ -209,3 +209,49 @@ test('blobs go as bytes between nodes that read them (no base64), and as base64 
   await a.link.close(); await b.link.close();
   assert.ok(srvNode.sent.bytes >= before);
 });
+
+test('a peer whose servers link only after its first read gets the records it replicates, as changes', async () => {
+  const scope = makeScope();
+  await server(scope, '1');
+  const a = await peer(scope, 'a');
+  await settle();
+  await a.storage.put('public', 'feed/1', { text: 'first post' });
+  await a.storage.put('public', 'other/1', 'not replicated');
+  await settle();
+  await a.link.close();
+  // A new browser: its node is there, but the servers are not linked to it yet.
+  const storage = new PeerPigeonStorage({ ...options, userId: 'user-b', peerId: 'b', replicate: ['feed/'], serverWaitMs: 50 });
+  await storage.init();
+  const n = scope.node(hex('b'));
+  const realConnect = n.connectToPeer;
+  n.connectToPeer = () => {}; // slow to reach the servers
+  const link = new StorageServerLink(n);
+  await storage.attachServers(link);
+  await link.start();
+  assert.deepEqual((await storage.list('public')).map((r) => r.key), [], 'nothing yet: its first read found no servers');
+  let arrived = null;
+  storage.on('change', (e) => { if (e.key === 'feed/1') arrived = e.record?.value; });
+  n.connectToPeer = realConnect; // the servers link now (the link looks again every 2 s)
+  for (let i = 0; i < 60 && !arrived; i++) await settle(100);
+  assert.deepEqual(arrived, { text: 'first post' });
+  assert.deepEqual((await storage.list('public')).filter((r) => r.key.startsWith('feed/')).map((r) => r.key), ['feed/1']);
+  await link.close();
+});
+
+test('a blob is found when the reader knows other servers than the writer did', async () => {
+  const scope = makeScope();
+  await server(scope, '1');
+  const a = await peer(scope, 'a');
+  await settle();
+  const bytes = new TextEncoder().encode('a picture in a post');
+  assert.equal(await a.link.putBlob(bytes), 1);
+  await a.link.close();
+  // More servers join, closer to the blob than the one that has it (not given it yet).
+  for (const id of ['2', '3', '4', '5', '6']) await server(scope, id);
+  const b = await peer(scope, 'b');
+  await settle();
+  const { createHash } = await import('node:crypto');
+  const got = await b.link.getBlob(createHash('sha256').update(bytes).digest('hex'));
+  assert.equal(new TextDecoder().decode(got), 'a picture in a post');
+  await b.link.close();
+});

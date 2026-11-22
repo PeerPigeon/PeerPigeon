@@ -3495,13 +3495,31 @@ var StorageServerLink = class {
   /** Content by its SHA-256 from the servers, checked; null if none has it. */
   async getBlob(hash) {
     const address = await blobAddress(hash);
-    for (const id of await this.serversForBlob(address)) {
+    for (const until = Date.now() + 4e3; !(await this.knownServers()).length && Date.now() < until; ) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    const asked = /* @__PURE__ */ new Set();
+    const tryOn = async (id) => {
+      asked.add(id);
       const a = await this.ask(id, { pp: PP, t: "bget", req: newReq(), addr: address, bin: 1 }, BLOB_TIMEOUT_MS);
       const sealed = a?.t !== "bgot" ? null : a.bytes instanceof Uint8Array ? a.bytes : typeof a.d === "string" ? fromB64(a.d) : null;
-      if (sealed) {
-        const bytes = await openBlob(hash, sealed);
-        if (bytes) return bytes;
+      return sealed ? await openBlob(hash, sealed) : null;
+    };
+    for (const id of await this.serversForBlob(address)) {
+      const bytes = await tryOn(id);
+      if (bytes) return bytes;
+    }
+    for (const id of await this.knownServers()) {
+      if (asked.has(id)) continue;
+      if (!this.node.getConnectedPeers().includes(id)) {
+        this.node.connectToPeer(id);
+        for (const until = Date.now() + 4e3; !this.node.getConnectedPeers().includes(id) && Date.now() < until; ) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        if (!this.node.getConnectedPeers().includes(id)) continue;
       }
+      const bytes = await tryOn(id);
+      if (bytes) return bytes;
     }
     return null;
   }
@@ -4226,8 +4244,12 @@ var PeerPigeonStorage = class {
         const cameUp = ready && !this.serversReady;
         this.serversReady = ready;
         if (ready) this.serversWaitDone?.();
-        if (cameUp) void this.migrateToServers().catch(() => {
-        });
+        if (cameUp) {
+          void this.migrateToServers().catch(() => {
+          });
+          void this.pullFromServers().catch(() => {
+          });
+        }
       } else if (event.type === "changed" && event.rec.room === room) {
         void this.applyServerRecord(event.rec, false).catch(() => {
         });
@@ -4239,6 +4261,27 @@ var PeerPigeonStorage = class {
       this.serversWaitDone?.();
       void this.migrateToServers().catch(() => {
       });
+      void this.pullFromServers().catch(() => {
+      });
+    }
+  }
+  /**
+   * The room's servers came up: what they keep under the prefixes this node
+   * replicates, or of keys it watches, comes here (as changes, so a page
+   * showing them updates). A peer whose servers linked only after its first
+   * read (a new browser, slow to reach them) gets the room's records all the same.
+   */
+  async pullFromServers() {
+    if (!this.servers || !this.serverIds) return;
+    for (const space of ["public", "user"]) {
+      const { tag } = await this.slotOf(space, "");
+      for (const rec of await this.servers.list(this.serverIds.room, tag)) {
+        if (this.closed) return;
+        const mutation = await this.decryptSyncEnvelope(rec.blob).catch(() => null);
+        if (!this.isStorageMutation(mutation) || mutation.space !== space) continue;
+        if (!this.usesLocally(space, mutation.key)) continue;
+        await this.applyRemoteMutation(mutation).catch(() => false);
+      }
     }
   }
   /**

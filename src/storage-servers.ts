@@ -430,14 +430,35 @@ export class StorageServerLink {
   /** Content by its SHA-256 from the servers, checked; null if none has it. */
   async getBlob(hash: string): Promise<Uint8Array | null> {
     const address = await blobAddress(hash);
-    for (const id of await this.serversForBlob(address)) {
+    // A page just opened may not know the servers yet: give it a moment to hear of them.
+    for (const until = Date.now() + 4_000; !(await this.knownServers()).length && Date.now() < until;) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    const asked = new Set<string>();
+    const tryOn = async (id: string): Promise<Uint8Array | null> => {
+      asked.add(id);
       // bin: we read bytes; a server that does answers with them, one that doesn't with base64 ('d').
       const a = await this.ask(id, { pp: PP, t: 'bget', req: newReq(), addr: address, bin: 1 }, BLOB_TIMEOUT_MS);
       const sealed = a?.t !== 'bgot' ? null : a.bytes instanceof Uint8Array ? a.bytes : typeof a.d === 'string' ? fromB64(a.d) : null;
-      if (sealed) {
-        const bytes = await openBlob(hash, sealed);
-        if (bytes) return bytes;
+      return sealed ? await openBlob(hash, sealed) : null;
+    };
+    for (const id of await this.serversForBlob(address)) {
+      const bytes = await tryOn(id);
+      if (bytes) return bytes;
+    }
+    // Not on the closest servers this page knows of (it may know fewer than the writer did, or they
+    // have not been given it yet): every other server known, linked to as needed.
+    for (const id of await this.knownServers()) {
+      if (asked.has(id)) continue;
+      if (!this.node.getConnectedPeers().includes(id)) {
+        this.node.connectToPeer(id);
+        for (const until = Date.now() + 4_000; !this.node.getConnectedPeers().includes(id) && Date.now() < until;) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        if (!this.node.getConnectedPeers().includes(id)) continue;
       }
+      const bytes = await tryOn(id);
+      if (bytes) return bytes;
     }
     return null;
   }

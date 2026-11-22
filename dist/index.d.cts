@@ -945,6 +945,13 @@ declare class PeerPigeonStorage {
      */
     attachServers(link: StorageServerLink): Promise<void>;
     /**
+     * The room's servers came up: what they keep under the prefixes this node
+     * replicates, or of keys it watches, comes here (as changes, so a page
+     * showing them updates). A peer whose servers linked only after its first
+     * read (a new browser, slow to reach them) gets the room's records all the same.
+     */
+    private pullFromServers;
+    /**
      * Sign this peer's changes as an account from now on: its keys (after the
      * person signs in), so what they write is theirs on every device they sign
      * in from. null goes back to the keys this storage started with (signing out).
