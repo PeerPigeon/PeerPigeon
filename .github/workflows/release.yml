@@ -1,0 +1,61 @@
+# Every push to main that changes the package: test, build, and publish to npm.
+# The version is package.json's when npm does not have it yet, else the next patch (committed back here).
+# Other Pigeon packages pinned to GitHub commits are published as their npm versions (.github/release.mjs).
+#
+# npm needs to trust this workflow, once, either way:
+#   - Trusted publishing (no token): npmjs.com > the package > Settings > Trusted publisher > GitHub Actions,
+#     this repository, workflow file "release.yml".
+#   - Or a token: an npm "Automation" token as the repository secret NPM_TOKEN.
+name: Test and publish to npm
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'examples/**', '.github/ISSUE_TEMPLATE/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # the version commit
+  id-token: write   # trusted publishing and provenance
+
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: npm 11 (trusted publishing)
+        run: npm install -g npm@11
+      - name: Install
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+      - name: Test
+        run: npm run build && node --test tests/storage-*.test.mjs tests/no-webcrypto.test.mjs tests/crypto-pq.test.mjs
+      - name: Build
+        run: npm run --if-present prepublishOnly
+      - name: Version and npm dependencies
+        id: v
+        run: |
+          # A build step may rewrite package.json (PeerPigeon pins freertc to main's head): start from the commit's.
+          git checkout -- package.json
+          node .github/release.mjs
+      - name: Publish
+        run: npm publish --access public --provenance --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Record the version here
+        if: steps.v.outputs.bumped == 'true'
+        run: |
+          git checkout -- package.json
+          npm pkg set version=${{ steps.v.outputs.version }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Version ${{ steps.v.outputs.version }} (published to npm) [skip ci]" -- package.json
+          git pull --rebase origin main && git push origin HEAD:main
