@@ -1319,9 +1319,20 @@ declare function rankSignalingServersByDistance(peerId: string, relays: readonly
 /** Choose exactly one relay by node-ID XOR distance to the peer ID. */
 declare function selectClosestSignalingServer(peerId: string, relayUrls: readonly SignalingRelayCandidate[]): Promise<string>;
 /**
- * A relay as a person reads it: the name a direct relay goes by when it has
- * one (ef0d4c0a988ec0d2.decentralize.ooo), else the host of its URL, with its
- * port when it is not the usual one.
+ * What a direct relay's directory record names it, for showing: its host name when it has one, else
+ * "relay <the first 16 hex of its node id>". A relay with no host name yet announces a label of its
+ * own making (an old one: its loopback address and port); that is never shown.
+ */
+declare function relayNameOf(record: {
+    name?: unknown;
+    node_id?: unknown;
+}): string | null;
+/**
+ * A relay as a person reads it: the host name a direct relay goes by when it
+ * has one (ef0d4c0a988ec0d2.decentralize.ooo), else its node id; any other
+ * relay by the host of its URL, with its port when it is not the usual one.
+ * Never an IP address: a relay reached by address alone is "direct relay",
+ * and one on this machine or network "local relay".
  */
 declare function relayDisplayName(url: string): string;
 /**
@@ -2045,4 +2056,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryServerRecordStore, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayScore, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, validRoom };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryServerRecordStore, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayNameOf, relayScore, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, validRoom };

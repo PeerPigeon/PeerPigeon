@@ -58,6 +58,7 @@ __export(index_exports, {
   rankSignalingServersByDistance: () => rankSignalingServersByDistance,
   reachableFromThisPage: () => reachableFromThisPage,
   relayDisplayName: () => relayDisplayName,
+  relayNameOf: () => relayNameOf,
   relayScore: () => relayScore,
   roomRoutingKey: () => roomRoutingKey,
   sealBlob: () => sealBlob,
@@ -6063,20 +6064,44 @@ async function selectClosestSignalingServer(peerId, relayUrls) {
   return ranked[0];
 }
 var directRelayNames = /* @__PURE__ */ new Map();
+function isAddress(host) {
+  const h = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
+  return !h || h === "localhost" || h.endsWith(".local") || h.endsWith(".localhost") || h.includes(":") || /^\d{1,3}(\.\d{1,3}){3}$/.test(h);
+}
+function namedHost(name) {
+  if (typeof name !== "string" || !name) return null;
+  try {
+    const host = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(name) ? name : `wss://${name}`).hostname;
+    return host.includes(".") && !isAddress(host) && !/\d{1,3}(\.\d{1,3}){3}/.test(host) ? host : null;
+  } catch {
+    return null;
+  }
+}
+function relayNameOf(record) {
+  const host = namedHost(record?.name);
+  if (host) return host;
+  return typeof record?.node_id === "string" && /^[0-9a-f]{16}/i.test(record.node_id) ? `relay ${record.node_id.slice(0, 16).toLowerCase()}` : null;
+}
 function noteRelayName(url, record) {
-  if (url && typeof record?.name === "string" && record.name) directRelayNames.set(url, record.name);
+  const name = url ? relayNameOf(record) : null;
+  if (name) directRelayNames.set(url, name);
   return url;
 }
 function relayDisplayName(url) {
   if (!url) return "";
   const named = directRelayNames.get(canonicalSignalingUrl(url) ?? url) ?? directRelayNames.get(url);
-  const shown = named || url;
+  if (named) return named;
   try {
-    const u = new URL(shown.replace(/^webrtc-direct:/, "https:"));
-    const usual = Boolean(named) || !u.port || u.port === "443" || u.port === "80";
+    const u = new URL(url.replace(/^webrtc-direct:/, "https:"));
+    if (isAddress(u.hostname)) {
+      const h = u.hostname.replace(/^\[|\]$/g, "");
+      const local = h === "localhost" || h === "::1" || /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h) || /^f[cde]/i.test(h) || h.endsWith(".local") || h.endsWith(".localhost");
+      return local ? "local relay" : "direct relay";
+    }
+    const usual = !u.port || u.port === "443" || u.port === "80";
     return usual ? u.hostname : `${u.hostname}:${u.port}`;
   } catch {
-    return shown;
+    return "relay";
   }
 }
 async function discoverSignalingRelays(options) {
@@ -9186,6 +9211,7 @@ var index_default = PartialMesh;
   rankSignalingServersByDistance,
   reachableFromThisPage,
   relayDisplayName,
+  relayNameOf,
   relayScore,
   roomRoutingKey,
   sealBlob,
