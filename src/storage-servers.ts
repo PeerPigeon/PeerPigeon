@@ -144,7 +144,10 @@ type Msg =
   | { pp: typeof PP; t: 'back'; req: string; ok: boolean; bytes?: Uint8Array }
   // bin: the asker reads bytes (the answer may come as bytes).
   | { pp: typeof PP; t: 'bget'; req: string; addr: string; bin?: 1 }
-  | { pp: typeof PP; t: 'bgot'; req: string; d?: string | null; bytes?: Uint8Array };
+  | { pp: typeof PP; t: 'bgot'; req: string; d?: string | null; bytes?: Uint8Array }
+  // Who runs a server, and (asked by that owner, signed) how it is doing: see statsText.
+  | { pp: typeof PP; t: 'stats'; req: string; at?: number; sig?: string }
+  | { pp: typeof PP; t: 'statsr'; req: string; owner: string | null; stats?: StorageServerStats & { uptimeMs: number } };
 
 export async function sha256Hex(text: string): Promise<string> {
   const digest = await subtle().digest('SHA-256', new TextEncoder().encode(text));
@@ -390,11 +393,30 @@ export class StorageServerLink {
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve({ ...data, recs: got }); }
       return;
     }
-    if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot') {
+    if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot' || data.t === 'statsr') {
       if ('bytes' in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve(data); }
     }
+  }
+
+  /**
+   * Who runs a server, and its stats when `sign` (the owner's signer, given the text to sign) is that
+   * owner's. Links to the server first if needed (waiting up to `waitMs`); null if it cannot be reached.
+   */
+  async serverStats(serverId: string, sign?: (text: string) => Promise<string>, waitMs = 6_000): Promise<{ owner: string | null; stats?: StorageServerStats & { uptimeMs: number } } | null> {
+    if (!this.node.getConnectedPeers().includes(serverId)) {
+      this.node.connectToPeer(serverId);
+      const until = Date.now() + waitMs;
+      while (!this.node.getConnectedPeers().includes(serverId) && Date.now() < until && !this.closed) await new Promise((r) => setTimeout(r, 100));
+      if (!this.node.getConnectedPeers().includes(serverId)) return null;
+    }
+    const at = Date.now();
+    const sig = sign ? await sign(statsText(serverId, at)).catch(() => undefined) : undefined;
+    const answer = await this.ask(serverId, { pp: PP, t: 'stats', req: newReq(), ...(sig ? { at, sig } : {}) });
+    if (answer?.t !== 'statsr') return null;
+    const owner = typeof answer.owner === 'string' ? answer.owner : null;
+    return answer.stats && typeof answer.stats === 'object' ? { owner, stats: answer.stats } : { owner };
   }
 
   /** Writes a record to the room's servers; resolves with how many took it. */
@@ -548,6 +570,21 @@ export class MemoryServerRecordStore implements ServerRecordStore {
   async blobUsage() { let bytes = 0; for (const b of this.blobMap.values()) bytes += b.length; return { count: this.blobMap.size, bytes }; }
 }
 
+/**
+ * What a server's owner signs to ask it for its stats: the server's peer id and the time, so the ask is
+ * good for that server only, for five minutes. Signed with the owner's P-256 key (an unsea signature).
+ */
+export const statsText = (serverId: string, at: number): string => `pp-ss-stats-v1:${serverId}:${at}`;
+const STATS_SKEW_MS = 5 * 60_000;
+
+export interface StorageServerOptions {
+  /**
+   * The signing key of the account that runs this server (a PigeonIdP account's `pub`), or a function
+   * giving it. Anyone can ask a server who its owner is; only the owner gets its stats.
+   */
+  owner?: string | null | (() => string | null);
+}
+
 export interface StorageServerStats {
   rooms: number;
   records: number;
@@ -574,7 +611,13 @@ export class StorageServer {
   private timer: ReturnType<typeof setInterval> | null = null;
   private onChange: ((rec: ServerRecord) => void) | null = null;
 
-  constructor(private readonly node: PeerPigeonNode, private readonly store: ServerRecordStore = new MemoryServerRecordStore()) {
+  private readonly startedAt = Date.now();
+
+  constructor(
+    private readonly node: PeerPigeonNode,
+    private readonly store: ServerRecordStore = new MemoryServerRecordStore(),
+    private readonly options: StorageServerOptions = {},
+  ) {
     node.on('message', (m) => { if (m.kind === 'direct' && m.fromPeerId) void this.onMessage(m.fromPeerId, m.data).catch(() => {}); });
     node.on('peerConnected', () => void this.rebalance());
     node.on('peerDisconnected', (peerId) => { for (const w of this.watchers.values()) w.delete(peerId); void this.rebalance(); });
@@ -603,6 +646,12 @@ export class StorageServer {
     const servers = linked.filter((id) => this.node.getPeerRole(id) === STORAGE_SERVER_ROLE).length;
     const b = (await this.store.blobUsage?.()) ?? { count: 0, bytes: 0 };
     return { rooms: rooms.length, records, blobs: b.count, blobBytes: b.bytes, servers, clients: linked.length - servers };
+  }
+
+  /** The owner this server was given, or null. */
+  owner(): string | null {
+    const value = typeof this.options.owner === 'function' ? this.options.owner() : this.options.owner;
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
   }
 
   private async self(): Promise<string> {
@@ -714,6 +763,16 @@ export class StorageServer {
         // Asked by one that reads bytes (bin): as bytes, in one binary frame; else (or not linked) base64.
         if (sealed && data.bin && await sendBytesSoon(this.node, from, { pp: PP, t: 'bgot', req: data.req }, sealed)) return;
         this.send(from, { pp: PP, t: 'bgot', req: data.req, d: sealed ? toB64(sealed) : null });
+        return;
+      }
+      case 'stats': {
+        // Who runs it, to anyone; its numbers, only to an ask its owner signed for this server, recently.
+        const owner = this.owner();
+        let ok = false;
+        if (owner && typeof data.sig === 'string' && typeof data.at === 'number' && Math.abs(Date.now() - data.at) <= STATS_SKEW_MS) {
+          try { ok = await verifyMessage(statsText(this.node.getClientId() ?? '', data.at), data.sig, owner); } catch { ok = false; }
+        }
+        this.send(from, { pp: PP, t: 'statsr', req: data.req, owner, ...(ok ? { stats: { ...(await this.stats()), uptimeMs: Date.now() - this.startedAt } } : {}) });
         return;
       }
       case 'sync': {

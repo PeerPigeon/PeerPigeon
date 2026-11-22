@@ -27,8 +27,8 @@ import type {
 import { PeerPigeonStorage } from './storage.js';
 import { subtle } from './subtle.js';
 import { StorageServerLink, StorageServer, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE } from './storage-servers.js';
-export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS, MAX_BLOB_BYTES, sealBlob, openBlob, blobAddress, ownedRoomOf, validRoom } from './storage-servers.js';
-export type { ServerRecord, ServerRecordStore, StorageServerStats } from './storage-servers.js';
+export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS, MAX_BLOB_BYTES, sealBlob, openBlob, blobAddress, ownedRoomOf, validRoom, statsText } from './storage-servers.js';
+export type { ServerRecord, ServerRecordStore, StorageServerStats, StorageServerOptions } from './storage-servers.js';
 import type { StorageOptions } from './storage.js';
 import { PeerPigeonCryptoProtocol } from './crypto.js';
 export { sha1Hex } from './sha1.js';
@@ -4386,10 +4386,12 @@ export class PeerPigeonNode {
   static storageServer(
     signaling: Pick<PartialMeshConfig, 'signalingServer' | 'signalingServers' | 'automaticSignalingServer' | 'relayDirectory' | 'iceServers'> = {},
     store?: import('./storage-servers.js').ServerRecordStore,
+    options?: import('./storage-servers.js').StorageServerOptions,
   ): StorageServer {
     return new StorageServer(
       PeerPigeonNode.serverScopeNode(signaling, { role: STORAGE_SERVER_ROLE, dialRoles: [STORAGE_SERVER_ROLE], maxPeers: 32, minPeers: 0 }),
       store,
+      options,
     );
   }
 

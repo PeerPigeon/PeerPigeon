@@ -3457,7 +3457,7 @@ var StorageServerLink = class {
       }
       return;
     }
-    if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot") {
+    if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot" || data.t === "statsr") {
       if ("bytes" in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) {
@@ -3466,6 +3466,24 @@ var StorageServerLink = class {
         p.resolve(data);
       }
     }
+  }
+  /**
+   * Who runs a server, and its stats when `sign` (the owner's signer, given the text to sign) is that
+   * owner's. Links to the server first if needed (waiting up to `waitMs`); null if it cannot be reached.
+   */
+  async serverStats(serverId, sign, waitMs = 6e3) {
+    if (!this.node.getConnectedPeers().includes(serverId)) {
+      this.node.connectToPeer(serverId);
+      const until = Date.now() + waitMs;
+      while (!this.node.getConnectedPeers().includes(serverId) && Date.now() < until && !this.closed) await new Promise((r) => setTimeout(r, 100));
+      if (!this.node.getConnectedPeers().includes(serverId)) return null;
+    }
+    const at = Date.now();
+    const sig = sign ? await sign(statsText(serverId, at)).catch(() => void 0) : void 0;
+    const answer = await this.ask(serverId, { pp: PP, t: "stats", req: newReq(), ...sig ? { at, sig } : {} });
+    if (answer?.t !== "statsr") return null;
+    const owner = typeof answer.owner === "string" ? answer.owner : null;
+    return answer.stats && typeof answer.stats === "object" ? { owner, stats: answer.stats } : { owner };
   }
   /** Writes a record to the room's servers; resolves with how many took it. */
   async put(rec, write) {
@@ -3615,10 +3633,13 @@ var MemoryServerRecordStore = class {
     return { count: this.blobMap.size, bytes };
   }
 };
+var statsText = (serverId, at) => `pp-ss-stats-v1:${serverId}:${at}`;
+var STATS_SKEW_MS = 5 * 6e4;
 var StorageServer = class {
-  constructor(node, store = new MemoryServerRecordStore()) {
+  constructor(node, store = new MemoryServerRecordStore(), options = {}) {
     this.node = node;
     this.store = store;
+    this.options = options;
     this.hashed = /* @__PURE__ */ new Map();
     this.watchers = /* @__PURE__ */ new Map();
     /** For each room: the servers last given its records. */
@@ -3628,6 +3649,7 @@ var StorageServer = class {
     this.selfHash = "";
     this.timer = null;
     this.onChange = null;
+    this.startedAt = Date.now();
     this.rebalancing = null;
     this.rebalanceAgain = false;
     node.on("message", (m) => {
@@ -3663,6 +3685,11 @@ var StorageServer = class {
     const servers = linked.filter((id) => this.node.getPeerRole(id) === STORAGE_SERVER_ROLE).length;
     const b = await this.store.blobUsage?.() ?? { count: 0, bytes: 0 };
     return { rooms: rooms.length, records, blobs: b.count, blobBytes: b.bytes, servers, clients: linked.length - servers };
+  }
+  /** The owner this server was given, or null. */
+  owner() {
+    const value = typeof this.options.owner === "function" ? this.options.owner() : this.options.owner;
+    return typeof value === "string" && value.trim() ? value.trim() : null;
   }
   async self() {
     const id = this.node.getClientId() ?? "";
@@ -3767,6 +3794,19 @@ var StorageServer = class {
         const sealed = validId(data.addr) && this.store.getBlob ? await this.store.getBlob(data.addr) : null;
         if (sealed && data.bin && await sendBytesSoon(this.node, from, { pp: PP, t: "bgot", req: data.req }, sealed)) return;
         this.send(from, { pp: PP, t: "bgot", req: data.req, d: sealed ? toB64(sealed) : null });
+        return;
+      }
+      case "stats": {
+        const owner = this.owner();
+        let ok = false;
+        if (owner && typeof data.sig === "string" && typeof data.at === "number" && Math.abs(Date.now() - data.at) <= STATS_SKEW_MS) {
+          try {
+            ok = await verifyMessage(statsText(this.node.getClientId() ?? "", data.at), data.sig, owner);
+          } catch {
+            ok = false;
+          }
+        }
+        this.send(from, { pp: PP, t: "statsr", req: data.req, owner, ...ok ? { stats: { ...await this.stats(), uptimeMs: Date.now() - this.startedAt } } : {} });
         return;
       }
       case "sync": {
@@ -8965,10 +9005,11 @@ var PeerPigeonNode = class _PeerPigeonNode {
     });
   }
   /** A storage server on the same relays as this node's settings (see storage-servers.ts). */
-  static storageServer(signaling = {}, store) {
+  static storageServer(signaling = {}, store, options) {
     return new StorageServer(
       _PeerPigeonNode.serverScopeNode(signaling, { role: STORAGE_SERVER_ROLE, dialRoles: [STORAGE_SERVER_ROLE], maxPeers: 32, minPeers: 0 }),
-      store
+      store,
+      options
     );
   }
   async destroy() {
@@ -9149,5 +9190,6 @@ export {
   sealBlob,
   selectClosestSignalingServer,
   sha1Hex,
+  statsText,
   validRoom
 };

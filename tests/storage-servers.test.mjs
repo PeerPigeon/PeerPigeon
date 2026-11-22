@@ -300,3 +300,38 @@ test('a list that waits for the servers includes a record that arrived while it 
   assert.deepEqual((await listing).map((r) => r.key), ['late/1']);
   await storage.close();
 });
+
+test('a server tells anyone its owner, and only its owner its stats', async () => {
+  const { generateRandomPair, signMessage } = await import('unsea');
+  const { statsText } = await import('../dist/index.js');
+  const owner = await generateRandomPair();
+  const stranger = await generateRandomPair();
+  const scope = makeScope();
+  const server = new StorageServer(scope.node(hex('s'), STORAGE_SERVER_ROLE), undefined, { owner: () => owner.pub });
+  await server.start();
+  const unowned = new StorageServer(scope.node(hex('t'), STORAGE_SERVER_ROLE));
+  await unowned.start();
+  const { storage, link } = await peer(scope, 'p');
+  await storage.put('user', 'k', 'v');
+  await settle();
+
+  const anonymous = await link.serverStats(hex('s'));
+  assert.equal(anonymous.owner, owner.pub);
+  assert.equal(anonymous.stats, undefined, 'no stats without the owner\'s signature');
+
+  const theirs = await link.serverStats(hex('s'), (text) => signMessage(text, stranger.priv));
+  assert.equal(theirs.stats, undefined, 'nor with someone else\'s');
+
+  const mine = await link.serverStats(hex('s'), (text) => signMessage(text, owner.priv));
+  assert.equal(mine.owner, owner.pub);
+  assert.ok(mine.stats.records >= 1 && mine.stats.rooms >= 1, 'it keeps the peer\'s record');
+  assert.ok(mine.stats.uptimeMs >= 0);
+
+  // An ask signed for another server, or long ago, gets no stats.
+  const elsewhere = await signMessage(statsText(hex('t'), Date.now()), owner.priv);
+  assert.equal((await link.serverStats(hex('s'), async () => elsewhere)).stats, undefined);
+
+  assert.equal((await link.serverStats(hex('t'))).owner, null);
+  assert.equal(await link.serverStats(hex('x'), undefined, 300), null, 'no such server');
+  await link.close(); await server.close(); await unowned.close(); await storage.close();
+});
