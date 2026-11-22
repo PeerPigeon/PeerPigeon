@@ -7,8 +7,21 @@
       </a>
 
       <div class="room" :title="effectiveSessionId">
-        <span class="room-label">Room</span>
-        <code class="room-name">{{ effectiveSessionId }}</code>
+        <label class="room-label" for="room-in-bar">Room</label>
+        <code v-if="activeNetworkName" class="room-name">{{ activeNetworkName }}:</code>
+        <!-- The room, editable: Enter or leaving the field moves the mesh to it. -->
+        <input
+          id="room-in-bar"
+          v-model.trim="roomDraft"
+          class="room-input"
+          data-testid="room-in-bar"
+          spellcheck="false"
+          autocomplete="off"
+          :size="Math.max(6, roomDraft.length)"
+          @keydown.enter.prevent="$event.target.blur()"
+          @keydown.esc="roomDraft = activeRoomSessionId; $event.target.blur()"
+          @blur="applyRoomFromBar"
+        />
         <button type="button" class="link-btn" data-testid="copy-share-link" @click="copyShareLink">Copy link</button>
       </div>
 
@@ -110,7 +123,7 @@
         <div class="where">
           <label class="field">
             <span>Room</span>
-            <input v-model.trim="roomSessionId" :disabled="isConnecting" class="input" data-testid="room-session-id" placeholder="my-room" />
+            <input v-model.trim="roomSessionId" :disabled="isConnecting" class="input" data-testid="room-session-id" placeholder="global" />
           </label>
           <label class="field">
             <span>Network</span>
@@ -649,6 +662,8 @@ const FONT_AWESOME_WIFI_OFFLINE_MASK = `url("data:image/svg+xml,${encodeURICompo
 )}")`;
 
 const DEFAULT_TOPOLOGY = 'token-ring';
+// The room a page joins when its link names none: everyone meets there.
+const DEFAULT_ROOM = 'global';
 const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
 const CRYPTO_PUBLIC_REQUEST_TYPE = 'pp-crypto-public-request-v1';
 const ENCRYPTED_BROADCAST_TYPE = 'pp-encrypted-broadcast-v1';
@@ -737,6 +752,8 @@ export default {
       customTopologyModalOpen: false,
       networkName: 'peerpigeon',
       roomSessionId: '',
+      // What the room field in the top bar shows while it is being edited.
+      roomDraft: '',
       signalingServer: 'auto',
       activeSignalingServer: '',
       signalingServerOptions: [...DEFAULT_SIGNALING_SERVERS],
@@ -855,12 +872,13 @@ export default {
       this.applyTopologyPreset(this.topology);
     }
 
-    // If URL does not provide a sessionId, use a fresh random room by default.
+    // If the URL names no room, everyone starts in the global one.
     if (hasExplicitSessionId) {
       this.roomSessionId = sessionIdParam;
     } else {
-      this.roomSessionId = this.generateRandomRoomSessionId();
+      this.roomSessionId = DEFAULT_ROOM;
     }
+    this.roomDraft = this.roomSessionId;
 
     const maxPeersParam = Number(params.get('maxPeers'));
     if (Number.isFinite(maxPeersParam) && maxPeersParam >= 1) {
@@ -1207,7 +1225,8 @@ export default {
     networkName() {
       this.updateUrlState();
     },
-    roomSessionId() {
+    roomSessionId(value) {
+      this.roomDraft = String(value || '');
       this.updateUrlState();
     },
     signalingServer() {
@@ -2184,10 +2203,6 @@ export default {
       }
     },
 
-    generateRandomRoomSessionId() {
-      return `gp-${Math.random().toString(36).slice(2, 10)}`;
-    },
-
     topologyPresetBounds(topology) {
       switch (topology) {
         case 'token-ring':
@@ -2290,6 +2305,28 @@ export default {
       this.$nextTick(() => this.$refs.minPeersInput?.focus());
     },
 
+    // The room field in the top bar: a new room goes into the link, and a running mesh leaves and joins it.
+    async applyRoomFromBar() {
+      const next = String(this.roomDraft || '').trim() || DEFAULT_ROOM;
+      this.roomDraft = next;
+      if (next === this.activeRoomSessionId) return;
+      try {
+        // updateUrlState keeps a room the page was opened with: replace that one first.
+        const url = new URL(window.location.href);
+        url.searchParams.delete('room');
+        url.searchParams.delete('roomSessionId');
+        url.searchParams.set('sessionId', next);
+        window.history.replaceState({}, '', url.toString());
+      } catch { /* the link stays as it was */ }
+      this.roomSessionId = next;
+      if (this.isRunning || this.isConnecting) {
+        this.showStatus('Changing room...', `Moving to ${this.activeNetworkName ? this.activeNetworkName + ':' : ''}${next}...`, 'connecting');
+        this.stopMesh();
+        await this.$nextTick();
+        await this.startMesh();
+      }
+    },
+
     async restartMeshForTopologyChange() {
       if (this.isConnecting) return;
       this.showStatus('Reconfiguring...', 'Applying topology and restarting mesh...', 'connecting');
@@ -2315,7 +2352,7 @@ export default {
         this.networkName = String(this.networkName || '').trim();
         this.roomSessionId = String(this.roomSessionId || '').trim();
         if (!this.roomSessionId) {
-          this.roomSessionId = this.generateRandomRoomSessionId();
+          this.roomSessionId = DEFAULT_ROOM;
         }
         const requestedSignalingServer = String(this.signalingServer || '').trim();
         const automaticSignalingServer = this.usesAutomaticSignalingServer(requestedSignalingServer);
@@ -4763,11 +4800,40 @@ export default {
 }
 
 .room-name {
+  flex: none;
   font-family: var(--mono);
   font-size: 0.85rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.room-input {
+  min-width: 0;
+  max-width: 16rem;
+  padding: 0;
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  color: var(--ink);
+  background: transparent;
+  border: 0;
+  border-radius: 2px;
+}
+
+/* Right after the network's name, as one name: the row's gap taken back. */
+.room-name + .room-input {
+  margin-left: -0.5rem;
+}
+
+.room-input:hover {
+  text-decoration: underline dotted var(--ink-2);
+  text-underline-offset: 3px;
+}
+
+/* Editing: a ring outside the text, so nothing shifts or covers the network's name. */
+.room-input:focus {
+  outline: 2px solid var(--sheen);
+  outline-offset: 3px;
+  text-decoration: none;
 }
 
 .bar-actions {
