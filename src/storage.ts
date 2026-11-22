@@ -709,8 +709,11 @@ export class PeerPigeonStorage {
 
   async list(space: StorageSpace): Promise<StorageRecord[]> {
     const driver = this.requireDriver();
+    // The wait for the servers (some seconds on a peer that just joined) comes before reading what is
+    // kept here: a record that arrives during it is then in the list, not lost between the two.
+    const linked = space !== 'private' && await this.serversLinked();
     const persisted = await driver.listBySpace(space);
-    if (space !== 'private' && await this.serversLinked()) {
+    if (linked) {
       // And what the room's servers keep that is not here (records moved to them).
       const here = new Set(persisted.map((r) => r.key));
       for (const record of await this.listFromServers(space)) if (!here.has(record.key)) persisted.push(record);

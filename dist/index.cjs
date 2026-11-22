@@ -4253,8 +4253,9 @@ var PeerPigeonStorage = class {
   }
   async list(space) {
     const driver = this.requireDriver();
+    const linked = space !== "private" && await this.serversLinked();
     const persisted = await driver.listBySpace(space);
-    if (space !== "private" && await this.serversLinked()) {
+    if (linked) {
       const here = new Set(persisted.map((r) => r.key));
       for (const record of await this.listFromServers(space)) if (!here.has(record.key)) persisted.push(record);
     }

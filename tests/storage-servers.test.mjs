@@ -289,3 +289,14 @@ test('a blob on a server the reader is slow to reach is found in about one link\
   assert.ok(secondMs < 300, `second piece in ${secondMs} ms (straight to the server that had the first)`);
   await link.close();
 });
+
+test('a list that waits for the servers includes a record that arrived while it waited', async () => {
+  const storage = new PeerPigeonStorage({ ...options, userId: 'user-w', peerId: 'w', serverWaitMs: 600 });
+  await storage.init();
+  storage.expectServers(); // none will come: the list waits serverWaitMs
+  const listing = storage.list('public');
+  await settle(150);
+  await storage.put('public', 'late/1', 'arrived during the wait');
+  assert.deepEqual((await listing).map((r) => r.key), ['late/1']);
+  await storage.close();
+});
