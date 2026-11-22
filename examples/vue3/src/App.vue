@@ -18,7 +18,10 @@
         :aria-label="theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'"
         :title="theme === 'dark' ? 'Light mode' : 'Dark mode'"
         @click="setTheme(theme === 'dark' ? 'light' : 'dark')"
-      ><FontAwesomeIcon :icon="theme === 'dark' ? icons.light : icons.dark" aria-hidden="true" /></button>
+      >
+        <svg v-if="theme === 'dark'" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.5" /><path d="M12 2.5v2.5M12 19v2.5M2.5 12H5M19 12h2.5M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M5.3 18.7l1.8-1.8M16.9 7.1l1.8-1.8" /></svg>
+        <svg v-else viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" /></svg>
+      </button>
 
       <div class="bar-actions">
         <button
@@ -574,8 +577,6 @@ import {
   faTriangleExclamation,
   faWifi,
   faXmark,
-  faSun,
-  faMoon,
   faRightFromBracket,
 } from '@fortawesome/free-solid-svg-icons';
 import PeerNetworkGraph from './components/PeerNetworkGraph.vue';
@@ -632,8 +633,6 @@ const APP_ICONS = Object.freeze({
   warning: faTriangleExclamation,
   close: faXmark,
   leave: faRightFromBracket,
-  light: faSun,
-  dark: faMoon,
 });
 
 const [wifiIconWidth, wifiIconHeight, , , wifiIconPathData] = faWifi.icon;
@@ -706,7 +705,11 @@ export default {
       noLinksHeld: false,
       // Dark unless this browser chose light (Light / Dark in the top bar).
       theme: (() => {
-        try { return localStorage.getItem('peerpigeon:theme') === 'light' ? 'light' : 'dark'; } catch { return 'dark'; }
+        // The one picked here last time, else the system's (as every PeerPigeon site does).
+        let picked = null;
+        try { picked = localStorage.getItem('peerpigeon:theme'); } catch { /* private mode */ }
+        if (picked === 'light' || picked === 'dark') return picked;
+        return window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
       })(),
       mesh: null,
       icons: APP_ICONS,
@@ -828,7 +831,7 @@ export default {
   mounted() {
     window.__app = this;
     this.startDiagnostics();
-    this.setTheme(this.theme);
+    this.setTheme(this.theme, false);
     const params = new URLSearchParams(window.location.search);
 
     // ==== IMPORTANT: URL params take ABSOLUTE priority for test isolation ====
@@ -1212,12 +1215,12 @@ export default {
     }
   },
   methods: {
-    setTheme(theme) {
+    setTheme(theme, remember = true) {
       this.theme = theme === 'light' ? 'light' : 'dark';
       // The page behind the app (overscroll, the browser chrome) follows too.
       document.documentElement.dataset.theme = this.theme;
       document.documentElement.style.colorScheme = this.theme;
-      try { localStorage.setItem('peerpigeon:theme', this.theme); } catch { /* private mode: not remembered */ }
+      if (remember) { try { localStorage.setItem('peerpigeon:theme', this.theme); } catch { /* private mode: not remembered */ } }
     },
 
     usesAutomaticSignalingServer(value) {
@@ -4660,10 +4663,24 @@ export default {
 
 .link-btn.theme-switch {
   margin-left: auto;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--ink-2);
-  font-size: 1.05rem;
-  line-height: 1;
-  padding: 0.35rem;
+}
+
+.link-btn.theme-switch svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .link-btn.theme-switch:hover {
