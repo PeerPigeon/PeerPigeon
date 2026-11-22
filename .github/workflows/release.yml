@@ -58,4 +58,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "Version ${{ steps.v.outputs.version }} (published to npm) [skip ci]" -- package.json
+          # What the build changed (PeerPigeon's rewrites its lockfiles) is not kept.
+          git reset --hard HEAD
+          git clean -fdq
           git pull --rebase origin main && git push origin HEAD:main
