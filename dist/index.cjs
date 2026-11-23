@@ -3534,6 +3534,8 @@ var StorageServerLink = class {
     this.listeners = /* @__PURE__ */ new Set();
     /** Servers whose own numbers this peer follows. */
     this.statsFollowing = /* @__PURE__ */ new Map();
+    /** What to call when a follow ends because the link to its server dropped, by server (and room). */
+    this.followEnds = /* @__PURE__ */ new Map();
     /** Rooms whose history this peer follows, by server and room. */
     this.following = /* @__PURE__ */ new Map();
     this.timer = null;
@@ -3548,9 +3550,22 @@ var StorageServerLink = class {
     node.on("peerConnected", () => void this.refresh());
     node.on("peerDisconnected", (peerId) => {
       this.failPending(peerId);
+      this.endFollowing(peerId);
       void this.refresh();
     });
     node.mesh?.on?.("peer:discovered", () => void this.refresh());
+  }
+  endFollowing(serverId) {
+    for (const [key, end] of [...this.followEnds]) {
+      if (key !== serverId && !key.startsWith(`${serverId}:`)) continue;
+      this.followEnds.delete(key);
+      this.statsFollowing.delete(key);
+      this.following.delete(key);
+      try {
+        end();
+      } catch {
+      }
+    }
   }
   async start() {
     await this.node.start();
@@ -3765,7 +3780,7 @@ var StorageServerLink = class {
    * serverStats is (the owner, or a pass). Resolves to { startedAt, stop }, or null if refused or not
    * reached. Ends by itself when the link to the server drops.
    */
-  async followServerStats(serverId, sign, onStats, pass, waitMs = 6e3) {
+  async followServerStats(serverId, sign, onStats, pass, onEnd, waitMs = 6e3) {
     if (!this.node.getConnectedPeers().includes(serverId)) {
       this.node.connectToPeer(serverId);
       const until = Date.now() + waitMs;
@@ -3781,11 +3796,13 @@ var StorageServerLink = class {
       if (this.statsFollowing.get(serverId) === onStats) this.statsFollowing.delete(serverId);
       return null;
     }
+    if (onEnd) this.followEnds.set(serverId, onEnd);
     return {
       startedAt: typeof answer.startedAt === "number" ? answer.startedAt : Date.now(),
       stop: () => {
         if (this.statsFollowing.get(serverId) !== onStats) return;
         this.statsFollowing.delete(serverId);
+        this.followEnds.delete(serverId);
         this.send(serverId, { pp: PP, t: "statsfollow", req: newReq(), stop: true });
       }
     };
@@ -3795,7 +3812,7 @@ var StorageServerLink = class {
    * each step. Asked as roomStats is (the owner, or a pass). Resolves to a function that stops it, or null
    * if the server refused or could not be reached. Ends by itself when the link to the server drops.
    */
-  async followRoomStats(serverId, room, sign, onNow, pass, waitMs = 6e3) {
+  async followRoomStats(serverId, room, sign, onNow, pass, waitMs = 6e3, onEnd) {
     if (!this.node.getConnectedPeers().includes(serverId)) {
       this.node.connectToPeer(serverId);
       const until = Date.now() + waitMs;
@@ -3812,9 +3829,11 @@ var StorageServerLink = class {
       if (this.following.get(key) === onNow) this.following.delete(key);
       return null;
     }
+    if (onEnd) this.followEnds.set(key, onEnd);
     return () => {
       if (this.following.get(key) !== onNow) return;
       this.following.delete(key);
+      this.followEnds.delete(key);
       this.send(serverId, { pp: PP, t: "roomfollow", req: newReq(), room, stop: true });
     };
   }

@@ -296,6 +296,18 @@ export class StorageServerLink {
   private readonly listeners = new Set<LinkListener>();
   /** Servers whose own numbers this peer follows. */
   private readonly statsFollowing = new Map<string, (stats: StorageServerStats) => void>();
+  /** What to call when a follow ends because the link to its server dropped, by server (and room). */
+  private readonly followEnds = new Map<string, () => void>();
+
+  private endFollowing(serverId: string): void {
+    for (const [key, end] of [...this.followEnds]) {
+      if (key !== serverId && !key.startsWith(`${serverId}:`)) continue;
+      this.followEnds.delete(key);
+      this.statsFollowing.delete(key);
+      this.following.delete(key);
+      try { end(); } catch { /* the listener's own trouble */ }
+    }
+  }
   /** Rooms whose history this peer follows, by server and room. */
   private readonly following = new Map<string, (now: RoomNow) => void>();
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -304,7 +316,7 @@ export class StorageServerLink {
   constructor(private readonly node: PeerPigeonNode) {
     node.on('message', (m) => { if (m.kind === 'direct' && m.fromPeerId) this.onMessage(m.fromPeerId, m.data); });
     node.on('peerConnected', () => void this.refresh());
-    node.on('peerDisconnected', (peerId) => { this.failPending(peerId); void this.refresh(); });
+    node.on('peerDisconnected', (peerId) => { this.failPending(peerId); this.endFollowing(peerId); void this.refresh(); });
     // A server listed by the relay is dialled at once, not at the next look.
     (node as { mesh?: { on?: (e: string, cb: () => void) => void } }).mesh?.on?.('peer:discovered', () => void this.refresh());
   }
@@ -487,7 +499,7 @@ export class StorageServerLink {
    * serverStats is (the owner, or a pass). Resolves to { startedAt, stop }, or null if refused or not
    * reached. Ends by itself when the link to the server drops.
    */
-  async followServerStats(serverId: string, sign: (text: string) => Promise<string>, onStats: (stats: StorageServerStats) => void, pass?: StatsPass, waitMs = 6_000): Promise<{ startedAt: number; stop: () => void } | null> {
+  async followServerStats(serverId: string, sign: (text: string) => Promise<string>, onStats: (stats: StorageServerStats) => void, pass?: StatsPass, onEnd?: () => void, waitMs = 6_000): Promise<{ startedAt: number; stop: () => void } | null> {
     if (!this.node.getConnectedPeers().includes(serverId)) {
       this.node.connectToPeer(serverId);
       const until = Date.now() + waitMs;
@@ -500,11 +512,13 @@ export class StorageServerLink {
     this.statsFollowing.set(serverId, onStats);
     const answer = await this.ask(serverId, { pp: PP, t: 'statsfollow', req: newReq(), at, sig, ...(pass ? { by: pass.by, until: pass.until, gsig: pass.gsig } : {}) });
     if (answer?.t !== 'statsfollowed' || !answer.ok) { if (this.statsFollowing.get(serverId) === onStats) this.statsFollowing.delete(serverId); return null; }
+    if (onEnd) this.followEnds.set(serverId, onEnd);
     return {
       startedAt: typeof answer.startedAt === 'number' ? answer.startedAt : Date.now(),
       stop: () => {
         if (this.statsFollowing.get(serverId) !== onStats) return;
         this.statsFollowing.delete(serverId);
+        this.followEnds.delete(serverId);
         this.send(serverId, { pp: PP, t: 'statsfollow', req: newReq(), stop: true });
       },
     };
@@ -515,7 +529,7 @@ export class StorageServerLink {
    * each step. Asked as roomStats is (the owner, or a pass). Resolves to a function that stops it, or null
    * if the server refused or could not be reached. Ends by itself when the link to the server drops.
    */
-  async followRoomStats(serverId: string, room: string, sign: (text: string) => Promise<string>, onNow: (now: RoomNow) => void, pass?: StatsPass, waitMs = 6_000): Promise<(() => void) | null> {
+  async followRoomStats(serverId: string, room: string, sign: (text: string) => Promise<string>, onNow: (now: RoomNow) => void, pass?: StatsPass, waitMs = 6_000, onEnd?: () => void): Promise<(() => void) | null> {
     if (!this.node.getConnectedPeers().includes(serverId)) {
       this.node.connectToPeer(serverId);
       const until = Date.now() + waitMs;
@@ -529,9 +543,11 @@ export class StorageServerLink {
     this.following.set(key, onNow);
     const answer = await this.ask(serverId, { pp: PP, t: 'roomfollow', req: newReq(), room, at, sig, ...(pass ? { by: pass.by, until: pass.until, gsig: pass.gsig } : {}) });
     if (answer?.t !== 'roomfollowed' || !answer.ok) { if (this.following.get(key) === onNow) this.following.delete(key); return null; }
+    if (onEnd) this.followEnds.set(key, onEnd);
     return () => {
       if (this.following.get(key) !== onNow) return;
       this.following.delete(key);
+      this.followEnds.delete(key);
       this.send(serverId, { pp: PP, t: 'roomfollow', req: newReq(), room, stop: true });
     };
   }

@@ -157,6 +157,9 @@ declare class StorageServerLink {
     private readonly listeners;
     /** Servers whose own numbers this peer follows. */
     private readonly statsFollowing;
+    /** What to call when a follow ends because the link to its server dropped, by server (and room). */
+    private readonly followEnds;
+    private endFollowing;
     /** Rooms whose history this peer follows, by server and room. */
     private readonly following;
     private timer;
@@ -208,7 +211,7 @@ declare class StorageServerLink {
      * serverStats is (the owner, or a pass). Resolves to { startedAt, stop }, or null if refused or not
      * reached. Ends by itself when the link to the server drops.
      */
-    followServerStats(serverId: string, sign: (text: string) => Promise<string>, onStats: (stats: StorageServerStats) => void, pass?: StatsPass, waitMs?: number): Promise<{
+    followServerStats(serverId: string, sign: (text: string) => Promise<string>, onStats: (stats: StorageServerStats) => void, pass?: StatsPass, onEnd?: () => void, waitMs?: number): Promise<{
         startedAt: number;
         stop: () => void;
     } | null>;
@@ -217,7 +220,7 @@ declare class StorageServerLink {
      * each step. Asked as roomStats is (the owner, or a pass). Resolves to a function that stops it, or null
      * if the server refused or could not be reached. Ends by itself when the link to the server drops.
      */
-    followRoomStats(serverId: string, room: string, sign: (text: string) => Promise<string>, onNow: (now: RoomNow) => void, pass?: StatsPass, waitMs?: number): Promise<(() => void) | null>;
+    followRoomStats(serverId: string, room: string, sign: (text: string) => Promise<string>, onNow: (now: RoomNow) => void, pass?: StatsPass, waitMs?: number, onEnd?: () => void): Promise<(() => void) | null>;
     /**
      * The owner takes `member`'s pass back at a server (restore: gives it back); `sign` signs as the owner.
      * Resolves true once the server has it, false if it refused or could not be reached.

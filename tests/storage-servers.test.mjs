@@ -544,7 +544,8 @@ test('a console following a server hears its numbers as they change, and nothing
   const a = await peer(scope, 'u');
   await settle(100);
   const heard = [];
-  const f = await a.link.followServerStats(hex('t'), (t) => signMessage(t, owner.priv), (st) => heard.push(st));
+  let ended = 0;
+  const f = await a.link.followServerStats(hex('t'), (t) => signMessage(t, owner.priv), (st) => heard.push(st), undefined, () => ended++);
   assert.ok(f && f.startedAt > 0, 'the owner may follow it');
   await settle(50);
   assert.equal(heard.length, 1, 'its numbers at once');
@@ -567,4 +568,21 @@ test('a console following a server hears its numbers as they change, and nothing
   assert.equal(heard.length, n, 'nothing after it stops');
   assert.equal(await a.link.followServerStats(hex('t'), (t) => signMessage(t, stranger.priv), () => {}), null, 'not for anyone else');
   await a.link.close(); await s.close(); await a.storage.close();
+});
+
+test('a follow ends, and says so, when the link to its server drops', async () => {
+  const { generateRandomPair, signMessage } = await import('unsea');
+  const owner = await generateRandomPair();
+  const scope = makeScope();
+  const s = new StorageServer(scope.node(hex('v'), STORAGE_SERVER_ROLE), undefined, { owner: owner.pub });
+  await s.start();
+  const a = await peer(scope, 'w');
+  await settle(100);
+  let ended = 0;
+  assert.ok(await a.link.followServerStats(hex('v'), (t) => signMessage(t, owner.priv), () => {}, undefined, () => ended++));
+  await s.close();
+  await s['node'].destroy();
+  await settle(150);
+  assert.equal(ended, 1);
+  await a.link.close(); await a.storage.close();
 });
