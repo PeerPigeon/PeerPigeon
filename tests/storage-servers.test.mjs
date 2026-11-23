@@ -51,10 +51,11 @@ const hex = (c) => c.repeat(64);
 const settle = (ms = 50) => new Promise((r) => setTimeout(r, ms));
 const options = { sessionId: 'net:room', syncSecret: 's3cret' };
 
-async function peer(scope, id, extra = {}) {
+async function peer(scope, id, extra = {}, role = null) {
   const storage = new PeerPigeonStorage({ ...options, userId: `user-${id}`, peerId: id, ...extra });
   await storage.init();
   const link = new StorageServerLink(scope.node(hex(id)));
+  link.role = role;
   await storage.attachServers(link);
   await link.start();
   return { storage, link };
@@ -451,18 +452,21 @@ test('a server counts who is in each room it keeps, and tells only its owner (or
   await settle(100);
   // b again, from another tab: a new peer id, the same person.
   const b2 = await peer(scope, 'k', { userId: 'user-j' });
+  // A bot: its role is in its own network, not the servers' scope, so it says so itself.
+  const bot = await peer(scope, 'l', {}, 'bot');
   await settle(100);
   await s.sampleRooms();
   const room = s['history'].rooms()[0];
-  assert.equal(s['watchers'].get(room)?.size, 3, 'three peers watch it');
+  assert.equal(s['watchers'].get(room)?.size, 4, 'four peers watch it');
   assert.ok(room, 'the peers\' room is watched');
   const now = Date.now();
   const asOwner = (text) => signMessage(text, owner.priv);
   const got = await a.link.roomStats(hex('h'), room, now - 3_600_000, now + 60_000, asOwner);
   assert.equal(got.step, 60_000);
   assert.equal(got.points.at(-1).people, 2);
+  assert.equal(got.points.at(-1).roles, 1, 'the bot, apart');
   const pass = { by: member.pub, until: 0, gsig: await signMessage(grantText(owner.pub, member.pub, 0), owner.priv) };
   assert.ok(await a.link.roomStats(hex('h'), room, now - 3_600_000, now + 60_000, (t) => signMessage(t, member.priv), pass), 'with a pass');
   assert.equal(await a.link.roomStats(hex('h'), room, now - 3_600_000, now + 60_000, (t) => signMessage(t, stranger.priv)), null, 'not to anyone else');
-  await a.link.close(); await b.link.close(); await b2.link.close(); await s.close(); await a.storage.close(); await b.storage.close(); await b2.storage.close();
+  await a.link.close(); await b.link.close(); await b2.link.close(); await bot.link.close(); await s.close(); await bot.storage.close(); await a.storage.close(); await b.storage.close(); await b2.storage.close();
 });

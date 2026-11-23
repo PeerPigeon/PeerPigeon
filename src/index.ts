@@ -4209,6 +4209,8 @@ export class PeerPigeonNode {
       ? { ...this.signalingOptions, signalingServer: relay, signalingServers: [relay], automaticSignalingServer: false }
       : this.signalingOptions;
     this.serverLink = new StorageServerLink(PeerPigeonNode.serverScopeNode(signaling, { dialRoles: [] }));
+    const role = this.getConfig().role;
+    this.serverLink.role = typeof role === 'string' && role ? role : null;
     await this.storage.attachServers(this.serverLink);
     await this.serverLink.start();
   }

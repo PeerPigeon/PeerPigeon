@@ -3510,6 +3510,8 @@ var StorageServerLink = class {
     this.listings = /* @__PURE__ */ new Map();
     this.rooms = /* @__PURE__ */ new Map();
     this.visitors = /* @__PURE__ */ new Map();
+    /** This peer's role in its own network (a bot's 'bot'), told to the servers with each watch. */
+    this.role = null;
     this.listeners = /* @__PURE__ */ new Set();
     this.timer = null;
     this.closed = false;
@@ -3599,7 +3601,7 @@ var StorageServerLink = class {
       const now = closest.filter((id) => linked.has(id));
       const fresh = now.filter((id) => !before.includes(id));
       this.rooms.set(room, now);
-      for (const id of fresh) this.send(id, { pp: PP, t: "watch", room, ...this.visitors.has(room) ? { v: this.visitors.get(room) } : {} });
+      for (const id of fresh) this.send(id, { pp: PP, t: "watch", room, ...this.visitors.has(room) ? { v: this.visitors.get(room) } : {}, ...this.role ? { r: this.role } : {} });
       if (fresh.length || now.length !== before.length) this.emit({ type: "servers", room, servers: now });
     }
   }
@@ -3890,7 +3892,7 @@ var StorageServer = class {
     this.store = store;
     this.options = options;
     this.hashed = /* @__PURE__ */ new Map();
-    /** For each room: the peers watching it, and who each is (its visitor id, else the peer id). */
+    /** For each room: the peers watching it, who each is (its visitor id, else the peer id), and its role. */
     this.watchers = /* @__PURE__ */ new Map();
     /** For each room: the servers last given its records. */
     this.placed = /* @__PURE__ */ new Map();
@@ -3937,9 +3939,9 @@ var StorageServer = class {
     for (const [room, peers] of this.watchers) {
       const people = [];
       let roles = 0;
-      for (const [peer, who] of peers) {
+      for (const [peer, { who, role: told }] of peers) {
         if (!linked.has(peer)) continue;
-        const role = this.node.getPeerRole(peer);
+        const role = told ?? this.node.getPeerRole(peer);
         if (role && role !== "client") roles++;
         else people.push(who);
       }
@@ -4062,7 +4064,7 @@ var StorageServer = class {
         if (!validRoom(data.room)) return;
         let w = this.watchers.get(data.room);
         if (!w) this.watchers.set(data.room, w = /* @__PURE__ */ new Map());
-        w.set(from, validId(data.v) ? data.v : from);
+        w.set(from, { who: validId(data.v) ? data.v : from, role: typeof data.r === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(data.r) ? data.r : null });
         return;
       }
       case "bput": {
@@ -9174,6 +9176,8 @@ var PeerPigeonNode = class _PeerPigeonNode {
     const relay = this.currentRelay();
     const signaling = relay ? { ...this.signalingOptions, signalingServer: relay, signalingServers: [relay], automaticSignalingServer: false } : this.signalingOptions;
     this.serverLink = new StorageServerLink(_PeerPigeonNode.serverScopeNode(signaling, { dialRoles: [] }));
+    const role = this.getConfig().role;
+    this.serverLink.role = typeof role === "string" && role ? role : null;
     await this.storage.attachServers(this.serverLink);
     await this.serverLink.start();
   }

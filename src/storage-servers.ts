@@ -138,7 +138,8 @@ type Msg =
   | { pp: typeof PP; t: 'list'; req: string; room: string; tag?: string }
   | { pp: typeof PP; t: 'listed'; req: string; recs: Omit<ServerRecord, 'wh'>[]; more: boolean }
   // v: who is watching, the same from visit to visit (a hash of their key and the room; see visitorOf).
-  | { pp: typeof PP; t: 'watch'; room: string; v?: string }
+  // r: its role in its own network (a bot's 'bot'), which the server cannot see from its own scope.
+  | { pp: typeof PP; t: 'watch'; room: string; v?: string; r?: string }
   | { pp: typeof PP; t: 'changed'; rec: Omit<ServerRecord, 'wh'> }
   | { pp: typeof PP; t: 'sync'; recs: ServerRecord[] }
   // A blob goes as base64 ('d'), or as bytes ('bytes': sent by sendBytes, to one that reads them).
@@ -280,6 +281,8 @@ export class StorageServerLink {
   private readonly listings = new Map<string, Omit<ServerRecord, 'wh'>[]>();
   private readonly rooms = new Map<string, string[]>();
   private readonly visitors = new Map<string, string>();
+  /** This peer's role in its own network (a bot's 'bot'), told to the servers with each watch. */
+  role: string | null = null;
   private readonly listeners = new Set<LinkListener>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
@@ -357,7 +360,7 @@ export class StorageServerLink {
       const now = closest.filter((id) => linked.has(id));
       const fresh = now.filter((id) => !before.includes(id));
       this.rooms.set(room, now);
-      for (const id of fresh) this.send(id, { pp: PP, t: 'watch', room, ...(this.visitors.has(room) ? { v: this.visitors.get(room) } : {}) });
+      for (const id of fresh) this.send(id, { pp: PP, t: 'watch', room, ...(this.visitors.has(room) ? { v: this.visitors.get(room) } : {}), ...(this.role ? { r: this.role } : {}) });
       if (fresh.length || now.length !== before.length) this.emit({ type: 'servers', room, servers: now });
     }
   }
@@ -682,8 +685,8 @@ export interface StorageServerStats {
  */
 export class StorageServer {
   private readonly hashed = new Map<string, string>();
-  /** For each room: the peers watching it, and who each is (its visitor id, else the peer id). */
-  private readonly watchers = new Map<string, Map<string, string>>();
+  /** For each room: the peers watching it, who each is (its visitor id, else the peer id), and its role. */
+  private readonly watchers = new Map<string, Map<string, { who: string; role: string | null }>>();
   /** For each room: the servers last given its records. */
   private readonly placed = new Map<string, string[]>();
   /** For each blob: the servers last given it. */
@@ -728,9 +731,9 @@ export class StorageServer {
     for (const [room, peers] of this.watchers) {
       const people: string[] = [];
       let roles = 0;
-      for (const [peer, who] of peers) {
+      for (const [peer, { who, role: told }] of peers) {
         if (!linked.has(peer)) continue;
-        const role = this.node.getPeerRole(peer);
+        const role = told ?? this.node.getPeerRole(peer);
         if (role && role !== 'client') roles++; else people.push(who);
       }
       await this.history.sample(room, people, roles, now).catch(() => {});
@@ -856,7 +859,7 @@ export class StorageServer {
         if (!validRoom(data.room)) return;
         let w = this.watchers.get(data.room);
         if (!w) this.watchers.set(data.room, (w = new Map()));
-        w.set(from, validId(data.v) ? data.v : from);
+        w.set(from, { who: validId(data.v) ? data.v : from, role: typeof data.r === 'string' && /^[a-z0-9][a-z0-9-]{0,31}$/.test(data.r) ? data.r : null });
         return;
       }
       case 'bput': {

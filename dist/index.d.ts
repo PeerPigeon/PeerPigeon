@@ -147,6 +147,8 @@ declare class StorageServerLink {
     private readonly listings;
     private readonly rooms;
     private readonly visitors;
+    /** This peer's role in its own network (a bot's 'bot'), told to the servers with each watch. */
+    role: string | null;
     private readonly listeners;
     private timer;
     private closed;
@@ -308,7 +310,7 @@ declare class StorageServer {
     private readonly store;
     private readonly options;
     private readonly hashed;
-    /** For each room: the peers watching it, and who each is (its visitor id, else the peer id). */
+    /** For each room: the peers watching it, who each is (its visitor id, else the peer id), and its role. */
     private readonly watchers;
     /** For each room: the servers last given its records. */
     private readonly placed;
