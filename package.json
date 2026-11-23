@@ -1,6 +1,6 @@
 {
   "name": "peerpigeon",
-  "version": "1.2.13",
+  "version": "1.2.14",
   "description": "PeerPigeon: WebRTC partial-mesh networking with gossip broadcast and direct messaging",
   "type": "module",
   "main": "./dist/index.cjs",
