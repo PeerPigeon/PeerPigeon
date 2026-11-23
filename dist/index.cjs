@@ -3979,7 +3979,7 @@ var StorageServer = class {
     });
     node.on("peerConnected", () => void this.rebalance());
     node.on("peerDisconnected", (peerId) => {
-      for (const w of this.watchers.values()) w.delete(peerId);
+      for (const [room, w] of this.watchers) if (w.delete(peerId)) void this.sampleRoom(room);
       for (const f of this.followers.values()) f.delete(peerId);
       void this.rebalance();
     });
@@ -3998,25 +3998,33 @@ var StorageServer = class {
   }
   /** Once a minute: how many are in each room watched here (people, and peers with a role). */
   async sampleRooms(now = Date.now()) {
+    for (const room of this.watchers.keys()) await this.sampleRoom(room, now);
+  }
+  /**
+   * One room's count now (the minute's, replaced as it changes), sent at once to the pages following it.
+   * Taken each minute, and also the moment someone starts or stops watching the room, so a page sees a
+   * peer come and go within seconds, not at the next minute.
+   */
+  async sampleRoom(room, now = Date.now()) {
+    const peers = this.watchers.get(room);
+    if (!peers) return;
     const linked = new Set(this.node.getConnectedPeers());
-    for (const [room, peers] of this.watchers) {
-      const people = [];
-      let roles = 0;
-      for (const [peer, { who, role: told }] of peers) {
-        if (!linked.has(peer)) continue;
-        const role = told ?? this.node.getPeerRole(peer);
-        if (role && role !== "client") roles++;
-        else people.push(who);
-      }
-      await this.history.sample(room, people, roles, now).catch(() => {
-      });
-      const following = this.followers.get(room);
-      if (following?.size) {
-        const c = await this.history.current(room, now);
-        const one = (p) => p ? packPoints([p])[0] : void 0;
-        const msg = { pp: PP, t: "roomnow", room, minute: one(c.minute), five: one(c.five), hour: one(c.hour), day: one(c.day) };
-        for (const peer of following.keys()) if (linked.has(peer)) this.send(peer, msg);
-      }
+    const people = [];
+    let roles = 0;
+    for (const [peer, { who, role: told }] of peers) {
+      if (!linked.has(peer)) continue;
+      const role = told ?? this.node.getPeerRole(peer);
+      if (role && role !== "client") roles++;
+      else people.push(who);
+    }
+    await this.history.sample(room, people, roles, now).catch(() => {
+    });
+    const following = this.followers.get(room);
+    if (following?.size) {
+      const c = await this.history.current(room, now);
+      const one = (p) => p ? packPoints([p])[0] : void 0;
+      const msg = { pp: PP, t: "roomnow", room, minute: one(c.minute), five: one(c.five), hour: one(c.hour), day: one(c.day) };
+      for (const peer of following.keys()) if (linked.has(peer)) this.send(peer, msg);
     }
   }
   async close() {
@@ -4134,7 +4142,9 @@ var StorageServer = class {
         if (!validRoom(data.room)) return;
         let w = this.watchers.get(data.room);
         if (!w) this.watchers.set(data.room, w = /* @__PURE__ */ new Map());
+        const fresh = !w.has(from);
         w.set(from, { who: validId(data.v) ? data.v : from, role: typeof data.r === "string" && /^[a-z0-9][a-z0-9-]{0,31}$/.test(data.r) ? data.r : null });
+        if (fresh) void this.sampleRoom(data.room);
         return;
       }
       case "bput": {

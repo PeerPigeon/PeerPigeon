@@ -351,6 +351,12 @@ declare class StorageServer {
     start(): Promise<void>;
     /** Once a minute: how many are in each room watched here (people, and peers with a role). */
     sampleRooms(now?: number): Promise<void>;
+    /**
+     * One room's count now (the minute's, replaced as it changes), sent at once to the pages following it.
+     * Taken each minute, and also the moment someone starts or stops watching the room, so a page sees a
+     * peer come and go within seconds, not at the next minute.
+     */
+    sampleRoom(room: string, now?: number): Promise<void>;
     close(): Promise<void>;
     stats(): Promise<StorageServerStats>;
     /** The owner this server was given, or null. */

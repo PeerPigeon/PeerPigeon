@@ -513,3 +513,23 @@ test('a page following a room hears each new count, with no asking, until it sto
   assert.equal(theirs.length, 1, 'nothing once the pass is taken back');
   await a.link.close(); await s.close(); await a.storage.close();
 });
+
+test('a page following a room hears someone come and go at once, not at the next minute', async () => {
+  const { generateRandomPair, signMessage } = await import('unsea');
+  const owner = await generateRandomPair();
+  const scope = makeScope();
+  const s = new StorageServer(scope.node(hex('q'), STORAGE_SERVER_ROLE), undefined, { owner: owner.pub });
+  await s.start();
+  const a = await peer(scope, 'r');
+  await settle(100);
+  const room = [...s['watchers'].keys()][0];
+  const heard = [];
+  assert.ok(await a.link.followRoomStats(hex('q'), room, (t) => signMessage(t, owner.priv), (now) => heard.push(now.minute.people)));
+  const b = await peer(scope, 's');
+  await settle(150);
+  assert.equal(heard.at(-1), 2, 'the second one, as it links');
+  await b.link.close();
+  await settle(150);
+  assert.equal(heard.at(-1), 1, 'and gone, as it leaves');
+  await a.link.close(); await s.close(); await a.storage.close(); await b.storage.close();
+});
