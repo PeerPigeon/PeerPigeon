@@ -470,3 +470,46 @@ test('a server counts who is in each room it keeps, and tells only its owner (or
   assert.equal(await a.link.roomStats(hex('h'), room, now - 3_600_000, now + 60_000, (t) => signMessage(t, stranger.priv)), null, 'not to anyone else');
   await a.link.close(); await b.link.close(); await b2.link.close(); await bot.link.close(); await s.close(); await bot.storage.close(); await a.storage.close(); await b.storage.close(); await b2.storage.close();
 });
+
+test('a page following a room hears each new count, with no asking, until it stops or its pass is taken back', async () => {
+  const { generateRandomPair, signMessage } = await import('unsea');
+  const { grantText } = await import('../dist/index.js');
+  const owner = await generateRandomPair();
+  const member = await generateRandomPair();
+  const stranger = await generateRandomPair();
+  const scope = makeScope();
+  const s = new StorageServer(scope.node(hex('m'), STORAGE_SERVER_ROLE), undefined, { owner: owner.pub });
+  await s.start();
+  const a = await peer(scope, 'n');
+  await a.storage.put('user', 'k', 'v');
+  await settle(100);
+  await s.sampleRooms();
+  const room = s['history'].rooms()[0];
+  const heard = [];
+  const stop = await a.link.followRoomStats(hex('m'), room, (t) => signMessage(t, owner.priv), (now) => heard.push(now));
+  assert.ok(stop, 'the owner may follow it');
+  await s.sampleRooms(Date.now() + 60_000);
+  await settle();
+  assert.equal(heard.length, 1);
+  assert.equal(heard[0].minute.people, 1);
+  assert.ok(heard[0].five && heard[0].hour && heard[0].day);
+  assert.equal(heard[0].hour.visitors, 1);
+  stop();
+  await settle();
+  await s.sampleRooms(Date.now() + 120_000);
+  await settle();
+  assert.equal(heard.length, 1, 'nothing after it stops');
+
+  assert.equal(await a.link.followRoomStats(hex('m'), room, (t) => signMessage(t, stranger.priv), () => {}), null, 'not for anyone else');
+  const pass = { by: member.pub, until: 0, gsig: await signMessage(grantText(owner.pub, member.pub, 0), owner.priv) };
+  const theirs = [];
+  assert.ok(await a.link.followRoomStats(hex('m'), room, (t) => signMessage(t, member.priv), (now) => theirs.push(now), pass), 'with a pass');
+  await s.sampleRooms(Date.now() + 180_000);
+  await settle();
+  assert.equal(theirs.length, 1);
+  assert.equal(await a.link.revokePass(hex('m'), member.pub, (t) => signMessage(t, owner.priv)), true);
+  await s.sampleRooms(Date.now() + 240_000);
+  await settle();
+  assert.equal(theirs.length, 1, 'nothing once the pass is taken back');
+  await a.link.close(); await s.close(); await a.storage.close();
+});

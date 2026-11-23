@@ -3280,6 +3280,25 @@ var RoomStats = class {
     const list = step === HOUR_MS ? h.hours : h.days;
     return { step, points: list.filter((x) => x.at >= from - step && x.at <= to).map((x) => ({ at: x.at, people: x.avg, peak: x.peak, roles: x.roles, visitors: x.visitors })) };
   }
+  /**
+   * The room's newest point in each step a reader can be showing (a minute, 5 minutes, an hour, a day),
+   * as read() gives them: sent to a page that follows the room, after each sample, so it needs no asking.
+   */
+  async current(room, now = Date.now()) {
+    const h = (await this.open(room)).history;
+    const last = h.minutes[h.minutes.length - 1] ?? null;
+    const fiveAt = Math.floor(now / (5 * MINUTE_MS)) * 5 * MINUTE_MS;
+    const five = h.minutes.filter((m) => m.at >= fiveAt);
+    const round = (n) => Math.round(n * 10) / 10;
+    const hour = h.hours[h.hours.length - 1] ?? null;
+    const day = h.days[h.days.length - 1] ?? null;
+    return {
+      minute: last ? { at: last.at, people: last.people, peak: last.people, roles: last.roles } : null,
+      five: five.length ? { at: fiveAt, people: round(five.reduce((t, m) => t + m.people, 0) / five.length), peak: Math.max(...five.map((m) => m.people)), roles: round(five.reduce((t, m) => t + m.roles, 0) / five.length) } : null,
+      hour: hour ? { at: hour.at, people: hour.avg, peak: hour.peak, roles: hour.roles, visitors: hour.visitors } : null,
+      day: day ? { at: day.at, people: day.avg, peak: day.peak, roles: day.roles, visitors: day.visitors } : null
+    };
+  }
   /** The rooms with a history so far, in memory. */
   rooms() {
     return [...this.live.keys()];
@@ -3437,6 +3456,8 @@ var StorageServerLink = class {
     /** This peer's role in its own network (a bot's 'bot'), told to the servers with each watch. */
     this.role = null;
     this.listeners = /* @__PURE__ */ new Set();
+    /** Rooms whose history this peer follows, by server and room. */
+    this.following = /* @__PURE__ */ new Map();
     this.timer = null;
     this.closed = false;
     this.refreshing = null;
@@ -3573,6 +3594,17 @@ var StorageServerLink = class {
   }
   onMessage(from, data) {
     if (!isMsg(data)) return;
+    if (data.t === "roomnow") {
+      const f = this.following.get(`${from}:${data.room}`);
+      if (f) {
+        const one = (v) => unpackPoints(Array.isArray(v) ? [v] : [])[0] ?? null;
+        try {
+          f({ minute: one(data.minute), five: one(data.five), hour: one(data.hour), day: one(data.day) });
+        } catch {
+        }
+      }
+      return;
+    }
     if (data.t === "changed") {
       if (validRecord(data.rec)) this.emit({ type: "changed", rec: data.rec });
       return;
@@ -3593,7 +3625,7 @@ var StorageServerLink = class {
       }
       return;
     }
-    if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot" || data.t === "statsr" || data.t === "revoked" || data.t === "roomstatsr") {
+    if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot" || data.t === "statsr" || data.t === "revoked" || data.t === "roomstatsr" || data.t === "roomfollowed") {
       if ("bytes" in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) {
@@ -3639,6 +3671,34 @@ var StorageServerLink = class {
     const answer = await this.ask(serverId, { pp: PP, t: "roomstats", req: newReq(), room, from, to, at, sig, ...pass ? { by: pass.by, until: pass.until, gsig: pass.gsig } : {} });
     if (answer?.t !== "roomstatsr" || !answer.ok || typeof answer.step !== "number") return null;
     return { step: answer.step, points: unpackPoints(answer.points) };
+  }
+  /**
+   * Follow a room's history at a server: after each minute's count, `onNow` gets the room's newest point in
+   * each step. Asked as roomStats is (the owner, or a pass). Resolves to a function that stops it, or null
+   * if the server refused or could not be reached. Ends by itself when the link to the server drops.
+   */
+  async followRoomStats(serverId, room, sign, onNow, pass, waitMs = 6e3) {
+    if (!this.node.getConnectedPeers().includes(serverId)) {
+      this.node.connectToPeer(serverId);
+      const until = Date.now() + waitMs;
+      while (!this.node.getConnectedPeers().includes(serverId) && Date.now() < until && !this.closed) await new Promise((r) => setTimeout(r, 100));
+      if (!this.node.getConnectedPeers().includes(serverId)) return null;
+    }
+    const at = Date.now();
+    const sig = await sign(statsText(serverId, at)).catch(() => null);
+    if (!sig) return null;
+    const key = `${serverId}:${room}`;
+    this.following.set(key, onNow);
+    const answer = await this.ask(serverId, { pp: PP, t: "roomfollow", req: newReq(), room, at, sig, ...pass ? { by: pass.by, until: pass.until, gsig: pass.gsig } : {} });
+    if (answer?.t !== "roomfollowed" || !answer.ok) {
+      if (this.following.get(key) === onNow) this.following.delete(key);
+      return null;
+    }
+    return () => {
+      if (this.following.get(key) !== onNow) return;
+      this.following.delete(key);
+      this.send(serverId, { pp: PP, t: "roomfollow", req: newReq(), room, stop: true });
+    };
   }
   /**
    * The owner takes `member`'s pass back at a server (restore: gives it back); `sign` signs as the owner.
@@ -3826,6 +3886,8 @@ var StorageServer = class {
     this.timer = null;
     this.onChange = null;
     this.startedAt = Date.now();
+    /** For each room: the peers following its history, and whose pass each came with (null: the owner's). */
+    this.followers = /* @__PURE__ */ new Map();
     this.sampler = null;
     this.rebalancing = null;
     this.rebalanceAgain = false;
@@ -3842,6 +3904,7 @@ var StorageServer = class {
     node.on("peerConnected", () => void this.rebalance());
     node.on("peerDisconnected", (peerId) => {
       for (const w of this.watchers.values()) w.delete(peerId);
+      for (const f of this.followers.values()) f.delete(peerId);
       void this.rebalance();
     });
     node.mesh?.on?.("peer:discovered", () => void this.rebalance());
@@ -3871,6 +3934,13 @@ var StorageServer = class {
       }
       await this.history.sample(room, people, roles, now).catch(() => {
       });
+      const following = this.followers.get(room);
+      if (following?.size) {
+        const c = await this.history.current(room, now);
+        const one = (p) => p ? packPoints([p])[0] : void 0;
+        const msg = { pp: PP, t: "roomnow", room, minute: one(c.minute), five: one(c.five), hour: one(c.hour), day: one(c.day) };
+        for (const peer of following.keys()) if (linked.has(peer)) this.send(peer, msg);
+      }
     }
   }
   async close() {
@@ -4028,6 +4098,19 @@ var StorageServer = class {
         this.send(from, { pp: PP, t: "roomstatsr", req: data.req, ok: true, step: got.step, points: packPoints(got.points) });
         return;
       }
+      case "roomfollow": {
+        if (!validRoom(data.room)) return void this.send(from, { pp: PP, t: "roomfollowed", req: data.req, ok: false });
+        if (data.stop) {
+          this.followers.get(data.room)?.delete(from);
+          return;
+        }
+        if (!await this.askedByOwner(data)) return void this.send(from, { pp: PP, t: "roomfollowed", req: data.req, ok: false });
+        let f = this.followers.get(data.room);
+        if (!f) this.followers.set(data.room, f = /* @__PURE__ */ new Map());
+        f.set(from, typeof data.by === "string" ? data.by : null);
+        this.send(from, { pp: PP, t: "roomfollowed", req: data.req, ok: true });
+        return;
+      }
       case "revoke": {
         const owner = this.owner();
         let ok = false;
@@ -4038,6 +4121,9 @@ var StorageServer = class {
             ok = false;
           }
           if (ok) await this.revoked.set(data.member, !data.restore);
+          if (ok && !data.restore) {
+            for (const f of this.followers.values()) for (const [peer, by] of f) if (by === data.member) f.delete(peer);
+          }
         }
         this.send(from, { pp: PP, t: "revoked", req: data.req, ok });
         return;

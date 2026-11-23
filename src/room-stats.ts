@@ -127,6 +127,26 @@ export class RoomStats {
     return { step, points: list.filter((x) => x.at >= from - step && x.at <= to).map((x) => ({ at: x.at, people: x.avg, peak: x.peak, roles: x.roles, visitors: x.visitors })) };
   }
 
+  /**
+   * The room's newest point in each step a reader can be showing (a minute, 5 minutes, an hour, a day),
+   * as read() gives them: sent to a page that follows the room, after each sample, so it needs no asking.
+   */
+  async current(room: string, now = Date.now()): Promise<Record<'minute' | 'five' | 'hour' | 'day', RoomStatsPoint | null>> {
+    const h = (await this.open(room)).history;
+    const last = h.minutes[h.minutes.length - 1] ?? null;
+    const fiveAt = Math.floor(now / (5 * MINUTE_MS)) * 5 * MINUTE_MS;
+    const five = h.minutes.filter((m) => m.at >= fiveAt);
+    const round = (n: number) => Math.round(n * 10) / 10;
+    const hour = h.hours[h.hours.length - 1] ?? null;
+    const day = h.days[h.days.length - 1] ?? null;
+    return {
+      minute: last ? { at: last.at, people: last.people, peak: last.people, roles: last.roles } : null,
+      five: five.length ? { at: fiveAt, people: round(five.reduce((t, m) => t + m.people, 0) / five.length), peak: Math.max(...five.map((m) => m.people)), roles: round(five.reduce((t, m) => t + m.roles, 0) / five.length) } : null,
+      hour: hour ? { at: hour.at, people: hour.avg, peak: hour.peak, roles: hour.roles, visitors: hour.visitors } : null,
+      day: day ? { at: day.at, people: day.avg, peak: day.peak, roles: day.roles, visitors: day.visitors } : null,
+    };
+  }
+
   /** The rooms with a history so far, in memory. */
   rooms(): string[] { return [...this.live.keys()]; }
 }
