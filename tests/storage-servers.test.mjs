@@ -533,3 +533,38 @@ test('a page following a room hears someone come and go at once, not at the next
   assert.equal(heard.at(-1), 1, 'and gone, as it leaves');
   await a.link.close(); await s.close(); await a.storage.close(); await b.storage.close();
 });
+
+test('a console following a server hears its numbers as they change, and nothing once it stops', async () => {
+  const { generateRandomPair, signMessage } = await import('unsea');
+  const owner = await generateRandomPair();
+  const stranger = await generateRandomPair();
+  const scope = makeScope();
+  const s = new StorageServer(scope.node(hex('t'), STORAGE_SERVER_ROLE), undefined, { owner: owner.pub });
+  await s.start();
+  const a = await peer(scope, 'u');
+  await settle(100);
+  const heard = [];
+  const f = await a.link.followServerStats(hex('t'), (t) => signMessage(t, owner.priv), (st) => heard.push(st));
+  assert.ok(f && f.startedAt > 0, 'the owner may follow it');
+  await settle(50);
+  assert.equal(heard.length, 1, 'its numbers at once');
+  const before = heard[0].records;
+  await a.storage.put('user', 'k2', 'v2');
+  await settle(100);
+  await s['sendStats']();
+  await settle(50);
+  assert.equal(heard.at(-1).records, before + 1, 'and again when they change');
+  const n = heard.length;
+  await s['sendStats']();
+  await settle(50);
+  assert.equal(heard.length, n, 'not when nothing changed');
+  f.stop();
+  await settle(50);
+  await a.storage.put('user', 'k3', 'v3');
+  await settle(100);
+  await s['sendStats']();
+  await settle(50);
+  assert.equal(heard.length, n, 'nothing after it stops');
+  assert.equal(await a.link.followServerStats(hex('t'), (t) => signMessage(t, stranger.priv), () => {}), null, 'not for anyone else');
+  await a.link.close(); await s.close(); await a.storage.close();
+});

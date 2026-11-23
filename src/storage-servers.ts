@@ -161,6 +161,11 @@ type Msg =
   // sends the room's newest point in each step (roomnow), so a page showing it never has to ask again.
   | { pp: typeof PP; t: 'roomfollow'; req: string; room: string; at?: number; sig?: string; by?: string; until?: number; gsig?: string; stop?: boolean }
   | { pp: typeof PP; t: 'roomfollowed'; req: string; ok: boolean }
+  // Following the server's own numbers (asked as stats is; stop: no more): it sends them (statsnow) when
+  // they change, so the console's Storage page never has to ask again.
+  | { pp: typeof PP; t: 'statsfollow'; req: string; at?: number; sig?: string; by?: string; until?: number; gsig?: string; stop?: boolean }
+  | { pp: typeof PP; t: 'statsfollowed'; req: string; ok: boolean; startedAt?: number }
+  | { pp: typeof PP; t: 'statsnow'; stats: StorageServerStats }
   | { pp: typeof PP; t: 'roomnow'; room: string; minute?: unknown; five?: unknown; hour?: unknown; day?: unknown };
 
 export async function sha256Hex(text: string): Promise<string> {
@@ -289,6 +294,8 @@ export class StorageServerLink {
   /** This peer's role in its own network (a bot's 'bot'), told to the servers with each watch. */
   role: string | null = null;
   private readonly listeners = new Set<LinkListener>();
+  /** Servers whose own numbers this peer follows. */
+  private readonly statsFollowing = new Map<string, (stats: StorageServerStats) => void>();
   /** Rooms whose history this peer follows, by server and room. */
   private readonly following = new Map<string, (now: RoomNow) => void>();
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -403,6 +410,11 @@ export class StorageServerLink {
 
   private onMessage(from: string, data: unknown): void {
     if (!isMsg(data)) return;
+    if (data.t === 'statsnow') {
+      const f = this.statsFollowing.get(from);
+      if (f && data.stats && typeof data.stats === 'object') { try { f(data.stats); } catch { /* the listener's own trouble */ } }
+      return;
+    }
     if (data.t === 'roomnow') {
       const f = this.following.get(`${from}:${data.room}`);
       if (f) {
@@ -424,7 +436,7 @@ export class StorageServerLink {
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve({ ...data, recs: got }); }
       return;
     }
-    if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot' || data.t === 'statsr' || data.t === 'revoked' || data.t === 'roomstatsr' || data.t === 'roomfollowed') {
+    if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot' || data.t === 'statsr' || data.t === 'revoked' || data.t === 'roomstatsr' || data.t === 'roomfollowed' || data.t === 'statsfollowed') {
       if ('bytes' in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve(data); }
@@ -468,6 +480,34 @@ export class StorageServerLink {
     const answer = await this.ask(serverId, { pp: PP, t: 'roomstats', req: newReq(), room, from, to, at, sig, ...(pass ? { by: pass.by, until: pass.until, gsig: pass.gsig } : {}) });
     if (answer?.t !== 'roomstatsr' || !answer.ok || typeof answer.step !== 'number') return null;
     return { step: answer.step, points: unpackPoints(answer.points) };
+  }
+
+  /**
+   * Follow a server's own numbers: `onStats` gets them now and again whenever they change. Asked as
+   * serverStats is (the owner, or a pass). Resolves to { startedAt, stop }, or null if refused or not
+   * reached. Ends by itself when the link to the server drops.
+   */
+  async followServerStats(serverId: string, sign: (text: string) => Promise<string>, onStats: (stats: StorageServerStats) => void, pass?: StatsPass, waitMs = 6_000): Promise<{ startedAt: number; stop: () => void } | null> {
+    if (!this.node.getConnectedPeers().includes(serverId)) {
+      this.node.connectToPeer(serverId);
+      const until = Date.now() + waitMs;
+      while (!this.node.getConnectedPeers().includes(serverId) && Date.now() < until && !this.closed) await new Promise((r) => setTimeout(r, 100));
+      if (!this.node.getConnectedPeers().includes(serverId)) return null;
+    }
+    const at = Date.now();
+    const sig = await sign(statsText(serverId, at)).catch(() => null);
+    if (!sig) return null;
+    this.statsFollowing.set(serverId, onStats);
+    const answer = await this.ask(serverId, { pp: PP, t: 'statsfollow', req: newReq(), at, sig, ...(pass ? { by: pass.by, until: pass.until, gsig: pass.gsig } : {}) });
+    if (answer?.t !== 'statsfollowed' || !answer.ok) { if (this.statsFollowing.get(serverId) === onStats) this.statsFollowing.delete(serverId); return null; }
+    return {
+      startedAt: typeof answer.startedAt === 'number' ? answer.startedAt : Date.now(),
+      stop: () => {
+        if (this.statsFollowing.get(serverId) !== onStats) return;
+        this.statsFollowing.delete(serverId);
+        this.send(serverId, { pp: PP, t: 'statsfollow', req: newReq(), stop: true });
+      },
+    };
   }
 
   /**
@@ -742,6 +782,10 @@ export class StorageServer {
   private readonly startedAt = Date.now();
   private readonly revoked: NonNullable<StorageServerOptions['revoked']>;
   private readonly history: RoomStats;
+  /** The peers following this server's own numbers, and whose pass each came with (null: the owner's). */
+  private readonly statsFollowers = new Map<string, string | null>();
+  private statsTimer: ReturnType<typeof setInterval> | null = null;
+  private statsSent = '';
   /** For each room: the peers following its history, and whose pass each came with (null: the owner's). */
   private readonly followers = new Map<string, Map<string, string | null>>();
   private sampler: ReturnType<typeof setInterval> | null = null;
@@ -759,6 +803,7 @@ export class StorageServer {
     node.on('peerDisconnected', (peerId) => {
       for (const [room, w] of this.watchers) if (w.delete(peerId)) void this.sampleRoom(room);
       for (const f of this.followers.values()) f.delete(peerId);
+      this.statsFollowers.delete(peerId);
       void this.rebalance();
     });
     (node as { mesh?: { on?: (e: string, cb: () => void) => void } }).mesh?.on?.('peer:discovered', () => void this.rebalance());
@@ -773,6 +818,22 @@ export class StorageServer {
     (this.timer as { unref?: () => void }).unref?.();
     this.sampler = setInterval(() => void this.sampleRooms(), MINUTE_MS);
     (this.sampler as { unref?: () => void }).unref?.();
+  }
+
+  /** The server's numbers to those following them, when they changed. */
+  private async sendStats(): Promise<void> {
+    if (!this.statsFollowers.size) {
+      if (this.statsTimer) clearInterval(this.statsTimer);
+      this.statsTimer = null;
+      this.statsSent = '';
+      return;
+    }
+    const stats = await this.stats();
+    const text = JSON.stringify(stats);
+    if (text === this.statsSent) return;
+    this.statsSent = text;
+    const linked = new Set(this.node.getConnectedPeers());
+    for (const peer of this.statsFollowers.keys()) if (linked.has(peer)) this.send(peer, { pp: PP, t: 'statsnow', stats });
   }
 
   /** Once a minute: how many are in each room watched here (people, and peers with a role). */
@@ -809,6 +870,7 @@ export class StorageServer {
   async close(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     if (this.sampler) clearInterval(this.sampler);
+    if (this.statsTimer) clearInterval(this.statsTimer);
     await this.node.destroy().catch(() => {});
   }
 
@@ -971,6 +1033,19 @@ export class StorageServer {
         this.send(from, { pp: PP, t: 'roomstatsr', req: data.req, ok: true, step: got.step, points: packPoints(got.points) });
         return;
       }
+      case 'statsfollow': {
+        if (data.stop) { this.statsFollowers.delete(from); return; }
+        if (!(await this.askedByOwner(data))) return void this.send(from, { pp: PP, t: 'statsfollowed', req: data.req, ok: false });
+        this.statsFollowers.set(from, typeof data.by === 'string' ? data.by : null);
+        this.send(from, { pp: PP, t: 'statsfollowed', req: data.req, ok: true, startedAt: this.startedAt });
+        this.send(from, { pp: PP, t: 'statsnow', stats: await this.stats() });
+        // Looked at every 5 seconds while anyone follows; sent only when something changed.
+        if (!this.statsTimer) {
+          this.statsTimer = setInterval(() => void this.sendStats(), 5_000);
+          (this.statsTimer as { unref?: () => void }).unref?.();
+        }
+        return;
+      }
       case 'roomfollow': {
         if (!validRoom(data.room)) return void this.send(from, { pp: PP, t: 'roomfollowed', req: data.req, ok: false });
         if (data.stop) { this.followers.get(data.room)?.delete(from); return; }
@@ -989,6 +1064,7 @@ export class StorageServer {
           if (ok) await this.revoked.set(data.member, !data.restore);
           // A pass taken back: the history it was following stops coming.
           if (ok && !data.restore) for (const f of this.followers.values()) for (const [peer, by] of f) if (by === data.member) f.delete(peer);
+          if (ok && !data.restore) for (const [peer, by] of this.statsFollowers) if (by === data.member) this.statsFollowers.delete(peer);
         }
         this.send(from, { pp: PP, t: 'revoked', req: data.req, ok });
         return;

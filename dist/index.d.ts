@@ -155,6 +155,8 @@ declare class StorageServerLink {
     /** This peer's role in its own network (a bot's 'bot'), told to the servers with each watch. */
     role: string | null;
     private readonly listeners;
+    /** Servers whose own numbers this peer follows. */
+    private readonly statsFollowing;
     /** Rooms whose history this peer follows, by server and room. */
     private readonly following;
     private timer;
@@ -200,6 +202,15 @@ declare class StorageServerLink {
     roomStats(serverId: string, room: string, from: number, to: number, sign: (text: string) => Promise<string>, pass?: StatsPass, waitMs?: number): Promise<{
         step: number;
         points: RoomStatsPoint[];
+    } | null>;
+    /**
+     * Follow a server's own numbers: `onStats` gets them now and again whenever they change. Asked as
+     * serverStats is (the owner, or a pass). Resolves to { startedAt, stop }, or null if refused or not
+     * reached. Ends by itself when the link to the server drops.
+     */
+    followServerStats(serverId: string, sign: (text: string) => Promise<string>, onStats: (stats: StorageServerStats) => void, pass?: StatsPass, waitMs?: number): Promise<{
+        startedAt: number;
+        stop: () => void;
     } | null>;
     /**
      * Follow a room's history at a server: after each minute's count, `onNow` gets the room's newest point in
@@ -342,6 +353,10 @@ declare class StorageServer {
     private readonly startedAt;
     private readonly revoked;
     private readonly history;
+    /** The peers following this server's own numbers, and whose pass each came with (null: the owner's). */
+    private readonly statsFollowers;
+    private statsTimer;
+    private statsSent;
     /** For each room: the peers following its history, and whose pass each came with (null: the owner's). */
     private readonly followers;
     private sampler;
@@ -349,6 +364,8 @@ declare class StorageServer {
     /** Called with each record this server takes (a write, or one handed to it). */
     onRecord(listener: (rec: ServerRecord) => void): void;
     start(): Promise<void>;
+    /** The server's numbers to those following them, when they changed. */
+    private sendStats;
     /** Once a minute: how many are in each room watched here (people, and peers with a role). */
     sampleRooms(now?: number): Promise<void>;
     /**
