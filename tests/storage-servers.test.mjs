@@ -403,3 +403,62 @@ test('a pass with no end date holds until the owner takes it back at the server'
   assert.ok((await link.serverStats(hex('y'), asMember, 6000, pass)).stats, 'given back');
   await link.close(); await server.close(); await storage.close();
 });
+
+test('a room\'s history: a sample a minute, hours and days summed up, read in steps that fit the range', async () => {
+  const { RoomStats, MemoryRoomStatsStore } = await import('../dist/index.js');
+  const store = new MemoryRoomStatsStore();
+  const stats = new RoomStats(store);
+  const room = hex('r');
+  const t0 = Date.UTC(2026, 10, 20, 10, 0);
+  const bot = (p) => p.startsWith('bot');
+  // 3 hours, a minute at a time: 2 people, then 4 in the second hour (one new each minute), and a bot.
+  for (let m = 0; m < 180; m++) {
+    const peers = m < 60 ? ['a', 'b', 'bot1'] : m < 120 ? ['a', 'b', `c${m}`, `d${m}`, 'bot1'] : ['a'];
+    await stats.sample(room, peers, bot, t0 + m * 60_000);
+  }
+  const hour = await stats.read(room, t0 + 120 * 60_000, t0 + 180 * 60_000);
+  assert.equal(hour.step, 60_000);
+  assert.ok(hour.points.every((p) => p.people === 1 && p.roles === 0));
+  const day = await stats.read(room, t0 - 20 * 3_600_000, t0 + 4 * 3_600_000);
+  assert.equal(day.step, 5 * 60_000);
+  assert.equal(day.points.length, 36);
+  assert.deepEqual(day.points[0], { at: t0, people: 2, peak: 2, roles: 1 });
+  const week = await stats.read(room, t0 - 6 * 86_400_000, t0 + 86_400_000);
+  assert.equal(week.step, 3_600_000);
+  assert.deepEqual(week.points.map((p) => [p.people, p.peak, p.visitors]), [[2, 2, 2], [4, 4, 122], [1, 1, 1]]);
+  const year = await stats.read(room, t0 - 300 * 86_400_000, t0 + 86_400_000);
+  assert.equal(year.step, 86_400_000);
+  assert.equal(year.points.length, 1);
+  assert.equal(year.points[0].peak, 4);
+  assert.equal(year.points[0].visitors, 122);
+  // Kept: a new reader (a restarted server) has it.
+  const again = await new RoomStats(store).read(room, t0 - 6 * 86_400_000, t0 + 86_400_000);
+  assert.equal(again.points.length, 3);
+});
+
+test('a server counts who is in each room it keeps, and tells only its owner (or a pass) the history', async () => {
+  const { generateRandomPair, signMessage } = await import('unsea');
+  const { grantText } = await import('../dist/index.js');
+  const owner = await generateRandomPair();
+  const member = await generateRandomPair();
+  const stranger = await generateRandomPair();
+  const scope = makeScope();
+  const s = new StorageServer(scope.node(hex('h'), STORAGE_SERVER_ROLE), undefined, { owner: owner.pub });
+  await s.start();
+  const a = await peer(scope, 'i');
+  const b = await peer(scope, 'j');
+  await a.storage.put('user', 'k', 'v');
+  await settle(100);
+  await s.sampleRooms();
+  const room = (await a.storage.serverRoom?.()) ?? s['history'].rooms()[0];
+  assert.ok(room, 'the peers\' room is watched');
+  const now = Date.now();
+  const asOwner = (text) => signMessage(text, owner.priv);
+  const got = await a.link.roomStats(hex('h'), room, now - 3_600_000, now + 60_000, asOwner);
+  assert.equal(got.step, 60_000);
+  assert.equal(got.points.at(-1).people, 2);
+  const pass = { by: member.pub, until: 0, gsig: await signMessage(grantText(owner.pub, member.pub, 0), owner.priv) };
+  assert.ok(await a.link.roomStats(hex('h'), room, now - 3_600_000, now + 60_000, (t) => signMessage(t, member.priv), pass), 'with a pass');
+  assert.equal(await a.link.roomStats(hex('h'), room, now - 3_600_000, now + 60_000, (t) => signMessage(t, stranger.priv)), null, 'not to anyone else');
+  await a.link.close(); await b.link.close(); await s.close(); await a.storage.close(); await b.storage.close();
+});

@@ -1,3 +1,80 @@
+/**
+ * A storage server's history of its rooms: how many peers were in each room it keeps, over time. A room's
+ * peers link to its closest storage servers and ask to hear of its changes (they 'watch' it), so a server
+ * knows who is in each of its rooms. Once a minute it writes down how many: people, and peers with a role
+ * (bots and the like). Each hour and each day it also counts how many different people it saw.
+ *
+ * Kept per room (the room's hashed id; a server never knows which app a room is): a sample a minute for the
+ * last 26 hours, an hour's summary for 400 days, a day's for 400 days. Counts only: no peer ids are kept,
+ * apart from the current hour's and day's, in memory, to count the different ones.
+ */
+interface MinuteSample {
+    at: number;
+    people: number;
+    roles: number;
+}
+interface HourSummary {
+    at: number;
+    avg: number;
+    peak: number;
+    roles: number;
+    visitors: number;
+}
+interface DaySummary {
+    at: number;
+    avg: number;
+    peak: number;
+    roles: number;
+    visitors: number;
+}
+interface RoomHistory {
+    minutes: MinuteSample[];
+    hours: HourSummary[];
+    days: DaySummary[];
+}
+/** Where a server keeps its rooms' history (PigeonFS: a file per room). */
+interface RoomStatsStore {
+    load(room: string): Promise<RoomHistory | null>;
+    save(room: string, history: RoomHistory): Promise<void>;
+}
+declare class MemoryRoomStatsStore implements RoomStatsStore {
+    private readonly rooms;
+    load(room: string): Promise<RoomHistory | null>;
+    save(room: string, history: RoomHistory): Promise<void>;
+}
+type RoomStatsPoint = {
+    at: number;
+    people: number;
+    peak: number;
+    roles: number;
+    visitors?: number;
+};
+declare class RoomStats {
+    private readonly store;
+    private readonly live;
+    constructor(store?: RoomStatsStore);
+    private open;
+    /** One minute's look at a room: who is in it (peer ids), and which of them have a role. */
+    sample(room: string, peers: string[], withRole: (peer: string) => boolean, now?: number): Promise<void>;
+    /** The summary for the period starting at `at`, from its minutes (or, for a day, also its earlier hours). */
+    private summarize;
+    /**
+     * A room's history from `from` to `to` (ms), in steps that keep it to a few hundred points: a minute for
+     * up to 2 hours, 5 minutes for up to 26 hours, an hour for up to 35 days, else a day. A step's `people`
+     * is its average, `peak` its most; `visitors` (hours and days) the different peers seen in it.
+     */
+    read(room: string, from: number, to: number): Promise<{
+        step: number;
+        points: RoomStatsPoint[];
+    }>;
+    /** The rooms with a history so far, in memory. */
+    rooms(): string[];
+}
+/** Points, compact for sending: [at, people, peak, roles, visitors?]. */
+type PackedPoint = [number, number, number, number] | [number, number, number, number, number];
+declare const packPoints: (points: RoomStatsPoint[]) => PackedPoint[];
+declare const unpackPoints: (packed: unknown) => RoomStatsPoint[];
+
 declare const STORAGE_SERVER_NETWORK = "peerpigeon-storage";
 declare const STORAGE_SERVER_ROOM = "servers";
 declare const STORAGE_SERVER_ROLE = "storage";
@@ -99,6 +176,15 @@ declare class StorageServerLink {
         };
     } | null>;
     /**
+     * How many were in `room` (a storage room id) from `from` to `to`, as one server saw it, asked as the
+     * owner or with the owner's pass (signed the same way as serverStats). Null if it cannot be reached or
+     * the ask is refused.
+     */
+    roomStats(serverId: string, room: string, from: number, to: number, sign: (text: string) => Promise<string>, pass?: StatsPass, waitMs?: number): Promise<{
+        step: number;
+        points: RoomStatsPoint[];
+    } | null>;
+    /**
      * The owner takes `member`'s pass back at a server (restore: gives it back); `sign` signs as the owner.
      * Resolves true once the server has it, false if it refused or could not be reached.
      */
@@ -184,6 +270,11 @@ interface StorageServerOptions {
         has(member: string): boolean | Promise<boolean>;
         set(member: string, revoked: boolean): void | Promise<void>;
     };
+    /**
+     * Where the server keeps its rooms' history: how many peers were in each room, a minute at a time (see
+     * RoomStats). In memory when not given; PigeonFS keeps it in its folder.
+     */
+    roomStats?: RoomStatsStore;
 }
 interface StorageServerStats {
     rooms: number;
@@ -214,10 +305,14 @@ declare class StorageServer {
     private onChange;
     private readonly startedAt;
     private readonly revoked;
+    private readonly history;
+    private sampler;
     constructor(node: PeerPigeonNode, store?: ServerRecordStore, options?: StorageServerOptions);
     /** Called with each record this server takes (a write, or one handed to it). */
     onRecord(listener: (rec: ServerRecord) => void): void;
     start(): Promise<void>;
+    /** Once a minute: how many are in each room watched here (people, and peers with a role). */
+    sampleRooms(now?: number): Promise<void>;
     close(): Promise<void>;
     stats(): Promise<StorageServerStats>;
     /** The owner this server was given, or null. */
@@ -228,6 +323,8 @@ declare class StorageServer {
     private send;
     /** Takes a record if it is new or newer, and its write token (or hash) is the slot's. */
     private take;
+    /** An ask signed, for this server and recently, by its owner or by someone holding the owner's pass. */
+    private askedByOwner;
     private onMessage;
     private rebalancing;
     private rebalanceAgain;
@@ -2116,4 +2213,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryServerRecordStore, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StatsPass, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerOptions, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, grantText, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayNameOf, relayScore, revokeText, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, statsText, validRoom };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type DaySummary, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, type HourSummary, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryRoomStatsStore, MemoryServerRecordStore, type MinuteSample, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, type RoomHistory, RoomStats, type RoomStatsPoint, type RoomStatsStore, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StatsPass, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerOptions, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, grantText, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, packPoints, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayNameOf, relayScore, revokeText, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, statsText, unpackPoints, validRoom };

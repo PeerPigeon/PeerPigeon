@@ -3160,6 +3160,133 @@ import { signMessage, verifyMessage as verifyMessage2 } from "unsea";
 
 // src/storage-servers.ts
 import { verifyMessage } from "unsea";
+
+// src/room-stats.ts
+var MemoryRoomStatsStore = class {
+  constructor() {
+    this.rooms = /* @__PURE__ */ new Map();
+  }
+  async load(room) {
+    return this.rooms.get(room) ?? null;
+  }
+  async save(room, history) {
+    this.rooms.set(room, JSON.parse(JSON.stringify(history)));
+  }
+};
+var MINUTE_MS = 6e4;
+var HOUR_MS = 36e5;
+var DAY_MS = 864e5;
+var KEEP_MINUTES_MS = 26 * HOUR_MS;
+var KEEP_SUMMARIES_MS = 400 * DAY_MS;
+var SAVE_EVERY_MS = 5 * MINUTE_MS;
+var RoomStats = class {
+  constructor(store = new MemoryRoomStatsStore()) {
+    this.store = store;
+    this.live = /* @__PURE__ */ new Map();
+  }
+  open(room) {
+    let l = this.live.get(room);
+    if (!l) {
+      l = this.store.load(room).catch(() => null).then((h) => ({
+        history: h ?? { minutes: [], hours: [], days: [] },
+        hourAt: 0,
+        hourSeen: /* @__PURE__ */ new Set(),
+        dayAt: 0,
+        daySeen: /* @__PURE__ */ new Set(),
+        savedAt: Date.now()
+      }));
+      this.live.set(room, l);
+    }
+    return l;
+  }
+  /** One minute's look at a room: who is in it (peer ids), and which of them have a role. */
+  async sample(room, peers, withRole, now = Date.now()) {
+    const l = await this.open(room);
+    const h = l.history;
+    const at = Math.floor(now / MINUTE_MS) * MINUTE_MS;
+    const people = peers.filter((p) => !withRole(p));
+    const roles = peers.length - people.length;
+    const sample = { at, people: people.length, roles };
+    if (h.minutes.length && h.minutes[h.minutes.length - 1].at === at) h.minutes[h.minutes.length - 1] = sample;
+    else h.minutes.push(sample);
+    while (h.minutes.length && h.minutes[0].at < now - KEEP_MINUTES_MS) h.minutes.shift();
+    const hourAt = Math.floor(now / HOUR_MS) * HOUR_MS;
+    const dayAt = Math.floor(now / DAY_MS) * DAY_MS;
+    let rolled = false;
+    if (l.hourAt !== hourAt) {
+      l.hourAt = hourAt;
+      l.hourSeen = /* @__PURE__ */ new Set();
+      rolled = true;
+    }
+    if (l.dayAt !== dayAt) {
+      l.dayAt = dayAt;
+      l.daySeen = /* @__PURE__ */ new Set();
+    }
+    for (const p of people) {
+      l.hourSeen.add(p);
+      l.daySeen.add(p);
+    }
+    this.summarize(h.hours, hourAt, h.minutes.filter((m) => m.at >= hourAt && m.at < hourAt + HOUR_MS), l.hourSeen.size);
+    this.summarize(h.days, dayAt, h.minutes.filter((m) => m.at >= dayAt && m.at < dayAt + DAY_MS), l.daySeen.size, h.hours.filter((x) => x.at >= dayAt && x.at < dayAt + DAY_MS));
+    for (const list of [h.hours, h.days]) while (list.length && list[0].at < now - KEEP_SUMMARIES_MS) list.shift();
+    if (rolled || now - l.savedAt >= SAVE_EVERY_MS) {
+      l.savedAt = now;
+      await this.store.save(room, h).catch(() => {
+      });
+    }
+  }
+  /** The summary for the period starting at `at`, from its minutes (or, for a day, also its earlier hours). */
+  summarize(list, at, minutes, visitors, hours = []) {
+    if (!minutes.length && !hours.length) return;
+    const peaks = [...minutes.map((m) => m.people), ...hours.map((x) => x.peak)];
+    const people = minutes.length ? minutes.reduce((s, m) => s + m.people, 0) / minutes.length : hours.reduce((s, x) => s + x.avg, 0) / hours.length;
+    const roles = minutes.length ? minutes.reduce((s, m) => s + m.roles, 0) / minutes.length : hours.reduce((s, x) => s + x.roles, 0) / hours.length;
+    const entry = { at, avg: Math.round(people * 10) / 10, peak: Math.max(...peaks), roles: Math.round(roles * 10) / 10, visitors };
+    if (list.length && list[list.length - 1].at === at) list[list.length - 1] = entry;
+    else list.push(entry);
+  }
+  /**
+   * A room's history from `from` to `to` (ms), in steps that keep it to a few hundred points: a minute for
+   * up to 2 hours, 5 minutes for up to 26 hours, an hour for up to 35 days, else a day. A step's `people`
+   * is its average, `peak` its most; `visitors` (hours and days) the different peers seen in it.
+   */
+  async read(room, from, to) {
+    const h = (await this.open(room)).history;
+    const span = to - from;
+    if (span <= 26 * HOUR_MS) {
+      const step2 = span <= 2 * HOUR_MS ? MINUTE_MS : 5 * MINUTE_MS;
+      const buckets = /* @__PURE__ */ new Map();
+      for (const m of h.minutes) {
+        if (m.at < from || m.at > to) continue;
+        const at = Math.floor(m.at / step2) * step2;
+        let b = buckets.get(at);
+        if (!b) buckets.set(at, b = []);
+        b.push(m);
+      }
+      const round = (n) => Math.round(n * 10) / 10;
+      return {
+        step: step2,
+        points: [...buckets].map(([at, ms]) => ({
+          at,
+          people: round(ms.reduce((s, m) => s + m.people, 0) / ms.length),
+          peak: Math.max(...ms.map((m) => m.people)),
+          roles: round(ms.reduce((s, m) => s + m.roles, 0) / ms.length)
+        }))
+      };
+    }
+    const step = span <= 35 * DAY_MS ? HOUR_MS : DAY_MS;
+    const list = step === HOUR_MS ? h.hours : h.days;
+    return { step, points: list.filter((x) => x.at >= from - step && x.at <= to).map((x) => ({ at: x.at, people: x.avg, peak: x.peak, roles: x.roles, visitors: x.visitors })) };
+  }
+  /** The rooms with a history so far, in memory. */
+  rooms() {
+    return [...this.live.keys()];
+  }
+};
+var packPoints = (points) => points.map((p) => p.visitors === void 0 ? [p.at, p.people, p.peak, p.roles] : [p.at, p.people, p.peak, p.roles, p.visitors]);
+var unpackPoints = (packed) => (Array.isArray(packed) ? packed : []).filter((p) => Array.isArray(p) && p.length >= 4 && p.every((n) => typeof n === "number" && Number.isFinite(n))).map((p) => ({ at: p[0], people: p[1], peak: p[2], roles: p[3], ...p.length > 4 ? { visitors: p[4] } : {} }));
+
+// src/storage-servers.ts
 var STORAGE_SERVER_NETWORK = "peerpigeon-storage";
 var STORAGE_SERVER_ROOM = "servers";
 var STORAGE_SERVER_ROLE = "storage";
@@ -3457,7 +3584,7 @@ var StorageServerLink = class {
       }
       return;
     }
-    if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot" || data.t === "statsr" || data.t === "revoked") {
+    if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot" || data.t === "statsr" || data.t === "revoked" || data.t === "roomstatsr") {
       if ("bytes" in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) {
@@ -3484,6 +3611,25 @@ var StorageServerLink = class {
     if (answer?.t !== "statsr") return null;
     const owner = typeof answer.owner === "string" ? answer.owner : null;
     return answer.stats && typeof answer.stats === "object" ? { owner, stats: answer.stats } : { owner };
+  }
+  /**
+   * How many were in `room` (a storage room id) from `from` to `to`, as one server saw it, asked as the
+   * owner or with the owner's pass (signed the same way as serverStats). Null if it cannot be reached or
+   * the ask is refused.
+   */
+  async roomStats(serverId, room, from, to, sign, pass, waitMs = 6e3) {
+    if (!this.node.getConnectedPeers().includes(serverId)) {
+      this.node.connectToPeer(serverId);
+      const until = Date.now() + waitMs;
+      while (!this.node.getConnectedPeers().includes(serverId) && Date.now() < until && !this.closed) await new Promise((r) => setTimeout(r, 100));
+      if (!this.node.getConnectedPeers().includes(serverId)) return null;
+    }
+    const at = Date.now();
+    const sig = await sign(statsText(serverId, at)).catch(() => null);
+    if (!sig) return null;
+    const answer = await this.ask(serverId, { pp: PP, t: "roomstats", req: newReq(), room, from, to, at, sig, ...pass ? { by: pass.by, until: pass.until, gsig: pass.gsig } : {} });
+    if (answer?.t !== "roomstatsr" || !answer.ok || typeof answer.step !== "number") return null;
+    return { step: answer.step, points: unpackPoints(answer.points) };
   }
   /**
    * The owner takes `member`'s pass back at a server (restore: gives it back); `sign` signs as the owner.
@@ -3669,9 +3815,11 @@ var StorageServer = class {
     this.timer = null;
     this.onChange = null;
     this.startedAt = Date.now();
+    this.sampler = null;
     this.rebalancing = null;
     this.rebalanceAgain = false;
     const kept = /* @__PURE__ */ new Set();
+    this.history = new RoomStats(options.roomStats);
     this.revoked = options.revoked ?? { has: (m) => kept.has(m), set: (m, r) => {
       if (r) kept.add(m);
       else kept.delete(m);
@@ -3695,9 +3843,24 @@ var StorageServer = class {
     await this.node.start();
     this.timer = setInterval(() => void this.rebalance(), 1e4);
     this.timer.unref?.();
+    this.sampler = setInterval(() => void this.sampleRooms(), MINUTE_MS);
+    this.sampler.unref?.();
+  }
+  /** Once a minute: how many are in each room watched here (people, and peers with a role). */
+  async sampleRooms(now = Date.now()) {
+    const linked = new Set(this.node.getConnectedPeers());
+    for (const [room, peers] of this.watchers) {
+      const here = [...peers].filter((p) => linked.has(p));
+      await this.history.sample(room, here, (p) => {
+        const r = this.node.getPeerRole(p);
+        return !!r && r !== "client";
+      }, now).catch(() => {
+      });
+    }
   }
   async close() {
     if (this.timer) clearInterval(this.timer);
+    if (this.sampler) clearInterval(this.sampler);
     await this.node.destroy().catch(() => {
     });
   }
@@ -3751,6 +3914,23 @@ var StorageServer = class {
     await this.store.put(rec);
     this.onChange?.(rec);
     return { ok: true };
+  }
+  /** An ask signed, for this server and recently, by its owner or by someone holding the owner's pass. */
+  async askedByOwner(data) {
+    const owner = this.owner();
+    if (!owner || typeof data.sig !== "string" || typeof data.at !== "number" || Math.abs(Date.now() - data.at) > STATS_SKEW_MS) return false;
+    let signer = owner;
+    if (typeof data.by === "string") {
+      const now = Date.now();
+      const valid = typeof data.until === "number" && (data.until === 0 || data.until >= now) && typeof data.gsig === "string" && await verifyMessage(grantText(owner, data.by, data.until), data.gsig, owner).catch(() => false) && !await this.revoked.has(data.by);
+      signer = valid ? data.by : null;
+    }
+    if (!signer) return false;
+    try {
+      return await verifyMessage(statsText(this.node.getClientId() ?? "", data.at), data.sig, signer);
+    } catch {
+      return false;
+    }
   }
   async onMessage(from, data) {
     if (!isMsg(data)) return;
@@ -3822,23 +4002,15 @@ var StorageServer = class {
       }
       case "stats": {
         const owner = this.owner();
-        let ok = false;
-        if (owner && typeof data.sig === "string" && typeof data.at === "number" && Math.abs(Date.now() - data.at) <= STATS_SKEW_MS) {
-          let signer = owner;
-          if (typeof data.by === "string") {
-            const now = Date.now();
-            const valid = typeof data.until === "number" && (data.until === 0 || data.until >= now) && typeof data.gsig === "string" && await verifyMessage(grantText(owner, data.by, data.until), data.gsig, owner).catch(() => false) && !await this.revoked.has(data.by);
-            signer = valid ? data.by : null;
-          }
-          if (signer) {
-            try {
-              ok = await verifyMessage(statsText(this.node.getClientId() ?? "", data.at), data.sig, signer);
-            } catch {
-              ok = false;
-            }
-          }
-        }
+        const ok = await this.askedByOwner(data);
         this.send(from, { pp: PP, t: "statsr", req: data.req, owner, ...ok ? { stats: { ...await this.stats(), uptimeMs: Date.now() - this.startedAt } } : {} });
+        return;
+      }
+      case "roomstats": {
+        const fine = validRoom(data.room) && typeof data.from === "number" && typeof data.to === "number" && data.to > data.from && await this.askedByOwner(data);
+        if (!fine) return void this.send(from, { pp: PP, t: "roomstatsr", req: data.req, ok: false });
+        const got = await this.history.read(data.room, data.from, data.to);
+        this.send(from, { pp: PP, t: "roomstatsr", req: data.req, ok: true, step: got.step, points: packPoints(got.points) });
         return;
       }
       case "revoke": {
@@ -9206,6 +9378,7 @@ export {
   GossipProtocol,
   MAX_BLOB_BYTES,
   MESH_SIGNAL_PAYLOAD_TYPE,
+  MemoryRoomStatsStore,
   MemoryServerRecordStore,
   NEGOTIATION_ACTIVE_ICE_DEADLINE_MS,
   NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS,
@@ -9219,6 +9392,7 @@ export {
   RELAY_SWITCH_MARGIN,
   RELAY_VIRTUAL_IDS,
   RelayScoreBook,
+  RoomStats,
   STORAGE_REPLICAS,
   STORAGE_SERVER_NETWORK,
   STORAGE_SERVER_ROLE,
@@ -9237,6 +9411,7 @@ export {
   isMeshSignalPayload,
   openBlob,
   ownedRoomOf,
+  packPoints,
   rankSignalingServersByDistance,
   reachableFromThisPage,
   relayDisplayName,
@@ -9248,5 +9423,6 @@ export {
   selectClosestSignalingServer,
   sha1Hex,
   statsText,
+  unpackPoints,
   validRoom
 };

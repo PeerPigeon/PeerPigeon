@@ -18,6 +18,7 @@
  */
 import { verifyMessage } from 'unsea';
 import { subtle } from './subtle.js';
+import { RoomStats, packPoints, unpackPoints, MINUTE_MS, type RoomStatsStore, type RoomStatsPoint } from './room-stats.js';
 import type { PeerPigeonNode } from './index.js';
 
 export const STORAGE_SERVER_NETWORK = 'peerpigeon-storage';
@@ -150,7 +151,10 @@ type Msg =
   | { pp: typeof PP; t: 'statsr'; req: string; owner: string | null; stats?: StorageServerStats & { uptimeMs: number } }
   // The owner taking a pass back (or giving it back: restore), signed: see revokeText.
   | { pp: typeof PP; t: 'revoke'; req: string; member: string; at: number; sig: string; restore?: boolean }
-  | { pp: typeof PP; t: 'revoked'; req: string; ok: boolean };
+  | { pp: typeof PP; t: 'revoked'; req: string; ok: boolean }
+  // A room's history (how many were in it, over time), asked as stats are: by the owner or a pass.
+  | { pp: typeof PP; t: 'roomstats'; req: string; room: string; from: number; to: number; at: number; sig: string; by?: string; until?: number; gsig?: string }
+  | { pp: typeof PP; t: 'roomstatsr'; req: string; ok: boolean; step?: number; points?: unknown };
 
 export async function sha256Hex(text: string): Promise<string> {
   const digest = await subtle().digest('SHA-256', new TextEncoder().encode(text));
@@ -396,7 +400,7 @@ export class StorageServerLink {
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve({ ...data, recs: got }); }
       return;
     }
-    if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot' || data.t === 'statsr' || data.t === 'revoked') {
+    if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot' || data.t === 'statsr' || data.t === 'revoked' || data.t === 'roomstatsr') {
       if ('bytes' in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve(data); }
@@ -420,6 +424,26 @@ export class StorageServerLink {
     if (answer?.t !== 'statsr') return null;
     const owner = typeof answer.owner === 'string' ? answer.owner : null;
     return answer.stats && typeof answer.stats === 'object' ? { owner, stats: answer.stats } : { owner };
+  }
+
+  /**
+   * How many were in `room` (a storage room id) from `from` to `to`, as one server saw it, asked as the
+   * owner or with the owner's pass (signed the same way as serverStats). Null if it cannot be reached or
+   * the ask is refused.
+   */
+  async roomStats(serverId: string, room: string, from: number, to: number, sign: (text: string) => Promise<string>, pass?: StatsPass, waitMs = 6_000): Promise<{ step: number; points: RoomStatsPoint[] } | null> {
+    if (!this.node.getConnectedPeers().includes(serverId)) {
+      this.node.connectToPeer(serverId);
+      const until = Date.now() + waitMs;
+      while (!this.node.getConnectedPeers().includes(serverId) && Date.now() < until && !this.closed) await new Promise((r) => setTimeout(r, 100));
+      if (!this.node.getConnectedPeers().includes(serverId)) return null;
+    }
+    const at = Date.now();
+    const sig = await sign(statsText(serverId, at)).catch(() => null);
+    if (!sig) return null;
+    const answer = await this.ask(serverId, { pp: PP, t: 'roomstats', req: newReq(), room, from, to, at, sig, ...(pass ? { by: pass.by, until: pass.until, gsig: pass.gsig } : {}) });
+    if (answer?.t !== 'roomstatsr' || !answer.ok || typeof answer.step !== 'number') return null;
+    return { step: answer.step, points: unpackPoints(answer.points) };
   }
 
   /**
@@ -622,6 +646,11 @@ export interface StorageServerOptions {
    * server that restarts should keep them (PigeonFS: revoked.json in its folder).
    */
   revoked?: { has(member: string): boolean | Promise<boolean>; set(member: string, revoked: boolean): void | Promise<void> };
+  /**
+   * Where the server keeps its rooms' history: how many peers were in each room, a minute at a time (see
+   * RoomStats). In memory when not given; PigeonFS keeps it in its folder.
+   */
+  roomStats?: RoomStatsStore;
 }
 
 export interface StorageServerStats {
@@ -652,6 +681,8 @@ export class StorageServer {
 
   private readonly startedAt = Date.now();
   private readonly revoked: NonNullable<StorageServerOptions['revoked']>;
+  private readonly history: RoomStats;
+  private sampler: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly node: PeerPigeonNode,
@@ -659,6 +690,7 @@ export class StorageServer {
     private readonly options: StorageServerOptions = {},
   ) {
     const kept = new Set<string>();
+    this.history = new RoomStats(options.roomStats);
     this.revoked = options.revoked ?? { has: (m) => kept.has(m), set: (m, r) => { if (r) kept.add(m); else kept.delete(m); } };
     node.on('message', (m) => { if (m.kind === 'direct' && m.fromPeerId) void this.onMessage(m.fromPeerId, m.data).catch(() => {}); });
     node.on('peerConnected', () => void this.rebalance());
@@ -673,10 +705,22 @@ export class StorageServer {
     await this.node.start();
     this.timer = setInterval(() => void this.rebalance(), 10_000);
     (this.timer as { unref?: () => void }).unref?.();
+    this.sampler = setInterval(() => void this.sampleRooms(), MINUTE_MS);
+    (this.sampler as { unref?: () => void }).unref?.();
+  }
+
+  /** Once a minute: how many are in each room watched here (people, and peers with a role). */
+  async sampleRooms(now = Date.now()): Promise<void> {
+    const linked = new Set(this.node.getConnectedPeers());
+    for (const [room, peers] of this.watchers) {
+      const here = [...peers].filter((p) => linked.has(p));
+      await this.history.sample(room, here, (p) => { const r = this.node.getPeerRole(p); return !!r && r !== 'client'; }, now).catch(() => {});
+    }
   }
 
   async close(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
+    if (this.sampler) clearInterval(this.sampler);
     await this.node.destroy().catch(() => {});
   }
 
@@ -738,6 +782,22 @@ export class StorageServer {
     await this.store.put(rec);
     this.onChange?.(rec);
     return { ok: true };
+  }
+
+  /** An ask signed, for this server and recently, by its owner or by someone holding the owner's pass. */
+  private async askedByOwner(data: { at?: number; sig?: string; by?: string; until?: number; gsig?: string }): Promise<boolean> {
+    const owner = this.owner();
+    if (!owner || typeof data.sig !== 'string' || typeof data.at !== 'number' || Math.abs(Date.now() - data.at) > STATS_SKEW_MS) return false;
+    let signer: string | null = owner;
+    if (typeof data.by === 'string') {
+      const now = Date.now();
+      const valid = typeof data.until === 'number' && (data.until === 0 || data.until >= now) && typeof data.gsig === 'string'
+        && await verifyMessage(grantText(owner, data.by, data.until), data.gsig, owner).catch(() => false)
+        && !(await this.revoked.has(data.by));
+      signer = valid ? data.by : null;
+    }
+    if (!signer) return false;
+    try { return await verifyMessage(statsText(this.node.getClientId() ?? '', data.at), data.sig, signer); } catch { return false; }
   }
 
   private async onMessage(from: string, data: unknown): Promise<void> {
@@ -810,20 +870,15 @@ export class StorageServer {
       case 'stats': {
         // Who runs it, to anyone; its numbers, only to an ask its owner signed for this server, recently.
         const owner = this.owner();
-        let ok = false;
-        if (owner && typeof data.sig === 'string' && typeof data.at === 'number' && Math.abs(Date.now() - data.at) <= STATS_SKEW_MS) {
-          // The owner, or someone holding the owner's pass (signing the ask with their own key).
-          let signer: string | null = owner;
-          if (typeof data.by === 'string') {
-            const now = Date.now();
-            const valid = typeof data.until === 'number' && (data.until === 0 || data.until >= now) && typeof data.gsig === 'string'
-              && await verifyMessage(grantText(owner, data.by, data.until), data.gsig, owner).catch(() => false)
-              && !(await this.revoked.has(data.by));
-            signer = valid ? data.by : null;
-          }
-          if (signer) { try { ok = await verifyMessage(statsText(this.node.getClientId() ?? '', data.at), data.sig, signer); } catch { ok = false; } }
-        }
+        const ok = await this.askedByOwner(data);
         this.send(from, { pp: PP, t: 'statsr', req: data.req, owner, ...(ok ? { stats: { ...(await this.stats()), uptimeMs: Date.now() - this.startedAt } } : {}) });
+        return;
+      }
+      case 'roomstats': {
+        const fine = validRoom(data.room) && typeof data.from === 'number' && typeof data.to === 'number' && data.to > data.from && await this.askedByOwner(data);
+        if (!fine) return void this.send(from, { pp: PP, t: 'roomstatsr', req: data.req, ok: false });
+        const got = await this.history.read(data.room, data.from, data.to);
+        this.send(from, { pp: PP, t: 'roomstatsr', req: data.req, ok: true, step: got.step, points: packPoints(got.points) });
         return;
       }
       case 'revoke': {
