@@ -51,6 +51,7 @@ __export(index_exports, {
   discoverClosestSignalingServer: () => discoverClosestSignalingServer,
   discoverClosestSignalingServers: () => discoverClosestSignalingServers,
   discoverSignalingRelays: () => discoverSignalingRelays,
+  grantText: () => grantText,
   isHealthy: () => isHealthy,
   isMeshSignalPayload: () => isMeshSignalPayload,
   openBlob: () => openBlob,
@@ -60,6 +61,7 @@ __export(index_exports, {
   relayDisplayName: () => relayDisplayName,
   relayNameOf: () => relayNameOf,
   relayScore: () => relayScore,
+  revokeText: () => revokeText,
   roomRoutingKey: () => roomRoutingKey,
   sealBlob: () => sealBlob,
   selectClosestSignalingServer: () => selectClosestSignalingServer,
@@ -3526,7 +3528,7 @@ var StorageServerLink = class {
       }
       return;
     }
-    if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot" || data.t === "statsr") {
+    if (data.t === "ack" || data.t === "got" || data.t === "back" || data.t === "bgot" || data.t === "statsr" || data.t === "revoked") {
       if ("bytes" in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) {
@@ -3540,7 +3542,7 @@ var StorageServerLink = class {
    * Who runs a server, and its stats when `sign` (the owner's signer, given the text to sign) is that
    * owner's. Links to the server first if needed (waiting up to `waitMs`); null if it cannot be reached.
    */
-  async serverStats(serverId, sign, waitMs = 6e3) {
+  async serverStats(serverId, sign, waitMs = 6e3, pass) {
     if (!this.node.getConnectedPeers().includes(serverId)) {
       this.node.connectToPeer(serverId);
       const until = Date.now() + waitMs;
@@ -3549,10 +3551,27 @@ var StorageServerLink = class {
     }
     const at = Date.now();
     const sig = sign ? await sign(statsText(serverId, at)).catch(() => void 0) : void 0;
-    const answer = await this.ask(serverId, { pp: PP, t: "stats", req: newReq(), ...sig ? { at, sig } : {} });
+    const answer = await this.ask(serverId, { pp: PP, t: "stats", req: newReq(), ...sig ? { at, sig } : {}, ...sig && pass ? { by: pass.by, until: pass.until, gsig: pass.gsig } : {} });
     if (answer?.t !== "statsr") return null;
     const owner = typeof answer.owner === "string" ? answer.owner : null;
     return answer.stats && typeof answer.stats === "object" ? { owner, stats: answer.stats } : { owner };
+  }
+  /**
+   * The owner takes `member`'s pass back at a server (restore: gives it back); `sign` signs as the owner.
+   * Resolves true once the server has it, false if it refused or could not be reached.
+   */
+  async revokePass(serverId, member, sign, restore = false, waitMs = 6e3) {
+    if (!this.node.getConnectedPeers().includes(serverId)) {
+      this.node.connectToPeer(serverId);
+      const until = Date.now() + waitMs;
+      while (!this.node.getConnectedPeers().includes(serverId) && Date.now() < until && !this.closed) await new Promise((r) => setTimeout(r, 100));
+      if (!this.node.getConnectedPeers().includes(serverId)) return false;
+    }
+    const at = Date.now();
+    const sig = await sign(revokeText(serverId, member, at, restore)).catch(() => null);
+    if (!sig) return false;
+    const answer = await this.ask(serverId, { pp: PP, t: "revoke", req: newReq(), member, at, sig, ...restore ? { restore: true } : {} });
+    return answer?.t === "revoked" && answer.ok === true;
   }
   /** Writes a record to the room's servers; resolves with how many took it. */
   async put(rec, write) {
@@ -3704,6 +3723,8 @@ var MemoryServerRecordStore = class {
 };
 var statsText = (serverId, at) => `pp-ss-stats-v1:${serverId}:${at}`;
 var STATS_SKEW_MS = 5 * 6e4;
+var grantText = (owner, member, until) => JSON.stringify(["pp-console-grant", 1, owner, member, until]);
+var revokeText = (serverId, member, at, restore) => JSON.stringify(["pp-ss-revoke", 1, serverId, member, at, restore]);
 var StorageServer = class {
   constructor(node, store = new MemoryServerRecordStore(), options = {}) {
     this.node = node;
@@ -3721,6 +3742,11 @@ var StorageServer = class {
     this.startedAt = Date.now();
     this.rebalancing = null;
     this.rebalanceAgain = false;
+    const kept = /* @__PURE__ */ new Set();
+    this.revoked = options.revoked ?? { has: (m) => kept.has(m), set: (m, r) => {
+      if (r) kept.add(m);
+      else kept.delete(m);
+    } };
     node.on("message", (m) => {
       if (m.kind === "direct" && m.fromPeerId) void this.onMessage(m.fromPeerId, m.data).catch(() => {
       });
@@ -3869,13 +3895,35 @@ var StorageServer = class {
         const owner = this.owner();
         let ok = false;
         if (owner && typeof data.sig === "string" && typeof data.at === "number" && Math.abs(Date.now() - data.at) <= STATS_SKEW_MS) {
-          try {
-            ok = await (0, import_unsea2.verifyMessage)(statsText(this.node.getClientId() ?? "", data.at), data.sig, owner);
-          } catch {
-            ok = false;
+          let signer = owner;
+          if (typeof data.by === "string") {
+            const now = Date.now();
+            const valid = typeof data.until === "number" && (data.until === 0 || data.until >= now) && typeof data.gsig === "string" && await (0, import_unsea2.verifyMessage)(grantText(owner, data.by, data.until), data.gsig, owner).catch(() => false) && !await this.revoked.has(data.by);
+            signer = valid ? data.by : null;
+          }
+          if (signer) {
+            try {
+              ok = await (0, import_unsea2.verifyMessage)(statsText(this.node.getClientId() ?? "", data.at), data.sig, signer);
+            } catch {
+              ok = false;
+            }
           }
         }
         this.send(from, { pp: PP, t: "statsr", req: data.req, owner, ...ok ? { stats: { ...await this.stats(), uptimeMs: Date.now() - this.startedAt } } : {} });
+        return;
+      }
+      case "revoke": {
+        const owner = this.owner();
+        let ok = false;
+        if (owner && typeof data.member === "string" && typeof data.sig === "string" && typeof data.at === "number" && Math.abs(Date.now() - data.at) <= STATS_SKEW_MS) {
+          try {
+            ok = await (0, import_unsea2.verifyMessage)(revokeText(this.node.getClientId() ?? "", data.member, data.at, !!data.restore), data.sig, owner);
+          } catch {
+            ok = false;
+          }
+          if (ok) await this.revoked.set(data.member, !data.restore);
+        }
+        this.send(from, { pp: PP, t: "revoked", req: data.req, ok });
         return;
       }
       case "sync": {
@@ -4209,6 +4257,15 @@ var PeerPigeonStorage = class {
       updatedAt: persisted.updatedAt,
       version: this.normalizeStorageVersion(persisted.version, this.versionSourceToken(persisted.ownerId ?? this.userId))
     };
+  }
+  /**
+   * The record as the room's storage servers have it now (taken here when it is newer than the copy kept
+   * here), else the copy kept here. get() reads the servers only when nothing is kept here, so a page that
+   * read a record before goes on seeing that copy until a change reaches it; fetch() asks first.
+   */
+  async fetch(space, key) {
+    if (space !== "private" && await this.serversLinked()) await this.readFromServers(space, this.normalizeKey(key));
+    return this.get(space, key);
   }
   async retrieve(space, key, options = {}) {
     const normalizedKey = this.normalizeKey(key);
@@ -9246,6 +9303,7 @@ var index_default = PartialMesh;
   discoverClosestSignalingServer,
   discoverClosestSignalingServers,
   discoverSignalingRelays,
+  grantText,
   isHealthy,
   isMeshSignalPayload,
   openBlob,
@@ -9255,6 +9313,7 @@ var index_default = PartialMesh;
   relayDisplayName,
   relayNameOf,
   relayScore,
+  revokeText,
   roomRoutingKey,
   sealBlob,
   selectClosestSignalingServer,

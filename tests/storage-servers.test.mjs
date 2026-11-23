@@ -335,3 +335,71 @@ test('a server tells anyone its owner, and only its owner its stats', async () =
   assert.equal(await link.serverStats(hex('x'), undefined, 300), null, 'no such server');
   await link.close(); await server.close(); await unowned.close(); await storage.close();
 });
+
+test('someone holding the owner\'s pass gets the stats too, until it runs out', async () => {
+  const { generateRandomPair, signMessage } = await import('unsea');
+  const { grantText } = await import('../dist/index.js');
+  const owner = await generateRandomPair();
+  const member = await generateRandomPair();
+  const scope = makeScope();
+  const server = new StorageServer(scope.node(hex('u'), STORAGE_SERVER_ROLE), undefined, { owner: owner.pub });
+  await server.start();
+  const { storage, link } = await peer(scope, 'q');
+  await settle();
+  const until = Date.now() + 86400_000;
+  const pass = { by: member.pub, until, gsig: await signMessage(grantText(owner.pub, member.pub, until), owner.priv) };
+  const asMember = (text) => signMessage(text, member.priv);
+  assert.ok((await link.serverStats(hex('u'), asMember, 6000, pass)).stats, 'with the pass');
+  assert.equal((await link.serverStats(hex('u'), asMember)).stats, undefined, 'not without it');
+  const forged = { ...pass, gsig: await signMessage(grantText(owner.pub, member.pub, until), member.priv) };
+  assert.equal((await link.serverStats(hex('u'), asMember, 6000, forged)).stats, undefined, 'not a pass the member made');
+  const past = Date.now() - 1000;
+  const expired = { by: member.pub, until: past, gsig: await signMessage(grantText(owner.pub, member.pub, past), owner.priv) };
+  assert.equal((await link.serverStats(hex('u'), asMember, 6000, expired)).stats, undefined, 'not after it runs out');
+  await link.close(); await server.close(); await storage.close();
+});
+
+test('fetch reads the servers\' newer copy where get keeps the one read before', async () => {
+  const scope = makeScope();
+  const server = new StorageServer(scope.node(hex('v'), STORAGE_SERVER_ROLE));
+  await server.start();
+  const a = await peer(scope, 'r');
+  await a.storage.put('user', 'k', 'one');
+  await settle(100);
+  const b = await peer(scope, 'w');
+  await settle(100);
+  assert.equal((await b.storage.get('user', 'k'))?.value, 'one');
+  // b's page goes away while a changes the record; b comes back with only its own copy.
+  await b.link.close();
+  await a.storage.put('user', 'k', 'two');
+  await settle(100);
+  const link2 = new StorageServerLink(scope.node(hex('x')));
+  await b.storage.attachServers(link2);
+  await link2.start();
+  await settle(100);
+  assert.equal((await b.storage.fetch('user', 'k'))?.value, 'two');
+  await a.link.close(); await link2.close(); await server.close(); await a.storage.close(); await b.storage.close();
+});
+
+test('a pass with no end date holds until the owner takes it back at the server', async () => {
+  const { generateRandomPair, signMessage } = await import('unsea');
+  const { grantText } = await import('../dist/index.js');
+  const owner = await generateRandomPair();
+  const member = await generateRandomPair();
+  const scope = makeScope();
+  const server = new StorageServer(scope.node(hex('y'), STORAGE_SERVER_ROLE), undefined, { owner: owner.pub });
+  await server.start();
+  const { storage, link } = await peer(scope, 'z');
+  await settle();
+  const pass = { by: member.pub, until: 0, gsig: await signMessage(grantText(owner.pub, member.pub, 0), owner.priv) };
+  const asMember = (text) => signMessage(text, member.priv);
+  const asOwner = (text) => signMessage(text, owner.priv);
+  assert.ok((await link.serverStats(hex('y'), asMember, 6000, pass)).stats, 'no end date');
+  assert.equal(await link.revokePass(hex('y'), member.pub, asMember), false, 'only the owner takes it back');
+  assert.ok((await link.serverStats(hex('y'), asMember, 6000, pass)).stats);
+  assert.equal(await link.revokePass(hex('y'), member.pub, asOwner), true);
+  assert.equal((await link.serverStats(hex('y'), asMember, 6000, pass)).stats, undefined, 'taken back');
+  assert.equal(await link.revokePass(hex('y'), member.pub, asOwner, true), true);
+  assert.ok((await link.serverStats(hex('y'), asMember, 6000, pass)).stats, 'given back');
+  await link.close(); await server.close(); await storage.close();
+});

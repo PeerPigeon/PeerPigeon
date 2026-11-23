@@ -605,6 +605,16 @@ export class PeerPigeonStorage {
     };
   }
 
+  /**
+   * The record as the room's storage servers have it now (taken here when it is newer than the copy kept
+   * here), else the copy kept here. get() reads the servers only when nothing is kept here, so a page that
+   * read a record before goes on seeing that copy until a change reaches it; fetch() asks first.
+   */
+  async fetch<T = unknown>(space: StorageSpace, key: string): Promise<StorageRecord<T> | null> {
+    if (space !== 'private' && await this.serversLinked()) await this.readFromServers(space, this.normalizeKey(key));
+    return this.get<T>(space, key);
+  }
+
   async retrieve<T = unknown>(space: StorageSpace, key: string, options: StorageRetrieveOptions = {}): Promise<StorageRecord<T> | null> {
     const normalizedKey = this.normalizeKey(key);
     // An explicit network Get is also the subscription boundary for future

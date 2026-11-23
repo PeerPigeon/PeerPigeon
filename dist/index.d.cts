@@ -92,12 +92,17 @@ declare class StorageServerLink {
      * Who runs a server, and its stats when `sign` (the owner's signer, given the text to sign) is that
      * owner's. Links to the server first if needed (waiting up to `waitMs`); null if it cannot be reached.
      */
-    serverStats(serverId: string, sign?: (text: string) => Promise<string>, waitMs?: number): Promise<{
+    serverStats(serverId: string, sign?: (text: string) => Promise<string>, waitMs?: number, pass?: StatsPass): Promise<{
         owner: string | null;
         stats?: StorageServerStats & {
             uptimeMs: number;
         };
     } | null>;
+    /**
+     * The owner takes `member`'s pass back at a server (restore: gives it back); `sign` signs as the owner.
+     * Resolves true once the server has it, false if it refused or could not be reached.
+     */
+    revokePass(serverId: string, member: string, sign: (text: string) => Promise<string>, restore?: boolean, waitMs?: number): Promise<boolean>;
     /** Writes a record to the room's servers; resolves with how many took it. */
     put(rec: Omit<ServerRecord, 'wh'>, write: string): Promise<number>;
     /** The newest copy of a record the room's servers hold, or null. */
@@ -151,12 +156,34 @@ declare class MemoryServerRecordStore implements ServerRecordStore {
  * good for that server only, for five minutes. Signed with the owner's P-256 key (an unsea signature).
  */
 declare const statsText: (serverId: string, at: number) => string;
+/**
+ * A pass a server's owner gives someone on their team (console.peerpigeon.io): `member` may ask for the
+ * stats as the owner may; `until` is 0 for a pass that holds until the owner takes it back, else a time
+ * (ms). Signed by the owner; the member signs each ask itself.
+ */
+declare const grantText: (owner: string, member: string, until: number) => string;
+/** What the owner signs to take a pass back from `member` at this server (restore: to give it back). */
+declare const revokeText: (serverId: string, member: string, at: number, restore: boolean) => string;
+/** A member's pass, sent with an ask. */
+interface StatsPass {
+    by: string;
+    until: number;
+    gsig: string;
+}
 interface StorageServerOptions {
     /**
      * The signing key of the account that runs this server (a PigeonIdP account's `pub`), or a function
      * giving it. Anyone can ask a server who its owner is; only the owner gets its stats.
      */
     owner?: string | null | (() => string | null);
+    /**
+     * Where the server keeps the keys whose passes its owner took back. Kept in memory when not given; a
+     * server that restarts should keep them (PigeonFS: revoked.json in its folder).
+     */
+    revoked?: {
+        has(member: string): boolean | Promise<boolean>;
+        set(member: string, revoked: boolean): void | Promise<void>;
+    };
 }
 interface StorageServerStats {
     rooms: number;
@@ -186,6 +213,7 @@ declare class StorageServer {
     private timer;
     private onChange;
     private readonly startedAt;
+    private readonly revoked;
     constructor(node: PeerPigeonNode, store?: ServerRecordStore, options?: StorageServerOptions);
     /** Called with each record this server takes (a write, or one handed to it). */
     onRecord(listener: (rec: ServerRecord) => void): void;
@@ -951,6 +979,12 @@ declare class PeerPigeonStorage {
     put<T = unknown>(space: StorageSpace, key: string, value: T, options?: StoragePutOptions): Promise<StorageRecord<T>>;
     putSystem<T = unknown>(space: StorageSpace, key: string, value: T, options?: StoragePutOptions): Promise<StorageRecord<T>>;
     get<T = unknown>(space: StorageSpace, key: string): Promise<StorageRecord<T> | null>;
+    /**
+     * The record as the room's storage servers have it now (taken here when it is newer than the copy kept
+     * here), else the copy kept here. get() reads the servers only when nothing is kept here, so a page that
+     * read a record before goes on seeing that copy until a change reaches it; fetch() asks first.
+     */
+    fetch<T = unknown>(space: StorageSpace, key: string): Promise<StorageRecord<T> | null>;
     retrieve<T = unknown>(space: StorageSpace, key: string, options?: StorageRetrieveOptions): Promise<StorageRecord<T> | null>;
     /** How long to wait for a Get's answer: twice the slowest recent answer, within bounds. */
     private expectedAnswerMs;
@@ -2082,4 +2116,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryServerRecordStore, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerOptions, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayNameOf, relayScore, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, statsText, validRoom };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryServerRecordStore, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StatsPass, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerOptions, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, grantText, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayNameOf, relayScore, revokeText, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, statsText, validRoom };
