@@ -1,6 +1,6 @@
 import { signMessage, verifyMessage } from 'unsea';
 import { subtle } from './subtle.js';
-import { ownedRoomOf, ownerText, sha256Hex, type ServerRecord, type StorageServerLink } from './storage-servers.js';
+import { ownedRoomOf, ownerText, sha256Hex, visitorOf, type ServerRecord, type StorageServerLink } from './storage-servers.js';
 
 export type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
 export type StorageVersion = string | number;
@@ -846,7 +846,7 @@ export class PeerPigeonStorage {
         void this.applyServerRecord(event.rec, false).catch(() => {});
       }
     });
-    link.keep(room);
+    link.keep(room, await visitorOf(room, this.ownerIdentity()));
     // The link may have found the room's servers already (a storage made again, on a link kept from
     // before): the event that said so has passed, so take them as they are now.
     if (link.serversFor(room).length > 0 && !this.serversReady) {

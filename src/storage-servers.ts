@@ -137,7 +137,8 @@ type Msg =
   | { pp: typeof PP; t: 'got'; req: string; rec: Omit<ServerRecord, 'wh'> | null }
   | { pp: typeof PP; t: 'list'; req: string; room: string; tag?: string }
   | { pp: typeof PP; t: 'listed'; req: string; recs: Omit<ServerRecord, 'wh'>[]; more: boolean }
-  | { pp: typeof PP; t: 'watch'; room: string }
+  // v: who is watching, the same from visit to visit (a hash of their key and the room; see visitorOf).
+  | { pp: typeof PP; t: 'watch'; room: string; v?: string }
   | { pp: typeof PP; t: 'changed'; rec: Omit<ServerRecord, 'wh'> }
   | { pp: typeof PP; t: 'sync'; recs: ServerRecord[] }
   // A blob goes as base64 ('d'), or as bytes ('bytes': sent by sendBytes, to one that reads them).
@@ -278,6 +279,7 @@ export class StorageServerLink {
   private readonly readsBytes = new Set<string>();
   private readonly listings = new Map<string, Omit<ServerRecord, 'wh'>[]>();
   private readonly rooms = new Map<string, string[]>();
+  private readonly visitors = new Map<string, string>();
   private readonly listeners = new Set<LinkListener>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
@@ -309,9 +311,13 @@ export class StorageServerLink {
     return () => this.listeners.delete(listener);
   }
 
-  /** Keep this room: link to its closest servers, and hear of changes to it. */
-  keep(room: string): void {
+  /**
+   * Keep this room: link to its closest servers, and hear of changes to it. `visitor` (see visitorOf) lets
+   * the servers count the same person once, from visit to visit, though the peer id is new each time.
+   */
+  keep(room: string, visitor?: string): void {
     if (!this.rooms.has(room)) this.rooms.set(room, []);
+    if (visitor) this.visitors.set(room, visitor);
     void this.refresh();
   }
 
@@ -351,7 +357,7 @@ export class StorageServerLink {
       const now = closest.filter((id) => linked.has(id));
       const fresh = now.filter((id) => !before.includes(id));
       this.rooms.set(room, now);
-      for (const id of fresh) this.send(id, { pp: PP, t: 'watch', room });
+      for (const id of fresh) this.send(id, { pp: PP, t: 'watch', room, ...(this.visitors.has(room) ? { v: this.visitors.get(room) } : {}) });
       if (fresh.length || now.length !== before.length) this.emit({ type: 'servers', room, servers: now });
     }
   }
@@ -619,6 +625,12 @@ export class MemoryServerRecordStore implements ServerRecordStore {
  * What a server's owner signs to ask it for its stats: the server's peer id and the time, so the ask is
  * good for that server only, for five minutes. Signed with the owner's P-256 key (an unsea signature).
  */
+/**
+ * Who someone is in a room, for counting them once from visit to visit (their peer id is new each time):
+ * a hash of the room and their key, so a server cannot tell them in one room from another, nor who they are.
+ */
+export const visitorOf = (room: string, key: string): Promise<string> => sha256Hex(`peerpigeon:visitor:v1:${room}:${key}`);
+
 export const statsText = (serverId: string, at: number): string => `pp-ss-stats-v1:${serverId}:${at}`;
 const STATS_SKEW_MS = 5 * 60_000;
 
@@ -670,7 +682,8 @@ export interface StorageServerStats {
  */
 export class StorageServer {
   private readonly hashed = new Map<string, string>();
-  private readonly watchers = new Map<string, Set<string>>();
+  /** For each room: the peers watching it, and who each is (its visitor id, else the peer id). */
+  private readonly watchers = new Map<string, Map<string, string>>();
   /** For each room: the servers last given its records. */
   private readonly placed = new Map<string, string[]>();
   /** For each blob: the servers last given it. */
@@ -713,8 +726,14 @@ export class StorageServer {
   async sampleRooms(now = Date.now()): Promise<void> {
     const linked = new Set(this.node.getConnectedPeers());
     for (const [room, peers] of this.watchers) {
-      const here = [...peers].filter((p) => linked.has(p));
-      await this.history.sample(room, here, (p) => { const r = this.node.getPeerRole(p); return !!r && r !== 'client'; }, now).catch(() => {});
+      const people: string[] = [];
+      let roles = 0;
+      for (const [peer, who] of peers) {
+        if (!linked.has(peer)) continue;
+        const role = this.node.getPeerRole(peer);
+        if (role && role !== 'client') roles++; else people.push(who);
+      }
+      await this.history.sample(room, people, roles, now).catch(() => {});
     }
   }
 
@@ -814,7 +833,7 @@ export class StorageServer {
         const result = await this.take(rec);
         this.send(from, { pp: PP, t: 'ack', req: data.req, ...result, at: rec.at });
         if (result.ok && (!before || before.at < rec.at)) {
-          for (const peer of this.watchers.get(rec.room) ?? []) if (peer !== from) this.send(peer, { pp: PP, t: 'changed', rec: strip(rec) });
+          for (const peer of this.watchers.get(rec.room)?.keys() ?? []) if (peer !== from) this.send(peer, { pp: PP, t: 'changed', rec: strip(rec) });
           // The room's other closest servers get it at once.
           const closest = closestIds(rec.room, await this.servers(), this.hashed).filter((id) => id !== this.node.getClientId());
           for (const id of closest) this.send(id, { pp: PP, t: 'sync', recs: [rec] });
@@ -836,8 +855,8 @@ export class StorageServer {
       case 'watch': {
         if (!validRoom(data.room)) return;
         let w = this.watchers.get(data.room);
-        if (!w) this.watchers.set(data.room, (w = new Set()));
-        w.add(from);
+        if (!w) this.watchers.set(data.room, (w = new Map()));
+        w.set(from, validId(data.v) ? data.v : from);
         return;
       }
       case 'bput': {
@@ -899,7 +918,7 @@ export class StorageServer {
           const before = await this.store.get(rec.room, rec.slot);
           const result = await this.take(rec);
           if (result.ok && (!before || before.at < rec.at)) {
-            for (const peer of this.watchers.get(rec.room) ?? []) this.send(peer, { pp: PP, t: 'changed', rec: strip(rec) });
+            for (const peer of this.watchers.get(rec.room)?.keys() ?? []) this.send(peer, { pp: PP, t: 'changed', rec: strip(rec) });
           }
         }
         return;

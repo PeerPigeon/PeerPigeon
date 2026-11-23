@@ -2,7 +2,8 @@
  * A storage server's history of its rooms: how many peers were in each room it keeps, over time. A room's
  * peers link to its closest storage servers and ask to hear of its changes (they 'watch' it), so a server
  * knows who is in each of its rooms. Once a minute it writes down how many: people, and peers with a role
- * (bots and the like). Each hour and each day it also counts how many different people it saw.
+ * (bots and the like). Each hour and each day it also counts how many different people it saw: by a visitor id each peer
+ * gives (a hash of its key and the room), so someone who comes back with a new peer id counts once.
  *
  * Kept per room (the room's hashed id; a server never knows which app a room is): a sample a minute for the
  * last 26 hours, an hour's summary for 400 days, a day's for 400 days. Counts only: no peer ids are kept,
@@ -54,8 +55,11 @@ declare class RoomStats {
     private readonly live;
     constructor(store?: RoomStatsStore);
     private open;
-    /** One minute's look at a room: who is in it (peer ids), and which of them have a role. */
-    sample(room: string, peers: string[], withRole: (peer: string) => boolean, now?: number): Promise<void>;
+    /**
+     * One minute's look at a room: who is in it (people: a visitor id each, the same person once however
+     * many tabs), and how many peers with a role (bots and the like).
+     */
+    sample(room: string, people: string[], roles: number, now?: number): Promise<void>;
     /** The summary for the period starting at `at`, from its minutes (or, for a day, also its earlier hours). */
     private summarize;
     /**
@@ -142,6 +146,7 @@ declare class StorageServerLink {
     private readonly readsBytes;
     private readonly listings;
     private readonly rooms;
+    private readonly visitors;
     private readonly listeners;
     private timer;
     private closed;
@@ -149,8 +154,11 @@ declare class StorageServerLink {
     start(): Promise<void>;
     close(): Promise<void>;
     on(listener: LinkListener): () => void;
-    /** Keep this room: link to its closest servers, and hear of changes to it. */
-    keep(room: string): void;
+    /**
+     * Keep this room: link to its closest servers, and hear of changes to it. `visitor` (see visitorOf) lets
+     * the servers count the same person once, from visit to visit, though the peer id is new each time.
+     */
+    keep(room: string, visitor?: string): void;
     /** The linked servers that keep this room, closest first. */
     serversFor(room: string): string[];
     /** Every server listed in the servers' scope. */
@@ -241,6 +249,11 @@ declare class MemoryServerRecordStore implements ServerRecordStore {
  * What a server's owner signs to ask it for its stats: the server's peer id and the time, so the ask is
  * good for that server only, for five minutes. Signed with the owner's P-256 key (an unsea signature).
  */
+/**
+ * Who someone is in a room, for counting them once from visit to visit (their peer id is new each time):
+ * a hash of the room and their key, so a server cannot tell them in one room from another, nor who they are.
+ */
+declare const visitorOf: (room: string, key: string) => Promise<string>;
 declare const statsText: (serverId: string, at: number) => string;
 /**
  * A pass a server's owner gives someone on their team (console.peerpigeon.io): `member` may ask for the
@@ -295,6 +308,7 @@ declare class StorageServer {
     private readonly store;
     private readonly options;
     private readonly hashed;
+    /** For each room: the peers watching it, and who each is (its visitor id, else the peer id). */
     private readonly watchers;
     /** For each room: the servers last given its records. */
     private readonly placed;
@@ -2213,4 +2227,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type DaySummary, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, type HourSummary, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryRoomStatsStore, MemoryServerRecordStore, type MinuteSample, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, type RoomHistory, RoomStats, type RoomStatsPoint, type RoomStatsStore, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StatsPass, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerOptions, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, grantText, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, packPoints, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayNameOf, relayScore, revokeText, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, statsText, unpackPoints, validRoom };
+export { type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type DaySummary, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, type HourSummary, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryRoomStatsStore, MemoryServerRecordStore, type MinuteSample, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, type RoomHistory, RoomStats, type RoomStatsPoint, type RoomStatsStore, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StatsPass, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerOptions, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, grantText, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, packPoints, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayNameOf, relayScore, revokeText, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, statsText, unpackPoints, validRoom, visitorOf };

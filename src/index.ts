@@ -27,7 +27,7 @@ import type {
 import { PeerPigeonStorage } from './storage.js';
 import { subtle } from './subtle.js';
 import { StorageServerLink, StorageServer, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE } from './storage-servers.js';
-export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS, MAX_BLOB_BYTES, sealBlob, openBlob, blobAddress, ownedRoomOf, validRoom, statsText, grantText, revokeText } from './storage-servers.js';
+export { StorageServerLink, StorageServer, MemoryServerRecordStore, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROOM, STORAGE_SERVER_ROLE, STORAGE_REPLICAS, MAX_BLOB_BYTES, sealBlob, openBlob, blobAddress, ownedRoomOf, validRoom, statsText, grantText, revokeText, visitorOf } from './storage-servers.js';
 export type { ServerRecord, ServerRecordStore, StorageServerStats, StorageServerOptions, StatsPass } from './storage-servers.js';
 export { RoomStats, MemoryRoomStatsStore, packPoints, unpackPoints } from './room-stats.js';
 export type { RoomStatsStore, RoomHistory, RoomStatsPoint, MinuteSample, HourSummary, DaySummary } from './room-stats.js';

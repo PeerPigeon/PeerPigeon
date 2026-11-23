@@ -410,11 +410,11 @@ test('a room\'s history: a sample a minute, hours and days summed up, read in st
   const stats = new RoomStats(store);
   const room = hex('r');
   const t0 = Date.UTC(2026, 10, 20, 10, 0);
-  const bot = (p) => p.startsWith('bot');
-  // 3 hours, a minute at a time: 2 people, then 4 in the second hour (one new each minute), and a bot.
+  // 3 hours, a minute at a time: 2 people (one in two tabs) and a bot, then 4 in the second hour (two new
+  // each minute), then 1.
   for (let m = 0; m < 180; m++) {
-    const peers = m < 60 ? ['a', 'b', 'bot1'] : m < 120 ? ['a', 'b', `c${m}`, `d${m}`, 'bot1'] : ['a'];
-    await stats.sample(room, peers, bot, t0 + m * 60_000);
+    const people = m < 60 ? ['a', 'b', 'b'] : m < 120 ? ['a', 'b', `c${m}`, `d${m}`] : ['a'];
+    await stats.sample(room, people, m < 120 ? 1 : 0, t0 + m * 60_000);
   }
   const hour = await stats.read(room, t0 + 120 * 60_000, t0 + 180 * 60_000);
   assert.equal(hour.step, 60_000);
@@ -449,8 +449,12 @@ test('a server counts who is in each room it keeps, and tells only its owner (or
   const b = await peer(scope, 'j');
   await a.storage.put('user', 'k', 'v');
   await settle(100);
+  // b again, from another tab: a new peer id, the same person.
+  const b2 = await peer(scope, 'k', { userId: 'user-j' });
+  await settle(100);
   await s.sampleRooms();
-  const room = (await a.storage.serverRoom?.()) ?? s['history'].rooms()[0];
+  const room = s['history'].rooms()[0];
+  assert.equal(s['watchers'].get(room)?.size, 3, 'three peers watch it');
   assert.ok(room, 'the peers\' room is watched');
   const now = Date.now();
   const asOwner = (text) => signMessage(text, owner.priv);
@@ -460,5 +464,5 @@ test('a server counts who is in each room it keeps, and tells only its owner (or
   const pass = { by: member.pub, until: 0, gsig: await signMessage(grantText(owner.pub, member.pub, 0), owner.priv) };
   assert.ok(await a.link.roomStats(hex('h'), room, now - 3_600_000, now + 60_000, (t) => signMessage(t, member.priv), pass), 'with a pass');
   assert.equal(await a.link.roomStats(hex('h'), room, now - 3_600_000, now + 60_000, (t) => signMessage(t, stranger.priv)), null, 'not to anyone else');
-  await a.link.close(); await b.link.close(); await s.close(); await a.storage.close(); await b.storage.close();
+  await a.link.close(); await b.link.close(); await b2.link.close(); await s.close(); await a.storage.close(); await b.storage.close(); await b2.storage.close();
 });

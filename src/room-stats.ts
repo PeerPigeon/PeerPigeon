@@ -2,7 +2,8 @@
  * A storage server's history of its rooms: how many peers were in each room it keeps, over time. A room's
  * peers link to its closest storage servers and ask to hear of its changes (they 'watch' it), so a server
  * knows who is in each of its rooms. Once a minute it writes down how many: people, and peers with a role
- * (bots and the like). Each hour and each day it also counts how many different people it saw.
+ * (bots and the like). Each hour and each day it also counts how many different people it saw: by a visitor id each peer
+ * gives (a hash of its key and the room), so someone who comes back with a new peer id counts once.
  *
  * Kept per room (the room's hashed id; a server never knows which app a room is): a sample a minute for the
  * last 26 hours, an hour's summary for 400 days, a day's for 400 days. Counts only: no peer ids are kept,
@@ -54,14 +55,16 @@ export class RoomStats {
     return l;
   }
 
-  /** One minute's look at a room: who is in it (peer ids), and which of them have a role. */
-  async sample(room: string, peers: string[], withRole: (peer: string) => boolean, now = Date.now()): Promise<void> {
+  /**
+   * One minute's look at a room: who is in it (people: a visitor id each, the same person once however
+   * many tabs), and how many peers with a role (bots and the like).
+   */
+  async sample(room: string, people: string[], roles: number, now = Date.now()): Promise<void> {
     const l = await this.open(room);
     const h = l.history;
     const at = Math.floor(now / MINUTE_MS) * MINUTE_MS;
-    const people = peers.filter((p) => !withRole(p));
-    const roles = peers.length - people.length;
-    const sample = { at, people: people.length, roles };
+    const unique = [...new Set(people)];
+    const sample = { at, people: unique.length, roles };
     if (h.minutes.length && h.minutes[h.minutes.length - 1].at === at) h.minutes[h.minutes.length - 1] = sample;
     else h.minutes.push(sample);
     while (h.minutes.length && h.minutes[0].at < now - KEEP_MINUTES_MS) h.minutes.shift();
@@ -72,7 +75,7 @@ export class RoomStats {
     let rolled = false;
     if (l.hourAt !== hourAt) { l.hourAt = hourAt; l.hourSeen = new Set(); rolled = true }
     if (l.dayAt !== dayAt) { l.dayAt = dayAt; l.daySeen = new Set() }
-    for (const p of people) { l.hourSeen.add(p); l.daySeen.add(p); }
+    for (const p of unique) { l.hourSeen.add(p); l.daySeen.add(p); }
 
     this.summarize(h.hours, hourAt, h.minutes.filter((m) => m.at >= hourAt && m.at < hourAt + HOUR_MS), l.hourSeen.size);
     this.summarize(h.days, dayAt, h.minutes.filter((m) => m.at >= dayAt && m.at < dayAt + DAY_MS), l.daySeen.size, h.hours.filter((x) => x.at >= dayAt && x.at < dayAt + DAY_MS));

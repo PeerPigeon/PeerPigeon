@@ -71,7 +71,8 @@ __export(index_exports, {
   sha1Hex: () => sha1Hex,
   statsText: () => statsText,
   unpackPoints: () => unpackPoints,
-  validRoom: () => validRoom
+  validRoom: () => validRoom,
+  visitorOf: () => visitorOf
 });
 module.exports = __toCommonJS(index_exports);
 var import_client2 = require("freertc/client");
@@ -3274,14 +3275,16 @@ var RoomStats = class {
     }
     return l;
   }
-  /** One minute's look at a room: who is in it (peer ids), and which of them have a role. */
-  async sample(room, peers, withRole, now = Date.now()) {
+  /**
+   * One minute's look at a room: who is in it (people: a visitor id each, the same person once however
+   * many tabs), and how many peers with a role (bots and the like).
+   */
+  async sample(room, people, roles, now = Date.now()) {
     const l = await this.open(room);
     const h = l.history;
     const at = Math.floor(now / MINUTE_MS) * MINUTE_MS;
-    const people = peers.filter((p) => !withRole(p));
-    const roles = peers.length - people.length;
-    const sample = { at, people: people.length, roles };
+    const unique = [...new Set(people)];
+    const sample = { at, people: unique.length, roles };
     if (h.minutes.length && h.minutes[h.minutes.length - 1].at === at) h.minutes[h.minutes.length - 1] = sample;
     else h.minutes.push(sample);
     while (h.minutes.length && h.minutes[0].at < now - KEEP_MINUTES_MS) h.minutes.shift();
@@ -3297,7 +3300,7 @@ var RoomStats = class {
       l.dayAt = dayAt;
       l.daySeen = /* @__PURE__ */ new Set();
     }
-    for (const p of people) {
+    for (const p of unique) {
       l.hourSeen.add(p);
       l.daySeen.add(p);
     }
@@ -3506,6 +3509,7 @@ var StorageServerLink = class {
     this.readsBytes = /* @__PURE__ */ new Set();
     this.listings = /* @__PURE__ */ new Map();
     this.rooms = /* @__PURE__ */ new Map();
+    this.visitors = /* @__PURE__ */ new Map();
     this.listeners = /* @__PURE__ */ new Set();
     this.timer = null;
     this.closed = false;
@@ -3543,9 +3547,13 @@ var StorageServerLink = class {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
-  /** Keep this room: link to its closest servers, and hear of changes to it. */
-  keep(room) {
+  /**
+   * Keep this room: link to its closest servers, and hear of changes to it. `visitor` (see visitorOf) lets
+   * the servers count the same person once, from visit to visit, though the peer id is new each time.
+   */
+  keep(room, visitor) {
     if (!this.rooms.has(room)) this.rooms.set(room, []);
+    if (visitor) this.visitors.set(room, visitor);
     void this.refresh();
   }
   /** The linked servers that keep this room, closest first. */
@@ -3591,7 +3599,7 @@ var StorageServerLink = class {
       const now = closest.filter((id) => linked.has(id));
       const fresh = now.filter((id) => !before.includes(id));
       this.rooms.set(room, now);
-      for (const id of fresh) this.send(id, { pp: PP, t: "watch", room });
+      for (const id of fresh) this.send(id, { pp: PP, t: "watch", room, ...this.visitors.has(room) ? { v: this.visitors.get(room) } : {} });
       if (fresh.length || now.length !== before.length) this.emit({ type: "servers", room, servers: now });
     }
   }
@@ -3871,6 +3879,7 @@ var MemoryServerRecordStore = class {
     return { count: this.blobMap.size, bytes };
   }
 };
+var visitorOf = (room, key) => sha256Hex(`peerpigeon:visitor:v1:${room}:${key}`);
 var statsText = (serverId, at) => `pp-ss-stats-v1:${serverId}:${at}`;
 var STATS_SKEW_MS = 5 * 6e4;
 var grantText = (owner, member, until) => JSON.stringify(["pp-console-grant", 1, owner, member, until]);
@@ -3881,6 +3890,7 @@ var StorageServer = class {
     this.store = store;
     this.options = options;
     this.hashed = /* @__PURE__ */ new Map();
+    /** For each room: the peers watching it, and who each is (its visitor id, else the peer id). */
     this.watchers = /* @__PURE__ */ new Map();
     /** For each room: the servers last given its records. */
     this.placed = /* @__PURE__ */ new Map();
@@ -3925,11 +3935,15 @@ var StorageServer = class {
   async sampleRooms(now = Date.now()) {
     const linked = new Set(this.node.getConnectedPeers());
     for (const [room, peers] of this.watchers) {
-      const here = [...peers].filter((p) => linked.has(p));
-      await this.history.sample(room, here, (p) => {
-        const r = this.node.getPeerRole(p);
-        return !!r && r !== "client";
-      }, now).catch(() => {
+      const people = [];
+      let roles = 0;
+      for (const [peer, who] of peers) {
+        if (!linked.has(peer)) continue;
+        const role = this.node.getPeerRole(peer);
+        if (role && role !== "client") roles++;
+        else people.push(who);
+      }
+      await this.history.sample(room, people, roles, now).catch(() => {
       });
     }
   }
@@ -4026,7 +4040,7 @@ var StorageServer = class {
         const result = await this.take(rec);
         this.send(from, { pp: PP, t: "ack", req: data.req, ...result, at: rec.at });
         if (result.ok && (!before || before.at < rec.at)) {
-          for (const peer of this.watchers.get(rec.room) ?? []) if (peer !== from) this.send(peer, { pp: PP, t: "changed", rec: strip(rec) });
+          for (const peer of this.watchers.get(rec.room)?.keys() ?? []) if (peer !== from) this.send(peer, { pp: PP, t: "changed", rec: strip(rec) });
           const closest = closestIds(rec.room, await this.servers(), this.hashed).filter((id) => id !== this.node.getClientId());
           for (const id of closest) this.send(id, { pp: PP, t: "sync", recs: [rec] });
         }
@@ -4047,8 +4061,8 @@ var StorageServer = class {
       case "watch": {
         if (!validRoom(data.room)) return;
         let w = this.watchers.get(data.room);
-        if (!w) this.watchers.set(data.room, w = /* @__PURE__ */ new Set());
-        w.add(from);
+        if (!w) this.watchers.set(data.room, w = /* @__PURE__ */ new Map());
+        w.set(from, validId(data.v) ? data.v : from);
         return;
       }
       case "bput": {
@@ -4109,7 +4123,7 @@ var StorageServer = class {
           const before = await this.store.get(rec.room, rec.slot);
           const result = await this.take(rec);
           if (result.ok && (!before || before.at < rec.at)) {
-            for (const peer of this.watchers.get(rec.room) ?? []) this.send(peer, { pp: PP, t: "changed", rec: strip(rec) });
+            for (const peer of this.watchers.get(rec.room)?.keys() ?? []) this.send(peer, { pp: PP, t: "changed", rec: strip(rec) });
           }
         }
         return;
@@ -4641,7 +4655,7 @@ var PeerPigeonStorage = class {
         });
       }
     });
-    link.keep(room);
+    link.keep(room, await visitorOf(room, this.ownerIdentity()));
     if (link.serversFor(room).length > 0 && !this.serversReady) {
       this.serversReady = true;
       this.serversWaitDone?.();
@@ -9499,5 +9513,6 @@ var index_default = PartialMesh;
   sha1Hex,
   statsText,
   unpackPoints,
-  validRoom
+  validRoom,
+  visitorOf
 });
