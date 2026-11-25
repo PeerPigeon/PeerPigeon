@@ -661,7 +661,7 @@ const FONT_AWESOME_WIFI_OFFLINE_MASK = `url("data:image/svg+xml,${encodeURICompo
   `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${wifiIconWidth} ${wifiIconHeight}">${wifiIconPaths}<path d="M ${wifiSlashInset} ${wifiSlashInset} L ${wifiIconWidth - wifiSlashInset} ${wifiIconHeight - wifiSlashInset}" fill="none" stroke="black" stroke-width="${wifiSlashWidth}" stroke-linecap="round"/></svg>`,
 )}")`;
 
-const DEFAULT_TOPOLOGY = 'token-ring';
+const DEFAULT_TOPOLOGY = 'partial-mesh';
 // The room a page joins when its link names none: everyone meets there.
 const DEFAULT_ROOM = 'global';
 const CRYPTO_PUBLIC_INFO_TYPE = 'pp-crypto-public-info-v1';
