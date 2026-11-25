@@ -179,6 +179,7 @@
               :links="networkGraphModel.links"
               :activity-by-peer="networkGraphActivityByPeer"
               :show-network-status="false"
+              :logo-nodes="logoNodes"
             />
           </div>
           <div class="stage-top">
@@ -244,6 +245,7 @@
               <option v-for="option in topologyOptions" :key="option.id" :value="option.id">{{ option.name }}</option>
             </select>
           </label>
+          <label class="check side-logos"><input v-model="logoNodes" type="checkbox" data-testid="logo-nodes" /><span>Show peers as pigeons</span></label>
 
           <div class="tabs" role="tablist" aria-label="PeerPigeon panels">
             <button
@@ -747,6 +749,7 @@ export default {
       messagesSeen: 0,
       maxPeers: 5,
       minPeers: 2,
+      logoNodes: false,
       tolerantPeers: 1,
       topology: DEFAULT_TOPOLOGY,
       customTopologyModalOpen: false,
@@ -1182,6 +1185,9 @@ export default {
     isRunning(running) {
       this.$nextTick(() => this.scheduleNetworkGraphBadgePinUpdate());
       if (running) this.scheduleDiagnosticScroll();
+    },
+    logoNodes() {
+      this.saveUiState();
     },
     diagnosticSyslogLevel() {
       this.saveUiState();
@@ -4470,6 +4476,7 @@ export default {
           diagnosticsOn: this.diagnosticLoggingEnabled === true,
           storageActiveSpace: this.storageActiveSpace || 'user',
           storageLookupOwnerId: String(this.storageLookupOwnerId || '').trim(),
+          logoNodes: this.logoNodes === true,
         });
 
         localStorage.setItem(this.uiStateKey, serialized);
@@ -4501,6 +4508,9 @@ export default {
         }
         if (typeof parsed.showPrivateCrypto === 'boolean') {
           this.showPrivateCrypto = parsed.showPrivateCrypto;
+        }
+        if (typeof parsed.logoNodes === 'boolean') {
+          this.logoNodes = parsed.logoNodes;
         }
         this.diagnosticSyslogLevel = normalizeSyslogLevel(
           parsed.diagnosticSyslogLevel,
@@ -5263,7 +5273,12 @@ select.input {
 }
 
 .side-topology {
-  padding: 0.9rem 0;
+  padding: 0.9rem 0 0.5rem;
+}
+
+.side-logos {
+  align-self: flex-start;
+  margin-bottom: 0.9rem;
 }
 
 .tabs {

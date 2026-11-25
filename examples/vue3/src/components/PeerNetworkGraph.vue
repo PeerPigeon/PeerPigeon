@@ -67,7 +67,37 @@ import {
 import { canonicalPeerId, formatPeerId } from '../peer-id.js';
 import { graphPeerSummary } from '../graph-coverage.js';
 
+import pigeonLogoSvg from '../../public/pigeonlogo.svg?raw';
+
 const DISTANT_STAR_RADIUS_THRESHOLD = 5;
+
+// The PeerPigeon mark, drawn in a peer's own colour when the graph shows peers as pigeons. Sized for the
+// canvas (the file's own width is 100%), and kept per colour once it has been tinted.
+const LOGO_SIZE = 128;
+const LOGO_SCALE = 1.25; // the mark a little larger than the circle it stands in for
+let logoImage = null;
+const logoTints = new Map();
+function logoIn(color) {
+  if (typeof document === 'undefined') return null;
+  if (!logoImage) {
+    logoImage = new Image();
+    const svg = pigeonLogoSvg.replace('width="100%"', `width="${LOGO_SIZE}" height="${LOGO_SIZE}"`);
+    logoImage.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+  }
+  if (!logoImage.complete || !logoImage.naturalWidth) return null;
+  let tinted = logoTints.get(color);
+  if (!tinted) {
+    tinted = document.createElement('canvas');
+    tinted.width = tinted.height = LOGO_SIZE * 2;
+    const c = tinted.getContext('2d');
+    c.drawImage(logoImage, 0, 0, tinted.width, tinted.height);
+    c.globalCompositeOperation = 'source-in';
+    c.fillStyle = color;
+    c.fillRect(0, 0, tinted.width, tinted.height);
+    logoTints.set(color, tinted);
+  }
+  return tinted;
+}
 const DISTANT_STAR_POINT_RADIUS = 1.65;
 const GRAPH_ROTATION_RADIANS_PER_MS = 0.000108; // raeder.io's resting spin (0.0018 rad a frame at 60 fps)
 const RIGID_ROTATION = true;
@@ -292,6 +322,11 @@ export default {
     showNetworkStatus: {
       type: Boolean,
       default: true,
+    },
+    // Peers drawn as the PeerPigeon mark (in their own colours) instead of circles. Far peers stay stars.
+    logoNodes: {
+      type: Boolean,
+      default: false,
     },
   },
   data() {
@@ -1185,10 +1220,18 @@ export default {
       }
 
       ctx.globalAlpha = coreAlpha * visibilityOpacity;
-      ctx.fillStyle = activityColor;
-      ctx.beginPath();
-      ctx.arc(node.screenX, node.screenY, radius, 0, Math.PI * 2);
-      ctx.fill();
+      const logo = this.logoNodes && !node.distantPoint && radius > DISTANT_STAR_RADIUS_THRESHOLD
+        ? logoIn(activityColor)
+        : null;
+      if (logo) {
+        const size = radius * 2 * LOGO_SCALE;
+        ctx.drawImage(logo, node.screenX - size / 2, node.screenY - size / 2, size, size);
+      } else {
+        ctx.fillStyle = activityColor;
+        ctx.beginPath();
+        ctx.arc(node.screenX, node.screenY, radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
 
       // A distant peer is still a real peer. Keep its exact ID prefix visible
       // after the circle contracts into a star so every live identity can be
