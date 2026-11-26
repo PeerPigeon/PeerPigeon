@@ -2150,7 +2150,7 @@ export class GossipProtocol {
     const onPathIds = new Set(Array.isArray(message.path) ? message.path : []);
     const learned = this.learnedRouteFor(message.to);
 
-    // CECR v1.3 multipath (Section 8.3, step 3a): the sender of a message for
+    // CECR v1.3 multipath (Section 8.6): the sender of a message for
     // a target that is not its neighbour sends it over k different first
     // hops, k = directPathCount(), in the usual order (learned route, then the
     // greedy candidates, then the other neighbours nearest the target). Each
