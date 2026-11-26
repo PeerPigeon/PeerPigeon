@@ -428,6 +428,7 @@ var FreeRTCClientAdapter = class {
       return true;
     }
     this.emitter.emit("signaling:log", { message: `[signal] ${reason} recovery: refreshing discovery` });
+    if (!isAttentionChangeOnly(reason)) this.client?.probeSignaling?.(reason);
     this.startRecoveryProbe(reason, true);
     this.nudgeSignaling(true);
     return true;

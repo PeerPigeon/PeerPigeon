@@ -556,6 +556,9 @@ export class FreeRTCClientAdapter {
     }
 
     this.emitter.emit('signaling:log', { message: `[signal] ${reason} recovery: refreshing discovery` });
+    // A relay socket that died while the machine slept still reads as open: freertc asks the relay, and
+    // replaces the socket within seconds if it does not answer (focus alone is not a wake).
+    if (!isAttentionChangeOnly(reason)) this.client?.probeSignaling?.(reason);
     this.startRecoveryProbe(reason, true);
     this.nudgeSignaling(true);
     return true;
