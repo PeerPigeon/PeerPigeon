@@ -360,7 +360,7 @@
                 <div class="media-stats">
                   <span class="media-title">You are sharing {{ mediaPublished.label }}</span>
                   <span>{{ mediaStatFor(mediaPublished.id)?.children.length ?? 0 }} fed by you</span>
-                  <span>{{ mediaTreeSize(mediaPublished.id) }} watching</span>
+                  <span>{{ mediaTreeSize(mediaPublished.id) }} {{ mediaPublished.hasVideo ? 'watching' : 'listening' }}</span>
                   <span v-if="mediaStatFor(mediaPublished.id)?.levels.length">sending {{ mediaStatFor(mediaPublished.id).levels.join(', ') }}</span>
                   <span v-if="mediaPublished.hasVideo">{{ mediaStatFor(mediaPublished.id)?.fps ?? 0 }} fps</span>
                   <span>{{ (mediaStatFor(mediaPublished.id)?.kbps ?? 0) + (mediaStatFor(mediaPublished.id)?.audioKbps ?? 0) }} kbps out, each</span>
@@ -373,7 +373,7 @@
                   <span class="media-title">{{ s.name }}</span>
                   <span class="msg-who" :title="s.source">from {{ s.source.slice(0, 8) }}…</span>
                   <span class="media-kind">{{ s.video && s.audio ? 'video and sound' : s.video ? 'video' : 'sound' }}</span>
-                  <button v-if="!mediaWatching[s.id]" type="button" class="btn" data-testid="media-watch" @click="watchMedia(s.id)">Watch</button>
+                  <button v-if="!mediaWatching[s.id]" type="button" class="btn" data-testid="media-watch" @click="watchMedia(s.id)">{{ s.video ? 'Watch' : 'Listen' }}</button>
                   <button v-else type="button" class="btn" data-testid="media-unwatch" @click="unwatchMedia(s.id)">Stop</button>
                 </div>
                 <template v-if="mediaWatching[s.id]">
@@ -402,6 +402,46 @@
                   </div>
                 </template>
               </div>
+            </template>
+          </div>
+
+          <!-- Files -->
+          <div v-else-if="activeTab === 'files'" class="panel panel-files" role="tabpanel" aria-label="Files">
+            <p class="note">
+              Files straight from the peers that have them, checked piece by piece. Everyone who downloads one
+              shares it too, so a file spreads the more it is fetched. It is here while someone who has it is online.
+            </p>
+            <p v-if="!isRunning" class="empty">Join the room to share or download.</p>
+            <template v-else>
+              <div class="media-actions">
+                <button type="button" class="btn btn-go" data-testid="files-share" :disabled="filesBusy" @click="$refs.filesInput.click()">{{ filesBusy ? 'Preparing…' : 'Share files' }}</button>
+                <input ref="filesInput" type="file" multiple class="visually-hidden" data-testid="files-input" @change="shareFiles" />
+              </div>
+              <p v-if="filesError" class="error">{{ filesError }}</p>
+              <p v-if="!roomFiles.length" class="empty">No files in this room yet.</p>
+              <ul v-else class="file-list">
+                <li v-for="f in roomFiles" :key="f.id" class="file-row" :data-testid="'file-' + f.id.slice(0, 12)">
+                  <div class="file-main">
+                    <span class="file-name" :title="f.name">{{ f.name }}</span>
+                    <span class="file-meta">
+                      {{ formatBytes(f.size) }} · {{ f.holders.length }} {{ f.holders.length === 1 ? 'peer has' : 'peers have' }} it
+                      <template v-if="f.mine"> · {{ fileDownloads[f.id] ? 'downloaded, shared by you' : 'shared by you' }}</template>
+                    </span>
+                    <div v-if="fileDownloads[f.id] && fileDownloads[f.id].state !== 'done'" class="file-progress">
+                      <div class="file-bar"><span :style="{ width: filePercent(fileDownloads[f.id]) + '%' }"></span></div>
+                      <span class="file-meta" data-testid="file-progress">
+                        {{ fileDownloads[f.id].state === 'failed' ? fileDownloads[f.id].error : `${filePercent(fileDownloads[f.id])}% · ${formatBytes(fileDownloads[f.id].rate)}/s · from ${fileDownloads[f.id].sources.length} peer${fileDownloads[f.id].sources.length === 1 ? '' : 's'}` }}
+                      </span>
+                    </div>
+                  </div>
+                  <div class="file-actions">
+                    <a v-if="fileUrls[f.id]" class="btn" :href="fileUrls[f.id]" :download="f.name" data-testid="file-save">Save</a>
+                    <button v-if="!f.mine && !fileDownloads[f.id]" type="button" class="btn" data-testid="file-download" @click="downloadFile(f)">Download</button>
+                    <button v-else-if="fileDownloads[f.id] && fileDownloads[f.id].state === 'downloading' || fileDownloads[f.id]?.state === 'starting'" type="button" class="btn" @click="cancelDownload(f.id)">Cancel</button>
+                    <button v-if="f.mine" type="button" class="btn" data-testid="file-unshare" @click="unshareFile(f.id)">Stop sharing</button>
+                  </div>
+                </li>
+              </ul>
             </template>
           </div>
 
@@ -633,7 +673,7 @@
 
 <script>
 import { DEFAULT_SIGNALING_SERVERS, PartialMesh, PeerPigeonNode, StorageServerLink } from 'peerpigeon';
-import { GossipProtocol, MediaStreams } from 'peerpigeon';
+import { GossipProtocol, MediaStreams, FileShares } from 'peerpigeon';
 import { markRaw } from 'vue';
 // pigeon-dev.peer.ooo is built with --mode dev (npm run deploy:dev): a network of its own, so its peers
 // are not mixed with pigeon.peer.ooo's, and the console shows it as a separate app.
@@ -821,6 +861,11 @@ export default {
       messageInput: '',
       directMode: false,
       activeTab: 'message',
+      roomFiles: [],
+      fileDownloads: {},
+      fileUrls: {},
+      filesBusy: false,
+      filesError: '',
       mediaSupported: MediaStreams.supported(),
       mediaAudioSupported: MediaStreams.audioSupported(),
       mediaUseCamera: true,
@@ -906,6 +951,7 @@ export default {
         { id: 'message', label: 'Messages' },
         { id: 'storage', label: 'Storage' },
         { id: 'media', label: 'Media' },
+        { id: 'files', label: 'Files' },
         { id: 'crypto', label: 'Keys' }
       ],
       topologyOptions: [
@@ -2691,6 +2737,7 @@ export default {
         });
 
         this.startMedia();
+        this.startFiles();
         await this.mesh.init();
         this.isRunning = true;
         this.isConnecting = false;
@@ -2710,6 +2757,7 @@ export default {
 
     stopMesh() {
       this.stopMedia();
+      this.stopFiles();
       this.stopCryptoAnnounceLoop();
       this.stopDebugMonitor();
       this.resetGraphStabilization();
@@ -2747,6 +2795,94 @@ export default {
       this.saveUiState();
       this.addLog('info', 'Mesh stopped', 'System');
       this.showStatus('Idle', 'Idle', 'info');
+    },
+
+    // ---------- files: shared peer to peer, every downloader sharing in turn ----------
+    startFiles() {
+      if (!this.mesh || !this.gossip) return;
+      const mesh = this.mesh;
+      const files = new FileShares({ mesh, gossip: this.gossip, connectToPeer: (id) => mesh.connectToPeer(id) });
+      this.files = markRaw(files);
+      files.on('files', (list) => { this.roomFiles = list; });
+      files.on('progress', (list) => {
+        const next = { ...this.fileDownloads };
+        for (const d of list) next[d.id] = { ...d, file: undefined };
+        this.fileDownloads = next;
+        this.roomFiles = files.list();
+      });
+      window.__files = files;
+    },
+
+    stopFiles() {
+      try { this.files?.destroy(); } catch { /* gone */ }
+      this.files = null;
+      for (const url of Object.values(this.fileUrls)) URL.revokeObjectURL(url);
+      this.roomFiles = [];
+      this.fileDownloads = {};
+      this.fileUrls = {};
+    },
+
+    async shareFiles(event) {
+      const picked = [...(event.target.files || [])];
+      event.target.value = '';
+      if (!picked.length || !this.files) return;
+      this.filesBusy = true;
+      this.filesError = '';
+      try {
+        for (const file of picked) {
+          const id = await this.files.share(file);
+          this.fileUrls = { ...this.fileUrls, [id]: URL.createObjectURL(file) };
+        }
+        this.roomFiles = this.files.list();
+      } catch (error) {
+        this.filesError = String(error?.message || error);
+      } finally {
+        this.filesBusy = false;
+      }
+    },
+
+    async downloadFile(f) {
+      if (!this.files) return;
+      this.filesError = '';
+      this.fileDownloads = { ...this.fileDownloads, [f.id]: { id: f.id, name: f.name, size: f.size, received: 0, sources: [], state: 'starting', rate: 0 } };
+      try {
+        const blob = await this.files.download(f.id);
+        this.fileUrls = { ...this.fileUrls, [f.id]: URL.createObjectURL(blob) };
+      } catch (error) {
+        if (String(error?.message) !== 'Cancelled') this.filesError = `${f.name}: ${String(error?.message || error)}`;
+        const next = { ...this.fileDownloads };
+        delete next[f.id];
+        this.fileDownloads = next;
+      }
+    },
+
+    unshareFile(id) {
+      this.files?.unshare(id);
+      if (this.fileUrls[id]) {
+        URL.revokeObjectURL(this.fileUrls[id]);
+        const next = { ...this.fileUrls };
+        delete next[id];
+        this.fileUrls = next;
+      }
+      const downloads = { ...this.fileDownloads };
+      delete downloads[id];
+      this.fileDownloads = downloads;
+    },
+
+    cancelDownload(id) {
+      this.files?.cancel(id);
+    },
+
+    filePercent(d) {
+      return d.size ? Math.min(100, Math.floor((d.received / d.size) * 100)) : 0;
+    },
+
+    formatBytes(n) {
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let v = Number(n) || 0;
+      let u = 0;
+      while (v >= 1000 && u < units.length - 1) { v /= 1000; u++; }
+      return `${v >= 100 || u === 0 ? Math.round(v) : v.toFixed(1)} ${units[u]}`;
     },
 
     // ---------- media: a camera shared through the mesh, viewers forwarding to viewers ----------
@@ -3104,7 +3240,7 @@ export default {
       return !!(
         data &&
         typeof data === 'object' &&
-        (data.__ppType === STORAGE_SYNC_ENVELOPE_TYPE || String(data.__ppType || '').startsWith('pp-media-'))
+        (data.__ppType === STORAGE_SYNC_ENVELOPE_TYPE || /^pp-(media|files)-/.test(String(data.__ppType || '')))
       );
     },
 
@@ -5571,6 +5707,78 @@ select.input {
   min-height: 0;
   padding-top: 0.85rem;
   overflow-y: auto;
+}
+
+/* files */
+.file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.file-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.file-name {
+  font-weight: 700;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-meta {
+  font-size: 0.82rem;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.file-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex: none;
+}
+
+.file-actions a.btn {
+  text-decoration: none;
+}
+
+.file-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.file-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.file-bar span {
+  display: block;
+  height: 100%;
+  background: var(--sheen);
+  transition: width 0.3s;
 }
 
 /* media */

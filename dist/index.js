@@ -386,9 +386,9 @@ var FreeRTCClientAdapter = class {
   }
   /** Re-announce and refresh discovery. `force` skips the budget, for explicit recovery. */
   nudgeSignaling(force = false) {
-    const now2 = Date.now();
-    this.nudgeTokens = Math.min(NUDGE_BURST, this.nudgeTokens + (now2 - this.nudgeRefilledAtMs) / this.nudgeIntervalMs);
-    this.nudgeRefilledAtMs = now2;
+    const now3 = Date.now();
+    this.nudgeTokens = Math.min(NUDGE_BURST, this.nudgeTokens + (now3 - this.nudgeRefilledAtMs) / this.nudgeIntervalMs);
+    this.nudgeRefilledAtMs = now3;
     if (!force) {
       if (this.nudgeTokens < 1) {
         if (!this.nudgeTimer) {
@@ -524,7 +524,7 @@ var FreeRTCClientAdapter = class {
     return this.peerRoles.get(this.normalizePeerId(peerId)) ?? null;
   }
   handleBootstrapCandidates(candidates) {
-    const now2 = Date.now();
+    const now3 = Date.now();
     const normalizedCandidates = (Array.isArray(candidates) ? candidates : []).map((candidate) => ({
       peerId: this.normalizePeerId(candidate?.peerId),
       advertisedAt: Number(candidate?.advertisedAt),
@@ -538,14 +538,14 @@ var FreeRTCClientAdapter = class {
     const snapshotPeers = new Set(normalizedCandidates.map(({ peerId }) => peerId));
     const activeSnapshotPeers = /* @__PURE__ */ new Set();
     for (const { peerId, advertisedAt, listedAt } of normalizedCandidates) {
-      this.knownPeerLastSeenAtMs.set(peerId, now2);
+      this.knownPeerLastSeenAtMs.set(peerId, now3);
       if (Number.isFinite(advertisedAt)) {
         const previous = this.knownPeerAdvertisedAtMs.get(peerId) ?? Number.NEGATIVE_INFINITY;
         this.knownPeerAdvertisedAtMs.set(peerId, Math.max(previous, advertisedAt));
       }
       const failedAdvertisementAt = this.failedPeerAdvertisementAtMs.get(peerId);
       const hasNewAdvertisement = failedAdvertisementAt == null || Number.isFinite(advertisedAt) && advertisedAt > failedAdvertisementAt;
-      const age = Number.isFinite(listedAt) ? listedAt - advertisedAt : now2 - advertisedAt;
+      const age = Number.isFinite(listedAt) ? listedAt - advertisedAt : now3 - advertisedAt;
       const isFresh = !Number.isFinite(advertisedAt) || age <= DISCOVERY_ACTIVE_MAX_AGE_MS;
       if (hasNewAdvertisement && isFresh) {
         activeSnapshotPeers.add(peerId);
@@ -555,8 +555,8 @@ var FreeRTCClientAdapter = class {
     const nextPeers = new Set(snapshotPeers);
     for (const peerId of this.knownPeers) {
       if (snapshotPeers.has(peerId)) continue;
-      const lastSeenAt = this.knownPeerLastSeenAtMs.get(peerId) ?? now2;
-      if (now2 - lastSeenAt < DISCOVERY_ABSENCE_GRACE_MS) {
+      const lastSeenAt = this.knownPeerLastSeenAtMs.get(peerId) ?? now3;
+      if (now3 - lastSeenAt < DISCOVERY_ABSENCE_GRACE_MS) {
         nextPeers.add(peerId);
       } else {
         this.knownPeerLastSeenAtMs.delete(peerId);
@@ -1266,8 +1266,8 @@ var _GossipProtocol = class _GossipProtocol {
       this.refreshAggregateState(aggregateState);
     }
     const sentPeers = [];
-    const now2 = Date.now();
-    const heldMs = Math.max(0, now2 - (this.messageLog.get(message.id)?.timestamp ?? now2));
+    const now3 = Date.now();
+    const heldMs = Math.max(0, now3 - (this.messageLog.get(message.id)?.timestamp ?? now3));
     const transitSoFar = Number.isFinite(message.transitMs) ? Number(message.transitMs) : 0;
     for (const peerId of connectedPeers) {
       const rtt = this.mesh.getLinkRttMs?.(peerId) ?? null;
@@ -1425,8 +1425,8 @@ var _GossipProtocol = class _GossipProtocol {
     if (envelopeDeadlines.length > 0) return Math.min(...envelopeDeadlines);
     return Number(message.timestamp) + this.deliveryTimeoutMs;
   }
-  canContinueInitialSpread(message, targetPeerId, now2 = Date.now(), view) {
-    if (now2 > this.initialSpreadDeadlineAt(message)) return false;
+  canContinueInitialSpread(message, targetPeerId, now3 = Date.now(), view) {
+    if (now3 > this.initialSpreadDeadlineAt(message)) return false;
     const spread = this.validSpreadEnvelope(message);
     if (!spread) return targetPeerId == null;
     if (!targetPeerId) return true;
@@ -1452,17 +1452,17 @@ var _GossipProtocol = class _GossipProtocol {
     );
     return !!aggregateState && aggregateState.settled && aggregateState.confirmedTotal >= expectedSize;
   }
-  recentRetainedMessageIds(targetPeerId, now2 = Date.now()) {
-    const minRetainedAt = now2 - this.trackingRetentionMs;
+  recentRetainedMessageIds(targetPeerId, now3 = Date.now()) {
+    const minRetainedAt = now3 - this.trackingRetentionMs;
     const peers = this.canonicalPeerSet();
     const view = { peers, hash: this.canonicalSetHash(peers) };
     const messageIds = [];
     for (const [messageId, retained] of this.retainedMessages) {
       if (retained.retainedAt < minRetainedAt) continue;
       if (retained.viewSize !== peers.length) continue;
-      if (now2 > this.initialSpreadDeadlineAt(retained.message)) continue;
+      if (now3 > this.initialSpreadDeadlineAt(retained.message)) continue;
       if (this.initialSpreadComplete(retained.message)) continue;
-      if (!this.canContinueInitialSpread(retained.message, targetPeerId, now2, view)) continue;
+      if (!this.canContinueInitialSpread(retained.message, targetPeerId, now3, view)) continue;
       messageIds.push(messageId);
     }
     return messageIds.slice(-this.antiEntropySummarySize);
@@ -1473,19 +1473,19 @@ var _GossipProtocol = class _GossipProtocol {
     const connected = new Set(this.mesh.getConnectedPeers());
     const targets = targetPeerId && connected.has(targetPeerId) ? [targetPeerId] : this.selectFanoutPeers(/* @__PURE__ */ new Set(), "anti-entropy");
     if (targets.length === 0) return;
-    const now2 = Date.now();
+    const now3 = Date.now();
     for (const peerId of targets) {
-      const retainedIds = this.recentRetainedMessageIds(peerId, now2);
+      const retainedIds = this.recentRetainedMessageIds(peerId, now3);
       if (retainedIds.length === 0) {
         this.lastSummaryByPeer.delete(peerId);
         continue;
       }
       const last = this.lastSummaryByPeer.get(peerId);
-      const full = !last || targetPeerId != null || now2 - last.fullAt >= _GossipProtocol.ANTI_ENTROPY_RESEND_MS;
+      const full = !last || targetPeerId != null || now3 - last.fullAt >= _GossipProtocol.ANTI_ENTROPY_RESEND_MS;
       const messageIds = full ? retainedIds : retainedIds.filter((messageId) => !last.told.has(messageId));
       if (messageIds.length === 0) continue;
       if (full) {
-        this.lastSummaryByPeer.set(peerId, { told: new Set(retainedIds), fullAt: now2 });
+        this.lastSummaryByPeer.set(peerId, { told: new Set(retainedIds), fullAt: now3 });
       } else {
         for (const messageId of messageIds) last.told.add(messageId);
       }
@@ -1574,7 +1574,7 @@ var _GossipProtocol = class _GossipProtocol {
     const existing = this.aggregateStates.get(message.id);
     if (existing) return existing;
     if (message.aggregate.protocol !== GOSSIP_AGGREGATE_PROTOCOL || !Number.isFinite(message.aggregate.deadlineAt) || message.aggregate.deadlineAt <= 0) return null;
-    const now2 = Date.now();
+    const now3 = Date.now();
     const state = {
       messageId: message.id,
       sender: message.sender,
@@ -1585,7 +1585,7 @@ var _GossipProtocol = class _GossipProtocol {
       maxHops: Math.max(0, Math.floor(Number(message.hops) || 0)),
       settled: false,
       createdAt: message.timestamp,
-      updatedAt: now2,
+      updatedAt: now3,
       deadlineAt: message.aggregate.deadlineAt,
       lastSentSignature: "",
       lastStatusSignature: "",
@@ -1706,9 +1706,9 @@ var _GossipProtocol = class _GossipProtocol {
     this.refreshAggregateState(state);
     this.publishAggregateState(state);
   }
-  maintainAggregateDeliveries(now2 = Date.now()) {
+  maintainAggregateDeliveries(now3 = Date.now()) {
     for (const state of this.aggregateStates.values()) {
-      if (now2 >= state.deadlineAt && !state.settled) {
+      if (now3 >= state.deadlineAt && !state.settled) {
         for (const [peerId, child] of state.children.entries()) {
           if (child.settled) continue;
           state.children.set(peerId, { ...child, settled: true });
@@ -1923,7 +1923,7 @@ var _GossipProtocol = class _GossipProtocol {
     }
     return owner;
   }
-  maintainTrackedDeliveries(now2 = Date.now()) {
+  maintainTrackedDeliveries(now3 = Date.now()) {
     const self = this.mesh.getClientId();
     if (!self) return;
     for (const state of this.deliveryStates.values()) {
@@ -1931,17 +1931,17 @@ var _GossipProtocol = class _GossipProtocol {
       if (state.message && peers) {
         const selfIndex = peers.indexOf(self);
         if (selfIndex >= 0 && this.setDeliveryBit(state.bits, selfIndex)) {
-          state.updatedAt = now2;
+          state.updatedAt = now3;
           this.dirtyDeliveryReceiptIds.add(state.messageId);
           this.emitDeliveryStatus(state);
         }
       }
       const status = this.deliveryStatusForState(state);
       if (status.complete) continue;
-      if (now2 >= state.deadlineAt) {
+      if (now3 >= state.deadlineAt) {
         if (!state.timedOut) {
           state.timedOut = true;
-          state.updatedAt = now2;
+          state.updatedAt = now3;
           this.emitDeliveryStatus(state);
           if (state.sender === self) this.emit("deliveryTimeout", this.deliveryStatusForState(state));
         }
@@ -1949,11 +1949,11 @@ var _GossipProtocol = class _GossipProtocol {
       }
       if (!state.message || !peers) continue;
       for (const targetPeerId of status.pendingPeerIds) {
-        if (!this.canContinueInitialSpread(state.message, targetPeerId, now2)) continue;
+        if (!this.canContinueInitialSpread(state.message, targetPeerId, now3)) continue;
         if (this.selectRepairOwner(state, targetPeerId) !== self) continue;
         const attempt = state.repairAttemptsByPeer.get(targetPeerId) ?? { attempts: 0, lastAttemptAt: 0 };
         if (attempt.attempts >= MAX_REPAIR_ATTEMPTS_PER_TARGET) continue;
-        if (now2 - attempt.lastAttemptAt < this.deliveryRepairIntervalMs) continue;
+        if (now3 - attempt.lastAttemptAt < this.deliveryRepairIntervalMs) continue;
         const repairMessage = {
           ...state.message,
           delivery: this.deliveryEnvelopeForState(state)
@@ -1965,7 +1965,7 @@ var _GossipProtocol = class _GossipProtocol {
         if (repairId) {
           state.repairAttemptsByPeer.set(targetPeerId, {
             attempts: attempt.attempts + 1,
-            lastAttemptAt: now2
+            lastAttemptAt: now3
           });
         }
       }
@@ -2106,17 +2106,17 @@ var _GossipProtocol = class _GossipProtocol {
   }
   hasCecrConsensus(local) {
     if (!this.cecrRequireConsensus) return true;
-    const now2 = Date.now();
-    if (now2 - local.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
+    const now3 = Date.now();
+    if (now3 - local.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
     const gossipIntervalMs = this.mesh.getCecrMembershipConfig?.().gossipIntervalMs ?? 2e3;
-    if (now2 - this.cecrViewChangedAtMs < this.cecrConvergenceRounds * gossipIntervalMs) return false;
+    if (now3 - this.cecrViewChangedAtMs < this.cecrConvergenceRounds * gossipIntervalMs) return false;
     if ((this.mesh.getCecrMembershipEquivocations?.().length ?? 0) > 0) return false;
     const configId = this.cecrConfigId();
     const connectedPeers = this.mesh.getConnectedPeers();
     for (const peerId of connectedPeers) {
       const remote = this.cecrRemoteStates.get(peerId);
       if (!remote) return false;
-      if (now2 - remote.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
+      if (now3 - remote.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
       if (remote.configId !== configId || remote.viewId !== local.setHash) return false;
       if (remote.matchingRounds < this.cecrConvergenceRounds) return false;
       if (remote.setHash !== local.setHash) return false;
@@ -2125,20 +2125,20 @@ var _GossipProtocol = class _GossipProtocol {
     }
     return true;
   }
-  cecrNetworkSizeEstimate(now2 = Date.now()) {
+  cecrNetworkSizeEstimate(now3 = Date.now()) {
     let best = {
       size: Math.max(1, this.canonicalPeerSet().length),
-      observedAt: now2
+      observedAt: now3
     };
     const maxAgeMs = this.cecrExtremaMaxAgeMs;
     for (const state of this.aggregateStates.values()) {
-      if (now2 - state.updatedAt > maxAgeMs) continue;
+      if (now3 - state.updatedAt > maxAgeMs) continue;
       if (state.confirmedTotal > best.size || state.confirmedTotal === best.size && state.updatedAt > best.observedAt) {
         best = { size: state.confirmedTotal, observedAt: state.updatedAt };
       }
     }
     for (const remote of this.cecrRemoteStates.values()) {
-      if (now2 - remote.networkSizeObservedAt > maxAgeMs) continue;
+      if (now3 - remote.networkSizeObservedAt > maxAgeMs) continue;
       if (remote.networkSizeEstimate > best.size || remote.networkSizeEstimate === best.size && remote.networkSizeObservedAt > best.observedAt) {
         best = {
           size: remote.networkSizeEstimate,
@@ -2220,7 +2220,7 @@ var _GossipProtocol = class _GossipProtocol {
     if (!message.setHash || typeof message.setHash !== "string") return;
     if (!Number.isFinite(message.size) || message.size < 1) return;
     try {
-      const now2 = Date.now();
+      const now3 = Date.now();
       const min = BigInt("0x" + message.minHex);
       const max = BigInt("0x" + message.maxHex);
       if (min > max) return;
@@ -2231,7 +2231,7 @@ var _GossipProtocol = class _GossipProtocol {
       const networkSizeEstimate = Number.isSafeInteger(message.networkSizeEstimate) ? Math.max(Math.floor(message.size), Math.floor(message.networkSizeEstimate ?? message.size)) : Math.floor(message.size);
       const requestedObservedAt = Number.isSafeInteger(message.networkSizeObservedAt) ? Math.floor(message.networkSizeObservedAt ?? message.timestamp) : Math.floor(message.timestamp);
       const clockSkewMs = this.mesh.getCecrMembershipConfig?.().clockSkewMs ?? 5e3;
-      const networkSizeObservedAt = requestedObservedAt > 0 && requestedObservedAt <= now2 + clockSkewMs ? requestedObservedAt : now2;
+      const networkSizeObservedAt = requestedObservedAt > 0 && requestedObservedAt <= now3 + clockSkewMs ? requestedObservedAt : now3;
       this.cecrRemoteStates.set(fromPeerId, {
         configId,
         viewId,
@@ -2241,7 +2241,7 @@ var _GossipProtocol = class _GossipProtocol {
         size: Math.floor(message.size),
         networkSizeEstimate,
         networkSizeObservedAt,
-        updatedAtMs: now2,
+        updatedAtMs: now3,
         matchingRounds
       });
       this.emit("cecrStateChanged", this.getCecrState());
@@ -2531,12 +2531,12 @@ var _GossipProtocol = class _GossipProtocol {
   }
   /** Learned routes, for diagnostics: compact target id -> { via, hops, ageMs }. */
   getLearnedRoutes() {
-    const now2 = Date.now();
+    const now3 = Date.now();
     return Array.from(this.learnedRoutes.entries()).map(([target, route]) => ({
       target,
       via: route.via,
       hops: route.hops,
-      ageMs: now2 - route.at
+      ageMs: now3 - route.at
     }));
   }
   // A route ack goes one hop back up a broadcast's path, toward the
@@ -2575,13 +2575,13 @@ var _GossipProtocol = class _GossipProtocol {
   }
   handleIncomingRouteAck(message, fromPeerId) {
     if (!this.learnRoutes || !Array.isArray(message.reached)) return;
-    const now2 = Date.now();
+    const now3 = Date.now();
     const parent = this.routeAckParents.get(message.id);
     for (const item of message.reached.slice(0, ROUTE_ACK_MAX_PEERS)) {
       if (!Array.isArray(item) || typeof item[0] !== "string" || !/^[0-9a-f]{40}$/.test(item[0])) continue;
       const hops = Math.max(1, Math.floor(Number(item[1]) || 1));
-      this.learnCompactRoute(item[0], fromPeerId, hops, now2);
-      if (parent && parent.parent !== fromPeerId && now2 - parent.at < this.learnedRouteMaxAgeMs && !parent.forwarded.has(item[0])) {
+      this.learnCompactRoute(item[0], fromPeerId, hops, now3);
+      if (parent && parent.parent !== fromPeerId && now3 - parent.at < this.learnedRouteMaxAgeMs && !parent.forwarded.has(item[0])) {
         parent.forwarded.add(item[0]);
         this.queueRouteAck(message.id, parent.parent, item[0], hops + 1);
       }
@@ -2682,13 +2682,13 @@ var _GossipProtocol = class _GossipProtocol {
     };
   }
   getStats() {
-    const now2 = Date.now();
+    const now3 = Date.now();
     const messages = Array.from(this.messageLog.entries()).map(([id, info]) => ({
       id,
       timestamp: info.timestamp,
       sender: info.sender,
       hops: info.hops,
-      age: now2 - info.timestamp
+      age: now3 - info.timestamp
     }));
     return {
       totalMessagesTracked: this.messageLog.size,
@@ -2698,26 +2698,26 @@ var _GossipProtocol = class _GossipProtocol {
     };
   }
   cleanup(maxAgeMs = 10 * 6e4) {
-    const now2 = Date.now();
+    const now3 = Date.now();
     for (const [id, info] of this.messageLog.entries()) {
-      if (now2 - info.timestamp > maxAgeMs) {
+      if (now3 - info.timestamp > maxAgeMs) {
         this.messageLog.delete(id);
         this.dropRetained(id);
       }
     }
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
-      if (now2 - timestamp > maxAgeMs) {
+      if (now3 - timestamp > maxAgeMs) {
         this.seenDirectIds.delete(id);
       }
     }
-    this.pruneRouteLearning(now2);
+    this.pruneRouteLearning(now3);
   }
-  pruneRouteLearning(now2 = Date.now()) {
+  pruneRouteLearning(now3 = Date.now()) {
     for (const [id, parent] of this.routeAckParents) {
-      if (now2 - parent.at > this.learnedRouteMaxAgeMs) this.routeAckParents.delete(id);
+      if (now3 - parent.at > this.learnedRouteMaxAgeMs) this.routeAckParents.delete(id);
     }
     for (const [target, route] of this.learnedRoutes) {
-      if (now2 - route.at > this.learnedRouteMaxAgeMs) this.learnedRoutes.delete(target);
+      if (now3 - route.at > this.learnedRouteMaxAgeMs) this.learnedRoutes.delete(target);
     }
   }
   markDirectSeen(id, timestamp) {
@@ -2726,9 +2726,9 @@ var _GossipProtocol = class _GossipProtocol {
       this.pruneTracking();
     }
   }
-  pruneTracking(now2 = Date.now()) {
-    const minTimestamp = now2 - this.trackingRetentionMs;
-    this.pruneRouteLearning(now2);
+  pruneTracking(now3 = Date.now()) {
+    const minTimestamp = now3 - this.trackingRetentionMs;
+    this.pruneRouteLearning(now3);
     for (const [id, info] of this.messageLog.entries()) {
       if (info.timestamp >= minTimestamp) {
         break;
@@ -2743,7 +2743,7 @@ var _GossipProtocol = class _GossipProtocol {
       this.dropRetained(oldest);
     }
     for (const [id, retained] of this.retainedMessages.entries()) {
-      if (retained.retainedAt < minTimestamp || now2 > this.initialSpreadDeadlineAt(retained.message)) this.dropRetained(id);
+      if (retained.retainedAt < minTimestamp || now3 > this.initialSpreadDeadlineAt(retained.message)) this.dropRetained(id);
     }
     while (this.retainedMessages.size > this.maxTrackedMessages) {
       const oldest = this.retainedMessages.keys().next().value;
@@ -2763,13 +2763,13 @@ var _GossipProtocol = class _GossipProtocol {
     }
     for (const [id, state] of this.deliveryStates.entries()) {
       const terminalAt = state.completedAt ?? (state.timedOut ? state.deadlineAt : null);
-      const expired = terminalAt != null ? now2 - terminalAt > this.trackingRetentionMs : now2 - state.createdAt > this.trackingRetentionMs;
+      const expired = terminalAt != null ? now3 - terminalAt > this.trackingRetentionMs : now3 - state.createdAt > this.trackingRetentionMs;
       if (!expired) continue;
       this.deliveryStates.delete(id);
       this.dirtyDeliveryReceiptIds.delete(id);
     }
     for (const [id, state] of this.aggregateStates.entries()) {
-      if (now2 - Math.max(state.updatedAt, state.deadlineAt) <= this.trackingRetentionMs) continue;
+      if (now3 - Math.max(state.updatedAt, state.deadlineAt) <= this.trackingRetentionMs) continue;
       this.aggregateStates.delete(id);
     }
   }
@@ -3012,11 +3012,11 @@ function dedupeRelays(relays) {
 var RELAY_SCORE_STORAGE_KEY = "peerpigeon:relay-scores:v1";
 var MAX_SHARED_SOURCES = 16;
 var PERSISTED_SHARED_SOURCES = 4;
-function freshMeasurement(m, now2) {
+function freshMeasurement(m, now3) {
   const value = m;
   if (!value || typeof value !== "object") return null;
   const at = Number(value.at);
-  if (!Number.isFinite(at) || now2 - at > SCORE_MAX_AGE_MS || at > now2 + 6e4) return null;
+  if (!Number.isFinite(at) || now3 - at > SCORE_MAX_AGE_MS || at > now3 + 6e4) return null;
   const attempts = Math.max(0, Math.min(1e6, Number(value.attempts) || 0));
   const failures = Math.max(0, Math.min(attempts, Number(value.failures) || 0));
   const joinMs = value.joinMs === null || value.joinMs === void 0 ? null : Number(value.joinMs);
@@ -3077,10 +3077,10 @@ var RelayScoreBook = class _RelayScoreBook {
   /** Merge scores another peer shared. Only its own measurements, one set per source. */
   mergeShared(sourcePeerId, scores) {
     if (!sourcePeerId || !Array.isArray(scores)) return;
-    const now2 = this.now();
+    const now3 = this.now();
     for (const score of scores.slice(0, 32)) {
       if (!NODE_ID_RE.test(String(score?.nodeId || ""))) continue;
-      const m = freshMeasurement(score, now2);
+      const m = freshMeasurement(score, now3);
       if (!m) continue;
       const entry = this.entry(score.nodeId);
       entry.shared.set(sourcePeerId, m);
@@ -3096,12 +3096,12 @@ var RelayScoreBook = class _RelayScoreBook {
   measurement(nodeId) {
     const entry = this.entries.get(nodeId);
     if (!entry) return null;
-    const now2 = this.now();
+    const now3 = this.now();
     const parts = [];
-    const own = entry.own && freshMeasurement(entry.own, now2);
+    const own = entry.own && freshMeasurement(entry.own, now3);
     if (own) parts.push({ m: own, weight: OWN_WEIGHT });
     for (const shared of entry.shared.values()) {
-      const m = freshMeasurement(shared, now2);
+      const m = freshMeasurement(shared, now3);
       if (m) parts.push({ m, weight: 1 });
     }
     if (parts.length === 0) return null;
@@ -3111,7 +3111,7 @@ var RelayScoreBook = class _RelayScoreBook {
     let joinWeight = 0;
     let at = 0;
     for (const { m, weight } of parts) {
-      const fade = failureFade(now2 - m.at);
+      const fade = failureFade(now3 - m.at);
       attempts += m.attempts * weight;
       failures += m.failures * weight * fade;
       if (m.joinMs !== null) {
@@ -3124,10 +3124,10 @@ var RelayScoreBook = class _RelayScoreBook {
   }
   /** This peer's own measurements, to share with others. */
   ownScores(limit = 8) {
-    const now2 = this.now();
+    const now3 = this.now();
     const out = [];
     for (const [nodeId, entry] of this.entries) {
-      const own = entry.own && freshMeasurement(entry.own, now2);
+      const own = entry.own && freshMeasurement(entry.own, now3);
       if (own) out.push({ nodeId, ...own });
     }
     return out.sort((a, b) => b.at - a.at).slice(0, limit);
@@ -3136,16 +3136,16 @@ var RelayScoreBook = class _RelayScoreBook {
     if (!this.storage) return;
     try {
       const raw = JSON.parse(this.storage.getItem(RELAY_SCORE_STORAGE_KEY) || "{}");
-      const now2 = this.now();
+      const now3 = this.now();
       for (const [nodeId, own] of Object.entries(raw?.own ?? {})) {
         if (!NODE_ID_RE.test(nodeId)) continue;
-        const m = freshMeasurement(own, now2);
+        const m = freshMeasurement(own, now3);
         if (m) this.entry(nodeId).own = m;
       }
       for (const [nodeId, sources] of Object.entries(raw?.shared ?? {})) {
         if (!NODE_ID_RE.test(nodeId) || !sources || typeof sources !== "object") continue;
         for (const [source, shared] of Object.entries(sources).slice(0, PERSISTED_SHARED_SOURCES)) {
-          const m = freshMeasurement(shared, now2);
+          const m = freshMeasurement(shared, now3);
           if (m) this.entry(nodeId).shared.set(source, m);
         }
       }
@@ -3216,17 +3216,17 @@ var RoomStats = class {
    * One minute's look at a room: who is in it (people: a visitor id each, the same person once however
    * many tabs), and how many peers with a role (bots and the like).
    */
-  async sample(room, people, roles, now2 = Date.now()) {
+  async sample(room, people, roles, now3 = Date.now()) {
     const l = await this.open(room);
     const h = l.history;
-    const at = Math.floor(now2 / MINUTE_MS) * MINUTE_MS;
+    const at = Math.floor(now3 / MINUTE_MS) * MINUTE_MS;
     const unique = [...new Set(people)];
     const sample = { at, people: unique.length, roles };
     if (h.minutes.length && h.minutes[h.minutes.length - 1].at === at) h.minutes[h.minutes.length - 1] = sample;
     else h.minutes.push(sample);
-    while (h.minutes.length && h.minutes[0].at < now2 - KEEP_MINUTES_MS) h.minutes.shift();
-    const hourAt = Math.floor(now2 / HOUR_MS) * HOUR_MS;
-    const dayAt = Math.floor(now2 / DAY_MS) * DAY_MS;
+    while (h.minutes.length && h.minutes[0].at < now3 - KEEP_MINUTES_MS) h.minutes.shift();
+    const hourAt = Math.floor(now3 / HOUR_MS) * HOUR_MS;
+    const dayAt = Math.floor(now3 / DAY_MS) * DAY_MS;
     let rolled = false;
     if (l.hourAt !== hourAt) {
       l.hourAt = hourAt;
@@ -3243,9 +3243,9 @@ var RoomStats = class {
     }
     this.summarize(h.hours, hourAt, h.minutes.filter((m) => m.at >= hourAt && m.at < hourAt + HOUR_MS), l.hourSeen.size);
     this.summarize(h.days, dayAt, h.minutes.filter((m) => m.at >= dayAt && m.at < dayAt + DAY_MS), l.daySeen.size, h.hours.filter((x) => x.at >= dayAt && x.at < dayAt + DAY_MS));
-    for (const list of [h.hours, h.days]) while (list.length && list[0].at < now2 - KEEP_SUMMARIES_MS) list.shift();
-    if (rolled || now2 - l.savedAt >= SAVE_EVERY_MS) {
-      l.savedAt = now2;
+    for (const list of [h.hours, h.days]) while (list.length && list[0].at < now3 - KEEP_SUMMARIES_MS) list.shift();
+    if (rolled || now3 - l.savedAt >= SAVE_EVERY_MS) {
+      l.savedAt = now3;
       await this.store.save(room, h).catch(() => {
       });
     }
@@ -3297,10 +3297,10 @@ var RoomStats = class {
    * The room's newest point in each step a reader can be showing (a minute, 5 minutes, an hour, a day),
    * as read() gives them: sent to a page that follows the room, after each sample, so it needs no asking.
    */
-  async current(room, now2 = Date.now()) {
+  async current(room, now3 = Date.now()) {
     const h = (await this.open(room)).history;
     const last = h.minutes[h.minutes.length - 1] ?? null;
-    const fiveAt = Math.floor(now2 / (5 * MINUTE_MS)) * 5 * MINUTE_MS;
+    const fiveAt = Math.floor(now3 / (5 * MINUTE_MS)) * 5 * MINUTE_MS;
     const five = h.minutes.filter((m) => m.at >= fiveAt);
     const round = (n) => Math.round(n * 10) / 10;
     const hour = h.hours[h.hours.length - 1] ?? null;
@@ -3573,11 +3573,11 @@ var StorageServerLink = class {
         wanted.add(id);
         if (!linked.has(id)) this.node.connectToPeer(id);
       }
-      const now2 = closest.filter((id) => linked.has(id));
-      const fresh = now2.filter((id) => !before.includes(id));
-      this.rooms.set(room, now2);
+      const now3 = closest.filter((id) => linked.has(id));
+      const fresh = now3.filter((id) => !before.includes(id));
+      this.rooms.set(room, now3);
       for (const id of fresh) this.send(id, { pp: PP, t: "watch", room, ...this.visitors.has(room) ? { v: this.visitors.get(room) } : {}, ...this.role ? { r: this.role } : {} });
-      if (fresh.length || now2.length !== before.length) this.emit({ type: "servers", room, servers: now2 });
+      if (fresh.length || now3.length !== before.length) this.emit({ type: "servers", room, servers: now3 });
     }
   }
   emit(event) {
@@ -4015,15 +4015,15 @@ var StorageServer = class {
     for (const peer of this.statsFollowers.keys()) if (linked.has(peer)) this.send(peer, { pp: PP, t: "statsnow", stats });
   }
   /** Once a minute: how many are in each room watched here (people, and peers with a role). */
-  async sampleRooms(now2 = Date.now()) {
-    for (const room of this.watchers.keys()) await this.sampleRoom(room, now2);
+  async sampleRooms(now3 = Date.now()) {
+    for (const room of this.watchers.keys()) await this.sampleRoom(room, now3);
   }
   /**
    * One room's count now (the minute's, replaced as it changes), sent at once to the pages following it.
    * Taken each minute, and also the moment someone starts or stops watching the room, so a page sees a
    * peer come and go within seconds, not at the next minute.
    */
-  async sampleRoom(room, now2 = Date.now()) {
+  async sampleRoom(room, now3 = Date.now()) {
     const peers = this.watchers.get(room);
     if (!peers) return;
     const linked = new Set(this.node.getConnectedPeers());
@@ -4035,11 +4035,11 @@ var StorageServer = class {
       if (role && role !== "client") roles++;
       else people.push(who);
     }
-    await this.history.sample(room, people, roles, now2).catch(() => {
+    await this.history.sample(room, people, roles, now3).catch(() => {
     });
     const following = this.followers.get(room);
     if (following?.size) {
-      const c = await this.history.current(room, now2);
+      const c = await this.history.current(room, now3);
       const one = (p) => p ? packPoints([p])[0] : void 0;
       const msg = { pp: PP, t: "roomnow", room, minute: one(c.minute), five: one(c.five), hour: one(c.hour), day: one(c.day) };
       for (const peer of following.keys()) if (linked.has(peer)) this.send(peer, msg);
@@ -4109,8 +4109,8 @@ var StorageServer = class {
     if (!owner || typeof data.sig !== "string" || typeof data.at !== "number" || Math.abs(Date.now() - data.at) > STATS_SKEW_MS) return false;
     let signer = owner;
     if (typeof data.by === "string") {
-      const now2 = Date.now();
-      const valid = typeof data.until === "number" && (data.until === 0 || data.until >= now2) && typeof data.gsig === "string" && await verifyMessage(grantText(owner, data.by, data.until), data.gsig, owner).catch(() => false) && !await this.revoked.has(data.by);
+      const now3 = Date.now();
+      const valid = typeof data.until === "number" && (data.until === 0 || data.until >= now3) && typeof data.gsig === "string" && await verifyMessage(grantText(owner, data.by, data.until), data.gsig, owner).catch(() => false) && !await this.revoked.has(data.by);
       signer = valid ? data.by : null;
     }
     if (!signer) return false;
@@ -4972,7 +4972,7 @@ var PeerPigeonStorage = class {
     const driver = this.requireDriver();
     const pk = this.makePk(space, normalizedKey);
     const existing = await driver.get(pk);
-    const now2 = Date.now();
+    const now3 = Date.now();
     this.assertCanWrite(space, existing, actorId, this.signingKeys ? void 0 : options.ownerId, allowSystemWrite);
     const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
     const modifiedBy = this.peerId || null;
@@ -4986,8 +4986,8 @@ var PeerPigeonStorage = class {
       modifiedBy,
       value: encoded.value,
       valueCipher: encoded.valueCipher,
-      createdAt: existing?.createdAt ?? now2,
-      updatedAt: now2,
+      createdAt: existing?.createdAt ?? now3,
+      updatedAt: now3,
       version: nextVersion
     };
     if (this.signingKeys && space !== "private") {
@@ -5004,7 +5004,7 @@ var PeerPigeonStorage = class {
       space,
       key: normalizedKey,
       actorId,
-      timestamp: now2,
+      timestamp: now3,
       record: persisted
     };
     this.emitChange({
@@ -5032,7 +5032,7 @@ var PeerPigeonStorage = class {
       space,
       key: normalizedKey,
       actorId,
-      timestamp: now2
+      timestamp: now3
     });
     return mutation;
   }
@@ -6064,9 +6064,9 @@ var PeerPigeonCryptoProtocol = class {
     const self = String(this.mesh.getClientId() ?? "").trim();
     const target = String(peerId ?? "").trim();
     if (!self || !target || target === self) return;
-    const now2 = Date.now();
-    if (now2 - (this.keyRequestedAt.get(target) ?? 0) < KEY_REQUEST_MIN_INTERVAL_MS) return;
-    this.keyRequestedAt.set(target, now2);
+    const now3 = Date.now();
+    if (now3 - (this.keyRequestedAt.get(target) ?? 0) < KEY_REQUEST_MIN_INTERVAL_MS) return;
+    this.keyRequestedAt.set(target, now3);
     if (this.keyRequestedAt.size > 512) this.keyRequestedAt.delete(this.keyRequestedAt.keys().next().value);
     const payload = {
       __ppType: CRYPTO_PUBLIC_REQUEST_TYPE,
@@ -6415,8 +6415,8 @@ var Counter = class {
     this.recoveries = 0;
     this.totalFrames = 0;
   }
-  roll(now2) {
-    const span = (now2 - this.windowAt) / 1e3;
+  roll(now3) {
+    const span = (now3 - this.windowAt) / 1e3;
     if (span < 1) return;
     this.fps = Math.round(this.frames / span);
     this.kbps = Math.round(this.bytes * 8 / 1e3 / span);
@@ -6428,7 +6428,7 @@ var Counter = class {
     this.delayCount = 0;
     this.forwardSum = 0;
     this.forwardCount = 0;
-    this.windowAt = now2;
+    this.windowAt = now3;
   }
 };
 var now = () => Date.now();
@@ -7655,6 +7655,525 @@ function waitOpen(channel, ms) {
 }
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// src/files.ts
+var FILES_PAYLOAD_PREFIX = "pp-files-";
+var ANNOUNCE2 = "pp-files-have";
+var GONE = "pp-files-gone";
+var PIECE = 256 * 1024;
+var FRAME = 48 * 1024;
+var ANNOUNCE_MS2 = 5e3;
+var HOLDER_STALE_MS = 16e3;
+var LINK_WAIT_MS2 = 8e3;
+var CHANNEL_OPEN_MS2 = 6e3;
+var PER_HOLDER = 4;
+var MAX_SOURCES = 4;
+var PIECE_TIMEOUT_MS = 2e4;
+var SOURCE_SILENT_MS = 4e3;
+var SEND_HIGH = 2 * 1024 * 1024;
+var MAX_NAME = 200;
+var FRAME_HEADER = 14;
+var now2 = () => Date.now();
+async function sha256Hex2(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+function manifestBytes(m) {
+  return new TextEncoder().encode(JSON.stringify({ v: 1, name: m.name, size: m.size, type: m.type, piece: m.piece, hashes: m.hashes }));
+}
+var FileShares = class {
+  constructor(host) {
+    this.host = host;
+    this.held = /* @__PURE__ */ new Map();
+    this.known = /* @__PURE__ */ new Map();
+    this.active = /* @__PURE__ */ new Map();
+    this.listeners = /* @__PURE__ */ new Map();
+    this.openingSources = /* @__PURE__ */ new Map();
+    host.gossip.on("messageReceived", ({ message, local }) => {
+      if (!local) this.onControl(message?.sender, message?.data);
+    });
+    host.mesh.on("peer:sidechannel", ({ peerId, name, channel }) => this.onSideChannel(peerId, name, channel));
+    host.mesh.on("peer:disconnected", (peerId) => this.onPeerGone(peerId));
+    this.timer = setInterval(() => this.tick(), 1e3);
+  }
+  on(event, handler) {
+    const set = this.listeners.get(event) ?? /* @__PURE__ */ new Set();
+    set.add(handler);
+    this.listeners.set(event, set);
+  }
+  off(event, handler) {
+    this.listeners.get(event)?.delete(handler);
+  }
+  /** The files in the room: announced by someone in the last few seconds, or this peer's own. */
+  list() {
+    const t = now2();
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const h of this.held.values()) {
+      const holders = this.liveHolders(h.id, t);
+      out.push({ id: h.id, name: h.manifest.name, size: h.manifest.size, type: h.manifest.type, holders, mine: true });
+      seen.add(h.id);
+    }
+    for (const [id, k] of this.known) {
+      if (seen.has(id)) continue;
+      const holders = this.liveHolders(id, t);
+      if (!holders.length) continue;
+      out.push({ id, name: k.name, size: k.size, type: k.type, holders, mine: false });
+    }
+    return out;
+  }
+  downloads() {
+    return [...this.active.values()].map((a) => ({ ...a.info, sources: [...a.sources.keys()] }));
+  }
+  /** Share a file with the room. Resolves to its ID once it is hashed (a few seconds for a large one). */
+  async share(file, name) {
+    const fileName = String(name ?? file.name ?? "file").slice(0, MAX_NAME);
+    const hashes = [];
+    for (let at = 0; at < file.size || file.size === 0 && hashes.length === 0; at += PIECE) {
+      hashes.push(await sha256Hex2(await file.slice(at, at + PIECE).arrayBuffer()));
+      if (file.size === 0) break;
+    }
+    const manifest = { v: 1, name: fileName, size: file.size, type: file.type || "application/octet-stream", piece: PIECE, hashes };
+    const id = await sha256Hex2(manifestBytes(manifest));
+    this.hold(id, manifest, file);
+    return id;
+  }
+  /** Stop sharing a file (this peer no longer announces or serves it). */
+  unshare(id) {
+    const h = this.held.get(id);
+    if (!h) return;
+    this.held.delete(id);
+    if (h.announced) clearInterval(h.announced);
+    this.host.gossip.broadcast({ __ppType: GONE, id });
+    this.emit("files", this.list());
+  }
+  /** The file, from this peer if it has it, else downloaded from the room's holders. */
+  download(id) {
+    const h = this.held.get(id);
+    if (h) return Promise.resolve(h.blob);
+    const existing = this.active.get(id);
+    if (existing) return new Promise((resolve, reject) => {
+      const done = existing.done;
+      const fail = existing.fail;
+      existing.done = (b) => {
+        done(b);
+        resolve(b);
+      };
+      existing.fail = (e) => {
+        fail(e);
+        reject(e);
+      };
+    });
+    const k = this.known.get(id);
+    return new Promise((resolve, reject) => {
+      const a = {
+        id,
+        manifest: null,
+        pieces: [],
+        partial: /* @__PURE__ */ new Map(),
+        asked: /* @__PURE__ */ new Map(),
+        sources: /* @__PURE__ */ new Map(),
+        tried: /* @__PURE__ */ new Set(),
+        info: { id, name: k?.name ?? "file", size: k?.size ?? 0, received: 0, sources: [], state: "starting", rate: 0 },
+        done: resolve,
+        fail: reject,
+        timer: null,
+        rateWindow: [],
+        manifestFrom: null,
+        idle: 0
+      };
+      this.active.set(id, a);
+      a.timer = setInterval(() => this.pump(a), 500);
+      this.pump(a);
+      this.progress();
+    });
+  }
+  /** Give up a download. */
+  cancel(id) {
+    const a = this.active.get(id);
+    if (!a) return;
+    this.finish(a, new Error("Cancelled"));
+  }
+  hold(id, manifest, blob) {
+    if (this.held.has(id)) return;
+    const h = { id, manifest, blob, announced: null };
+    const announce = () => this.host.gossip.broadcast({ __ppType: ANNOUNCE2, id, name: manifest.name, size: manifest.size, type: manifest.type });
+    announce();
+    h.announced = setInterval(announce, ANNOUNCE_MS2);
+    this.held.set(id, h);
+    this.emit("files", this.list());
+  }
+  liveHolders(id, t) {
+    const me = this.host.mesh.getClientId() ?? "";
+    const holders = [...(this.known.get(id)?.holders ?? /* @__PURE__ */ new Map()).entries()].filter(([, seen]) => t - seen < HOLDER_STALE_MS).map(([p]) => p);
+    if (this.held.has(id) && me && !holders.includes(me)) holders.unshift(me);
+    return holders;
+  }
+  // ---------------------------------------------------------------- downloading
+  /** Keep a download moving: sources up to MAX_SOURCES, the manifest, then pieces, a few per source. */
+  pump(a) {
+    if (!this.active.has(a.id)) return;
+    const t = now2();
+    const me = this.host.mesh.getClientId() ?? "";
+    const holders = this.liveHolders(a.id, t).filter((p) => p !== me);
+    const linked = new Set(this.host.mesh.getConnectedPeers());
+    const fresh = holders.filter((p) => !a.sources.has(p) && !a.tried.has(p)).sort((x, y) => (linked.has(x) ? 0 : 1) - (linked.has(y) ? 0 : 1));
+    for (const p of fresh) {
+      if (a.sources.size + this.opening(a) >= MAX_SOURCES) break;
+      void this.addSource(a, p);
+    }
+    if (!a.sources.size && !this.opening(a) && fresh.length === 0 && holders.every((p) => a.tried.has(p))) a.tried.clear();
+    if (!a.manifest) {
+      const s = [...a.sources.values()].find((x) => !x.failed && x.channel.readyState === "open");
+      if (s && (!a.manifestFrom || !a.sources.has(a.manifestFrom))) {
+        a.manifestFrom = s.peerId;
+        try {
+          s.channel.send(JSON.stringify({ t: "manifest" }));
+        } catch {
+        }
+      }
+      return;
+    }
+    for (const src of [...a.sources.values()]) if (src.inFlight.size && t - src.lastByte > SOURCE_SILENT_MS) this.dropSource(a, src);
+    for (const [i, ask] of a.asked) if (t - ask.at > PIECE_TIMEOUT_MS) {
+      a.asked.delete(i);
+      a.sources.get(ask.peerId)?.inFlight.delete(i);
+      a.partial.delete(i);
+    }
+    const missing = [];
+    for (let i = 0; i < a.pieces.length; i++) if (!a.pieces[i] && !a.asked.has(i)) missing.push(i);
+    for (const s of a.sources.values()) {
+      if (s.failed || s.channel.readyState !== "open") continue;
+      if (!s.inFlight.size) s.lastByte = t;
+      while (s.inFlight.size < PER_HOLDER && missing.length) {
+        const i = missing.shift();
+        s.inFlight.add(i);
+        a.asked.set(i, { peerId: s.peerId, at: t });
+        try {
+          s.channel.send(JSON.stringify({ t: "piece", i }));
+        } catch {
+          s.inFlight.delete(i);
+          a.asked.delete(i);
+          break;
+        }
+      }
+    }
+  }
+  opening(a) {
+    return this.openingSources.get(a.id)?.size ?? 0;
+  }
+  async addSource(a, peerId) {
+    let set = this.openingSources.get(a.id);
+    if (!set) {
+      set = /* @__PURE__ */ new Set();
+      this.openingSources.set(a.id, set);
+    }
+    if (set.has(peerId)) return;
+    set.add(peerId);
+    a.tried.add(peerId);
+    try {
+      if (!this.host.mesh.getConnectedPeers().includes(peerId)) {
+        this.host.connectToPeer(peerId);
+        const until = now2() + LINK_WAIT_MS2;
+        while (!this.host.mesh.getConnectedPeers().includes(peerId) && now2() < until && this.active.has(a.id)) await sleep2(150);
+      }
+      const channel = this.host.mesh.openSideChannel(peerId, `f:${a.id}`, { reliable: true });
+      if (!channel) return;
+      channel.binaryType = "arraybuffer";
+      if (!await waitOpen2(channel, CHANNEL_OPEN_MS2) || !this.active.has(a.id)) {
+        try {
+          channel.close();
+        } catch {
+        }
+        return;
+      }
+      const s = { peerId, channel, inFlight: /* @__PURE__ */ new Set(), failed: false, lastByte: now2() };
+      a.sources.set(peerId, s);
+      channel.onmessage = (event) => void this.onReply(a, s, event.data);
+      channel.onclose = () => this.dropSource(a, s);
+      if (a.info.state === "starting") a.info.state = "downloading";
+      this.pump(a);
+    } finally {
+      set.delete(peerId);
+    }
+  }
+  dropSource(a, s) {
+    if (a.sources.get(s.peerId) !== s) return;
+    a.sources.delete(s.peerId);
+    for (const i of s.inFlight) {
+      a.asked.delete(i);
+      a.partial.delete(i);
+    }
+    s.inFlight.clear();
+    if (a.manifestFrom === s.peerId) a.manifestFrom = null;
+    try {
+      s.channel.close();
+    } catch {
+    }
+    this.pump(a);
+  }
+  async onReply(a, s, data) {
+    if (!this.active.has(a.id)) return;
+    if (typeof data === "string") {
+      let msg;
+      try {
+        msg = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (msg?.t === "manifest" && !a.manifest) {
+        const m = msg.m;
+        if (!m || m.v !== 1 || !Array.isArray(m.hashes) || typeof m.size !== "number" || m.piece !== PIECE) {
+          s.failed = true;
+          this.dropSource(a, s);
+          return;
+        }
+        const id = await sha256Hex2(manifestBytes(m));
+        if (id !== a.id) {
+          s.failed = true;
+          this.dropSource(a, s);
+          return;
+        }
+        if (a.manifest) return;
+        a.manifest = m;
+        a.pieces = new Array(m.hashes.length).fill(null);
+        a.info.name = m.name;
+        a.info.size = m.size;
+        this.pump(a);
+      } else if (msg?.t === "none" && Number.isInteger(msg.i)) {
+        s.inFlight.delete(msg.i);
+        a.asked.delete(msg.i);
+        s.failed = true;
+        this.dropSource(a, s);
+      }
+      return;
+    }
+    if (!(data instanceof ArrayBuffer) || data.byteLength < FRAME_HEADER || !a.manifest) return;
+    s.lastByte = now2();
+    const view = new DataView(data);
+    if (view.getUint8(0) !== 80 || view.getUint8(1) !== 70) return;
+    const i = view.getUint32(2);
+    const offset = view.getUint32(6);
+    const length = view.getUint32(10);
+    if (i >= a.pieces.length || a.pieces[i] || length > PIECE || offset + data.byteLength - FRAME_HEADER > length) return;
+    let part = a.partial.get(i);
+    if (!part) {
+      part = { bytes: new Uint8Array(length), got: 0 };
+      a.partial.set(i, part);
+    }
+    part.bytes.set(new Uint8Array(data, FRAME_HEADER), offset);
+    part.got += data.byteLength - FRAME_HEADER;
+    this.counted(a, data.byteLength - FRAME_HEADER);
+    if (part.got < length) return;
+    a.partial.delete(i);
+    s.inFlight.delete(i);
+    a.asked.delete(i);
+    const hash = await sha256Hex2(part.bytes);
+    if (hash !== a.manifest.hashes[i]) {
+      a.info.received -= length;
+      s.failed = true;
+      this.dropSource(a, s);
+      return;
+    }
+    a.pieces[i] = part.bytes;
+    if (a.pieces.every((p) => p)) {
+      const blob = new Blob(a.pieces, { type: a.manifest.type });
+      this.finish(a, null, blob);
+      return;
+    }
+    this.pump(a);
+  }
+  counted(a, bytes) {
+    a.info.received += bytes;
+    a.rateWindow.push({ at: now2(), bytes });
+  }
+  finish(a, error, blob) {
+    if (!this.active.has(a.id)) return;
+    this.active.delete(a.id);
+    if (a.timer) clearInterval(a.timer);
+    for (const s of a.sources.values()) {
+      s.channel.onclose = null;
+      try {
+        s.channel.close();
+      } catch {
+      }
+    }
+    if (blob && a.manifest) {
+      a.info.state = "done";
+      a.info.received = a.manifest.size;
+      a.info.file = blob;
+      this.hold(a.id, a.manifest, blob);
+      this.emit("progress", [...this.downloads(), a.info]);
+      a.done(blob);
+    } else {
+      a.info.state = "failed";
+      a.info.error = error?.message ?? "Failed";
+      this.emit("progress", [...this.downloads(), a.info]);
+      a.fail(error ?? new Error("Failed"));
+    }
+  }
+  // ---------------------------------------------------------------- serving
+  onSideChannel(peerId, name, channel) {
+    if (!name.startsWith("f:")) return;
+    const id = name.slice(2);
+    channel.binaryType = "arraybuffer";
+    const queue = [];
+    let sending = false;
+    const sendNext = async () => {
+      if (sending) return;
+      sending = true;
+      try {
+        while (queue.length && channel.readyState === "open") {
+          const h = this.held.get(id);
+          const i = queue.shift();
+          if (!h || i >= h.manifest.hashes.length) {
+            channel.send(JSON.stringify({ t: "none", i }));
+            continue;
+          }
+          const bytes = new Uint8Array(await h.blob.slice(i * PIECE, Math.min(h.manifest.size, (i + 1) * PIECE)).arrayBuffer());
+          for (let off = 0; off < bytes.length || bytes.length === 0 && off === 0; off += FRAME) {
+            if (channel.bufferedAmount > SEND_HIGH) await drained(channel);
+            if (channel.readyState !== "open") return;
+            const slice = bytes.subarray(off, Math.min(bytes.length, off + FRAME));
+            const frame = new Uint8Array(FRAME_HEADER + slice.length);
+            const v = new DataView(frame.buffer);
+            v.setUint8(0, 80);
+            v.setUint8(1, 70);
+            v.setUint32(2, i);
+            v.setUint32(6, off);
+            v.setUint32(10, bytes.length);
+            frame.set(slice, FRAME_HEADER);
+            channel.send(frame);
+            if (bytes.length === 0) break;
+          }
+        }
+      } catch {
+      } finally {
+        sending = false;
+      }
+    };
+    channel.onmessage = (event) => {
+      if (typeof event.data !== "string") return;
+      let msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      const h = this.held.get(id);
+      if (msg?.t === "manifest") {
+        if (!h) {
+          try {
+            channel.close();
+          } catch {
+          }
+          return;
+        }
+        try {
+          channel.send(JSON.stringify({ t: "manifest", m: h.manifest }));
+        } catch {
+        }
+      } else if (msg?.t === "piece" && Number.isInteger(msg.i) && msg.i >= 0) {
+        if (queue.length < 64) queue.push(msg.i);
+        void sendNext();
+      }
+    };
+    void peerId;
+  }
+  // ---------------------------------------------------------------- room
+  onControl(from, data) {
+    if (!from || !data || typeof data !== "object" || typeof data.__ppType !== "string" || !data.__ppType.startsWith(FILES_PAYLOAD_PREFIX)) return;
+    if (typeof data.id !== "string" || !/^[0-9a-f]{64}$/.test(data.id)) return;
+    if (data.__ppType === ANNOUNCE2) {
+      let k = this.known.get(data.id);
+      const isNew = !k || !this.liveHolders(data.id, now2()).length;
+      if (!k) {
+        k = { name: String(data.name ?? "file").slice(0, MAX_NAME), size: Math.max(0, Number(data.size) || 0), type: String(data.type ?? "").slice(0, 100), holders: /* @__PURE__ */ new Map() };
+        this.known.set(data.id, k);
+      }
+      const had = k.holders.has(from);
+      k.holders.set(from, now2());
+      if (isNew || !had) this.emit("files", this.list());
+      for (const a of this.active.values()) if (a.id === data.id) this.pump(a);
+    } else if (data.__ppType === GONE) {
+      if (this.known.get(data.id)?.holders.delete(from)) this.emit("files", this.list());
+    }
+  }
+  onPeerGone(peerId) {
+    let changed = false;
+    for (const k of this.known.values()) if (k.holders.delete(peerId)) changed = true;
+    for (const a of this.active.values()) {
+      const s = a.sources.get(peerId);
+      if (s) this.dropSource(a, s);
+    }
+    if (changed) this.emit("files", this.list());
+  }
+  progress() {
+    if (this.active.size) this.emit("progress", this.downloads());
+  }
+  tick() {
+    const t = now2();
+    const me = this.host.mesh.getClientId();
+    for (const a of [...this.active.values()]) {
+      a.rateWindow = a.rateWindow.filter((r) => t - r.at < 3e3);
+      a.info.rate = Math.round(a.rateWindow.reduce((n, r) => n + r.bytes, 0) / 3);
+      const anyone = a.sources.size > 0 || this.liveHolders(a.id, t).some((p) => p !== me);
+      a.idle = anyone ? 0 : a.idle + 1;
+      if (a.idle > 15) this.finish(a, new Error("Nobody who has this file is online"));
+    }
+    let expired = false;
+    for (const [id, k] of this.known) {
+      for (const [p, seen] of k.holders) if (t - seen > HOLDER_STALE_MS) {
+        k.holders.delete(p);
+        expired = true;
+      }
+      if (!k.holders.size && !this.held.has(id) && !this.active.has(id)) this.known.delete(id);
+    }
+    if (expired) this.emit("files", this.list());
+    this.progress();
+  }
+  destroy() {
+    for (const id of [...this.held.keys()]) this.unshare(id);
+    for (const a of [...this.active.values()]) this.finish(a, new Error("Stopped"));
+    clearInterval(this.timer);
+    this.listeners.clear();
+  }
+  emit(event, ...args) {
+    for (const handler of this.listeners.get(event) ?? []) {
+      try {
+        handler(...args);
+      } catch {
+      }
+    }
+  }
+};
+function waitOpen2(channel, ms) {
+  if (channel.readyState === "open") return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    channel.addEventListener("open", () => {
+      clearTimeout(timer);
+      resolve(true);
+    }, { once: true });
+    channel.addEventListener("close", () => {
+      clearTimeout(timer);
+      resolve(false);
+    }, { once: true });
+  });
+}
+function drained(channel) {
+  return new Promise((resolve) => {
+    channel.bufferedAmountLowThreshold = SEND_HIGH / 4;
+    const done = () => {
+      channel.removeEventListener("bufferedamountlow", done);
+      channel.removeEventListener("close", done);
+      resolve();
+    };
+    channel.addEventListener("bufferedamountlow", done);
+    channel.addEventListener("close", done);
+  });
+}
+var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 // src/index.ts
 var MESH_SIGNAL_PAYLOAD_TYPE = "pp-signal-v1";
 function isMeshSignalPayload(value) {
@@ -8629,13 +9148,13 @@ var PartialMesh = class {
     const connectedPeers = this.getConnectedPeers();
     const overflow = connectedPeers.length - this.config.maxPeers;
     if (overflow <= 0) return;
-    const now2 = Date.now();
+    const now3 = Date.now();
     for (const [peerId, until] of this.bridgeGraceUntilMs) {
-      if (until <= now2 || !connectedPeers.includes(peerId)) this.bridgeGraceUntilMs.delete(peerId);
+      if (until <= now3 || !connectedPeers.includes(peerId)) this.bridgeGraceUntilMs.delete(peerId);
     }
     if (this.bridgeGraceUntilMs.size > 0 && overflow <= this.config.tolerantPeers) {
       if (!this.bridgeTrimTimer) {
-        const wait = Math.max(...this.bridgeGraceUntilMs.values()) - now2 + 50;
+        const wait = Math.max(...this.bridgeGraceUntilMs.values()) - now3 + 50;
         this.bridgeTrimTimer = setTimeout(() => {
           this.bridgeTrimTimer = null;
           this.trimExcessPeers();
@@ -8666,7 +9185,7 @@ var PartialMesh = class {
       needy: (() => {
         const capacity = this.freshPeerCapacity(peerId);
         if (capacity) return capacity.connectedPeers <= this.config.minPeers;
-        return now2 - (this.peerConnectedAtMs.get(peerId) ?? 0) < NEEDY_UNREPORTED_MS;
+        return now3 - (this.peerConnectedAtMs.get(peerId) ?? 0) < NEEDY_UNREPORTED_MS;
       })()
     })).sort((a, b) => {
       if (a.needy !== b.needy) return a.needy ? 1 : -1;
@@ -8685,17 +9204,17 @@ var PartialMesh = class {
     }
   }
   getOldestPendingAgeMs() {
-    const now2 = Date.now();
+    const now3 = Date.now();
     let oldest = 0;
     for (const peerId of this.connecting) {
-      const startedAt = this.connectionStartedAtMs.get(peerId) ?? now2;
-      const age = Math.max(0, now2 - startedAt);
+      const startedAt = this.connectionStartedAtMs.get(peerId) ?? now3;
+      const age = Math.max(0, now3 - startedAt);
       if (age > oldest) oldest = age;
     }
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
-      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now2;
-      const age = Math.max(0, now2 - startedAt);
+      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now3;
+      const age = Math.max(0, now3 - startedAt);
       if (age > oldest) oldest = age;
     }
     return oldest;
@@ -8796,8 +9315,8 @@ var PartialMesh = class {
   maybeRebalanceForCloserPeer(candidates) {
     const selfId = this.normalizePeerId(this.clientId);
     if (!selfId || this.config.tolerantPeers <= 0) return false;
-    const now2 = Date.now();
-    if (now2 < this.rebalanceCooldownUntilMs) {
+    const now3 = Date.now();
+    if (now3 < this.rebalanceCooldownUntilMs) {
       return false;
     }
     const connectedPeers = this.getConnectedPeers();
@@ -8832,8 +9351,8 @@ var PartialMesh = class {
     });
     const farthestConnected = connectedByDistance[connectedByDistance.length - 1];
     const closestCandidate = candidateByDistance.find((candidate) => {
-      const discoveredAgeMs = now2 - candidate.discoveredAt;
-      const sinceAttemptMs = now2 - candidate.lastAttemptAt;
+      const discoveredAgeMs = now3 - candidate.discoveredAt;
+      const sinceAttemptMs = now3 - candidate.lastAttemptAt;
       return discoveredAgeMs >= 1e3 && sinceAttemptMs >= 5e3;
     });
     if (!closestCandidate || !farthestConnected) {
@@ -8842,7 +9361,7 @@ var PartialMesh = class {
     if (farthestConnected.cecrProtected) {
       return false;
     }
-    const connectedAgeMs = now2 - (farthestConnected.connectedAt || 0);
+    const connectedAgeMs = now3 - (farthestConnected.connectedAt || 0);
     if (connectedAgeMs < REBALANCE_EDGE_MIN_AGE_MS) {
       return false;
     }
@@ -8859,10 +9378,10 @@ var PartialMesh = class {
     if (otherDiscoveredPeers < 1) {
       return false;
     }
-    this.rebalanceCooldownUntilMs = now2 + this.rebalanceCooldownMs;
+    this.rebalanceCooldownUntilMs = now3 + this.rebalanceCooldownMs;
     this.rebalanceCooldownMs = Math.min(REBALANCE_COOLDOWN_MAX_MS, this.rebalanceCooldownMs * 2);
-    this.rebalanceAttemptAtMs.set(closestCandidate.peerId, now2);
-    this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now2);
+    this.rebalanceAttemptAtMs.set(closestCandidate.peerId, now3);
+    this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now3);
     this.pendingRebalanceDropByTarget.set(closestCandidate.peerId, farthestConnected.peerId);
     this.emit("signaling:log", {
       message: `[rebalance] dial priority ${closestCandidate.peerId.slice(0, 8)} then drop ${farthestConnected.peerId.slice(0, 8)}`
@@ -9162,14 +9681,14 @@ var PartialMesh = class {
     if (!this.config.autoDiscover) return;
     const connected = this.getConnectedPeers().length;
     const pending = this.getPendingPeerCount();
-    const now2 = Date.now();
+    const now3 = Date.now();
     const underConnected = connected < this.config.minPeers;
     const hasFewCandidates = this.discoveredPeers.size < this.config.minPeers;
     const saturatedWithoutSpareCandidates = connected >= this.config.maxPeers && this.discoveredPeers.size <= connected;
     const negotiationNeedsFreshSnapshot = pending > 0;
     if (!underConnected && !hasFewCandidates && !saturatedWithoutSpareCandidates && !negotiationNeedsFreshSnapshot) return;
-    if (now2 - this.lastDiscoveryRefreshAtMs < this.discoveryRefreshWaitMs) return;
-    this.lastDiscoveryRefreshAtMs = now2;
+    if (now3 - this.lastDiscoveryRefreshAtMs < this.discoveryRefreshWaitMs) return;
+    this.lastDiscoveryRefreshAtMs = now3;
     this.discoveryRefreshWaitMs = Math.min(this.discoveryRefreshWaitMs * 2, DISCOVERY_REFRESH_MAX_MS);
     try {
       this.signalingClient?.joinSession(this.config.sessionId);
@@ -9192,7 +9711,7 @@ var PartialMesh = class {
     }
   }
   recoverMeshAfterInactivity(reason) {
-    const now2 = Date.now();
+    const now3 = Date.now();
     if (!isAttentionChangeOnly(reason)) {
       this.dialFailureCount.clear();
       this.dialBackoffUntilMs.clear();
@@ -9209,7 +9728,7 @@ var PartialMesh = class {
       this.emit("signaling:log", {
         message: `[webrtc] ${reason} recovery: revalidating transports immediately`
       });
-      this.recoverOrphanedRtcNegotiations(now2);
+      this.recoverOrphanedRtcNegotiations(now3);
       this.maybeRecoverStalledNegotiations();
       this.maintainPeerConnections();
     } catch {
@@ -9222,7 +9741,7 @@ var PartialMesh = class {
    * peer. Without local peer/pending state, the normal negotiation watchdog
    * cannot see it, while connectToPeerInternal treats it as active forever.
    */
-  recoverOrphanedRtcNegotiations(now2 = Date.now()) {
+  recoverOrphanedRtcNegotiations(now3 = Date.now()) {
     const connections = this.signalingClient?.client?.mesh?.connections;
     if (!connections || typeof connections.entries !== "function") return;
     for (const [rawPeerId, entry] of Array.from(connections.entries())) {
@@ -9239,10 +9758,10 @@ var PartialMesh = class {
         continue;
       }
       const lastSeen = Number(entry?.lastSeen);
-      const initialObservation = Number.isFinite(lastSeen) && lastSeen > 0 ? Math.min(now2, lastSeen) : now2;
+      const initialObservation = Number.isFinite(lastSeen) && lastSeen > 0 ? Math.min(now3, lastSeen) : now3;
       const firstSeenAt = this.orphanRtcFirstSeenAtMs.get(peerId) ?? initialObservation;
       this.orphanRtcFirstSeenAtMs.set(peerId, firstSeenAt);
-      const orphanAgeMs = Math.max(0, now2 - firstSeenAt);
+      const orphanAgeMs = Math.max(0, now3 - firstSeenAt);
       const terminalTransport = connectionState === "failed" || connectionState === "closed" || String(entry?.state ?? "").toLowerCase() === "dead";
       const staleAfterMs = terminalTransport ? 0 : Math.max(6e3, this.config.connectionTimeoutMs);
       if (orphanAgeMs < staleAfterMs) continue;
@@ -9269,7 +9788,7 @@ var PartialMesh = class {
     }
   }
   maybeRecoverStalledNegotiations() {
-    const now2 = Date.now();
+    const now3 = Date.now();
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
     const ownerTimeoutMs = Math.max(NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, this.config.connectionTimeoutMs);
@@ -9297,15 +9816,15 @@ var PartialMesh = class {
       const repeatedlyFailing = (this.dialFailureCount.get(peer.id) ?? 0) >= 2;
       const timeoutMs = activeIce || connectedWithoutChannel ? activeIceTimeoutMs : deadTransport ? ownerTimeoutMs : offerTimeoutMs;
       const phase = deadTransport ? "dead" : connectedWithoutChannel ? "sctp" : activeIce ? "ice" : stalledOffer ? "offer" : noRtcProgress ? "pending" : "idle";
-      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now2;
+      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now3;
       const tracked = this.negotiationPhaseByPeerId.get(peer.id);
       const firstSeenAt = tracked?.firstSeenAt ?? startedAt;
       if (!tracked || tracked.phase !== phase) {
         this.negotiationPhaseByPeerId.set(peer.id, { phase, firstSeenAt });
-        if (tracked) this.connectionStartedAtMs.set(peer.id, now2);
+        if (tracked) this.connectionStartedAtMs.set(peer.id, now3);
       }
-      const ageMs = Math.max(0, now2 - (this.connectionStartedAtMs.get(peer.id) ?? now2));
-      const totalAgeMs = Math.max(0, now2 - firstSeenAt);
+      const ageMs = Math.max(0, now3 - (this.connectionStartedAtMs.get(peer.id) ?? now3));
+      const totalAgeMs = Math.max(0, now3 - firstSeenAt);
       if (ageMs < timeoutMs && totalAgeMs < NEGOTIATION_TOTAL_BUDGET_MS) continue;
       if (!stalledOffer && !deadTransport && !noRtcProgress && !connectedWithoutChannel && !activeIce) {
         continue;
@@ -9342,16 +9861,16 @@ var PartialMesh = class {
     const isolatedThresholdMs = Math.max(3500, Math.min(thresholdMs, 8e3));
     const hasStalePending = pending > 0 && oldestPendingAge >= isolatedThresholdMs;
     const hasRepeatedFailures = candidatePeerIds.some((peerId) => (this.dialFailureCount.get(peerId) ?? 0) >= 3);
-    const now2 = Date.now();
+    const now3 = Date.now();
     if (!underConnected && !isolated) {
       this.underConnectedSinceMs = null;
       return;
     }
     if (isolated && (hasStalePending || hasRepeatedFailures)) {
-      if (now2 - this.lastUnderConnectedRecoveryAtMs < isolatedThresholdMs) {
+      if (now3 - this.lastUnderConnectedRecoveryAtMs < isolatedThresholdMs) {
         return;
       }
-      this.lastUnderConnectedRecoveryAtMs = now2;
+      this.lastUnderConnectedRecoveryAtMs = now3;
       this.emit("signaling:log", {
         message: "[webrtc] isolated recovery: preserving FreeRTC negotiation and refreshing discovery"
       });
@@ -9370,13 +9889,13 @@ var PartialMesh = class {
       }
     }
     if (this.underConnectedSinceMs == null) {
-      this.underConnectedSinceMs = now2;
+      this.underConnectedSinceMs = now3;
       return;
     }
-    if (now2 - this.underConnectedSinceMs < thresholdMs) return;
-    if (now2 - this.lastUnderConnectedRecoveryAtMs < thresholdMs) return;
-    this.lastUnderConnectedRecoveryAtMs = now2;
-    this.underConnectedSinceMs = now2;
+    if (now3 - this.underConnectedSinceMs < thresholdMs) return;
+    if (now3 - this.lastUnderConnectedRecoveryAtMs < thresholdMs) return;
+    this.lastUnderConnectedRecoveryAtMs = now3;
+    this.underConnectedSinceMs = now3;
     this.emit("signaling:log", {
       message: "[webrtc] under-connected recovery: refreshing discovery without resetting FreeRTC"
     });
@@ -9403,9 +9922,9 @@ var PartialMesh = class {
     this.lastDialFailureAtMs.delete(peerId);
     this.dialBackoffUntilMs.delete(peerId);
   }
-  forgetStaleDialFailures(now2) {
+  forgetStaleDialFailures(now3) {
     for (const [peerId, failedAt] of this.lastDialFailureAtMs) {
-      if (now2 - failedAt < DIAL_FAILURE_MEMORY_MS) continue;
+      if (now3 - failedAt < DIAL_FAILURE_MEMORY_MS) continue;
       this.lastDialFailureAtMs.delete(peerId);
       this.dialFailureCount.delete(peerId);
     }
@@ -9428,10 +9947,10 @@ var PartialMesh = class {
     }
     this.noteDialSuccess(peerId);
   }
-  noteStablePeerConnections(now2) {
+  noteStablePeerConnections(now3) {
     for (const [peerId, connectedAt] of this.peerConnectedAtMs) {
       if (!this.peers.get(peerId)?.connected) continue;
-      if (now2 - connectedAt >= STABLE_PEER_CONNECTION_MS) {
+      if (now3 - connectedAt >= STABLE_PEER_CONNECTION_MS) {
         this.noteDialSuccess(peerId);
       }
     }
@@ -9542,10 +10061,10 @@ var PartialMesh = class {
     return role !== null && this.dialRoles.has(role);
   }
   maintainPeerConnections() {
-    const now2 = Date.now();
-    this.noteStablePeerConnections(now2);
-    this.forgetStaleDialFailures(now2);
-    this.recoverOrphanedRtcNegotiations(now2);
+    const now3 = Date.now();
+    this.noteStablePeerConnections(now3);
+    this.forgetStaleDialFailures(now3);
+    this.recoverOrphanedRtcNegotiations(now3);
     const connectedCount = this.getConnectedPeerCount();
     const pendingCount = this.getPendingPeerCount();
     const candidatePeerIds = this.dialCandidatePeerIds(connectedCount === 0);
@@ -9577,10 +10096,10 @@ var PartialMesh = class {
         this.connectToPeer(peerId);
       }
     } else if (totalInProgress < fillCeiling && available.length > 0) {
-      if (now2 < this.rebalanceCooldownUntilMs || now2 < this.fillBackoffUntilMs) {
+      if (now3 < this.rebalanceCooldownUntilMs || now3 < this.fillBackoffUntilMs) {
         return;
       }
-      if (this.fillBackoffMs > 0 && now2 - this.fillBackoffUntilMs > FILL_BACKOFF_MAX_MS) this.fillBackoffMs = 0;
+      if (this.fillBackoffMs > 0 && now3 - this.fillBackoffUntilMs > FILL_BACKOFF_MAX_MS) this.fillBackoffMs = 0;
       const healthy = connectedCount > this.config.minPeers;
       const withRoom = (peerId) => {
         const capacity = this.freshPeerCapacity(peerId);
@@ -9603,8 +10122,8 @@ var PartialMesh = class {
         return ourListed.every((member) => member === selfId || this.peerDistance(member, peerId) > mine);
       };
       const foreign = available.filter((peerId) => !this.globalPeers.has(peerId) && this.activeSignalingPeers.has(peerId) && weAreNearest(peerId));
-      if (foreign.length > 0 && now2 - this.lastBridgeDialAtMs >= BRIDGE_DIAL_INTERVAL_MS) {
-        this.lastBridgeDialAtMs = now2;
+      if (foreign.length > 0 && now3 - this.lastBridgeDialAtMs >= BRIDGE_DIAL_INTERVAL_MS) {
+        this.lastBridgeDialAtMs = now3;
         const target = foreign.slice().sort((a, b) => this.compareDialCandidates(a, b))[0];
         this.emit("signaling:log", { message: `[bridge] dial ${target.slice(0, 8)}: listed by the relay, not in our membership` });
         this.connectToPeerInternal(target, true);
@@ -9904,8 +10423,8 @@ var PartialMesh = class {
   }
   /** Reconstruct the complete currently-known node and undirected edge snapshot. */
   getGraphSnapshot() {
-    const now2 = Date.now();
-    this.pruneMembershipRecords(now2, false);
+    const now3 = Date.now();
+    this.pruneMembershipRecords(now3, false);
     const self = this.normalizePeerId(this.clientId) || null;
     const connected = new Set(this.getConnectedPeers());
     const knownIds = /* @__PURE__ */ new Set();
@@ -9999,7 +10518,7 @@ var PartialMesh = class {
       edges,
       complete: missingTopologyPeerIds.length === 0,
       missingTopologyPeerIds,
-      generatedAt: now2
+      generatedAt: now3
     };
   }
   /**
@@ -10051,17 +10570,17 @@ var PartialMesh = class {
   renewLocalMembership(force = false) {
     const self = this.normalizePeerId(this.clientId);
     if (!self) return false;
-    const now2 = Date.now();
+    const now3 = Date.now();
     const existing = this.membershipRecordsById.get(self);
-    if (!force && existing?.state === "alive" && existing.validUntil != null && existing.validUntil - now2 > this.config.membershipGossipIntervalMs * 2) return false;
+    if (!force && existing?.state === "alive" && existing.validUntil != null && existing.validUntil - now3 > this.config.membershipGossipIntervalMs * 2) return false;
     this.membershipSequence += 1;
     this.membershipRecordsById.set(self, {
       peerId: self,
       incarnation: this.membershipIncarnation,
       sequence: this.membershipSequence,
       state: "alive",
-      issuedAt: now2,
-      validUntil: now2 + this.config.membershipLeaseMs
+      issuedAt: now3,
+      validUntil: now3 + this.config.membershipLeaseMs
     });
     return true;
   }
@@ -10070,7 +10589,7 @@ var PartialMesh = class {
     if (incoming.incarnation !== existing.incarnation) return incoming.incarnation > existing.incarnation;
     return incoming.sequence > existing.sequence;
   }
-  mergeMembershipRecord(record, now2 = Date.now()) {
+  mergeMembershipRecord(record, now3 = Date.now()) {
     const peerId = this.normalizePeerId(record.peerId);
     if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) return false;
     const canonicalId = peerId.replace(/-/g, "").toLowerCase();
@@ -10078,13 +10597,13 @@ var PartialMesh = class {
     if (!Number.isSafeInteger(record.incarnation) || record.incarnation < 0) return false;
     if (!Number.isSafeInteger(record.sequence) || record.sequence < 0) return false;
     if (!Number.isSafeInteger(record.issuedAt) || record.issuedAt <= 0) return false;
-    if (record.issuedAt > now2 + this.config.membershipClockSkewMs) return false;
+    if (record.issuedAt > now3 + this.config.membershipClockSkewMs) return false;
     if (record.state !== "alive" && record.state !== "left") return false;
     if (record.state === "alive") {
       if (!Number.isSafeInteger(record.validUntil)) return false;
       if ((record.validUntil ?? 0) <= record.issuedAt) return false;
       if ((record.validUntil ?? 0) - record.issuedAt > this.config.membershipLeaseMs) return false;
-      if ((record.validUntil ?? 0) + this.config.membershipTombstoneRetentionMs <= now2) return false;
+      if ((record.validUntil ?? 0) + this.config.membershipTombstoneRetentionMs <= now3) return false;
     } else if (record.validUntil !== null) {
       return false;
     }
@@ -10093,7 +10612,7 @@ var PartialMesh = class {
     if (existing && existing.incarnation === normalized.incarnation && existing.sequence === normalized.sequence) {
       const identical = existing.state === normalized.state && existing.issuedAt === normalized.issuedAt && existing.validUntil === normalized.validUntil;
       if (!identical) {
-        this.membershipEquivocationAtById.set(peerId, now2);
+        this.membershipEquivocationAtById.set(peerId, now3);
         return true;
       }
       return false;
@@ -10103,10 +10622,10 @@ var PartialMesh = class {
     return true;
   }
   rebuildGlobalMembership(emitChanges = true) {
-    const now2 = Date.now();
+    const now3 = Date.now();
     const next = /* @__PURE__ */ new Set();
     for (const record of this.membershipRecordsById.values()) {
-      if (record.state === "alive" && record.validUntil != null && record.validUntil > now2 && !this.isSelfAlias(record.peerId) && !this.retiredPeerIds.has(record.peerId) && !this.membershipEquivocationAtById.has(record.peerId)) next.add(record.peerId);
+      if (record.state === "alive" && record.validUntil != null && record.validUntil > now3 && !this.isSelfAlias(record.peerId) && !this.retiredPeerIds.has(record.peerId) && !this.membershipEquivocationAtById.has(record.peerId)) next.add(record.peerId);
     }
     const changed = next.size !== this.globalPeers.size || Array.from(next).some((peerId) => !this.globalPeers.has(peerId));
     if (!changed) return false;
@@ -10123,17 +10642,17 @@ var PartialMesh = class {
     }
     return true;
   }
-  pruneMembershipRecords(now2 = Date.now(), emitChanges = true) {
+  pruneMembershipRecords(now3 = Date.now(), emitChanges = true) {
     let pruned = false;
     for (const [peerId, record] of this.membershipRecordsById.entries()) {
-      const expiredAlive = record.state === "alive" && (record.validUntil == null || record.validUntil + this.config.membershipTombstoneRetentionMs <= now2);
-      const expiredTombstone = record.state === "left" && now2 - record.issuedAt > this.config.membershipTombstoneRetentionMs;
+      const expiredAlive = record.state === "alive" && (record.validUntil == null || record.validUntil + this.config.membershipTombstoneRetentionMs <= now3);
+      const expiredTombstone = record.state === "left" && now3 - record.issuedAt > this.config.membershipTombstoneRetentionMs;
       if (!expiredAlive && !expiredTombstone) continue;
       this.membershipRecordsById.delete(peerId);
       pruned = true;
     }
     for (const [peerId, quarantinedAt] of this.membershipEquivocationAtById.entries()) {
-      if (now2 - quarantinedAt <= this.config.membershipTombstoneRetentionMs) continue;
+      if (now3 - quarantinedAt <= this.config.membershipTombstoneRetentionMs) continue;
       this.membershipEquivocationAtById.delete(peerId);
       pruned = true;
     }
@@ -10141,10 +10660,10 @@ var PartialMesh = class {
   }
   membershipRecordsForWire() {
     const records = {};
-    const now2 = Date.now();
+    const now3 = Date.now();
     for (const record of this.membershipRecordsById.values()) {
-      if (record.state === "alive" && (record.validUntil == null || record.validUntil <= now2)) continue;
-      if (record.state === "left" && now2 - record.issuedAt > this.config.membershipTombstoneRetentionMs) continue;
+      if (record.state === "alive" && (record.validUntil == null || record.validUntil <= now3)) continue;
+      if (record.state === "left" && now3 - record.issuedAt > this.config.membershipTombstoneRetentionMs) continue;
       records[record.peerId] = [
         record.incarnation,
         record.sequence,
@@ -10218,8 +10737,8 @@ var PartialMesh = class {
     this.renewalForwardTimer.unref?.();
   }
   broadcastMembership(exceptPeerId) {
-    const now2 = Date.now();
-    const elapsed = now2 - this.membershipBroadcastAtMs;
+    const now3 = Date.now();
+    const elapsed = now3 - this.membershipBroadcastAtMs;
     if (elapsed < MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS) {
       if (!this.membershipBroadcastTimer) {
         this.membershipBroadcastTimer = setTimeout(() => {
@@ -10230,7 +10749,7 @@ var PartialMesh = class {
       }
       return;
     }
-    this.membershipBroadcastAtMs = now2;
+    this.membershipBroadcastAtMs = now3;
     for (const peerId of this.getConnectedPeers()) {
       if (peerId !== exceptPeerId) this.sendMembership(peerId);
     }
@@ -10258,7 +10777,7 @@ var PartialMesh = class {
     let capacityChanged = false;
     let topologyChanged = false;
     let departureMerged = false;
-    const now2 = Date.now();
+    const now3 = Date.now();
     const renewed = [];
     const returning = [];
     for (const [rawPeerId, rawRecord] of Object.entries(records || {})) {
@@ -10273,7 +10792,7 @@ var PartialMesh = class {
         issuedAt: Math.floor(Number(rawRecord[3])),
         validUntil: rawRecord[4] === null ? null : Math.floor(Number(rawRecord[4]))
       };
-      if (this.mergeMembershipRecord(record, now2)) {
+      if (this.mergeMembershipRecord(record, now3)) {
         membershipChanged = true;
         if (record.state === "left") {
           departureMerged = true;
@@ -10293,10 +10812,10 @@ var PartialMesh = class {
         incarnation: existing?.incarnation ?? 0,
         sequence: (existing?.sequence ?? 0) + 1,
         state: "left",
-        issuedAt: now2,
+        issuedAt: now3,
         validUntil: null
       };
-      if (this.mergeMembershipRecord(left, now2)) {
+      if (this.mergeMembershipRecord(left, now3)) {
         membershipChanged = true;
         this.forgetDepartedPeer(normalizedFromPeerId);
         departureMerged = true;
@@ -10310,11 +10829,11 @@ var PartialMesh = class {
       if (this.mergeMembershipRecord({
         peerId: id,
         incarnation: 0,
-        sequence: now2,
+        sequence: now3,
         state: "alive",
-        issuedAt: now2,
-        validUntil: now2 + this.config.membershipLeaseMs
-      }, now2)) membershipChanged = true;
+        issuedAt: now3,
+        validUntil: now3 + this.config.membershipLeaseMs
+      }, now3)) membershipChanged = true;
     }
     const viewChanged = this.rebuildGlobalMembership(false);
     if (viewChanged) membershipChanged = true;
@@ -10343,7 +10862,7 @@ var PartialMesh = class {
       if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
       if (!Array.isArray(rawState) || rawState.length < 2 || !Array.isArray(rawState[0])) continue;
       const updatedAt = Math.floor(Number(rawState[1]));
-      if (!Number.isSafeInteger(updatedAt) || updatedAt <= 0 || updatedAt > now2 + this.config.membershipClockSkewMs) continue;
+      if (!Number.isSafeInteger(updatedAt) || updatedAt <= 0 || updatedAt > now3 + this.config.membershipClockSkewMs) continue;
       const connectedPeerIds = Array.from(new Set(
         rawState[0].map((value) => this.normalizePeerId(typeof value === "string" ? value : "")).filter((id) => id && id !== peerId && !this.retiredPeerIds.has(id))
       )).sort();
@@ -10375,14 +10894,14 @@ var PartialMesh = class {
     const neighbours = this.getConnectedPeers();
     if (!self || neighbours.length === 0 || !this.signalingClient) return false;
     this.membershipSequence += 1;
-    const now2 = Date.now();
-    const left = [this.membershipIncarnation, this.membershipSequence, "left", now2, null];
+    const now3 = Date.now();
+    const left = [this.membershipIncarnation, this.membershipSequence, "left", now3, null];
     this.membershipRecordsById.set(self, {
       peerId: self,
       incarnation: this.membershipIncarnation,
       sequence: this.membershipSequence,
       state: "left",
-      issuedAt: now2,
+      issuedAt: now3,
       validUntil: null
     });
     const payload = JSON.stringify({
@@ -10494,6 +11013,7 @@ var PeerPigeonNode = class _PeerPigeonNode {
     this.relayScoreTimer = null;
     this.useServers = false;
     this.mediaStreams = null;
+    this.fileShares = null;
     const { gossip = {}, crypto: crypto2 = {}, storage = false, ...meshOptions } = options;
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
@@ -10667,6 +11187,14 @@ var PeerPigeonNode = class _PeerPigeonNode {
     return this.mesh.getDiscoveredPeers();
   }
   /**
+   * Files shared in the room, peer to peer: share a file, list the room's, download one from the peers
+   * that have it (checked piece by piece against its ID). Relays never carry them. Made on first use.
+   */
+  get files() {
+    if (!this.fileShares) this.fileShares = new FileShares(this);
+    return this.fileShares;
+  }
+  /**
    * Media streams in the room, with peers as forwarders (a virtual SFU): publish a camera track, watch a
    * stream. Video goes over side channels on the peers' own links; relays never carry it. Made on first use.
    */
@@ -10798,6 +11326,8 @@ var PeerPigeonNode = class _PeerPigeonNode {
     this.storage = null;
     this.mediaStreams?.destroy();
     this.mediaStreams = null;
+    this.fileShares?.destroy();
+    this.fileShares = null;
     this.crypto?.destroy();
     this.gossip.destroy();
     const flushMs = this.mesh.destroy();
@@ -10902,7 +11432,7 @@ var PeerPigeonNode = class _PeerPigeonNode {
     if (PeerPigeonCryptoProtocol.isProtocolPayload(data)) return true;
     if (!data || typeof data !== "object") return false;
     const type = data.__ppType;
-    return typeof type === "string" && (type.startsWith("pp-storage-") || type.startsWith("pp-signal-") || type.startsWith("pp-relay-") || type.startsWith("pp-media-"));
+    return typeof type === "string" && (type.startsWith("pp-storage-") || type.startsWith("pp-signal-") || type.startsWith("pp-relay-") || type.startsWith("pp-media-") || type.startsWith("pp-files-"));
   }
   emitError(error) {
     this.emit("error", error instanceof Error ? error : new Error(String(error)));
@@ -10920,6 +11450,7 @@ var index_default = PartialMesh;
 export {
   DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
   DEFAULT_SIGNALING_SERVERS,
+  FileShares,
   GossipProtocol,
   MAX_BLOB_BYTES,
   MESH_SIGNAL_PAYLOAD_TYPE,

@@ -36,6 +36,8 @@ import { PeerPigeonCryptoProtocol } from './crypto.js';
 export { sha1Hex } from './sha1.js';
 export { MediaStreams, type MediaPublishOptions, type MediaStreamInfo, type MediaStats } from './media.js';
 import { MediaStreams } from './media.js';
+export { FileShares, type SharedFileInfo, type FileDownload } from './files.js';
+import { FileShares } from './files.js';
 import type {
   PeerPigeonCryptoOptions,
   PeerPigeonKeyPair,
@@ -3109,7 +3111,7 @@ export class PartialMesh {
    * rules (media: unordered, no retransmits, the default). Null when the peer is not linked over WebRTC.
    * The neighbour receives it as 'peer:sidechannel'. Relays never carry these.
    */
-  public openSideChannel(peerId: string, name: string, init?: { ordered?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number }): RTCDataChannel | null {
+  public openSideChannel(peerId: string, name: string, init?: { ordered?: boolean; reliable?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number }): RTCDataChannel | null {
     const peerConnection = this.peers.get(peerId);
     if (!peerConnection?.connected) return null;
     return (this.signalingClient as FreeRTCClientAdapter | null)?.openSideChannel(peerId, name, init) ?? null;
@@ -4284,6 +4286,15 @@ export class PeerPigeonNode {
   getLinkLog() { return this.mesh.getLinkLog(); }
   getDiscoveredPeers(): string[] { return this.mesh.getDiscoveredPeers(); }
   private mediaStreams: MediaStreams | null = null;
+  private fileShares: FileShares | null = null;
+  /**
+   * Files shared in the room, peer to peer: share a file, list the room's, download one from the peers
+   * that have it (checked piece by piece against its ID). Relays never carry them. Made on first use.
+   */
+  get files(): FileShares {
+    if (!this.fileShares) this.fileShares = new FileShares(this);
+    return this.fileShares;
+  }
   /**
    * Media streams in the room, with peers as forwarders (a virtual SFU): publish a camera track, watch a
    * stream. Video goes over side channels on the peers' own links; relays never carry it. Made on first use.
@@ -4294,7 +4305,7 @@ export class PeerPigeonNode {
   }
 
   /** Another data channel on the WebRTC link to a neighbour (see PartialMesh.openSideChannel). */
-  openSideChannel(peerId: string, name: string, init?: { ordered?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number }): RTCDataChannel | null {
+  openSideChannel(peerId: string, name: string, init?: { ordered?: boolean; reliable?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number }): RTCDataChannel | null {
     return this.mesh.openSideChannel(peerId, name, init);
   }
   /** The role a relay listed this peer with, or null. */
@@ -4441,6 +4452,8 @@ export class PeerPigeonNode {
     this.storage = null;
     this.mediaStreams?.destroy();
     this.mediaStreams = null;
+    this.fileShares?.destroy();
+    this.fileShares = null;
     this.crypto?.destroy();
     this.gossip.destroy();
     const flushMs = this.mesh.destroy();
@@ -4556,7 +4569,7 @@ export class PeerPigeonNode {
     if (PeerPigeonCryptoProtocol.isProtocolPayload(data)) return true;
     if (!data || typeof data !== 'object') return false;
     const type = (data as { __ppType?: unknown }).__ppType;
-    return typeof type === 'string' && (type.startsWith('pp-storage-') || type.startsWith('pp-signal-') || type.startsWith('pp-relay-') || type.startsWith('pp-media-'));
+    return typeof type === 'string' && (type.startsWith('pp-storage-') || type.startsWith('pp-signal-') || type.startsWith('pp-relay-') || type.startsWith('pp-media-') || type.startsWith('pp-files-'));
   }
 
   private emitError(error: unknown): void {

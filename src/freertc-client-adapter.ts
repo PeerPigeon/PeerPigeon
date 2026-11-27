@@ -218,7 +218,7 @@ export class FreeRTCClientAdapter {
   }
 
   /** Another data channel on the WebRTC link to a peer (unordered, no retransmits by default); null without one. */
-  openSideChannel(peerId: string, name: string, init?: { ordered?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number }): RTCDataChannel | null {
+  openSideChannel(peerId: string, name: string, init?: { ordered?: boolean; reliable?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number }): RTCDataChannel | null {
     try { return this.client?.openSideChannel?.(peerId, name, init) ?? null; } catch { return null; }
   }
 
