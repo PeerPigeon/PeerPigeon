@@ -328,6 +328,59 @@
             </div>
           </div>
 
+          <!-- Media -->
+          <div v-else-if="activeTab === 'media'" class="panel panel-media" role="tabpanel" aria-label="Media">
+            <p class="note">
+              Video between peers, with viewers passing it on to other viewers: each peer forwards the
+              encoded frames as they came, and the source sends its camera only a few times however many watch.
+              No relay carries any of it.
+            </p>
+            <p v-if="!mediaSupported" class="error">This browser can’t encode or decode video here (no WebCodecs).</p>
+            <p v-else-if="!isRunning" class="empty">Join the room to share or watch.</p>
+            <template v-else>
+              <div class="media-actions">
+                <button v-if="!mediaPublished" type="button" class="btn btn-go" data-testid="media-share" :disabled="mediaBusy" @click="startMediaShare">Share your camera</button>
+                <button v-else type="button" class="btn btn-stop" data-testid="media-stop" @click="stopMediaShare">Stop sharing</button>
+                <span v-if="mediaError" class="error">{{ mediaError }}</span>
+              </div>
+
+              <div v-if="mediaPublished" class="media-card own">
+                <video ref="mediaPreview" class="media-video" muted playsinline autoplay></video>
+                <div class="media-stats">
+                  <span class="media-title">You are sharing</span>
+                  <span>{{ mediaStatFor(mediaPublished.id)?.children.length ?? 0 }} fed by you</span>
+                  <span>{{ mediaTreeSize(mediaPublished.id) }} watching</span>
+                  <span>{{ mediaStatFor(mediaPublished.id)?.fps ?? 0 }} fps</span>
+                  <span>{{ mediaStatFor(mediaPublished.id)?.kbps ?? 0 }} kbps out, each</span>
+                  <span>{{ mediaStatFor(mediaPublished.id)?.keyRequests ?? 0 }} key frames asked for</span>
+                </div>
+              </div>
+
+              <p v-if="!mediaOthers.length" class="empty">No one else is sharing in this room.</p>
+              <div v-for="s in mediaOthers" :key="s.id" class="media-card" :data-testid="'media-stream-' + s.id">
+                <div class="media-head">
+                  <span class="media-title">{{ s.name }}</span>
+                  <span class="msg-who" :title="s.source">from {{ s.source.slice(0, 8) }}…</span>
+                  <button v-if="!mediaWatching[s.id]" type="button" class="btn" data-testid="media-watch" @click="watchMedia(s.id)">Watch</button>
+                  <button v-else type="button" class="btn" data-testid="media-unwatch" @click="unwatchMedia(s.id)">Stop watching</button>
+                </div>
+                <template v-if="mediaWatching[s.id]">
+                  <canvas :ref="(el) => setMediaCanvas(s.id, el)" class="media-video"></canvas>
+                  <div v-if="mediaStatFor(s.id)" class="media-stats" data-testid="media-stats">
+                    <span>{{ mediaStatFor(s.id).depth ? `${mediaStatFor(s.id).depth} hop${mediaStatFor(s.id).depth === 1 ? '' : 's'} from the source` : 'Finding a peer to feed you…' }}</span>
+                    <span v-if="mediaStatFor(s.id).parent">via {{ mediaStatFor(s.id).parent === s.source ? 'the source' : mediaStatFor(s.id).parent.slice(0, 8) + '…' }}</span>
+                    <span>{{ mediaStatFor(s.id).fps }} fps</span>
+                    <span>{{ mediaStatFor(s.id).kbps }} kbps</span>
+                    <span>{{ mediaStatFor(s.id).delayMs != null ? `${mediaStatFor(s.id).delayMs} ms behind the camera` : 'delay: measuring…' }}</span>
+                    <span v-if="mediaStatFor(s.id).children.length">forwarding to {{ mediaStatFor(s.id).children.length }} ({{ mediaStatFor(s.id).forwardMs ?? 0 }} ms each frame)</span>
+                    <span>{{ mediaStatFor(s.id).framesDropped }} frames dropped</span>
+                    <span v-if="mediaStatFor(s.id).recoveries">back {{ mediaStatFor(s.id).lastRecoveryMs }} ms after losing its feed ({{ mediaStatFor(s.id).recoveries }}×)</span>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+
           <!-- Storage -->
           <div v-else-if="activeTab === 'storage'" class="panel panel-storage" role="tabpanel" aria-label="Storage">
             <p class="note">
@@ -556,7 +609,8 @@
 
 <script>
 import { DEFAULT_SIGNALING_SERVERS, PartialMesh, PeerPigeonNode, StorageServerLink } from 'peerpigeon';
-import { GossipProtocol } from 'peerpigeon';
+import { GossipProtocol, MediaStreams } from 'peerpigeon';
+import { markRaw } from 'vue';
 // pigeon-dev.peer.ooo is built with --mode dev (npm run deploy:dev): a network of its own, so its peers
 // are not mixed with pigeon.peer.ooo's, and the console shows it as a separate app.
 const DEFAULT_NETWORK = import.meta.env.MODE === 'dev' ? 'peerpigeon-dev' : 'peerpigeon';
@@ -743,6 +797,14 @@ export default {
       messageInput: '',
       directMode: false,
       activeTab: 'message',
+      mediaSupported: MediaStreams.supported(),
+      mediaStreams: [],
+      mediaStats: [],
+      mediaTrees: {},
+      mediaPublished: null,
+      mediaWatching: {},
+      mediaBusy: false,
+      mediaError: '',
       dmTarget: '',
       showPrivateCrypto: false,
       clientId: '',
@@ -814,6 +876,7 @@ export default {
       uiTabs: [
         { id: 'message', label: 'Messages' },
         { id: 'storage', label: 'Storage' },
+        { id: 'media', label: 'Media' },
         { id: 'crypto', label: 'Keys' }
       ],
       topologyOptions: [
@@ -1027,6 +1090,10 @@ export default {
   computed: {
     defaultNetwork() {
       return DEFAULT_NETWORK;
+    },
+    mediaOthers() {
+      const mine = this.mediaPublished?.id;
+      return this.mediaStreams.filter((s) => s.id !== mine && s.live);
     },
     gossipBadgeSnapshot() {
       const badge = gossipBadgeState({
@@ -2594,6 +2661,7 @@ export default {
           });
         });
 
+        this.startMedia();
         await this.mesh.init();
         this.isRunning = true;
         this.isConnecting = false;
@@ -2612,6 +2680,7 @@ export default {
     },
 
     stopMesh() {
+      this.stopMedia();
       this.stopCryptoAnnounceLoop();
       this.stopDebugMonitor();
       this.resetGraphStabilization();
@@ -2649,6 +2718,97 @@ export default {
       this.saveUiState();
       this.addLog('info', 'Mesh stopped', 'System');
       this.showStatus('Idle', 'Idle', 'info');
+    },
+
+    // ---------- media: a camera shared through the mesh, viewers forwarding to viewers ----------
+    startMedia() {
+      if (!this.mediaSupported || !this.mesh || !this.gossip) return;
+      const mesh = this.mesh;
+      const media = new MediaStreams({ mesh, gossip: this.gossip, connectToPeer: (id) => mesh.connectToPeer(id) });
+      this.media = markRaw(media);
+      this.mediaCanvases = new Map();
+      media.on('streams', (list) => { this.mediaStreams = list; });
+      media.on('stats', (stats) => {
+        this.mediaStats = stats;
+        this.mediaStreams = media.list();
+        if (this.mediaPublished) this.mediaTrees = { [this.mediaPublished.id]: media.tree(this.mediaPublished.id) };
+      });
+      window.__media = media;
+    },
+
+    stopMedia() {
+      if (this.mediaPublished?.track) { try { this.mediaPublished.track.stop(); } catch { /* stopped */ } }
+      try { this.media?.destroy(); } catch { /* gone */ }
+      this.media = null;
+      this.mediaPublished = null;
+      this.mediaWatching = {};
+      this.mediaStreams = [];
+      this.mediaStats = [];
+      this.mediaTrees = {};
+    },
+
+    async startMediaShare() {
+      if (!this.media) return;
+      this.mediaBusy = true;
+      this.mediaError = '';
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }, audio: false });
+        const track = stream.getVideoTracks()[0];
+        const id = await this.media.publish(track, { name: 'Camera' });
+        this.mediaPublished = markRaw({ id, track, stream });
+        await this.$nextTick();
+        if (this.$refs.mediaPreview) this.$refs.mediaPreview.srcObject = stream;
+      } catch (error) {
+        this.mediaError = error?.name === 'NotAllowedError' ? 'The camera was not allowed.' : String(error?.message || error);
+      } finally {
+        this.mediaBusy = false;
+      }
+    },
+
+    stopMediaShare() {
+      if (!this.mediaPublished) return;
+      this.media?.unpublish(this.mediaPublished.id);
+      try { this.mediaPublished.track.stop(); } catch { /* stopped */ }
+      this.mediaPublished = null;
+    },
+
+    watchMedia(id) {
+      if (!this.media) return;
+      this.mediaWatching = { ...this.mediaWatching, [id]: true };
+      try {
+        this.media.watch(id, (frame) => {
+          const canvas = this.mediaCanvases?.get(id);
+          if (canvas) {
+            if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+            if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
+            canvas.getContext('2d')?.drawImage(frame, 0, 0);
+          }
+          frame.close();
+        });
+      } catch (error) {
+        this.mediaError = String(error?.message || error);
+        this.unwatchMedia(id);
+      }
+    },
+
+    unwatchMedia(id) {
+      this.media?.unwatch(id);
+      const next = { ...this.mediaWatching };
+      delete next[id];
+      this.mediaWatching = next;
+    },
+
+    setMediaCanvas(id, el) {
+      if (!this.mediaCanvases) this.mediaCanvases = new Map();
+      if (el) this.mediaCanvases.set(id, el); else this.mediaCanvases.delete(id);
+    },
+
+    mediaStatFor(id) {
+      return this.mediaStats.find((s) => s.id === id) || null;
+    },
+
+    mediaTreeSize(id) {
+      return (this.mediaTrees[id] || []).length;
     },
 
     async sendMessage() {
@@ -2857,7 +3017,7 @@ export default {
       return !!(
         data &&
         typeof data === 'object' &&
-        data.__ppType === STORAGE_SYNC_ENVELOPE_TYPE
+        (data.__ppType === STORAGE_SYNC_ENVELOPE_TYPE || String(data.__ppType || '').startsWith('pp-media-'))
       );
     },
 
@@ -3194,6 +3354,7 @@ export default {
     async handleDirectPayload(message) {
       const from = String(message.from || 'peer');
       const payload = normalizeMessagePayload(message?.data);
+      if (this.isStorageInternalPayload(payload)) return;
 
       if (this.isCryptoPublicInfoPayload(payload)) {
         if (this.cryptoProtocol) return;
@@ -5323,6 +5484,58 @@ select.input {
   min-height: 0;
   padding-top: 0.85rem;
   overflow-y: auto;
+}
+
+/* media */
+.media-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.media-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.media-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.media-head .btn {
+  margin-left: auto;
+}
+
+.media-title {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.media-video {
+  width: 100%;
+  max-height: 360px;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  background: var(--night);
+  border-radius: var(--radius);
+}
+
+.media-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.9rem;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
 }
 
 /* messages */

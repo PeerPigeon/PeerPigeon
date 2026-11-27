@@ -25,6 +25,7 @@ __export(index_exports, {
   GossipProtocol: () => GossipProtocol,
   MAX_BLOB_BYTES: () => MAX_BLOB_BYTES,
   MESH_SIGNAL_PAYLOAD_TYPE: () => MESH_SIGNAL_PAYLOAD_TYPE,
+  MediaStreams: () => MediaStreams,
   MemoryRoomStatsStore: () => MemoryRoomStatsStore,
   MemoryServerRecordStore: () => MemoryServerRecordStore,
   NEGOTIATION_ACTIVE_ICE_DEADLINE_MS: () => NEGOTIATION_ACTIVE_ICE_DEADLINE_MS,
@@ -196,6 +197,14 @@ var FreeRTCClientAdapter = class {
     this.addSelfAlias(this.previousPeerId);
     for (const peerId of this.retiredPeerIds) this.addSelfAlias(peerId);
   }
+  /** Another data channel on the WebRTC link to a peer (unordered, no retransmits by default); null without one. */
+  openSideChannel(peerId, name, init) {
+    try {
+      return this.client?.openSideChannel?.(peerId, name, init) ?? null;
+    } catch {
+      return null;
+    }
+  }
   on(event, handler) {
     this.emitter.on(event, handler);
   }
@@ -290,6 +299,10 @@ var FreeRTCClientAdapter = class {
       trickleIce: this.trickleIce,
       capabilities: this.role ? { role: this.role } : {},
       autoConnect: false,
+      // More channels on a peer's WebRTC link (media), opened in band: the relay never carries them.
+      onSideChannel: (event) => {
+        this.emitter.emit("sidechannel", event);
+      },
       relay: this.relayOnDemand ? { mode: "on-demand", ...this.relayHold ? { hold: this.relayHold } : {} } : {},
       onRelayStateChange: ({ state } = {}) => {
         if (!isCurrentClient()) return;
@@ -450,9 +463,9 @@ var FreeRTCClientAdapter = class {
   }
   /** Re-announce and refresh discovery. `force` skips the budget, for explicit recovery. */
   nudgeSignaling(force = false) {
-    const now = Date.now();
-    this.nudgeTokens = Math.min(NUDGE_BURST, this.nudgeTokens + (now - this.nudgeRefilledAtMs) / this.nudgeIntervalMs);
-    this.nudgeRefilledAtMs = now;
+    const now2 = Date.now();
+    this.nudgeTokens = Math.min(NUDGE_BURST, this.nudgeTokens + (now2 - this.nudgeRefilledAtMs) / this.nudgeIntervalMs);
+    this.nudgeRefilledAtMs = now2;
     if (!force) {
       if (this.nudgeTokens < 1) {
         if (!this.nudgeTimer) {
@@ -588,7 +601,7 @@ var FreeRTCClientAdapter = class {
     return this.peerRoles.get(this.normalizePeerId(peerId)) ?? null;
   }
   handleBootstrapCandidates(candidates) {
-    const now = Date.now();
+    const now2 = Date.now();
     const normalizedCandidates = (Array.isArray(candidates) ? candidates : []).map((candidate) => ({
       peerId: this.normalizePeerId(candidate?.peerId),
       advertisedAt: Number(candidate?.advertisedAt),
@@ -602,14 +615,14 @@ var FreeRTCClientAdapter = class {
     const snapshotPeers = new Set(normalizedCandidates.map(({ peerId }) => peerId));
     const activeSnapshotPeers = /* @__PURE__ */ new Set();
     for (const { peerId, advertisedAt, listedAt } of normalizedCandidates) {
-      this.knownPeerLastSeenAtMs.set(peerId, now);
+      this.knownPeerLastSeenAtMs.set(peerId, now2);
       if (Number.isFinite(advertisedAt)) {
         const previous = this.knownPeerAdvertisedAtMs.get(peerId) ?? Number.NEGATIVE_INFINITY;
         this.knownPeerAdvertisedAtMs.set(peerId, Math.max(previous, advertisedAt));
       }
       const failedAdvertisementAt = this.failedPeerAdvertisementAtMs.get(peerId);
       const hasNewAdvertisement = failedAdvertisementAt == null || Number.isFinite(advertisedAt) && advertisedAt > failedAdvertisementAt;
-      const age = Number.isFinite(listedAt) ? listedAt - advertisedAt : now - advertisedAt;
+      const age = Number.isFinite(listedAt) ? listedAt - advertisedAt : now2 - advertisedAt;
       const isFresh = !Number.isFinite(advertisedAt) || age <= DISCOVERY_ACTIVE_MAX_AGE_MS;
       if (hasNewAdvertisement && isFresh) {
         activeSnapshotPeers.add(peerId);
@@ -619,8 +632,8 @@ var FreeRTCClientAdapter = class {
     const nextPeers = new Set(snapshotPeers);
     for (const peerId of this.knownPeers) {
       if (snapshotPeers.has(peerId)) continue;
-      const lastSeenAt = this.knownPeerLastSeenAtMs.get(peerId) ?? now;
-      if (now - lastSeenAt < DISCOVERY_ABSENCE_GRACE_MS) {
+      const lastSeenAt = this.knownPeerLastSeenAtMs.get(peerId) ?? now2;
+      if (now2 - lastSeenAt < DISCOVERY_ABSENCE_GRACE_MS) {
         nextPeers.add(peerId);
       } else {
         this.knownPeerLastSeenAtMs.delete(peerId);
@@ -1330,8 +1343,8 @@ var _GossipProtocol = class _GossipProtocol {
       this.refreshAggregateState(aggregateState);
     }
     const sentPeers = [];
-    const now = Date.now();
-    const heldMs = Math.max(0, now - (this.messageLog.get(message.id)?.timestamp ?? now));
+    const now2 = Date.now();
+    const heldMs = Math.max(0, now2 - (this.messageLog.get(message.id)?.timestamp ?? now2));
     const transitSoFar = Number.isFinite(message.transitMs) ? Number(message.transitMs) : 0;
     for (const peerId of connectedPeers) {
       const rtt = this.mesh.getLinkRttMs?.(peerId) ?? null;
@@ -1489,8 +1502,8 @@ var _GossipProtocol = class _GossipProtocol {
     if (envelopeDeadlines.length > 0) return Math.min(...envelopeDeadlines);
     return Number(message.timestamp) + this.deliveryTimeoutMs;
   }
-  canContinueInitialSpread(message, targetPeerId, now = Date.now(), view) {
-    if (now > this.initialSpreadDeadlineAt(message)) return false;
+  canContinueInitialSpread(message, targetPeerId, now2 = Date.now(), view) {
+    if (now2 > this.initialSpreadDeadlineAt(message)) return false;
     const spread = this.validSpreadEnvelope(message);
     if (!spread) return targetPeerId == null;
     if (!targetPeerId) return true;
@@ -1516,17 +1529,17 @@ var _GossipProtocol = class _GossipProtocol {
     );
     return !!aggregateState && aggregateState.settled && aggregateState.confirmedTotal >= expectedSize;
   }
-  recentRetainedMessageIds(targetPeerId, now = Date.now()) {
-    const minRetainedAt = now - this.trackingRetentionMs;
+  recentRetainedMessageIds(targetPeerId, now2 = Date.now()) {
+    const minRetainedAt = now2 - this.trackingRetentionMs;
     const peers = this.canonicalPeerSet();
     const view = { peers, hash: this.canonicalSetHash(peers) };
     const messageIds = [];
     for (const [messageId, retained] of this.retainedMessages) {
       if (retained.retainedAt < minRetainedAt) continue;
       if (retained.viewSize !== peers.length) continue;
-      if (now > this.initialSpreadDeadlineAt(retained.message)) continue;
+      if (now2 > this.initialSpreadDeadlineAt(retained.message)) continue;
       if (this.initialSpreadComplete(retained.message)) continue;
-      if (!this.canContinueInitialSpread(retained.message, targetPeerId, now, view)) continue;
+      if (!this.canContinueInitialSpread(retained.message, targetPeerId, now2, view)) continue;
       messageIds.push(messageId);
     }
     return messageIds.slice(-this.antiEntropySummarySize);
@@ -1537,19 +1550,19 @@ var _GossipProtocol = class _GossipProtocol {
     const connected = new Set(this.mesh.getConnectedPeers());
     const targets = targetPeerId && connected.has(targetPeerId) ? [targetPeerId] : this.selectFanoutPeers(/* @__PURE__ */ new Set(), "anti-entropy");
     if (targets.length === 0) return;
-    const now = Date.now();
+    const now2 = Date.now();
     for (const peerId of targets) {
-      const retainedIds = this.recentRetainedMessageIds(peerId, now);
+      const retainedIds = this.recentRetainedMessageIds(peerId, now2);
       if (retainedIds.length === 0) {
         this.lastSummaryByPeer.delete(peerId);
         continue;
       }
       const last = this.lastSummaryByPeer.get(peerId);
-      const full = !last || targetPeerId != null || now - last.fullAt >= _GossipProtocol.ANTI_ENTROPY_RESEND_MS;
+      const full = !last || targetPeerId != null || now2 - last.fullAt >= _GossipProtocol.ANTI_ENTROPY_RESEND_MS;
       const messageIds = full ? retainedIds : retainedIds.filter((messageId) => !last.told.has(messageId));
       if (messageIds.length === 0) continue;
       if (full) {
-        this.lastSummaryByPeer.set(peerId, { told: new Set(retainedIds), fullAt: now });
+        this.lastSummaryByPeer.set(peerId, { told: new Set(retainedIds), fullAt: now2 });
       } else {
         for (const messageId of messageIds) last.told.add(messageId);
       }
@@ -1638,7 +1651,7 @@ var _GossipProtocol = class _GossipProtocol {
     const existing = this.aggregateStates.get(message.id);
     if (existing) return existing;
     if (message.aggregate.protocol !== GOSSIP_AGGREGATE_PROTOCOL || !Number.isFinite(message.aggregate.deadlineAt) || message.aggregate.deadlineAt <= 0) return null;
-    const now = Date.now();
+    const now2 = Date.now();
     const state = {
       messageId: message.id,
       sender: message.sender,
@@ -1649,7 +1662,7 @@ var _GossipProtocol = class _GossipProtocol {
       maxHops: Math.max(0, Math.floor(Number(message.hops) || 0)),
       settled: false,
       createdAt: message.timestamp,
-      updatedAt: now,
+      updatedAt: now2,
       deadlineAt: message.aggregate.deadlineAt,
       lastSentSignature: "",
       lastStatusSignature: "",
@@ -1770,9 +1783,9 @@ var _GossipProtocol = class _GossipProtocol {
     this.refreshAggregateState(state);
     this.publishAggregateState(state);
   }
-  maintainAggregateDeliveries(now = Date.now()) {
+  maintainAggregateDeliveries(now2 = Date.now()) {
     for (const state of this.aggregateStates.values()) {
-      if (now >= state.deadlineAt && !state.settled) {
+      if (now2 >= state.deadlineAt && !state.settled) {
         for (const [peerId, child] of state.children.entries()) {
           if (child.settled) continue;
           state.children.set(peerId, { ...child, settled: true });
@@ -1987,7 +2000,7 @@ var _GossipProtocol = class _GossipProtocol {
     }
     return owner;
   }
-  maintainTrackedDeliveries(now = Date.now()) {
+  maintainTrackedDeliveries(now2 = Date.now()) {
     const self = this.mesh.getClientId();
     if (!self) return;
     for (const state of this.deliveryStates.values()) {
@@ -1995,17 +2008,17 @@ var _GossipProtocol = class _GossipProtocol {
       if (state.message && peers) {
         const selfIndex = peers.indexOf(self);
         if (selfIndex >= 0 && this.setDeliveryBit(state.bits, selfIndex)) {
-          state.updatedAt = now;
+          state.updatedAt = now2;
           this.dirtyDeliveryReceiptIds.add(state.messageId);
           this.emitDeliveryStatus(state);
         }
       }
       const status = this.deliveryStatusForState(state);
       if (status.complete) continue;
-      if (now >= state.deadlineAt) {
+      if (now2 >= state.deadlineAt) {
         if (!state.timedOut) {
           state.timedOut = true;
-          state.updatedAt = now;
+          state.updatedAt = now2;
           this.emitDeliveryStatus(state);
           if (state.sender === self) this.emit("deliveryTimeout", this.deliveryStatusForState(state));
         }
@@ -2013,11 +2026,11 @@ var _GossipProtocol = class _GossipProtocol {
       }
       if (!state.message || !peers) continue;
       for (const targetPeerId of status.pendingPeerIds) {
-        if (!this.canContinueInitialSpread(state.message, targetPeerId, now)) continue;
+        if (!this.canContinueInitialSpread(state.message, targetPeerId, now2)) continue;
         if (this.selectRepairOwner(state, targetPeerId) !== self) continue;
         const attempt = state.repairAttemptsByPeer.get(targetPeerId) ?? { attempts: 0, lastAttemptAt: 0 };
         if (attempt.attempts >= MAX_REPAIR_ATTEMPTS_PER_TARGET) continue;
-        if (now - attempt.lastAttemptAt < this.deliveryRepairIntervalMs) continue;
+        if (now2 - attempt.lastAttemptAt < this.deliveryRepairIntervalMs) continue;
         const repairMessage = {
           ...state.message,
           delivery: this.deliveryEnvelopeForState(state)
@@ -2029,7 +2042,7 @@ var _GossipProtocol = class _GossipProtocol {
         if (repairId) {
           state.repairAttemptsByPeer.set(targetPeerId, {
             attempts: attempt.attempts + 1,
-            lastAttemptAt: now
+            lastAttemptAt: now2
           });
         }
       }
@@ -2170,17 +2183,17 @@ var _GossipProtocol = class _GossipProtocol {
   }
   hasCecrConsensus(local) {
     if (!this.cecrRequireConsensus) return true;
-    const now = Date.now();
-    if (now - local.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
+    const now2 = Date.now();
+    if (now2 - local.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
     const gossipIntervalMs = this.mesh.getCecrMembershipConfig?.().gossipIntervalMs ?? 2e3;
-    if (now - this.cecrViewChangedAtMs < this.cecrConvergenceRounds * gossipIntervalMs) return false;
+    if (now2 - this.cecrViewChangedAtMs < this.cecrConvergenceRounds * gossipIntervalMs) return false;
     if ((this.mesh.getCecrMembershipEquivocations?.().length ?? 0) > 0) return false;
     const configId = this.cecrConfigId();
     const connectedPeers = this.mesh.getConnectedPeers();
     for (const peerId of connectedPeers) {
       const remote = this.cecrRemoteStates.get(peerId);
       if (!remote) return false;
-      if (now - remote.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
+      if (now2 - remote.updatedAtMs > this.cecrExtremaMaxAgeMs) return false;
       if (remote.configId !== configId || remote.viewId !== local.setHash) return false;
       if (remote.matchingRounds < this.cecrConvergenceRounds) return false;
       if (remote.setHash !== local.setHash) return false;
@@ -2189,20 +2202,20 @@ var _GossipProtocol = class _GossipProtocol {
     }
     return true;
   }
-  cecrNetworkSizeEstimate(now = Date.now()) {
+  cecrNetworkSizeEstimate(now2 = Date.now()) {
     let best = {
       size: Math.max(1, this.canonicalPeerSet().length),
-      observedAt: now
+      observedAt: now2
     };
     const maxAgeMs = this.cecrExtremaMaxAgeMs;
     for (const state of this.aggregateStates.values()) {
-      if (now - state.updatedAt > maxAgeMs) continue;
+      if (now2 - state.updatedAt > maxAgeMs) continue;
       if (state.confirmedTotal > best.size || state.confirmedTotal === best.size && state.updatedAt > best.observedAt) {
         best = { size: state.confirmedTotal, observedAt: state.updatedAt };
       }
     }
     for (const remote of this.cecrRemoteStates.values()) {
-      if (now - remote.networkSizeObservedAt > maxAgeMs) continue;
+      if (now2 - remote.networkSizeObservedAt > maxAgeMs) continue;
       if (remote.networkSizeEstimate > best.size || remote.networkSizeEstimate === best.size && remote.networkSizeObservedAt > best.observedAt) {
         best = {
           size: remote.networkSizeEstimate,
@@ -2284,7 +2297,7 @@ var _GossipProtocol = class _GossipProtocol {
     if (!message.setHash || typeof message.setHash !== "string") return;
     if (!Number.isFinite(message.size) || message.size < 1) return;
     try {
-      const now = Date.now();
+      const now2 = Date.now();
       const min = BigInt("0x" + message.minHex);
       const max = BigInt("0x" + message.maxHex);
       if (min > max) return;
@@ -2295,7 +2308,7 @@ var _GossipProtocol = class _GossipProtocol {
       const networkSizeEstimate = Number.isSafeInteger(message.networkSizeEstimate) ? Math.max(Math.floor(message.size), Math.floor(message.networkSizeEstimate ?? message.size)) : Math.floor(message.size);
       const requestedObservedAt = Number.isSafeInteger(message.networkSizeObservedAt) ? Math.floor(message.networkSizeObservedAt ?? message.timestamp) : Math.floor(message.timestamp);
       const clockSkewMs = this.mesh.getCecrMembershipConfig?.().clockSkewMs ?? 5e3;
-      const networkSizeObservedAt = requestedObservedAt > 0 && requestedObservedAt <= now + clockSkewMs ? requestedObservedAt : now;
+      const networkSizeObservedAt = requestedObservedAt > 0 && requestedObservedAt <= now2 + clockSkewMs ? requestedObservedAt : now2;
       this.cecrRemoteStates.set(fromPeerId, {
         configId,
         viewId,
@@ -2305,7 +2318,7 @@ var _GossipProtocol = class _GossipProtocol {
         size: Math.floor(message.size),
         networkSizeEstimate,
         networkSizeObservedAt,
-        updatedAtMs: now,
+        updatedAtMs: now2,
         matchingRounds
       });
       this.emit("cecrStateChanged", this.getCecrState());
@@ -2595,12 +2608,12 @@ var _GossipProtocol = class _GossipProtocol {
   }
   /** Learned routes, for diagnostics: compact target id -> { via, hops, ageMs }. */
   getLearnedRoutes() {
-    const now = Date.now();
+    const now2 = Date.now();
     return Array.from(this.learnedRoutes.entries()).map(([target, route]) => ({
       target,
       via: route.via,
       hops: route.hops,
-      ageMs: now - route.at
+      ageMs: now2 - route.at
     }));
   }
   // A route ack goes one hop back up a broadcast's path, toward the
@@ -2639,13 +2652,13 @@ var _GossipProtocol = class _GossipProtocol {
   }
   handleIncomingRouteAck(message, fromPeerId) {
     if (!this.learnRoutes || !Array.isArray(message.reached)) return;
-    const now = Date.now();
+    const now2 = Date.now();
     const parent = this.routeAckParents.get(message.id);
     for (const item of message.reached.slice(0, ROUTE_ACK_MAX_PEERS)) {
       if (!Array.isArray(item) || typeof item[0] !== "string" || !/^[0-9a-f]{40}$/.test(item[0])) continue;
       const hops = Math.max(1, Math.floor(Number(item[1]) || 1));
-      this.learnCompactRoute(item[0], fromPeerId, hops, now);
-      if (parent && parent.parent !== fromPeerId && now - parent.at < this.learnedRouteMaxAgeMs && !parent.forwarded.has(item[0])) {
+      this.learnCompactRoute(item[0], fromPeerId, hops, now2);
+      if (parent && parent.parent !== fromPeerId && now2 - parent.at < this.learnedRouteMaxAgeMs && !parent.forwarded.has(item[0])) {
         parent.forwarded.add(item[0]);
         this.queueRouteAck(message.id, parent.parent, item[0], hops + 1);
       }
@@ -2746,13 +2759,13 @@ var _GossipProtocol = class _GossipProtocol {
     };
   }
   getStats() {
-    const now = Date.now();
+    const now2 = Date.now();
     const messages = Array.from(this.messageLog.entries()).map(([id, info]) => ({
       id,
       timestamp: info.timestamp,
       sender: info.sender,
       hops: info.hops,
-      age: now - info.timestamp
+      age: now2 - info.timestamp
     }));
     return {
       totalMessagesTracked: this.messageLog.size,
@@ -2762,26 +2775,26 @@ var _GossipProtocol = class _GossipProtocol {
     };
   }
   cleanup(maxAgeMs = 10 * 6e4) {
-    const now = Date.now();
+    const now2 = Date.now();
     for (const [id, info] of this.messageLog.entries()) {
-      if (now - info.timestamp > maxAgeMs) {
+      if (now2 - info.timestamp > maxAgeMs) {
         this.messageLog.delete(id);
         this.dropRetained(id);
       }
     }
     for (const [id, timestamp] of this.seenDirectIds.entries()) {
-      if (now - timestamp > maxAgeMs) {
+      if (now2 - timestamp > maxAgeMs) {
         this.seenDirectIds.delete(id);
       }
     }
-    this.pruneRouteLearning(now);
+    this.pruneRouteLearning(now2);
   }
-  pruneRouteLearning(now = Date.now()) {
+  pruneRouteLearning(now2 = Date.now()) {
     for (const [id, parent] of this.routeAckParents) {
-      if (now - parent.at > this.learnedRouteMaxAgeMs) this.routeAckParents.delete(id);
+      if (now2 - parent.at > this.learnedRouteMaxAgeMs) this.routeAckParents.delete(id);
     }
     for (const [target, route] of this.learnedRoutes) {
-      if (now - route.at > this.learnedRouteMaxAgeMs) this.learnedRoutes.delete(target);
+      if (now2 - route.at > this.learnedRouteMaxAgeMs) this.learnedRoutes.delete(target);
     }
   }
   markDirectSeen(id, timestamp) {
@@ -2790,9 +2803,9 @@ var _GossipProtocol = class _GossipProtocol {
       this.pruneTracking();
     }
   }
-  pruneTracking(now = Date.now()) {
-    const minTimestamp = now - this.trackingRetentionMs;
-    this.pruneRouteLearning(now);
+  pruneTracking(now2 = Date.now()) {
+    const minTimestamp = now2 - this.trackingRetentionMs;
+    this.pruneRouteLearning(now2);
     for (const [id, info] of this.messageLog.entries()) {
       if (info.timestamp >= minTimestamp) {
         break;
@@ -2807,7 +2820,7 @@ var _GossipProtocol = class _GossipProtocol {
       this.dropRetained(oldest);
     }
     for (const [id, retained] of this.retainedMessages.entries()) {
-      if (retained.retainedAt < minTimestamp || now > this.initialSpreadDeadlineAt(retained.message)) this.dropRetained(id);
+      if (retained.retainedAt < minTimestamp || now2 > this.initialSpreadDeadlineAt(retained.message)) this.dropRetained(id);
     }
     while (this.retainedMessages.size > this.maxTrackedMessages) {
       const oldest = this.retainedMessages.keys().next().value;
@@ -2827,13 +2840,13 @@ var _GossipProtocol = class _GossipProtocol {
     }
     for (const [id, state] of this.deliveryStates.entries()) {
       const terminalAt = state.completedAt ?? (state.timedOut ? state.deadlineAt : null);
-      const expired = terminalAt != null ? now - terminalAt > this.trackingRetentionMs : now - state.createdAt > this.trackingRetentionMs;
+      const expired = terminalAt != null ? now2 - terminalAt > this.trackingRetentionMs : now2 - state.createdAt > this.trackingRetentionMs;
       if (!expired) continue;
       this.deliveryStates.delete(id);
       this.dirtyDeliveryReceiptIds.delete(id);
     }
     for (const [id, state] of this.aggregateStates.entries()) {
-      if (now - Math.max(state.updatedAt, state.deadlineAt) <= this.trackingRetentionMs) continue;
+      if (now2 - Math.max(state.updatedAt, state.deadlineAt) <= this.trackingRetentionMs) continue;
       this.aggregateStates.delete(id);
     }
   }
@@ -3076,11 +3089,11 @@ function dedupeRelays(relays) {
 var RELAY_SCORE_STORAGE_KEY = "peerpigeon:relay-scores:v1";
 var MAX_SHARED_SOURCES = 16;
 var PERSISTED_SHARED_SOURCES = 4;
-function freshMeasurement(m, now) {
+function freshMeasurement(m, now2) {
   const value = m;
   if (!value || typeof value !== "object") return null;
   const at = Number(value.at);
-  if (!Number.isFinite(at) || now - at > SCORE_MAX_AGE_MS || at > now + 6e4) return null;
+  if (!Number.isFinite(at) || now2 - at > SCORE_MAX_AGE_MS || at > now2 + 6e4) return null;
   const attempts = Math.max(0, Math.min(1e6, Number(value.attempts) || 0));
   const failures = Math.max(0, Math.min(attempts, Number(value.failures) || 0));
   const joinMs = value.joinMs === null || value.joinMs === void 0 ? null : Number(value.joinMs);
@@ -3141,10 +3154,10 @@ var RelayScoreBook = class _RelayScoreBook {
   /** Merge scores another peer shared. Only its own measurements, one set per source. */
   mergeShared(sourcePeerId, scores) {
     if (!sourcePeerId || !Array.isArray(scores)) return;
-    const now = this.now();
+    const now2 = this.now();
     for (const score of scores.slice(0, 32)) {
       if (!NODE_ID_RE.test(String(score?.nodeId || ""))) continue;
-      const m = freshMeasurement(score, now);
+      const m = freshMeasurement(score, now2);
       if (!m) continue;
       const entry = this.entry(score.nodeId);
       entry.shared.set(sourcePeerId, m);
@@ -3160,12 +3173,12 @@ var RelayScoreBook = class _RelayScoreBook {
   measurement(nodeId) {
     const entry = this.entries.get(nodeId);
     if (!entry) return null;
-    const now = this.now();
+    const now2 = this.now();
     const parts = [];
-    const own = entry.own && freshMeasurement(entry.own, now);
+    const own = entry.own && freshMeasurement(entry.own, now2);
     if (own) parts.push({ m: own, weight: OWN_WEIGHT });
     for (const shared of entry.shared.values()) {
-      const m = freshMeasurement(shared, now);
+      const m = freshMeasurement(shared, now2);
       if (m) parts.push({ m, weight: 1 });
     }
     if (parts.length === 0) return null;
@@ -3175,7 +3188,7 @@ var RelayScoreBook = class _RelayScoreBook {
     let joinWeight = 0;
     let at = 0;
     for (const { m, weight } of parts) {
-      const fade = failureFade(now - m.at);
+      const fade = failureFade(now2 - m.at);
       attempts += m.attempts * weight;
       failures += m.failures * weight * fade;
       if (m.joinMs !== null) {
@@ -3188,10 +3201,10 @@ var RelayScoreBook = class _RelayScoreBook {
   }
   /** This peer's own measurements, to share with others. */
   ownScores(limit = 8) {
-    const now = this.now();
+    const now2 = this.now();
     const out = [];
     for (const [nodeId, entry] of this.entries) {
-      const own = entry.own && freshMeasurement(entry.own, now);
+      const own = entry.own && freshMeasurement(entry.own, now2);
       if (own) out.push({ nodeId, ...own });
     }
     return out.sort((a, b) => b.at - a.at).slice(0, limit);
@@ -3200,16 +3213,16 @@ var RelayScoreBook = class _RelayScoreBook {
     if (!this.storage) return;
     try {
       const raw = JSON.parse(this.storage.getItem(RELAY_SCORE_STORAGE_KEY) || "{}");
-      const now = this.now();
+      const now2 = this.now();
       for (const [nodeId, own] of Object.entries(raw?.own ?? {})) {
         if (!NODE_ID_RE.test(nodeId)) continue;
-        const m = freshMeasurement(own, now);
+        const m = freshMeasurement(own, now2);
         if (m) this.entry(nodeId).own = m;
       }
       for (const [nodeId, sources] of Object.entries(raw?.shared ?? {})) {
         if (!NODE_ID_RE.test(nodeId) || !sources || typeof sources !== "object") continue;
         for (const [source, shared] of Object.entries(sources).slice(0, PERSISTED_SHARED_SOURCES)) {
-          const m = freshMeasurement(shared, now);
+          const m = freshMeasurement(shared, now2);
           if (m) this.entry(nodeId).shared.set(source, m);
         }
       }
@@ -3280,17 +3293,17 @@ var RoomStats = class {
    * One minute's look at a room: who is in it (people: a visitor id each, the same person once however
    * many tabs), and how many peers with a role (bots and the like).
    */
-  async sample(room, people, roles, now = Date.now()) {
+  async sample(room, people, roles, now2 = Date.now()) {
     const l = await this.open(room);
     const h = l.history;
-    const at = Math.floor(now / MINUTE_MS) * MINUTE_MS;
+    const at = Math.floor(now2 / MINUTE_MS) * MINUTE_MS;
     const unique = [...new Set(people)];
     const sample = { at, people: unique.length, roles };
     if (h.minutes.length && h.minutes[h.minutes.length - 1].at === at) h.minutes[h.minutes.length - 1] = sample;
     else h.minutes.push(sample);
-    while (h.minutes.length && h.minutes[0].at < now - KEEP_MINUTES_MS) h.minutes.shift();
-    const hourAt = Math.floor(now / HOUR_MS) * HOUR_MS;
-    const dayAt = Math.floor(now / DAY_MS) * DAY_MS;
+    while (h.minutes.length && h.minutes[0].at < now2 - KEEP_MINUTES_MS) h.minutes.shift();
+    const hourAt = Math.floor(now2 / HOUR_MS) * HOUR_MS;
+    const dayAt = Math.floor(now2 / DAY_MS) * DAY_MS;
     let rolled = false;
     if (l.hourAt !== hourAt) {
       l.hourAt = hourAt;
@@ -3307,9 +3320,9 @@ var RoomStats = class {
     }
     this.summarize(h.hours, hourAt, h.minutes.filter((m) => m.at >= hourAt && m.at < hourAt + HOUR_MS), l.hourSeen.size);
     this.summarize(h.days, dayAt, h.minutes.filter((m) => m.at >= dayAt && m.at < dayAt + DAY_MS), l.daySeen.size, h.hours.filter((x) => x.at >= dayAt && x.at < dayAt + DAY_MS));
-    for (const list of [h.hours, h.days]) while (list.length && list[0].at < now - KEEP_SUMMARIES_MS) list.shift();
-    if (rolled || now - l.savedAt >= SAVE_EVERY_MS) {
-      l.savedAt = now;
+    for (const list of [h.hours, h.days]) while (list.length && list[0].at < now2 - KEEP_SUMMARIES_MS) list.shift();
+    if (rolled || now2 - l.savedAt >= SAVE_EVERY_MS) {
+      l.savedAt = now2;
       await this.store.save(room, h).catch(() => {
       });
     }
@@ -3361,10 +3374,10 @@ var RoomStats = class {
    * The room's newest point in each step a reader can be showing (a minute, 5 minutes, an hour, a day),
    * as read() gives them: sent to a page that follows the room, after each sample, so it needs no asking.
    */
-  async current(room, now = Date.now()) {
+  async current(room, now2 = Date.now()) {
     const h = (await this.open(room)).history;
     const last = h.minutes[h.minutes.length - 1] ?? null;
-    const fiveAt = Math.floor(now / (5 * MINUTE_MS)) * 5 * MINUTE_MS;
+    const fiveAt = Math.floor(now2 / (5 * MINUTE_MS)) * 5 * MINUTE_MS;
     const five = h.minutes.filter((m) => m.at >= fiveAt);
     const round = (n) => Math.round(n * 10) / 10;
     const hour = h.hours[h.hours.length - 1] ?? null;
@@ -3637,11 +3650,11 @@ var StorageServerLink = class {
         wanted.add(id);
         if (!linked.has(id)) this.node.connectToPeer(id);
       }
-      const now = closest.filter((id) => linked.has(id));
-      const fresh = now.filter((id) => !before.includes(id));
-      this.rooms.set(room, now);
+      const now2 = closest.filter((id) => linked.has(id));
+      const fresh = now2.filter((id) => !before.includes(id));
+      this.rooms.set(room, now2);
       for (const id of fresh) this.send(id, { pp: PP, t: "watch", room, ...this.visitors.has(room) ? { v: this.visitors.get(room) } : {}, ...this.role ? { r: this.role } : {} });
-      if (fresh.length || now.length !== before.length) this.emit({ type: "servers", room, servers: now });
+      if (fresh.length || now2.length !== before.length) this.emit({ type: "servers", room, servers: now2 });
     }
   }
   emit(event) {
@@ -4079,15 +4092,15 @@ var StorageServer = class {
     for (const peer of this.statsFollowers.keys()) if (linked.has(peer)) this.send(peer, { pp: PP, t: "statsnow", stats });
   }
   /** Once a minute: how many are in each room watched here (people, and peers with a role). */
-  async sampleRooms(now = Date.now()) {
-    for (const room of this.watchers.keys()) await this.sampleRoom(room, now);
+  async sampleRooms(now2 = Date.now()) {
+    for (const room of this.watchers.keys()) await this.sampleRoom(room, now2);
   }
   /**
    * One room's count now (the minute's, replaced as it changes), sent at once to the pages following it.
    * Taken each minute, and also the moment someone starts or stops watching the room, so a page sees a
    * peer come and go within seconds, not at the next minute.
    */
-  async sampleRoom(room, now = Date.now()) {
+  async sampleRoom(room, now2 = Date.now()) {
     const peers = this.watchers.get(room);
     if (!peers) return;
     const linked = new Set(this.node.getConnectedPeers());
@@ -4099,11 +4112,11 @@ var StorageServer = class {
       if (role && role !== "client") roles++;
       else people.push(who);
     }
-    await this.history.sample(room, people, roles, now).catch(() => {
+    await this.history.sample(room, people, roles, now2).catch(() => {
     });
     const following = this.followers.get(room);
     if (following?.size) {
-      const c = await this.history.current(room, now);
+      const c = await this.history.current(room, now2);
       const one = (p) => p ? packPoints([p])[0] : void 0;
       const msg = { pp: PP, t: "roomnow", room, minute: one(c.minute), five: one(c.five), hour: one(c.hour), day: one(c.day) };
       for (const peer of following.keys()) if (linked.has(peer)) this.send(peer, msg);
@@ -4173,8 +4186,8 @@ var StorageServer = class {
     if (!owner || typeof data.sig !== "string" || typeof data.at !== "number" || Math.abs(Date.now() - data.at) > STATS_SKEW_MS) return false;
     let signer = owner;
     if (typeof data.by === "string") {
-      const now = Date.now();
-      const valid = typeof data.until === "number" && (data.until === 0 || data.until >= now) && typeof data.gsig === "string" && await (0, import_unsea2.verifyMessage)(grantText(owner, data.by, data.until), data.gsig, owner).catch(() => false) && !await this.revoked.has(data.by);
+      const now2 = Date.now();
+      const valid = typeof data.until === "number" && (data.until === 0 || data.until >= now2) && typeof data.gsig === "string" && await (0, import_unsea2.verifyMessage)(grantText(owner, data.by, data.until), data.gsig, owner).catch(() => false) && !await this.revoked.has(data.by);
       signer = valid ? data.by : null;
     }
     if (!signer) return false;
@@ -5036,7 +5049,7 @@ var PeerPigeonStorage = class {
     const driver = this.requireDriver();
     const pk = this.makePk(space, normalizedKey);
     const existing = await driver.get(pk);
-    const now = Date.now();
+    const now2 = Date.now();
     this.assertCanWrite(space, existing, actorId, this.signingKeys ? void 0 : options.ownerId, allowSystemWrite);
     const ownerId = this.resolveOwnerId(space, existing, actorId, options.ownerId);
     const modifiedBy = this.peerId || null;
@@ -5050,8 +5063,8 @@ var PeerPigeonStorage = class {
       modifiedBy,
       value: encoded.value,
       valueCipher: encoded.valueCipher,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
+      createdAt: existing?.createdAt ?? now2,
+      updatedAt: now2,
       version: nextVersion
     };
     if (this.signingKeys && space !== "private") {
@@ -5068,7 +5081,7 @@ var PeerPigeonStorage = class {
       space,
       key: normalizedKey,
       actorId,
-      timestamp: now,
+      timestamp: now2,
       record: persisted
     };
     this.emitChange({
@@ -5096,7 +5109,7 @@ var PeerPigeonStorage = class {
       space,
       key: normalizedKey,
       actorId,
-      timestamp: now
+      timestamp: now2
     });
     return mutation;
   }
@@ -6128,9 +6141,9 @@ var PeerPigeonCryptoProtocol = class {
     const self = String(this.mesh.getClientId() ?? "").trim();
     const target = String(peerId ?? "").trim();
     if (!self || !target || target === self) return;
-    const now = Date.now();
-    if (now - (this.keyRequestedAt.get(target) ?? 0) < KEY_REQUEST_MIN_INTERVAL_MS) return;
-    this.keyRequestedAt.set(target, now);
+    const now2 = Date.now();
+    if (now2 - (this.keyRequestedAt.get(target) ?? 0) < KEY_REQUEST_MIN_INTERVAL_MS) return;
+    this.keyRequestedAt.set(target, now2);
     if (this.keyRequestedAt.size > 512) this.keyRequestedAt.delete(this.keyRequestedAt.keys().next().value);
     const payload = {
       __ppType: CRYPTO_PUBLIC_REQUEST_TYPE,
@@ -6428,6 +6441,747 @@ var PeerPigeonCryptoProtocol = class {
     }
   }
 };
+
+// src/media.ts
+var MEDIA_PAYLOAD_PREFIX = "pp-media-";
+var ANNOUNCE = "pp-media-announce";
+var END = "pp-media-end";
+var JOIN = "pp-media-join";
+var ATTACH = "pp-media-attach";
+var REPORT = "pp-media-report";
+var PING = "pp-media-ping";
+var PONG = "pp-media-pong";
+var ANNOUNCE_MS = 4e3;
+var ANNOUNCE_STALE_MS = 13e3;
+var REPORT_MS = 2500;
+var MEMBER_STALE_MS = 8e3;
+var PARENT_SILENT_MS = 3e3;
+var LINK_WAIT_MS = 8e3;
+var CHANNEL_OPEN_MS = 6e3;
+var KEY_REQUEST_MIN_MS = 500;
+var KEY_INTERVAL_MS = 2e3;
+var FRAGMENT_LIFETIME_MS = 250;
+var PING_MS = 5e3;
+var CHILD_BACKLOG_BYTES = 1e6;
+var HEADER = 28;
+var FRAGMENT = 15e3;
+var KEY_REQUEST = 75;
+var Counter = class {
+  constructor() {
+    this.frames = 0;
+    this.bytes = 0;
+    this.windowAt = Date.now();
+    this.fps = 0;
+    this.kbps = 0;
+    this.delaySum = 0;
+    this.delayCount = 0;
+    this.delayMs = null;
+    this.forwardSum = 0;
+    this.forwardCount = 0;
+    this.forwardMs = null;
+    this.dropped = 0;
+    this.keyRequests = 0;
+    this.lastRecoveryMs = null;
+    this.recoveries = 0;
+  }
+  roll(now2) {
+    const span = (now2 - this.windowAt) / 1e3;
+    if (span < 1) return;
+    this.fps = Math.round(this.frames / span);
+    this.kbps = Math.round(this.bytes * 8 / 1e3 / span);
+    this.delayMs = this.delayCount ? Math.round(this.delaySum / this.delayCount) : this.delayMs;
+    this.forwardMs = this.forwardCount ? Math.round(this.forwardSum / this.forwardCount * 100) / 100 : this.forwardMs;
+    this.frames = 0;
+    this.bytes = 0;
+    this.delaySum = 0;
+    this.delayCount = 0;
+    this.forwardSum = 0;
+    this.forwardCount = 0;
+    this.windowAt = now2;
+  }
+};
+var now = () => Date.now();
+var randomId = () => Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("");
+var channelName = (id) => `m:${id}`;
+var MediaStreams = class _MediaStreams {
+  constructor(host) {
+    this.host = host;
+    this.published = /* @__PURE__ */ new Map();
+    this.watching = /* @__PURE__ */ new Map();
+    this.streams = /* @__PURE__ */ new Map();
+    /** Clock offsets to sources: their clock minus ours, ms, from the quickest recent exchange. */
+    this.offsets = /* @__PURE__ */ new Map();
+    this.offsetSamples = /* @__PURE__ */ new Map();
+    this.listeners = /* @__PURE__ */ new Map();
+    this.timers = [];
+    this.pendingAttach = /* @__PURE__ */ new Map();
+    host.gossip.on("messageReceived", ({ message, local }) => {
+      if (!local) this.onControl(message?.sender, message?.data);
+    });
+    host.gossip.on("directMessageReceived", ({ message }) => this.onControl(message?.from, message?.data));
+    host.mesh.on("peer:sidechannel", ({ peerId, name, channel }) => this.onSideChannel(peerId, name, channel));
+    host.mesh.on("peer:disconnected", (peerId) => this.onPeerGone(peerId));
+    this.timers.push(setInterval(() => this.tick(), 1e3));
+    this.timers.push(setInterval(() => this.pingSources(), PING_MS));
+  }
+  /** Whether this browser can send or receive (WebCodecs). */
+  static supported() {
+    return typeof globalThis.VideoEncoder === "function" && typeof globalThis.VideoDecoder === "function";
+  }
+  on(event, handler) {
+    const set = this.listeners.get(event) ?? /* @__PURE__ */ new Set();
+    set.add(handler);
+    this.listeners.set(event, set);
+  }
+  off(event, handler) {
+    this.listeners.get(event)?.delete(handler);
+  }
+  /** The streams announced in the room (this peer's own too). */
+  list() {
+    const t = now();
+    return [...this.streams.values()].map(({ seen, ...info }) => ({ ...info, live: t - seen < ANNOUNCE_STALE_MS }));
+  }
+  stats() {
+    const out = [];
+    for (const p of this.published.values()) {
+      out.push({ id: p.id, role: "source", parent: null, children: [...p.children.keys()], depth: 0, fps: p.stats.fps, kbps: p.stats.kbps, delayMs: null, forwardMs: null, framesDropped: p.stats.dropped, keyRequests: p.stats.keyRequests, lastRecoveryMs: null, recoveries: 0 });
+    }
+    for (const w of this.watching.values()) {
+      out.push({ id: w.id, role: "viewer", parent: w.parent, children: [...w.children.keys()], depth: w.depth, fps: w.stats.fps, kbps: w.stats.kbps, delayMs: w.stats.delayMs, forwardMs: w.children.size ? w.stats.forwardMs : null, framesDropped: w.stats.dropped, keyRequests: w.stats.keyRequests, lastRecoveryMs: w.stats.lastRecoveryMs, recoveries: w.stats.recoveries });
+    }
+    return out;
+  }
+  /** The source's tree, as it knows it: who feeds whom. */
+  tree(id) {
+    const p = this.published.get(id);
+    if (!p) return [];
+    return [...p.members.values()].map(({ peerId, parent, depth }) => ({ peerId, parent, depth }));
+  }
+  // ---------------------------------------------------------------- source
+  async publish(track, options = {}) {
+    if (!_MediaStreams.supported()) throw new Error("This browser has no WebCodecs: it cannot send video");
+    const settings = track.getSettings?.() ?? {};
+    const opts = {
+      width: options.width ?? settings.width ?? 1280,
+      height: options.height ?? settings.height ?? 720,
+      fps: options.fps ?? Math.min(30, Math.round(settings.frameRate ?? 30)),
+      bitrate: options.bitrate ?? 15e5,
+      maxChildren: options.maxChildren ?? 3
+    };
+    const id = randomId();
+    const p = {
+      id,
+      name: options.name ?? "Camera",
+      track,
+      opts,
+      encoder: null,
+      video: null,
+      timer: null,
+      frame: 0,
+      forceKey: true,
+      lastKeyAt: 0,
+      keyTimer: null,
+      children: /* @__PURE__ */ new Map(),
+      members: /* @__PURE__ */ new Map(),
+      stats: new Counter(),
+      announceTimer: null
+    };
+    const Encoder = globalThis.VideoEncoder;
+    p.encoder = new Encoder({
+      output: (chunk) => this.sendChunk(p, chunk),
+      error: () => {
+        p.forceKey = true;
+      }
+    });
+    p.encoder.configure({ codec: "vp8", width: opts.width, height: opts.height, bitrate: opts.bitrate, framerate: opts.fps, latencyMode: "realtime" });
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.autoplay = true;
+    video.srcObject = new MediaStream([track]);
+    await video.play().catch(() => {
+    });
+    p.video = video;
+    const started = performance.now();
+    p.timer = setInterval(() => {
+      if (!p.encoder || p.encoder.state !== "configured" || video.readyState < 2) return;
+      if (p.encoder.encodeQueueSize > 2) {
+        p.stats.dropped++;
+        return;
+      }
+      const VF = globalThis.VideoFrame;
+      let frame;
+      try {
+        frame = new VF(video, { timestamp: Math.round((performance.now() - started) * 1e3) });
+      } catch {
+        return;
+      }
+      const key = p.forceKey || now() - p.lastKeyAt >= KEY_INTERVAL_MS;
+      if (key) {
+        p.forceKey = false;
+        p.lastKeyAt = now();
+      }
+      try {
+        p.encoder.encode(frame, { keyFrame: key });
+      } finally {
+        frame.close();
+      }
+      p.frame++;
+    }, Math.round(1e3 / opts.fps));
+    this.published.set(id, p);
+    const me = this.host.mesh.getClientId() ?? "";
+    this.streams.set(id, { id, source: me, name: p.name, width: opts.width, height: opts.height, fps: opts.fps, live: true, seen: now() });
+    const announce = () => this.host.gossip.broadcast({ __ppType: ANNOUNCE, id, name: p.name, width: opts.width, height: opts.height, fps: opts.fps });
+    announce();
+    p.announceTimer = setInterval(announce, ANNOUNCE_MS);
+    this.emit("streams", this.list());
+    return id;
+  }
+  unpublish(id) {
+    const p = this.published.get(id);
+    if (!p) return;
+    this.published.delete(id);
+    if (p.timer) clearInterval(p.timer);
+    if (p.keyTimer) clearTimeout(p.keyTimer);
+    if (p.announceTimer) clearInterval(p.announceTimer);
+    try {
+      p.encoder?.close();
+    } catch {
+    }
+    if (p.video) p.video.srcObject = null;
+    for (const c of p.children.values()) {
+      try {
+        c.channel.close();
+      } catch {
+      }
+    }
+    this.streams.delete(id);
+    this.host.gossip.broadcast({ __ppType: END, id });
+    this.emit("streams", this.list());
+  }
+  sendChunk(p, chunk) {
+    const bytes = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(bytes);
+    const key = chunk.type === "key";
+    const fragments = makeFragments(p.frame, key, Date.now(), chunk.timestamp, bytes);
+    p.stats.frames++;
+    p.stats.bytes += bytes.length;
+    for (const child of p.children.values()) sendToChild(child, fragments, key, p.stats);
+  }
+  /** The source picks a parent for a joining viewer. */
+  pickParent(p, viewer, links, avoid) {
+    const me = this.host.mesh.getClientId() ?? "";
+    const t = now();
+    for (const [peerId, m] of p.members) if (t - m.seen > MEMBER_STALE_MS) p.members.delete(peerId);
+    const below = /* @__PURE__ */ new Set();
+    const subtree = (root) => {
+      for (const m of p.members.values()) if (m.parent === root && !below.has(m.peerId)) {
+        below.add(m.peerId);
+        subtree(m.peerId);
+      }
+    };
+    subtree(viewer);
+    const candidates = [{ peerId: me, depth: 0, children: p.children.size }];
+    for (const m of p.members.values()) {
+      if (m.peerId === viewer || below.has(m.peerId)) continue;
+      candidates.push({ peerId: m.peerId, depth: m.depth, children: m.children });
+    }
+    const free = candidates.filter((c) => c.children < p.opts.maxChildren && !avoid.includes(c.peerId));
+    const pool = free.length ? free : candidates.filter((c) => !avoid.includes(c.peerId));
+    pool.sort((a, b) => {
+      const la = links.includes(a.peerId) ? 0 : 1;
+      const lb = links.includes(b.peerId) ? 0 : 1;
+      return a.depth - b.depth || la - lb || a.children - b.children;
+    });
+    const chosen = pool[0] ?? candidates[0];
+    if (chosen.peerId !== me) {
+      const m = p.members.get(chosen.peerId);
+      if (m) m.children++;
+    }
+    p.members.set(viewer, { peerId: viewer, parent: chosen.peerId, depth: chosen.depth + 1, children: p.members.get(viewer)?.children ?? 0, links, seen: t });
+    return { parent: chosen.peerId, depth: chosen.depth + 1 };
+  }
+  // ---------------------------------------------------------------- viewer
+  /** Watch a stream: decoded frames go to onFrame (draw them, then frame.close()). */
+  watch(id, onFrame) {
+    if (!_MediaStreams.supported()) throw new Error("This browser has no WebCodecs: it cannot show video");
+    if (this.watching.has(id)) return;
+    const info = this.streams.get(id);
+    if (!info) throw new Error("No such stream in this room");
+    const Decoder = globalThis.VideoDecoder;
+    const w = {
+      id,
+      source: info.source,
+      parent: null,
+      depth: 0,
+      upstream: null,
+      children: /* @__PURE__ */ new Map(),
+      decoder: null,
+      onFrame,
+      frames: /* @__PURE__ */ new Map(),
+      lastFrame: -1,
+      needKey: true,
+      lastKeyRequest: 0,
+      lastData: now(),
+      joining: false,
+      lostAt: null,
+      avoid: /* @__PURE__ */ new Set(),
+      stats: new Counter(),
+      watchdog: null,
+      reportTimer: null,
+      stopped: false
+    };
+    w.decoder = new Decoder({
+      output: (frame) => {
+        if (w.lostAt != null) {
+          w.stats.lastRecoveryMs = now() - w.lostAt;
+          w.stats.recoveries++;
+          w.lostAt = null;
+        }
+        try {
+          w.onFrame(frame);
+        } catch {
+          try {
+            frame.close();
+          } catch {
+          }
+        }
+      },
+      error: () => {
+        w.needKey = true;
+        this.resetDecoder(w);
+      }
+    });
+    w.decoder.configure({ codec: "vp8", optimizeForLatency: true });
+    this.watching.set(id, w);
+    w.watchdog = setInterval(() => {
+      if (w.stopped || w.joining) return;
+      if (now() - w.lastData > PARENT_SILENT_MS) this.lostParent(w, "silent");
+    }, 1e3);
+    w.reportTimer = setInterval(() => this.report(w), REPORT_MS);
+    void this.join(w);
+  }
+  unwatch(id) {
+    const w = this.watching.get(id);
+    if (!w) return;
+    w.stopped = true;
+    this.watching.delete(id);
+    if (w.watchdog) clearInterval(w.watchdog);
+    if (w.reportTimer) clearInterval(w.reportTimer);
+    try {
+      w.upstream?.close();
+    } catch {
+    }
+    for (const c of w.children.values()) {
+      try {
+        c.channel.close();
+      } catch {
+      }
+    }
+    try {
+      w.decoder?.close();
+    } catch {
+    }
+  }
+  resetDecoder(w) {
+    try {
+      w.decoder.reset();
+      w.decoder.configure({ codec: "vp8", optimizeForLatency: true });
+    } catch {
+    }
+  }
+  async join(w) {
+    if (w.stopped || w.joining) return;
+    w.joining = true;
+    try {
+      const attach = await this.ask(w);
+      if (w.stopped) return;
+      if (!attach) {
+        w.lastData = now();
+        return;
+      }
+      const parent = attach.parent;
+      const me = this.host.mesh.getClientId() ?? "";
+      if (parent === me) return;
+      if (!this.host.mesh.getConnectedPeers().includes(parent)) {
+        this.host.connectToPeer(parent);
+        const until = now() + LINK_WAIT_MS;
+        while (!this.host.mesh.getConnectedPeers().includes(parent) && now() < until && !w.stopped) await sleep(150);
+      }
+      const channel = this.host.mesh.openSideChannel(parent, channelName(w.id), { ordered: false, maxPacketLifeTime: FRAGMENT_LIFETIME_MS });
+      if (!channel) {
+        w.avoid.add(parent);
+        w.lastData = now() - PARENT_SILENT_MS;
+        return;
+      }
+      const opened = await waitOpen(channel, CHANNEL_OPEN_MS);
+      if (!opened || w.stopped) {
+        try {
+          channel.close();
+        } catch {
+        }
+        w.avoid.add(parent);
+        w.lastData = now() - PARENT_SILENT_MS;
+        return;
+      }
+      try {
+        w.upstream?.close();
+      } catch {
+      }
+      w.upstream = channel;
+      w.parent = parent;
+      w.depth = attach.depth;
+      w.needKey = true;
+      w.lastData = now();
+      w.avoid.clear();
+      channel.onmessage = (event) => this.onFragment(w, channel, event.data);
+      channel.onclose = () => {
+        if (w.upstream === channel) this.lostParent(w, "closed");
+      };
+      this.requestKey(w, true);
+      this.report(w);
+    } finally {
+      w.joining = false;
+    }
+  }
+  /** Ask the source where to attach; null when it does not answer. */
+  ask(w) {
+    return new Promise((resolve) => {
+      const nonce = randomId();
+      const done = (value) => {
+        clearTimeout(timer);
+        this.pendingAttach.delete(nonce);
+        resolve(value);
+      };
+      const timer = setTimeout(() => done(null), 5e3);
+      this.pendingAttach.set(nonce, done);
+      this.host.gossip.sendDirect(w.source, { __ppType: JOIN, id: w.id, nonce, links: this.host.mesh.getConnectedPeers(), avoid: [...w.avoid] });
+    });
+  }
+  lostParent(w, _why) {
+    if (w.stopped || w.joining) return;
+    if (w.lostAt == null) w.lostAt = now();
+    if (w.parent) w.avoid.add(w.parent);
+    const old = w.upstream;
+    w.upstream = null;
+    w.parent = null;
+    if (old) {
+      old.onclose = null;
+      try {
+        old.close();
+      } catch {
+      }
+    }
+    void this.join(w);
+  }
+  onFragment(w, channel, data) {
+    if (!(data instanceof ArrayBuffer) || data.byteLength < HEADER) return;
+    const arrived = performance.now();
+    w.lastData = now();
+    const view = new DataView(data);
+    if (view.getUint8(0) !== 80 || view.getUint8(1) !== 77) return;
+    const key = (view.getUint8(3) & 1) === 1;
+    const frameNo = view.getUint32(4);
+    const index = view.getUint16(8);
+    const count = view.getUint16(10);
+    const capturedAt = view.getFloat64(12);
+    const ts = view.getFloat64(20);
+    if (w.children.size) {
+      const frag = new Uint8Array(data);
+      for (const child of w.children.values()) sendToChild(child, [frag], key, w.stats, index === 0);
+      w.stats.forwardSum += performance.now() - arrived;
+      w.stats.forwardCount++;
+    }
+    w.stats.bytes += data.byteLength;
+    let entry = w.frames.get(frameNo);
+    if (!entry) {
+      entry = { got: 0, count, parts: new Array(count), key, capturedAt, ts };
+      w.frames.set(frameNo, entry);
+    }
+    if (!entry.parts[index]) {
+      entry.parts[index] = new Uint8Array(data, HEADER);
+      entry.got++;
+    }
+    if (entry.got < entry.count) {
+      for (const n of w.frames.keys()) if (n < frameNo - 3) {
+        w.frames.delete(n);
+        w.stats.dropped++;
+        if (!w.needKey) {
+          w.needKey = true;
+          this.requestKey(w);
+        }
+      }
+      return;
+    }
+    w.frames.delete(frameNo);
+    for (const n of w.frames.keys()) if (n < frameNo) {
+      w.frames.delete(n);
+      w.stats.dropped++;
+      w.needKey = true;
+    }
+    if (frameNo <= w.lastFrame) return;
+    if (frameNo !== w.lastFrame + 1 && !entry.key) w.needKey = true;
+    if (w.needKey && !entry.key) {
+      this.requestKey(w);
+      w.stats.dropped++;
+      return;
+    }
+    w.needKey = false;
+    w.lastFrame = frameNo;
+    const size = entry.parts.reduce((n, p) => n + p.length, 0);
+    const bytes = new Uint8Array(size);
+    let at = 0;
+    for (const p of entry.parts) {
+      bytes.set(p, at);
+      at += p.length;
+    }
+    const Chunk = globalThis.EncodedVideoChunk;
+    try {
+      w.decoder.decode(new Chunk({ type: entry.key ? "key" : "delta", timestamp: ts, data: bytes }));
+    } catch {
+      w.needKey = true;
+      this.resetDecoder(w);
+      return;
+    }
+    w.stats.frames++;
+    const offset = this.offsets.get(w.source);
+    if (offset != null) {
+      w.stats.delaySum += Date.now() + offset - entry.capturedAt;
+      w.stats.delayCount++;
+    }
+    void channel;
+  }
+  requestKey(w, force = false) {
+    if (!w.upstream || w.upstream.readyState !== "open") return;
+    if (!force && now() - w.lastKeyRequest < KEY_REQUEST_MIN_MS) return;
+    w.lastKeyRequest = now();
+    w.stats.keyRequests++;
+    try {
+      w.upstream.send(new Uint8Array([KEY_REQUEST]));
+    } catch {
+    }
+  }
+  report(w) {
+    if (!w.parent || w.stopped) return;
+    this.host.gossip.sendDirect(w.source, { __ppType: REPORT, id: w.id, parent: w.parent, depth: w.depth, children: w.children.size, links: this.host.mesh.getConnectedPeers() });
+  }
+  // ---------------------------------------------------------------- both
+  /** A child opened a side channel to this peer: feed it, if this peer has the stream. */
+  onSideChannel(peerId, name, channel) {
+    if (!name.startsWith("m:")) return;
+    const id = name.slice(2);
+    const p = this.published.get(id);
+    const w = this.watching.get(id);
+    const children = p?.children ?? w?.children;
+    if (!children || w && w.parent === peerId) {
+      try {
+        channel.close();
+      } catch {
+      }
+      return;
+    }
+    const child = { peerId, channel, waitingForKey: true };
+    const drop = () => {
+      if (children.get(peerId)?.channel === channel) children.delete(peerId);
+    };
+    channel.onclose = drop;
+    channel.onerror = drop;
+    channel.onmessage = (event) => {
+      const data = event.data;
+      if (data instanceof ArrayBuffer && data.byteLength === 1 && new Uint8Array(data)[0] === KEY_REQUEST) {
+        child.waitingForKey = true;
+        this.upstreamKey(id);
+      }
+    };
+    const old = children.get(peerId);
+    if (old && old.channel !== channel) {
+      old.channel.onclose = null;
+      try {
+        old.channel.close();
+      } catch {
+      }
+    }
+    children.set(peerId, child);
+    this.upstreamKey(id);
+  }
+  /** A key frame for a child: the source makes one, a viewer asks its own parent. */
+  upstreamKey(id) {
+    const p = this.published.get(id);
+    if (p) {
+      p.stats.keyRequests++;
+      const wait = KEY_REQUEST_MIN_MS - (now() - p.lastKeyAt);
+      if (wait <= 0) p.forceKey = true;
+      else if (!p.keyTimer) p.keyTimer = setTimeout(() => {
+        p.keyTimer = null;
+        p.forceKey = true;
+      }, wait);
+      return;
+    }
+    const w = this.watching.get(id);
+    if (w) this.requestKey(w);
+  }
+  onPeerGone(peerId) {
+    for (const p of this.published.values()) {
+      p.children.delete(peerId);
+      p.members.delete(peerId);
+    }
+    for (const w of this.watching.values()) {
+      w.children.delete(peerId);
+      if (w.parent === peerId) this.lostParent(w, "disconnected");
+    }
+  }
+  onControl(from, data) {
+    if (!from || !data || typeof data !== "object" || typeof data.__ppType !== "string" || !data.__ppType.startsWith(MEDIA_PAYLOAD_PREFIX)) return;
+    const t = now();
+    switch (data.__ppType) {
+      case ANNOUNCE: {
+        if (typeof data.id !== "string") return;
+        const known = this.streams.has(data.id);
+        this.streams.set(data.id, { id: data.id, source: from, name: String(data.name ?? "Camera").slice(0, 80), width: Number(data.width) || 0, height: Number(data.height) || 0, fps: Number(data.fps) || 0, live: true, seen: t });
+        if (!known) this.emit("streams", this.list());
+        return;
+      }
+      case END: {
+        if (this.streams.get(data.id)?.source !== from) return;
+        this.streams.delete(data.id);
+        this.unwatch(data.id);
+        this.emit("streams", this.list());
+        return;
+      }
+      case JOIN: {
+        const p = this.published.get(data.id);
+        if (!p || typeof data.nonce !== "string") return;
+        const links = Array.isArray(data.links) ? data.links.map(String) : [];
+        const avoid = Array.isArray(data.avoid) ? data.avoid.map(String) : [];
+        const { parent, depth } = this.pickParent(p, from, links, avoid);
+        this.host.gossip.sendDirect(from, { __ppType: ATTACH, id: p.id, nonce: data.nonce, parent, depth });
+        return;
+      }
+      case ATTACH: {
+        const done = this.pendingAttach.get(data.nonce);
+        if (done && typeof data.parent === "string") done({ parent: data.parent, depth: Number(data.depth) || 1 });
+        return;
+      }
+      case REPORT: {
+        const p = this.published.get(data.id);
+        if (!p || typeof data.parent !== "string") return;
+        p.members.set(from, { peerId: from, parent: data.parent, depth: Number(data.depth) || 1, children: Number(data.children) || 0, links: Array.isArray(data.links) ? data.links.map(String) : [], seen: t });
+        return;
+      }
+      case PING: {
+        this.host.gossip.sendDirect(from, { __ppType: PONG, t0: data.t0, t1: Date.now() });
+        return;
+      }
+      case PONG: {
+        const t0 = Number(data.t0);
+        const t1 = Number(data.t1);
+        const t3 = Date.now();
+        if (!Number.isFinite(t0) || !Number.isFinite(t1) || t3 - t0 > 2e3) return;
+        const offset = t1 - (t0 + t3) / 2;
+        const rtt = t3 - t0;
+        const best = this.offsetSamples.get(from);
+        if (!best || rtt <= best.rtt * 1.2 || t3 - best.at > 6e4) {
+          this.offsetSamples.set(from, { rtt, offset, at: t3 });
+          this.offsets.set(from, offset);
+        }
+        return;
+      }
+    }
+  }
+  pingSources() {
+    const sources = new Set([...this.watching.values()].map((w) => w.source));
+    for (const s of sources) this.host.gossip.sendDirect(s, { __ppType: PING, t0: Date.now() });
+  }
+  tick() {
+    const t = now();
+    for (const p of this.published.values()) p.stats.roll(t);
+    for (const w of this.watching.values()) w.stats.roll(t);
+    let changed = false;
+    for (const [id, s] of this.streams) {
+      if (this.published.has(id)) {
+        s.seen = t;
+        continue;
+      }
+      if (t - s.seen > ANNOUNCE_STALE_MS * 2) {
+        this.streams.delete(id);
+        this.unwatch(id);
+        changed = true;
+      }
+    }
+    if (changed) this.emit("streams", this.list());
+    if (this.published.size || this.watching.size) this.emit("stats", this.stats());
+  }
+  destroy() {
+    for (const id of [...this.published.keys()]) this.unpublish(id);
+    for (const id of [...this.watching.keys()]) this.unwatch(id);
+    for (const timer of this.timers) clearInterval(timer);
+    this.listeners.clear();
+  }
+  emit(event, ...args) {
+    for (const handler of this.listeners.get(event) ?? []) {
+      try {
+        handler(...args);
+      } catch {
+      }
+    }
+  }
+};
+function makeFragments(frameNo, key, capturedAt, ts, bytes) {
+  const count = Math.max(1, Math.ceil(bytes.length / FRAGMENT));
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const slice = bytes.subarray(i * FRAGMENT, Math.min(bytes.length, (i + 1) * FRAGMENT));
+    const frag = new Uint8Array(HEADER + slice.length);
+    const view = new DataView(frag.buffer);
+    view.setUint8(0, 80);
+    view.setUint8(1, 77);
+    view.setUint8(2, 1);
+    view.setUint8(3, key ? 1 : 0);
+    view.setUint32(4, frameNo >>> 0);
+    view.setUint16(8, i);
+    view.setUint16(10, count);
+    view.setFloat64(12, capturedAt);
+    view.setFloat64(20, ts);
+    frag.set(slice, HEADER);
+    out.push(frag);
+  }
+  return out;
+}
+function sendToChild(child, fragments, key, stats, frameStart = true) {
+  const ch = child.channel;
+  if (ch.readyState !== "open") return;
+  if (frameStart) {
+    if (ch.bufferedAmount > CHILD_BACKLOG_BYTES) {
+      child.waitingForKey = true;
+      stats.dropped++;
+      return;
+    }
+    if (child.waitingForKey && !key) return;
+    if (key) child.waitingForKey = false;
+  } else if (child.waitingForKey) return;
+  for (const f of fragments) {
+    try {
+      ch.send(f);
+    } catch {
+      return;
+    }
+  }
+}
+function waitOpen(channel, ms) {
+  if (channel.readyState === "open") return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    channel.addEventListener("open", () => {
+      clearTimeout(timer);
+      resolve(true);
+    }, { once: true });
+    channel.addEventListener("close", () => {
+      clearTimeout(timer);
+      resolve(false);
+    }, { once: true });
+  });
+}
+var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // src/index.ts
 var MESH_SIGNAL_PAYLOAD_TYPE = "pp-signal-v1";
@@ -6934,6 +7688,7 @@ var PartialMesh = class {
       "peer:disconnected",
       "peer:data",
       "peer:bytes",
+      "peer:sidechannel",
       "peer:error",
       "peer:discovered",
       "mesh:ready",
@@ -7402,13 +8157,13 @@ var PartialMesh = class {
     const connectedPeers = this.getConnectedPeers();
     const overflow = connectedPeers.length - this.config.maxPeers;
     if (overflow <= 0) return;
-    const now = Date.now();
+    const now2 = Date.now();
     for (const [peerId, until] of this.bridgeGraceUntilMs) {
-      if (until <= now || !connectedPeers.includes(peerId)) this.bridgeGraceUntilMs.delete(peerId);
+      if (until <= now2 || !connectedPeers.includes(peerId)) this.bridgeGraceUntilMs.delete(peerId);
     }
     if (this.bridgeGraceUntilMs.size > 0 && overflow <= this.config.tolerantPeers) {
       if (!this.bridgeTrimTimer) {
-        const wait = Math.max(...this.bridgeGraceUntilMs.values()) - now + 50;
+        const wait = Math.max(...this.bridgeGraceUntilMs.values()) - now2 + 50;
         this.bridgeTrimTimer = setTimeout(() => {
           this.bridgeTrimTimer = null;
           this.trimExcessPeers();
@@ -7439,7 +8194,7 @@ var PartialMesh = class {
       needy: (() => {
         const capacity = this.freshPeerCapacity(peerId);
         if (capacity) return capacity.connectedPeers <= this.config.minPeers;
-        return now - (this.peerConnectedAtMs.get(peerId) ?? 0) < NEEDY_UNREPORTED_MS;
+        return now2 - (this.peerConnectedAtMs.get(peerId) ?? 0) < NEEDY_UNREPORTED_MS;
       })()
     })).sort((a, b) => {
       if (a.needy !== b.needy) return a.needy ? 1 : -1;
@@ -7458,17 +8213,17 @@ var PartialMesh = class {
     }
   }
   getOldestPendingAgeMs() {
-    const now = Date.now();
+    const now2 = Date.now();
     let oldest = 0;
     for (const peerId of this.connecting) {
-      const startedAt = this.connectionStartedAtMs.get(peerId) ?? now;
-      const age = Math.max(0, now - startedAt);
+      const startedAt = this.connectionStartedAtMs.get(peerId) ?? now2;
+      const age = Math.max(0, now2 - startedAt);
       if (age > oldest) oldest = age;
     }
     for (const peer of this.peers.values()) {
       if (peer.connected) continue;
-      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
-      const age = Math.max(0, now - startedAt);
+      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now2;
+      const age = Math.max(0, now2 - startedAt);
       if (age > oldest) oldest = age;
     }
     return oldest;
@@ -7569,8 +8324,8 @@ var PartialMesh = class {
   maybeRebalanceForCloserPeer(candidates) {
     const selfId = this.normalizePeerId(this.clientId);
     if (!selfId || this.config.tolerantPeers <= 0) return false;
-    const now = Date.now();
-    if (now < this.rebalanceCooldownUntilMs) {
+    const now2 = Date.now();
+    if (now2 < this.rebalanceCooldownUntilMs) {
       return false;
     }
     const connectedPeers = this.getConnectedPeers();
@@ -7605,8 +8360,8 @@ var PartialMesh = class {
     });
     const farthestConnected = connectedByDistance[connectedByDistance.length - 1];
     const closestCandidate = candidateByDistance.find((candidate) => {
-      const discoveredAgeMs = now - candidate.discoveredAt;
-      const sinceAttemptMs = now - candidate.lastAttemptAt;
+      const discoveredAgeMs = now2 - candidate.discoveredAt;
+      const sinceAttemptMs = now2 - candidate.lastAttemptAt;
       return discoveredAgeMs >= 1e3 && sinceAttemptMs >= 5e3;
     });
     if (!closestCandidate || !farthestConnected) {
@@ -7615,7 +8370,7 @@ var PartialMesh = class {
     if (farthestConnected.cecrProtected) {
       return false;
     }
-    const connectedAgeMs = now - (farthestConnected.connectedAt || 0);
+    const connectedAgeMs = now2 - (farthestConnected.connectedAt || 0);
     if (connectedAgeMs < REBALANCE_EDGE_MIN_AGE_MS) {
       return false;
     }
@@ -7632,10 +8387,10 @@ var PartialMesh = class {
     if (otherDiscoveredPeers < 1) {
       return false;
     }
-    this.rebalanceCooldownUntilMs = now + this.rebalanceCooldownMs;
+    this.rebalanceCooldownUntilMs = now2 + this.rebalanceCooldownMs;
     this.rebalanceCooldownMs = Math.min(REBALANCE_COOLDOWN_MAX_MS, this.rebalanceCooldownMs * 2);
-    this.rebalanceAttemptAtMs.set(closestCandidate.peerId, now);
-    this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now);
+    this.rebalanceAttemptAtMs.set(closestCandidate.peerId, now2);
+    this.rebalanceAttemptAtMs.set(farthestConnected.peerId, now2);
     this.pendingRebalanceDropByTarget.set(closestCandidate.peerId, farthestConnected.peerId);
     this.emit("signaling:log", {
       message: `[rebalance] dial priority ${closestCandidate.peerId.slice(0, 8)} then drop ${farthestConnected.peerId.slice(0, 8)}`
@@ -7748,6 +8503,9 @@ var PartialMesh = class {
     });
     this.signalingClient.on("disconnected", () => {
       this.emit("signaling:disconnected");
+    });
+    this.signalingClient.on("sidechannel", (data) => {
+      this.emit("peer:sidechannel", data);
     });
     this.signalingClient.on("lifecycle:resume", (data) => {
       this.recoverMeshAfterInactivity(String(data?.reason || "resume"));
@@ -7932,14 +8690,14 @@ var PartialMesh = class {
     if (!this.config.autoDiscover) return;
     const connected = this.getConnectedPeers().length;
     const pending = this.getPendingPeerCount();
-    const now = Date.now();
+    const now2 = Date.now();
     const underConnected = connected < this.config.minPeers;
     const hasFewCandidates = this.discoveredPeers.size < this.config.minPeers;
     const saturatedWithoutSpareCandidates = connected >= this.config.maxPeers && this.discoveredPeers.size <= connected;
     const negotiationNeedsFreshSnapshot = pending > 0;
     if (!underConnected && !hasFewCandidates && !saturatedWithoutSpareCandidates && !negotiationNeedsFreshSnapshot) return;
-    if (now - this.lastDiscoveryRefreshAtMs < this.discoveryRefreshWaitMs) return;
-    this.lastDiscoveryRefreshAtMs = now;
+    if (now2 - this.lastDiscoveryRefreshAtMs < this.discoveryRefreshWaitMs) return;
+    this.lastDiscoveryRefreshAtMs = now2;
     this.discoveryRefreshWaitMs = Math.min(this.discoveryRefreshWaitMs * 2, DISCOVERY_REFRESH_MAX_MS);
     try {
       this.signalingClient?.joinSession(this.config.sessionId);
@@ -7962,7 +8720,7 @@ var PartialMesh = class {
     }
   }
   recoverMeshAfterInactivity(reason) {
-    const now = Date.now();
+    const now2 = Date.now();
     if (!isAttentionChangeOnly(reason)) {
       this.dialFailureCount.clear();
       this.dialBackoffUntilMs.clear();
@@ -7979,7 +8737,7 @@ var PartialMesh = class {
       this.emit("signaling:log", {
         message: `[webrtc] ${reason} recovery: revalidating transports immediately`
       });
-      this.recoverOrphanedRtcNegotiations(now);
+      this.recoverOrphanedRtcNegotiations(now2);
       this.maybeRecoverStalledNegotiations();
       this.maintainPeerConnections();
     } catch {
@@ -7992,7 +8750,7 @@ var PartialMesh = class {
    * peer. Without local peer/pending state, the normal negotiation watchdog
    * cannot see it, while connectToPeerInternal treats it as active forever.
    */
-  recoverOrphanedRtcNegotiations(now = Date.now()) {
+  recoverOrphanedRtcNegotiations(now2 = Date.now()) {
     const connections = this.signalingClient?.client?.mesh?.connections;
     if (!connections || typeof connections.entries !== "function") return;
     for (const [rawPeerId, entry] of Array.from(connections.entries())) {
@@ -8009,10 +8767,10 @@ var PartialMesh = class {
         continue;
       }
       const lastSeen = Number(entry?.lastSeen);
-      const initialObservation = Number.isFinite(lastSeen) && lastSeen > 0 ? Math.min(now, lastSeen) : now;
+      const initialObservation = Number.isFinite(lastSeen) && lastSeen > 0 ? Math.min(now2, lastSeen) : now2;
       const firstSeenAt = this.orphanRtcFirstSeenAtMs.get(peerId) ?? initialObservation;
       this.orphanRtcFirstSeenAtMs.set(peerId, firstSeenAt);
-      const orphanAgeMs = Math.max(0, now - firstSeenAt);
+      const orphanAgeMs = Math.max(0, now2 - firstSeenAt);
       const terminalTransport = connectionState === "failed" || connectionState === "closed" || String(entry?.state ?? "").toLowerCase() === "dead";
       const staleAfterMs = terminalTransport ? 0 : Math.max(6e3, this.config.connectionTimeoutMs);
       if (orphanAgeMs < staleAfterMs) continue;
@@ -8039,7 +8797,7 @@ var PartialMesh = class {
     }
   }
   maybeRecoverStalledNegotiations() {
-    const now = Date.now();
+    const now2 = Date.now();
     const connectedCount = this.getConnectedPeerCount();
     const isolated = connectedCount === 0 && this.dialCandidatePeerIds(true).length > 0;
     const ownerTimeoutMs = Math.max(NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, this.config.connectionTimeoutMs);
@@ -8067,15 +8825,15 @@ var PartialMesh = class {
       const repeatedlyFailing = (this.dialFailureCount.get(peer.id) ?? 0) >= 2;
       const timeoutMs = activeIce || connectedWithoutChannel ? activeIceTimeoutMs : deadTransport ? ownerTimeoutMs : offerTimeoutMs;
       const phase = deadTransport ? "dead" : connectedWithoutChannel ? "sctp" : activeIce ? "ice" : stalledOffer ? "offer" : noRtcProgress ? "pending" : "idle";
-      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now;
+      const startedAt = this.connectionStartedAtMs.get(peer.id) ?? now2;
       const tracked = this.negotiationPhaseByPeerId.get(peer.id);
       const firstSeenAt = tracked?.firstSeenAt ?? startedAt;
       if (!tracked || tracked.phase !== phase) {
         this.negotiationPhaseByPeerId.set(peer.id, { phase, firstSeenAt });
-        if (tracked) this.connectionStartedAtMs.set(peer.id, now);
+        if (tracked) this.connectionStartedAtMs.set(peer.id, now2);
       }
-      const ageMs = Math.max(0, now - (this.connectionStartedAtMs.get(peer.id) ?? now));
-      const totalAgeMs = Math.max(0, now - firstSeenAt);
+      const ageMs = Math.max(0, now2 - (this.connectionStartedAtMs.get(peer.id) ?? now2));
+      const totalAgeMs = Math.max(0, now2 - firstSeenAt);
       if (ageMs < timeoutMs && totalAgeMs < NEGOTIATION_TOTAL_BUDGET_MS) continue;
       if (!stalledOffer && !deadTransport && !noRtcProgress && !connectedWithoutChannel && !activeIce) {
         continue;
@@ -8112,16 +8870,16 @@ var PartialMesh = class {
     const isolatedThresholdMs = Math.max(3500, Math.min(thresholdMs, 8e3));
     const hasStalePending = pending > 0 && oldestPendingAge >= isolatedThresholdMs;
     const hasRepeatedFailures = candidatePeerIds.some((peerId) => (this.dialFailureCount.get(peerId) ?? 0) >= 3);
-    const now = Date.now();
+    const now2 = Date.now();
     if (!underConnected && !isolated) {
       this.underConnectedSinceMs = null;
       return;
     }
     if (isolated && (hasStalePending || hasRepeatedFailures)) {
-      if (now - this.lastUnderConnectedRecoveryAtMs < isolatedThresholdMs) {
+      if (now2 - this.lastUnderConnectedRecoveryAtMs < isolatedThresholdMs) {
         return;
       }
-      this.lastUnderConnectedRecoveryAtMs = now;
+      this.lastUnderConnectedRecoveryAtMs = now2;
       this.emit("signaling:log", {
         message: "[webrtc] isolated recovery: preserving FreeRTC negotiation and refreshing discovery"
       });
@@ -8140,13 +8898,13 @@ var PartialMesh = class {
       }
     }
     if (this.underConnectedSinceMs == null) {
-      this.underConnectedSinceMs = now;
+      this.underConnectedSinceMs = now2;
       return;
     }
-    if (now - this.underConnectedSinceMs < thresholdMs) return;
-    if (now - this.lastUnderConnectedRecoveryAtMs < thresholdMs) return;
-    this.lastUnderConnectedRecoveryAtMs = now;
-    this.underConnectedSinceMs = now;
+    if (now2 - this.underConnectedSinceMs < thresholdMs) return;
+    if (now2 - this.lastUnderConnectedRecoveryAtMs < thresholdMs) return;
+    this.lastUnderConnectedRecoveryAtMs = now2;
+    this.underConnectedSinceMs = now2;
     this.emit("signaling:log", {
       message: "[webrtc] under-connected recovery: refreshing discovery without resetting FreeRTC"
     });
@@ -8173,9 +8931,9 @@ var PartialMesh = class {
     this.lastDialFailureAtMs.delete(peerId);
     this.dialBackoffUntilMs.delete(peerId);
   }
-  forgetStaleDialFailures(now) {
+  forgetStaleDialFailures(now2) {
     for (const [peerId, failedAt] of this.lastDialFailureAtMs) {
-      if (now - failedAt < DIAL_FAILURE_MEMORY_MS) continue;
+      if (now2 - failedAt < DIAL_FAILURE_MEMORY_MS) continue;
       this.lastDialFailureAtMs.delete(peerId);
       this.dialFailureCount.delete(peerId);
     }
@@ -8198,10 +8956,10 @@ var PartialMesh = class {
     }
     this.noteDialSuccess(peerId);
   }
-  noteStablePeerConnections(now) {
+  noteStablePeerConnections(now2) {
     for (const [peerId, connectedAt] of this.peerConnectedAtMs) {
       if (!this.peers.get(peerId)?.connected) continue;
-      if (now - connectedAt >= STABLE_PEER_CONNECTION_MS) {
+      if (now2 - connectedAt >= STABLE_PEER_CONNECTION_MS) {
         this.noteDialSuccess(peerId);
       }
     }
@@ -8312,10 +9070,10 @@ var PartialMesh = class {
     return role !== null && this.dialRoles.has(role);
   }
   maintainPeerConnections() {
-    const now = Date.now();
-    this.noteStablePeerConnections(now);
-    this.forgetStaleDialFailures(now);
-    this.recoverOrphanedRtcNegotiations(now);
+    const now2 = Date.now();
+    this.noteStablePeerConnections(now2);
+    this.forgetStaleDialFailures(now2);
+    this.recoverOrphanedRtcNegotiations(now2);
     const connectedCount = this.getConnectedPeerCount();
     const pendingCount = this.getPendingPeerCount();
     const candidatePeerIds = this.dialCandidatePeerIds(connectedCount === 0);
@@ -8347,10 +9105,10 @@ var PartialMesh = class {
         this.connectToPeer(peerId);
       }
     } else if (totalInProgress < fillCeiling && available.length > 0) {
-      if (now < this.rebalanceCooldownUntilMs || now < this.fillBackoffUntilMs) {
+      if (now2 < this.rebalanceCooldownUntilMs || now2 < this.fillBackoffUntilMs) {
         return;
       }
-      if (this.fillBackoffMs > 0 && now - this.fillBackoffUntilMs > FILL_BACKOFF_MAX_MS) this.fillBackoffMs = 0;
+      if (this.fillBackoffMs > 0 && now2 - this.fillBackoffUntilMs > FILL_BACKOFF_MAX_MS) this.fillBackoffMs = 0;
       const healthy = connectedCount > this.config.minPeers;
       const withRoom = (peerId) => {
         const capacity = this.freshPeerCapacity(peerId);
@@ -8373,8 +9131,8 @@ var PartialMesh = class {
         return ourListed.every((member) => member === selfId || this.peerDistance(member, peerId) > mine);
       };
       const foreign = available.filter((peerId) => !this.globalPeers.has(peerId) && this.activeSignalingPeers.has(peerId) && weAreNearest(peerId));
-      if (foreign.length > 0 && now - this.lastBridgeDialAtMs >= BRIDGE_DIAL_INTERVAL_MS) {
-        this.lastBridgeDialAtMs = now;
+      if (foreign.length > 0 && now2 - this.lastBridgeDialAtMs >= BRIDGE_DIAL_INTERVAL_MS) {
+        this.lastBridgeDialAtMs = now2;
         const target = foreign.slice().sort((a, b) => this.compareDialCandidates(a, b))[0];
         this.emit("signaling:log", { message: `[bridge] dial ${target.slice(0, 8)}: listed by the relay, not in our membership` });
         this.connectToPeerInternal(target, true);
@@ -8510,6 +9268,16 @@ var PartialMesh = class {
     } catch {
       return false;
     }
+  }
+  /**
+   * Another data channel on the WebRTC link to a linked neighbour, for traffic with its own delivery
+   * rules (media: unordered, no retransmits, the default). Null when the peer is not linked over WebRTC.
+   * The neighbour receives it as 'peer:sidechannel'. Relays never carry these.
+   */
+  openSideChannel(peerId, name, init) {
+    const peerConnection = this.peers.get(peerId);
+    if (!peerConnection?.connected) return null;
+    return this.signalingClient?.openSideChannel(peerId, name, init) ?? null;
   }
   /**
    * Broadcast data to all connected peers
@@ -8664,8 +9432,8 @@ var PartialMesh = class {
   }
   /** Reconstruct the complete currently-known node and undirected edge snapshot. */
   getGraphSnapshot() {
-    const now = Date.now();
-    this.pruneMembershipRecords(now, false);
+    const now2 = Date.now();
+    this.pruneMembershipRecords(now2, false);
     const self = this.normalizePeerId(this.clientId) || null;
     const connected = new Set(this.getConnectedPeers());
     const knownIds = /* @__PURE__ */ new Set();
@@ -8759,7 +9527,7 @@ var PartialMesh = class {
       edges,
       complete: missingTopologyPeerIds.length === 0,
       missingTopologyPeerIds,
-      generatedAt: now
+      generatedAt: now2
     };
   }
   /**
@@ -8811,17 +9579,17 @@ var PartialMesh = class {
   renewLocalMembership(force = false) {
     const self = this.normalizePeerId(this.clientId);
     if (!self) return false;
-    const now = Date.now();
+    const now2 = Date.now();
     const existing = this.membershipRecordsById.get(self);
-    if (!force && existing?.state === "alive" && existing.validUntil != null && existing.validUntil - now > this.config.membershipGossipIntervalMs * 2) return false;
+    if (!force && existing?.state === "alive" && existing.validUntil != null && existing.validUntil - now2 > this.config.membershipGossipIntervalMs * 2) return false;
     this.membershipSequence += 1;
     this.membershipRecordsById.set(self, {
       peerId: self,
       incarnation: this.membershipIncarnation,
       sequence: this.membershipSequence,
       state: "alive",
-      issuedAt: now,
-      validUntil: now + this.config.membershipLeaseMs
+      issuedAt: now2,
+      validUntil: now2 + this.config.membershipLeaseMs
     });
     return true;
   }
@@ -8830,7 +9598,7 @@ var PartialMesh = class {
     if (incoming.incarnation !== existing.incarnation) return incoming.incarnation > existing.incarnation;
     return incoming.sequence > existing.sequence;
   }
-  mergeMembershipRecord(record, now = Date.now()) {
+  mergeMembershipRecord(record, now2 = Date.now()) {
     const peerId = this.normalizePeerId(record.peerId);
     if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) return false;
     const canonicalId = peerId.replace(/-/g, "").toLowerCase();
@@ -8838,13 +9606,13 @@ var PartialMesh = class {
     if (!Number.isSafeInteger(record.incarnation) || record.incarnation < 0) return false;
     if (!Number.isSafeInteger(record.sequence) || record.sequence < 0) return false;
     if (!Number.isSafeInteger(record.issuedAt) || record.issuedAt <= 0) return false;
-    if (record.issuedAt > now + this.config.membershipClockSkewMs) return false;
+    if (record.issuedAt > now2 + this.config.membershipClockSkewMs) return false;
     if (record.state !== "alive" && record.state !== "left") return false;
     if (record.state === "alive") {
       if (!Number.isSafeInteger(record.validUntil)) return false;
       if ((record.validUntil ?? 0) <= record.issuedAt) return false;
       if ((record.validUntil ?? 0) - record.issuedAt > this.config.membershipLeaseMs) return false;
-      if ((record.validUntil ?? 0) + this.config.membershipTombstoneRetentionMs <= now) return false;
+      if ((record.validUntil ?? 0) + this.config.membershipTombstoneRetentionMs <= now2) return false;
     } else if (record.validUntil !== null) {
       return false;
     }
@@ -8853,7 +9621,7 @@ var PartialMesh = class {
     if (existing && existing.incarnation === normalized.incarnation && existing.sequence === normalized.sequence) {
       const identical = existing.state === normalized.state && existing.issuedAt === normalized.issuedAt && existing.validUntil === normalized.validUntil;
       if (!identical) {
-        this.membershipEquivocationAtById.set(peerId, now);
+        this.membershipEquivocationAtById.set(peerId, now2);
         return true;
       }
       return false;
@@ -8863,10 +9631,10 @@ var PartialMesh = class {
     return true;
   }
   rebuildGlobalMembership(emitChanges = true) {
-    const now = Date.now();
+    const now2 = Date.now();
     const next = /* @__PURE__ */ new Set();
     for (const record of this.membershipRecordsById.values()) {
-      if (record.state === "alive" && record.validUntil != null && record.validUntil > now && !this.isSelfAlias(record.peerId) && !this.retiredPeerIds.has(record.peerId) && !this.membershipEquivocationAtById.has(record.peerId)) next.add(record.peerId);
+      if (record.state === "alive" && record.validUntil != null && record.validUntil > now2 && !this.isSelfAlias(record.peerId) && !this.retiredPeerIds.has(record.peerId) && !this.membershipEquivocationAtById.has(record.peerId)) next.add(record.peerId);
     }
     const changed = next.size !== this.globalPeers.size || Array.from(next).some((peerId) => !this.globalPeers.has(peerId));
     if (!changed) return false;
@@ -8883,17 +9651,17 @@ var PartialMesh = class {
     }
     return true;
   }
-  pruneMembershipRecords(now = Date.now(), emitChanges = true) {
+  pruneMembershipRecords(now2 = Date.now(), emitChanges = true) {
     let pruned = false;
     for (const [peerId, record] of this.membershipRecordsById.entries()) {
-      const expiredAlive = record.state === "alive" && (record.validUntil == null || record.validUntil + this.config.membershipTombstoneRetentionMs <= now);
-      const expiredTombstone = record.state === "left" && now - record.issuedAt > this.config.membershipTombstoneRetentionMs;
+      const expiredAlive = record.state === "alive" && (record.validUntil == null || record.validUntil + this.config.membershipTombstoneRetentionMs <= now2);
+      const expiredTombstone = record.state === "left" && now2 - record.issuedAt > this.config.membershipTombstoneRetentionMs;
       if (!expiredAlive && !expiredTombstone) continue;
       this.membershipRecordsById.delete(peerId);
       pruned = true;
     }
     for (const [peerId, quarantinedAt] of this.membershipEquivocationAtById.entries()) {
-      if (now - quarantinedAt <= this.config.membershipTombstoneRetentionMs) continue;
+      if (now2 - quarantinedAt <= this.config.membershipTombstoneRetentionMs) continue;
       this.membershipEquivocationAtById.delete(peerId);
       pruned = true;
     }
@@ -8901,10 +9669,10 @@ var PartialMesh = class {
   }
   membershipRecordsForWire() {
     const records = {};
-    const now = Date.now();
+    const now2 = Date.now();
     for (const record of this.membershipRecordsById.values()) {
-      if (record.state === "alive" && (record.validUntil == null || record.validUntil <= now)) continue;
-      if (record.state === "left" && now - record.issuedAt > this.config.membershipTombstoneRetentionMs) continue;
+      if (record.state === "alive" && (record.validUntil == null || record.validUntil <= now2)) continue;
+      if (record.state === "left" && now2 - record.issuedAt > this.config.membershipTombstoneRetentionMs) continue;
       records[record.peerId] = [
         record.incarnation,
         record.sequence,
@@ -8978,8 +9746,8 @@ var PartialMesh = class {
     this.renewalForwardTimer.unref?.();
   }
   broadcastMembership(exceptPeerId) {
-    const now = Date.now();
-    const elapsed = now - this.membershipBroadcastAtMs;
+    const now2 = Date.now();
+    const elapsed = now2 - this.membershipBroadcastAtMs;
     if (elapsed < MEMBERSHIP_BROADCAST_MIN_INTERVAL_MS) {
       if (!this.membershipBroadcastTimer) {
         this.membershipBroadcastTimer = setTimeout(() => {
@@ -8990,7 +9758,7 @@ var PartialMesh = class {
       }
       return;
     }
-    this.membershipBroadcastAtMs = now;
+    this.membershipBroadcastAtMs = now2;
     for (const peerId of this.getConnectedPeers()) {
       if (peerId !== exceptPeerId) this.sendMembership(peerId);
     }
@@ -9018,7 +9786,7 @@ var PartialMesh = class {
     let capacityChanged = false;
     let topologyChanged = false;
     let departureMerged = false;
-    const now = Date.now();
+    const now2 = Date.now();
     const renewed = [];
     const returning = [];
     for (const [rawPeerId, rawRecord] of Object.entries(records || {})) {
@@ -9033,7 +9801,7 @@ var PartialMesh = class {
         issuedAt: Math.floor(Number(rawRecord[3])),
         validUntil: rawRecord[4] === null ? null : Math.floor(Number(rawRecord[4]))
       };
-      if (this.mergeMembershipRecord(record, now)) {
+      if (this.mergeMembershipRecord(record, now2)) {
         membershipChanged = true;
         if (record.state === "left") {
           departureMerged = true;
@@ -9053,10 +9821,10 @@ var PartialMesh = class {
         incarnation: existing?.incarnation ?? 0,
         sequence: (existing?.sequence ?? 0) + 1,
         state: "left",
-        issuedAt: now,
+        issuedAt: now2,
         validUntil: null
       };
-      if (this.mergeMembershipRecord(left, now)) {
+      if (this.mergeMembershipRecord(left, now2)) {
         membershipChanged = true;
         this.forgetDepartedPeer(normalizedFromPeerId);
         departureMerged = true;
@@ -9070,11 +9838,11 @@ var PartialMesh = class {
       if (this.mergeMembershipRecord({
         peerId: id,
         incarnation: 0,
-        sequence: now,
+        sequence: now2,
         state: "alive",
-        issuedAt: now,
-        validUntil: now + this.config.membershipLeaseMs
-      }, now)) membershipChanged = true;
+        issuedAt: now2,
+        validUntil: now2 + this.config.membershipLeaseMs
+      }, now2)) membershipChanged = true;
     }
     const viewChanged = this.rebuildGlobalMembership(false);
     if (viewChanged) membershipChanged = true;
@@ -9103,7 +9871,7 @@ var PartialMesh = class {
       if (!peerId || this.isSelfAlias(peerId) || this.retiredPeerIds.has(peerId)) continue;
       if (!Array.isArray(rawState) || rawState.length < 2 || !Array.isArray(rawState[0])) continue;
       const updatedAt = Math.floor(Number(rawState[1]));
-      if (!Number.isSafeInteger(updatedAt) || updatedAt <= 0 || updatedAt > now + this.config.membershipClockSkewMs) continue;
+      if (!Number.isSafeInteger(updatedAt) || updatedAt <= 0 || updatedAt > now2 + this.config.membershipClockSkewMs) continue;
       const connectedPeerIds = Array.from(new Set(
         rawState[0].map((value) => this.normalizePeerId(typeof value === "string" ? value : "")).filter((id) => id && id !== peerId && !this.retiredPeerIds.has(id))
       )).sort();
@@ -9135,14 +9903,14 @@ var PartialMesh = class {
     const neighbours = this.getConnectedPeers();
     if (!self || neighbours.length === 0 || !this.signalingClient) return false;
     this.membershipSequence += 1;
-    const now = Date.now();
-    const left = [this.membershipIncarnation, this.membershipSequence, "left", now, null];
+    const now2 = Date.now();
+    const left = [this.membershipIncarnation, this.membershipSequence, "left", now2, null];
     this.membershipRecordsById.set(self, {
       peerId: self,
       incarnation: this.membershipIncarnation,
       sequence: this.membershipSequence,
       state: "left",
-      issuedAt: now,
+      issuedAt: now2,
       validUntil: null
     });
     const payload = JSON.stringify({
@@ -9253,7 +10021,8 @@ var PeerPigeonNode = class _PeerPigeonNode {
     this.started = false;
     this.relayScoreTimer = null;
     this.useServers = false;
-    const { gossip = {}, crypto = {}, storage = false, ...meshOptions } = options;
+    this.mediaStreams = null;
+    const { gossip = {}, crypto: crypto2 = {}, storage = false, ...meshOptions } = options;
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
     this.storageOptions = storage;
@@ -9273,14 +10042,14 @@ var PeerPigeonNode = class _PeerPigeonNode {
         return this.gossip.sendDirect(to, { __ppType: MESH_SIGNAL_PAYLOAD_TYPE, envelope }) !== null;
       }
     });
-    if (crypto === false) {
+    if (crypto2 === false) {
       this.crypto = null;
     } else {
       const networkId = String(meshOptions.networkId ?? meshOptions.sessionId ?? "peerpigeon").trim();
       const sessionId = String(meshOptions.sessionId ?? "default-session").trim();
       this.crypto = new PeerPigeonCryptoProtocol(this.mesh, this.gossip, {
-        ...crypto,
-        roomId: String(crypto.roomId ?? `${networkId}:${sessionId}`).trim()
+        ...crypto2,
+        roomId: String(crypto2.roomId ?? `${networkId}:${sessionId}`).trim()
       });
     }
     this.bindComponentEvents();
@@ -9425,6 +10194,18 @@ var PeerPigeonNode = class _PeerPigeonNode {
   getDiscoveredPeers() {
     return this.mesh.getDiscoveredPeers();
   }
+  /**
+   * Media streams in the room, with peers as forwarders (a virtual SFU): publish a camera track, watch a
+   * stream. Video goes over side channels on the peers' own links; relays never carry it. Made on first use.
+   */
+  get media() {
+    if (!this.mediaStreams) this.mediaStreams = new MediaStreams(this);
+    return this.mediaStreams;
+  }
+  /** Another data channel on the WebRTC link to a neighbour (see PartialMesh.openSideChannel). */
+  openSideChannel(peerId, name, init) {
+    return this.mesh.openSideChannel(peerId, name, init);
+  }
   /** The role a relay listed this peer with, or null. */
   getPeerRole(peerId) {
     return this.mesh.getPeerRole(peerId);
@@ -9543,6 +10324,8 @@ var PeerPigeonNode = class _PeerPigeonNode {
     }
     if (this.storage) await this.storage.close();
     this.storage = null;
+    this.mediaStreams?.destroy();
+    this.mediaStreams = null;
     this.crypto?.destroy();
     this.gossip.destroy();
     const flushMs = this.mesh.destroy();
@@ -9647,7 +10430,7 @@ var PeerPigeonNode = class _PeerPigeonNode {
     if (PeerPigeonCryptoProtocol.isProtocolPayload(data)) return true;
     if (!data || typeof data !== "object") return false;
     const type = data.__ppType;
-    return typeof type === "string" && (type.startsWith("pp-storage-") || type.startsWith("pp-signal-") || type.startsWith("pp-relay-"));
+    return typeof type === "string" && (type.startsWith("pp-storage-") || type.startsWith("pp-signal-") || type.startsWith("pp-relay-") || type.startsWith("pp-media-"));
   }
   emitError(error) {
     this.emit("error", error instanceof Error ? error : new Error(String(error)));
@@ -9669,6 +10452,7 @@ var index_default = PartialMesh;
   GossipProtocol,
   MAX_BLOB_BYTES,
   MESH_SIGNAL_PAYLOAD_TYPE,
+  MediaStreams,
   MemoryRoomStatsStore,
   MemoryServerRecordStore,
   NEGOTIATION_ACTIVE_ICE_DEADLINE_MS,

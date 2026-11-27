@@ -217,6 +217,11 @@ export class FreeRTCClientAdapter {
     for (const peerId of this.retiredPeerIds) this.addSelfAlias(peerId);
   }
 
+  /** Another data channel on the WebRTC link to a peer (unordered, no retransmits by default); null without one. */
+  openSideChannel(peerId: string, name: string, init?: { ordered?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number }): RTCDataChannel | null {
+    try { return this.client?.openSideChannel?.(peerId, name, init) ?? null; } catch { return null; }
+  }
+
   on(event: string, handler: Handler): void {
     this.emitter.on(event, handler);
   }
@@ -322,6 +327,10 @@ export class FreeRTCClientAdapter {
       trickleIce: this.trickleIce,
       capabilities: this.role ? { role: this.role } : {},
       autoConnect: false,
+      // More channels on a peer's WebRTC link (media), opened in band: the relay never carries them.
+      onSideChannel: (event: { peerId: string; name: string; channel: RTCDataChannel }) => {
+        this.emitter.emit('sidechannel', event);
+      },
       relay: this.relayOnDemand ? { mode: 'on-demand', ...(this.relayHold ? { hold: this.relayHold } : {}) } : {},
       onRelayStateChange: ({ state }: { state?: string } = {}) => {
         if (!isCurrentClient()) return;

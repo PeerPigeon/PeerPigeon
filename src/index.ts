@@ -34,6 +34,8 @@ export type { RoomStatsStore, RoomHistory, RoomStatsPoint, MinuteSample, HourSum
 import type { StorageOptions } from './storage.js';
 import { PeerPigeonCryptoProtocol } from './crypto.js';
 export { sha1Hex } from './sha1.js';
+export { MediaStreams, type MediaPublishOptions, type MediaStreamInfo, type MediaStats } from './media.js';
+import { MediaStreams } from './media.js';
 import type {
   PeerPigeonCryptoOptions,
   PeerPigeonKeyPair,
@@ -785,6 +787,7 @@ export type PartialMeshEvents = {
   'peer:disconnected': (peerId: string) => void;
   'peer:data': (data: { peerId: string; data: any }) => void;
   'peer:bytes': (data: { peerId: string; meta: Record<string, unknown>; bytes: Uint8Array }) => void;
+  'peer:sidechannel': (data: { peerId: string; name: string; channel: RTCDataChannel }) => void;
   'peer:error': (data: { peerId: string; error: any }) => void;
   'peer:discovered': (peerId: string) => void;
   'mesh:ready': () => void;
@@ -966,6 +969,7 @@ export class PartialMesh {
       'peer:disconnected',
       'peer:data',
       'peer:bytes',
+      'peer:sidechannel',
       'peer:error',
       'peer:discovered',
       'mesh:ready',
@@ -2001,6 +2005,10 @@ export class PartialMesh {
 
     this.signalingClient.on('disconnected', () => {
       this.emit('signaling:disconnected');
+    });
+
+    this.signalingClient.on('sidechannel', (data: { peerId: string; name: string; channel: RTCDataChannel }) => {
+      this.emit('peer:sidechannel', data);
     });
 
     this.signalingClient.on('lifecycle:resume', (data: { reason?: string }) => {
@@ -3094,6 +3102,17 @@ export class PartialMesh {
     const peerConnection = this.peers.get(peerId);
     if (!peerConnection?.connected) return false;
     try { this.signalingClient.send(peerId, encodeBytesFrame(meta, bytes)); return true; } catch { return false; }
+  }
+
+  /**
+   * Another data channel on the WebRTC link to a linked neighbour, for traffic with its own delivery
+   * rules (media: unordered, no retransmits, the default). Null when the peer is not linked over WebRTC.
+   * The neighbour receives it as 'peer:sidechannel'. Relays never carry these.
+   */
+  public openSideChannel(peerId: string, name: string, init?: { ordered?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number }): RTCDataChannel | null {
+    const peerConnection = this.peers.get(peerId);
+    if (!peerConnection?.connected) return null;
+    return (this.signalingClient as FreeRTCClientAdapter | null)?.openSideChannel(peerId, name, init) ?? null;
   }
 
   /**
@@ -4264,6 +4283,20 @@ export class PeerPigeonNode {
   }
   getLinkLog() { return this.mesh.getLinkLog(); }
   getDiscoveredPeers(): string[] { return this.mesh.getDiscoveredPeers(); }
+  private mediaStreams: MediaStreams | null = null;
+  /**
+   * Media streams in the room, with peers as forwarders (a virtual SFU): publish a camera track, watch a
+   * stream. Video goes over side channels on the peers' own links; relays never carry it. Made on first use.
+   */
+  get media(): MediaStreams {
+    if (!this.mediaStreams) this.mediaStreams = new MediaStreams(this);
+    return this.mediaStreams;
+  }
+
+  /** Another data channel on the WebRTC link to a neighbour (see PartialMesh.openSideChannel). */
+  openSideChannel(peerId: string, name: string, init?: { ordered?: boolean; maxRetransmits?: number; maxPacketLifeTime?: number }): RTCDataChannel | null {
+    return this.mesh.openSideChannel(peerId, name, init);
+  }
   /** The role a relay listed this peer with, or null. */
   getPeerRole(peerId: string): string | null { return this.mesh.getPeerRole(peerId); }
   /** Dial this peer now, whatever its role. */
@@ -4406,6 +4439,8 @@ export class PeerPigeonNode {
     if (this.serverLink) { await this.serverLink.close(); this.serverLink = null; }
     if (this.storage) await this.storage.close();
     this.storage = null;
+    this.mediaStreams?.destroy();
+    this.mediaStreams = null;
     this.crypto?.destroy();
     this.gossip.destroy();
     const flushMs = this.mesh.destroy();
@@ -4521,7 +4556,7 @@ export class PeerPigeonNode {
     if (PeerPigeonCryptoProtocol.isProtocolPayload(data)) return true;
     if (!data || typeof data !== 'object') return false;
     const type = (data as { __ppType?: unknown }).__ppType;
-    return typeof type === 'string' && (type.startsWith('pp-storage-') || type.startsWith('pp-signal-') || type.startsWith('pp-relay-'));
+    return typeof type === 'string' && (type.startsWith('pp-storage-') || type.startsWith('pp-signal-') || type.startsWith('pp-relay-') || type.startsWith('pp-media-'));
   }
 
   private emitError(error: unknown): void {

@@ -47,7 +47,9 @@ function packageIsPinned(packageRoot, dependencySpec, commit) {
 // installing whatever main is right now — not rewriting the manifest to a
 // commit. That keeps every checkout, every CI run and every consumer on the
 // same moving head instead of a hash someone has to remember to bump.
-const followsMain = /draeder\/freertc(?:\.git)?#main$/i.test(String(readJson(path.join(projectRoot, 'package.json')).dependencies?.freertc ?? ''));
+// A branch (main; dev on PeerPigeon's dev branch), not a commit: follow it.
+const freertcSpec = String(readJson(path.join(projectRoot, 'package.json')).dependencies?.freertc ?? '');
+const followsMain = /draeder\/freertc(?:\.git)?#(?![0-9a-f]{40}$)[A-Za-z][\w.\/-]*$/i.test(freertcSpec);
 if (followsMain) {
   for (const packageRoot of packageRoots) {
     if (!existsSync(path.join(packageRoot, 'package.json'))) continue;
@@ -57,7 +59,7 @@ if (followsMain) {
         cwd: packageRoot, stdio: 'inherit', timeout: installTimeoutMs, killSignal: 'SIGKILL',
         env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
       });
-      console.log(`FreeRTC follows main in ${label}`);
+      console.log(`FreeRTC follows its branch in ${label}`);
     } catch (error) {
       console.warn(`Could not refresh FreeRTC main in ${label}: ${error?.message || error}`);
     }
