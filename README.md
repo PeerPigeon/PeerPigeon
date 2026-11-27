@@ -158,4 +158,4 @@ npm run example:vue3
 
 ## License
 
-ISC
+[MIT](LICENSE)
