@@ -4532,7 +4532,11 @@ var PeerPigeonStorage = class {
     if (space !== "private" && !options.silent) {
       await this.broadcastMutation(mutation);
     }
-    if (space !== "private") void this.pushToServers(mutation);
+    if (space !== "private") {
+      if (options.waitForServers) {
+        if (await this.serversLinked()) await this.pushToServers(mutation);
+      } else void this.pushToServers(mutation);
+    }
     return await this.get(space, key);
   }
   async putSystem(space, key, value, options = {}) {
@@ -9164,6 +9168,7 @@ var PartialMesh = class {
     return announced ? LEAVE_FLUSH_MS : 0;
   }
 };
+var APPS_ROOM = "pigeon-apps";
 var RELAY_SCORES_PAYLOAD_TYPE = "pp-relay-scores";
 var RELAY_SCORE_SHARE_MS = 10 * 6e4;
 var PeerPigeonNode = class _PeerPigeonNode {
@@ -9177,7 +9182,8 @@ var PeerPigeonNode = class _PeerPigeonNode {
     this.started = false;
     this.relayScoreTimer = null;
     this.useServers = false;
-    const { gossip = {}, crypto = {}, storage = false, ...meshOptions } = options;
+    const { gossip = {}, crypto = {}, storage = false, listApp = {}, ...meshOptions } = options;
+    this.listAppOption = listApp;
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
     this.storageOptions = storage;
@@ -9239,8 +9245,12 @@ var PeerPigeonNode = class _PeerPigeonNode {
         if (useServers) this.storage.expectServers();
       }
       await this.mesh.init();
-      if (this.storage && this.useServers) this.linking = this.linkServers().catch(() => {
-      });
+      if (this.storage && this.useServers) {
+        this.linking = this.linkServers().catch(() => {
+        });
+        void this.linking.then(() => this.listInDirectory()).catch(() => {
+        });
+      }
     } catch (error) {
       this.started = false;
       throw error;
@@ -9289,6 +9299,45 @@ var PeerPigeonNode = class _PeerPigeonNode {
       });
     }
     return storage;
+  }
+  /**
+   * List this app in the mesh's directory (APPS_ROOM), so consoles find it: one record a month per network and
+   * site, written by the first visitor who finds none (a record belongs to whoever wrote it first). Browsers on
+   * https sites only: not a local or test address, not Node.
+   */
+  async listInDirectory() {
+    if (this.listAppOption === false || !this.storage || !this.serverLink) return;
+    const where = globalThis.location;
+    if (!where || where.protocol !== "https:" || !where.host || !where.origin) return;
+    const host = String(where.hostname ?? "").toLowerCase();
+    if (!host || host === "localhost" || /\.(localhost|test|local|internal)$/.test(host) || /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0$|\[)/.test(host)) return;
+    const network = String(this.mesh.getConfig().networkId ?? "");
+    if (!network) return;
+    const month = (/* @__PURE__ */ new Date()).toISOString().slice(0, 7);
+    const key = `app/${network}/${where.host}/${month}`;
+    const mark = `peerpigeon:listed:${key}`;
+    const store = globalThis.localStorage;
+    try {
+      if (store?.getItem(mark)) return;
+    } catch {
+    }
+    const until = Date.now() + 3e4;
+    while (!await this.serverLink.hasServers().catch(() => false) && Date.now() < until) await new Promise((r) => setTimeout(r, 1e3));
+    const doc = globalThis.document;
+    const name = String(this.listAppOption.name ?? doc?.title ?? network).trim().slice(0, 80) || network;
+    const room = await this.openStorage(APPS_ROOM);
+    try {
+      const there = await room.retrieve("public", key, { timeoutMs: 5e3 }).catch(() => null);
+      if (!there) await room.put("public", key, { v: 1, network, url: where.origin, name, at: Date.now() }, { waitForServers: true });
+      try {
+        store?.setItem(mark, String(Date.now()));
+      } catch {
+      }
+    } finally {
+      await room.close().catch(() => {
+      });
+      this.openedStorages.delete(room);
+    }
   }
   async linkServers() {
     const until = Date.now() + 2e4;
@@ -9587,6 +9636,7 @@ var PeerPigeonNode = class _PeerPigeonNode {
 };
 var index_default = PartialMesh;
 export {
+  APPS_ROOM,
   DEFAULT_CLOSE_SIGNALING_RELAY_COUNT,
   DEFAULT_SIGNALING_SERVERS,
   GossipProtocol,

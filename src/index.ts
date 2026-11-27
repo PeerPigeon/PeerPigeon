@@ -4012,7 +4012,16 @@ export type PeerPigeonNodeOptions = PartialMeshConfig & {
   crypto?: false | (Omit<PeerPigeonCryptoOptions, 'roomId'> & { roomId?: string });
   /** Disabled by default. Pass options to attach encrypted synchronized storage. */
   storage?: false | PeerPigeonNodeStorageOptions;
+  /**
+   * In a browser, on an https site with storage on: the app lists itself in the mesh's directory of apps
+   * (APPS_ROOM on the storage servers), so consoles find it. Its network, its address and a name (the
+   * page's title, or this name); never a room. Once a month at most, from the first visitor. false: not listed.
+   */
+  listApp?: false | { name?: string };
 };
+
+/** The storage room where apps list themselves: app/<network>/<host>/<YYYY-MM> → { network, url, name, at }. */
+export const APPS_ROOM = 'pigeon-apps';
 
 export type PeerPigeonNodeMessage = {
   kind: 'broadcast' | 'direct';
@@ -4060,6 +4069,7 @@ export class PeerPigeonNode {
   private readonly signalingOptions: Pick<PartialMeshConfig, 'signalingServer' | 'signalingServers' | 'automaticSignalingServer' | 'relayDirectory' | 'iceServers'>;
   private serverLink: StorageServerLink | null = null;
   private linking: Promise<void> | null = null;
+  private readonly listAppOption: false | { name?: string };
   private storageUserId = '';
   private readonly openedStorages = new Set<PeerPigeonStorage>();
   private readonly callbacks: Partial<Record<keyof PeerPigeonNodeEvents, Set<Function>>> = {};
@@ -4067,7 +4077,8 @@ export class PeerPigeonNode {
   private relayScoreTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(options: PeerPigeonNodeOptions = {}) {
-    const { gossip = {}, crypto = {}, storage = false, ...meshOptions } = options;
+    const { gossip = {}, crypto = {}, storage = false, listApp = {}, ...meshOptions } = options;
+    this.listAppOption = listApp;
     this.mesh = new PartialMesh(meshOptions);
     this.gossip = new GossipProtocol(this.mesh, gossip);
     this.storageOptions = storage;
@@ -4146,7 +4157,10 @@ export class PeerPigeonNode {
       // its own, only the servers closest to this room. It joins the relay this
       // node chose, so it finds the servers this node's relay knows (a local
       // relay first), rather than choosing a relay of its own.
-      if (this.storage && this.useServers) this.linking = this.linkServers().catch(() => {});
+      if (this.storage && this.useServers) {
+        this.linking = this.linkServers().catch(() => {});
+        void this.linking.then(() => this.listInDirectory()).catch(() => {});
+      }
     } catch (error) {
       this.started = false;
       throw error;
@@ -4198,6 +4212,40 @@ export class PeerPigeonNode {
       void (this.linking ?? Promise.resolve()).then(() => { if (this.serverLink) return storage.attachServers(this.serverLink); }).catch(() => {});
     }
     return storage;
+  }
+
+  /**
+   * List this app in the mesh's directory (APPS_ROOM), so consoles find it: one record a month per network and
+   * site, written by the first visitor who finds none (a record belongs to whoever wrote it first). Browsers on
+   * https sites only: not a local or test address, not Node.
+   */
+  private async listInDirectory(): Promise<void> {
+    if (this.listAppOption === false || !this.storage || !this.serverLink) return;
+    const where = (globalThis as { location?: { protocol?: string; host?: string; hostname?: string; origin?: string } }).location;
+    if (!where || where.protocol !== 'https:' || !where.host || !where.origin) return;
+    const host = String(where.hostname ?? '').toLowerCase();
+    if (!host || host === 'localhost' || /\.(localhost|test|local|internal)$/.test(host) || /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0$|\[)/.test(host)) return;
+    const network = String(this.mesh.getConfig().networkId ?? '');
+    if (!network) return;
+    const month = new Date().toISOString().slice(0, 7);
+    const key = `app/${network}/${where.host}/${month}`;
+    const mark = `peerpigeon:listed:${key}`;
+    const store = (globalThis as { localStorage?: Storage }).localStorage;
+    try { if (store?.getItem(mark)) return; } catch { /* no storage: list anyway */ }
+    // Once the servers are linked (they hold the directory).
+    const until = Date.now() + 30_000;
+    while (!(await this.serverLink.hasServers().catch(() => false)) && Date.now() < until) await new Promise((r) => setTimeout(r, 1_000));
+    const doc = (globalThis as { document?: { title?: string } }).document;
+    const name = String(this.listAppOption.name ?? doc?.title ?? network).trim().slice(0, 80) || network;
+    const room = await this.openStorage(APPS_ROOM);
+    try {
+      const there = await room.retrieve('public', key, { timeoutMs: 5_000 }).catch(() => null);
+      if (!there) await room.put('public', key, { v: 1, network, url: where.origin, name, at: Date.now() }, { waitForServers: true });
+      try { store?.setItem(mark, String(Date.now())); } catch { /* not kept: once more next visit */ }
+    } finally {
+      await room.close().catch(() => {});
+      this.openedStorages.delete(room);
+    }
   }
 
   private async linkServers(): Promise<void> {
