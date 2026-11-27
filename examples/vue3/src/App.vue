@@ -212,7 +212,9 @@
           </div>
         </div>
 
-        <aside class="side">
+        <!-- Only Messages scrolls inside a fixed height (its thread); every other tab's side column grows with
+             what it shows, so nothing in it is cut off. -->
+        <aside class="side" :class="{ 'side-grow': activeTab !== 'message' }">
           <dl class="facts">
             <div class="fact fact-you">
               <dt>You</dt>
@@ -5629,6 +5631,16 @@ select.input {
   height: calc(100dvh - 56px - 48px);
   min-height: 560px;
   max-height: 820px;
+}
+
+.side-grow {
+  height: auto;
+  max-height: none;
+}
+
+.side-grow .panel {
+  flex: none;
+  overflow: visible;
 }
 
 .facts {
