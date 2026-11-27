@@ -13,7 +13,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "deploy": "npm run build && npx wrangler@4 deploy",
-    "deploy:dev": "npm run build && npx wrangler@4 deploy --env dev"
+    "deploy:dev": "npm run build -- --mode dev && npx wrangler@4 deploy --env dev"
   },
   "dependencies": {
     "@fortawesome/fontawesome-svg-core": "^7.3.1",

@@ -127,7 +127,7 @@
           </label>
           <label class="field">
             <span>Network</span>
-            <input v-model.trim="networkName" :disabled="isConnecting" class="input" data-testid="network-name" placeholder="peerpigeon" />
+            <input v-model.trim="networkName" :disabled="isConnecting" class="input" data-testid="network-name" :placeholder="defaultNetwork" />
           </label>
           <label class="field field-wide">
             <span>Relay</span>
@@ -557,6 +557,9 @@
 <script>
 import { DEFAULT_SIGNALING_SERVERS, PartialMesh, PeerPigeonNode, StorageServerLink } from 'peerpigeon';
 import { GossipProtocol } from 'peerpigeon';
+// pigeon-dev.peer.ooo is built with --mode dev (npm run deploy:dev): a network of its own, so its peers
+// are not mixed with pigeon.peer.ooo's, and the console shows it as a separate app.
+const DEFAULT_NETWORK = import.meta.env.MODE === 'dev' ? 'peerpigeon-dev' : 'peerpigeon';
 import { PeerPigeonStorage } from 'peerpigeon';
 import { PeerPigeonCryptoProtocol } from 'peerpigeon';
 import { generateRandomPair, encryptMessageWithMeta, decryptMessageWithMeta } from 'unsea';
@@ -753,7 +756,7 @@ export default {
       tolerantPeers: 1,
       topology: DEFAULT_TOPOLOGY,
       customTopologyModalOpen: false,
-      networkName: 'peerpigeon',
+      networkName: DEFAULT_NETWORK,
       roomSessionId: '',
       // What the room field in the top bar shows while it is being edited.
       roomDraft: '',
@@ -1022,6 +1025,9 @@ export default {
     this.scheduleNetworkGraphBadgePinUpdate();
   },
   computed: {
+    defaultNetwork() {
+      return DEFAULT_NETWORK;
+    },
     gossipBadgeSnapshot() {
       const badge = gossipBadgeState({
         running: this.isRunning,
