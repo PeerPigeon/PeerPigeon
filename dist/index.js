@@ -6386,9 +6386,16 @@ var KEY_INTERVAL_MS = 2e3;
 var FRAGMENT_LIFETIME_MS = 250;
 var PING_MS = 5e3;
 var CHILD_BACKLOG_BYTES = 1e6;
-var HEADER = 28;
+var AUDIO_RATE = 48e3;
+var AUDIO_FRAME = 960;
+var HEADER = 30;
 var FRAGMENT = 15e3;
 var KEY_REQUEST = 75;
+var LEVELS_WANTED = 76;
+var FLAG_KEY = 1;
+var FLAG_AUDIO = 2;
+var QUALITY_LEVEL = { low: 0, medium: 1, high: 2 };
+var LEVEL_NAMES = ["low", "medium", "high"];
 var Counter = class {
   constructor() {
     this.frames = 0;
@@ -6406,6 +6413,7 @@ var Counter = class {
     this.keyRequests = 0;
     this.lastRecoveryMs = null;
     this.recoveries = 0;
+    this.totalFrames = 0;
   }
   roll(now2) {
     const span = (now2 - this.windowAt) / 1e3;
@@ -6426,6 +6434,50 @@ var Counter = class {
 var now = () => Date.now();
 var randomId = () => Array.from(crypto.getRandomValues(new Uint8Array(6)), (b) => b.toString(16).padStart(2, "0")).join("");
 var channelName = (id) => `m:${id}`;
+var even = (n) => Math.max(2, Math.round(n / 2) * 2);
+var WORKLETS = `
+class PPCapture extends AudioWorkletProcessor {
+  process(inputs) { const i = inputs[0]; if (i && i.length && i[0].length) this.port.postMessage(i.map((c) => c.slice(0))); return true; }
+}
+registerProcessor('pp-capture', PPCapture);
+class PPPlay extends AudioWorkletProcessor {
+  constructor() {
+    super(); this.q = []; this.off = 0; this.started = false;
+    this.port.onmessage = (e) => {
+      this.q.push(e.data);
+      let total = -this.off; for (const b of this.q) total += b[0].length;
+      while (total > sampleRate * 0.25 && this.q.length > 1) { total -= this.q[0][0].length - this.off; this.q.shift(); this.off = 0; }
+    };
+  }
+  process(_, outputs) {
+    const out = outputs[0]; const n = out[0].length;
+    let total = -this.off; for (const b of this.q) total += b[0].length;
+    if (!this.started && total < sampleRate * 0.06) { for (const c of out) c.fill(0); return true; }
+    this.started = total > 0;
+    let w = 0;
+    while (w < n && this.q.length) {
+      const b = this.q[0]; const take = Math.min(n - w, b[0].length - this.off);
+      for (let c = 0; c < out.length; c++) out[c].set(b[Math.min(c, b.length - 1)].subarray(this.off, this.off + take), w);
+      w += take; this.off += take;
+      if (this.off >= b[0].length) { this.q.shift(); this.off = 0; }
+    }
+    for (const c of out) c.fill(0, w);
+    if (w < n) this.started = false;
+    return true;
+  }
+}
+registerProcessor('pp-play', PPPlay);
+`;
+var workletsLoaded = /* @__PURE__ */ new WeakMap();
+function loadWorklets(context) {
+  let ready = workletsLoaded.get(context);
+  if (!ready) {
+    const url = URL.createObjectURL(new Blob([WORKLETS], { type: "application/javascript" }));
+    ready = context.audioWorklet.addModule(url).finally(() => URL.revokeObjectURL(url));
+    workletsLoaded.set(context, ready);
+  }
+  return ready;
+}
 var MediaStreams = class _MediaStreams {
   constructor(host) {
     this.host = host;
@@ -6447,9 +6499,13 @@ var MediaStreams = class _MediaStreams {
     this.timers.push(setInterval(() => this.tick(), 1e3));
     this.timers.push(setInterval(() => this.pingSources(), PING_MS));
   }
-  /** Whether this browser can send or receive (WebCodecs). */
+  /** Whether this browser can send or receive video (WebCodecs). */
   static supported() {
     return typeof globalThis.VideoEncoder === "function" && typeof globalThis.VideoDecoder === "function";
+  }
+  /** Whether this browser can send or receive audio (WebCodecs' AudioEncoder and AudioDecoder, and AudioWorklet). */
+  static audioSupported() {
+    return typeof globalThis.AudioEncoder === "function" && typeof globalThis.AudioDecoder === "function" && typeof globalThis.AudioWorkletNode === "function";
   }
   on(event, handler) {
     const set = this.listeners.get(event) ?? /* @__PURE__ */ new Set();
@@ -6467,10 +6523,48 @@ var MediaStreams = class _MediaStreams {
   stats() {
     const out = [];
     for (const p of this.published.values()) {
-      out.push({ id: p.id, role: "source", parent: null, children: [...p.children.keys()], depth: 0, fps: p.stats.fps, kbps: p.stats.kbps, delayMs: null, forwardMs: null, framesDropped: p.stats.dropped, keyRequests: p.stats.keyRequests, lastRecoveryMs: null, recoveries: 0 });
+      out.push({
+        id: p.id,
+        role: "source",
+        parent: null,
+        children: [...p.children.keys()],
+        depth: 0,
+        fps: p.stats.fps,
+        kbps: p.stats.kbps,
+        level: null,
+        levels: p.levels.filter((l) => l.encoder).map((l) => LEVEL_NAMES[l.level]),
+        quality: null,
+        audio: !!p.audio,
+        audioKbps: p.audioStats.kbps,
+        delayMs: null,
+        forwardMs: null,
+        framesDropped: p.stats.dropped,
+        keyRequests: p.stats.keyRequests,
+        lastRecoveryMs: null,
+        recoveries: 0
+      });
     }
     for (const w of this.watching.values()) {
-      out.push({ id: w.id, role: "viewer", parent: w.parent, children: [...w.children.keys()], depth: w.depth, fps: w.stats.fps, kbps: w.stats.kbps, delayMs: w.stats.delayMs, forwardMs: w.children.size ? w.stats.forwardMs : null, framesDropped: w.stats.dropped, keyRequests: w.stats.keyRequests, lastRecoveryMs: w.stats.lastRecoveryMs, recoveries: w.stats.recoveries });
+      out.push({
+        id: w.id,
+        role: "viewer",
+        parent: w.parent,
+        children: [...w.children.keys()],
+        depth: w.depth,
+        fps: w.stats.fps,
+        kbps: w.stats.kbps,
+        level: w.info.video ? LEVEL_NAMES[w.level] : null,
+        levels: levelsIn(this.neededMask(w)),
+        quality: w.info.video ? w.quality : null,
+        audio: w.info.audio,
+        audioKbps: w.audioStats.kbps,
+        delayMs: w.info.video ? w.stats.delayMs : w.audioStats.delayMs,
+        forwardMs: w.children.size ? w.stats.forwardMs : null,
+        framesDropped: w.stats.dropped,
+        keyRequests: w.stats.keyRequests,
+        lastRecoveryMs: w.stats.lastRecoveryMs,
+        recoveries: w.stats.recoveries
+      });
     }
     return out;
   }
@@ -6481,80 +6575,97 @@ var MediaStreams = class _MediaStreams {
     return [...p.members.values()].map(({ peerId, parent, depth }) => ({ peerId, parent, depth }));
   }
   // ---------------------------------------------------------------- source
-  async publish(track, options = {}) {
-    if (!_MediaStreams.supported()) throw new Error("This browser has no WebCodecs: it cannot send video");
-    const settings = track.getSettings?.() ?? {};
-    const opts = {
-      width: options.width ?? settings.width ?? 1280,
-      height: options.height ?? settings.height ?? 720,
-      fps: options.fps ?? Math.min(30, Math.round(settings.frameRate ?? 30)),
-      bitrate: options.bitrate ?? 15e5,
-      maxChildren: options.maxChildren ?? 3
-    };
+  /**
+   * Send video, audio or both: a camera or microphone track, or a <video>/<audio> playing a file (the
+   * stream follows it: pause, seek). A track given alone is taken as video or audio by its kind.
+   */
+  async publish(input, options = {}) {
+    const given = isTrack(input) ? input.kind === "audio" ? { audio: input } : { video: input } : input;
+    if (!given.video && !given.audio) throw new Error("Nothing to send: give a video or an audio source");
+    if (given.video && !_MediaStreams.supported()) throw new Error("This browser has no WebCodecs: it cannot send video");
+    if (given.audio && !_MediaStreams.audioSupported()) throw new Error("This browser cannot encode audio here");
     const id = randomId();
+    const opts = { fps: options.fps ?? 30, bitrate: options.bitrate ?? 15e5, maxChildren: options.maxChildren ?? 3 };
+    let video = null;
+    let ownVideo = false;
+    const levels = [];
+    if (given.video) {
+      if (isTrack(given.video)) {
+        video = document.createElement("video");
+        video.muted = true;
+        video.playsInline = true;
+        video.autoplay = true;
+        video.srcObject = new MediaStream([given.video]);
+        await video.play().catch(() => {
+        });
+        ownVideo = true;
+        const s = given.video.getSettings?.() ?? {};
+        opts.fps = options.fps ?? Math.min(30, Math.round(s.frameRate ?? 30));
+      } else {
+        video = given.video;
+        if (video.readyState < 1) {
+          const el = video;
+          const loaded = await new Promise((r) => {
+            const t = setTimeout(() => r(false), 1e4);
+            el.addEventListener("loadedmetadata", () => {
+              clearTimeout(t);
+              r(true);
+            }, { once: true });
+            el.addEventListener("error", () => {
+              clearTimeout(t);
+              r(false);
+            }, { once: true });
+          });
+          if (!loaded) throw new Error("This browser can\u2019t play that video");
+        }
+      }
+      const srcW = options.width ?? (video.videoWidth || 1280);
+      const srcH = options.height ?? (video.videoHeight || 720);
+      const scale = Math.min(1, 1280 / srcW, 720 / srcH);
+      const highW = even(srcW * scale);
+      const highH = even(srcH * scale);
+      const plan = options.levels === false ? [{ level: 2, div: 1, rate: 1, fps: opts.fps }] : [{ level: 0, div: 4, rate: 0.1, fps: Math.min(15, opts.fps) }, { level: 1, div: 2, rate: 0.3, fps: opts.fps }, { level: 2, div: 1, rate: 1, fps: opts.fps }];
+      for (const l of plan) {
+        if (l.div > 1 && highW / l.div < 120) continue;
+        levels.push({ level: l.level, width: even(highW / l.div), height: even(highH / l.div), fps: l.fps, bitrate: Math.round(opts.bitrate * l.rate), encoder: null, canvas: null, frame: 0, forceKey: true, lastKeyAt: 0, keyTimer: null, tick: 0 });
+      }
+    }
+    const info = {
+      id,
+      source: this.host.mesh.getClientId() ?? "",
+      name: options.name ?? (given.video ? "Camera" : "Audio"),
+      video: levels.length > 0,
+      audio: !!given.audio,
+      levels: levels.map((l) => ({ level: l.level, width: l.width, height: l.height, fps: l.fps, kbps: Math.round(l.bitrate / 1e3) })),
+      width: levels[levels.length - 1]?.width ?? 0,
+      height: levels[levels.length - 1]?.height ?? 0,
+      fps: levels[levels.length - 1]?.fps ?? 0,
+      live: true
+    };
     const p = {
       id,
-      name: options.name ?? "Camera",
-      track,
+      name: info.name,
       opts,
-      encoder: null,
-      video: null,
+      video,
+      ownVideo,
+      levels,
       timer: null,
-      frame: 0,
-      forceKey: true,
-      lastKeyAt: 0,
-      keyTimer: null,
+      audio: null,
       children: /* @__PURE__ */ new Map(),
       members: /* @__PURE__ */ new Map(),
       stats: new Counter(),
-      announceTimer: null
+      audioStats: new Counter(),
+      announceTimer: null,
+      info
     };
-    const Encoder = globalThis.VideoEncoder;
-    p.encoder = new Encoder({
-      output: (chunk) => this.sendChunk(p, chunk),
-      error: () => {
-        p.forceKey = true;
-      }
-    });
-    p.encoder.configure({ codec: "vp8", width: opts.width, height: opts.height, bitrate: opts.bitrate, framerate: opts.fps, latencyMode: "realtime" });
-    const video = document.createElement("video");
-    video.muted = true;
-    video.playsInline = true;
-    video.autoplay = true;
-    video.srcObject = new MediaStream([track]);
-    await video.play().catch(() => {
-    });
-    p.video = video;
-    const started = performance.now();
-    p.timer = setInterval(() => {
-      if (!p.encoder || p.encoder.state !== "configured" || video.readyState < 2) return;
-      if (p.encoder.encodeQueueSize > 2) {
-        p.stats.dropped++;
-        return;
-      }
-      const VF = globalThis.VideoFrame;
-      let frame;
-      try {
-        frame = new VF(video, { timestamp: Math.round((performance.now() - started) * 1e3) });
-      } catch {
-        return;
-      }
-      const key = p.forceKey || now() - p.lastKeyAt >= KEY_INTERVAL_MS;
-      if (key) {
-        p.forceKey = false;
-        p.lastKeyAt = now();
-      }
-      try {
-        p.encoder.encode(frame, { keyFrame: key });
-      } finally {
-        frame.close();
-      }
-      p.frame++;
-    }, Math.round(1e3 / opts.fps));
     this.published.set(id, p);
-    const me = this.host.mesh.getClientId() ?? "";
-    this.streams.set(id, { id, source: me, name: p.name, width: opts.width, height: opts.height, fps: opts.fps, live: true, seen: now() });
-    const announce = () => this.host.gossip.broadcast({ __ppType: ANNOUNCE, id, name: p.name, width: opts.width, height: opts.height, fps: opts.fps });
+    if (levels.length) {
+      const started = performance.now();
+      p.timer = setInterval(() => this.encodeTick(p, started), Math.round(1e3 / opts.fps));
+    }
+    if (given.audio) p.audio = await this.startAudioSend(p, given.audio);
+    this.streams.set(id, { ...info, seen: now() });
+    const announce = () => this.host.gossip.broadcast({ __ppType: ANNOUNCE, ...announced(p.info) });
     announce();
     p.announceTimer = setInterval(announce, ANNOUNCE_MS);
     this.emit("streams", this.list());
@@ -6565,13 +6676,28 @@ var MediaStreams = class _MediaStreams {
     if (!p) return;
     this.published.delete(id);
     if (p.timer) clearInterval(p.timer);
-    if (p.keyTimer) clearTimeout(p.keyTimer);
     if (p.announceTimer) clearInterval(p.announceTimer);
-    try {
-      p.encoder?.close();
-    } catch {
+    for (const l of p.levels) {
+      if (l.keyTimer) clearTimeout(l.keyTimer);
+      try {
+        l.encoder?.close();
+      } catch {
+      }
     }
-    if (p.video) p.video.srcObject = null;
+    if (p.ownVideo && p.video) p.video.srcObject = null;
+    if (p.audio) {
+      try {
+        p.audio.node.disconnect();
+        p.audio.sourceNode.disconnect();
+      } catch {
+      }
+      try {
+        p.audio.encoder.close();
+      } catch {
+      }
+      if (p.audio.ownElement) void p.audio.context.close().catch(() => {
+      });
+    }
     for (const c of p.children.values()) {
       try {
         c.channel.close();
@@ -6582,14 +6708,163 @@ var MediaStreams = class _MediaStreams {
     this.host.gossip.broadcast({ __ppType: END, id });
     this.emit("streams", this.list());
   }
-  sendChunk(p, chunk) {
-    const bytes = new Uint8Array(chunk.byteLength);
-    chunk.copyTo(bytes);
-    const key = chunk.type === "key";
-    const fragments = makeFragments(p.frame, key, Date.now(), chunk.timestamp, bytes);
-    p.stats.frames++;
-    p.stats.bytes += bytes.length;
-    for (const child of p.children.values()) sendToChild(child, fragments, key, p.stats);
+  /** The levels the source's children need, and so the ones it encodes. */
+  wantedLevels(p) {
+    let mask = 0;
+    for (const c of p.children.values()) mask |= c.mask;
+    return mask;
+  }
+  encodeTick(p, started) {
+    const video = p.video;
+    if (!video || video.readyState < 2) return;
+    const wanted = this.wantedLevels(p);
+    const VF = globalThis.VideoFrame;
+    const timestamp = Math.round((performance.now() - started) * 1e3);
+    for (const l of p.levels) {
+      if (!(wanted & 1 << l.level)) {
+        if (l.encoder) {
+          try {
+            l.encoder.close();
+          } catch {
+          }
+          l.encoder = null;
+        }
+        continue;
+      }
+      if (!l.encoder) {
+        this.openEncoder(p, l);
+        l.forceKey = true;
+      }
+      if (l.encoder.state !== "configured") continue;
+      l.tick++;
+      if (l.fps < p.opts.fps && l.tick % Math.round(p.opts.fps / l.fps) !== 0) continue;
+      if (l.encoder.encodeQueueSize > 2) {
+        p.stats.dropped++;
+        continue;
+      }
+      let frame;
+      try {
+        if (video.videoWidth === l.width && video.videoHeight === l.height) frame = new VF(video, { timestamp });
+        else {
+          if (!l.canvas) {
+            const C = globalThis.OffscreenCanvas;
+            l.canvas = C ? new C(l.width, l.height) : Object.assign(document.createElement("canvas"), { width: l.width, height: l.height });
+          }
+          l.canvas.getContext("2d").drawImage(video, 0, 0, l.width, l.height);
+          frame = new VF(l.canvas, { timestamp });
+        }
+      } catch {
+        continue;
+      }
+      const key = l.forceKey || now() - l.lastKeyAt >= KEY_INTERVAL_MS;
+      if (key) {
+        l.forceKey = false;
+        l.lastKeyAt = now();
+      }
+      try {
+        l.encoder.encode(frame, { keyFrame: key });
+      } catch {
+        l.forceKey = true;
+      } finally {
+        frame.close();
+      }
+    }
+  }
+  openEncoder(p, l) {
+    const Encoder = globalThis.VideoEncoder;
+    l.encoder = new Encoder({
+      output: (chunk) => {
+        const bytes = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(bytes);
+        const key = chunk.type === "key";
+        const fragments = makeFragments(key ? FLAG_KEY : 0, l.level, l.frame++, Date.now(), chunk.timestamp, bytes);
+        if (l.level === highestLevel(this.wantedLevels(p))) {
+          p.stats.frames++;
+        }
+        p.stats.bytes += bytes.length;
+        for (const child of p.children.values()) sendVideo(child, fragments, l.level, key, p.stats, true);
+      },
+      error: () => {
+        l.forceKey = true;
+        try {
+          l.encoder?.close();
+        } catch {
+        }
+        l.encoder = null;
+      }
+    });
+    l.encoder.configure({ codec: "vp8", width: l.width, height: l.height, bitrate: l.bitrate, framerate: l.fps, latencyMode: "realtime" });
+  }
+  async startAudioSend(p, source) {
+    const context = new AudioContext({ sampleRate: AUDIO_RATE, latencyHint: "interactive" });
+    await loadWorklets(context);
+    if (context.state === "suspended") await context.resume().catch(() => {
+    });
+    let sourceNode;
+    let ownElement = true;
+    let channels = 1;
+    if (isTrack(source)) {
+      sourceNode = context.createMediaStreamSource(new MediaStream([source]));
+      channels = Math.min(2, source.getSettings?.().channelCount ?? 1) || 1;
+    } else {
+      sourceNode = context.createMediaElementSource(source);
+      sourceNode.connect(context.destination);
+      channels = 2;
+    }
+    const node = new AudioWorkletNode(context, "pp-capture", { numberOfInputs: 1, numberOfOutputs: 1, channelCount: channels, channelCountMode: "explicit" });
+    sourceNode.connect(node);
+    const sink = context.createGain();
+    sink.gain.value = 0;
+    node.connect(sink).connect(context.destination);
+    const Encoder = globalThis.AudioEncoder;
+    const send = { context, node, sourceNode, channels, encoder: null, samples: 0, frame: 0, ownElement };
+    send.encoder = new Encoder({
+      output: (chunk) => {
+        const bytes = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(bytes);
+        const fragments = makeFragments(FLAG_AUDIO | FLAG_KEY, 0, send.frame++, Date.now(), chunk.timestamp, bytes);
+        p.audioStats.frames++;
+        p.audioStats.bytes += bytes.length;
+        for (const child of p.children.values()) sendAudio(child, fragments);
+      },
+      error: () => {
+      }
+    });
+    send.encoder.configure({ codec: "opus", sampleRate: AUDIO_RATE, numberOfChannels: channels, bitrate: channels > 1 ? 96e3 : 48e3 });
+    const AD = globalThis.AudioData;
+    const frame = new Float32Array(AUDIO_FRAME * channels);
+    let fill = 0;
+    node.port.onmessage = (event) => {
+      if (!p.children.size) {
+        fill = 0;
+        return;
+      }
+      const planes = event.data;
+      const n = planes[0]?.length ?? 0;
+      let read = 0;
+      while (read < n) {
+        const take = Math.min(n - read, AUDIO_FRAME - fill);
+        for (let c = 0; c < channels; c++) frame.set(planes[Math.min(c, planes.length - 1)].subarray(read, read + take), c * AUDIO_FRAME + fill);
+        fill += take;
+        read += take;
+        if (fill < AUDIO_FRAME) break;
+        fill = 0;
+        const timestamp = Math.round(send.samples / AUDIO_RATE * 1e6);
+        send.samples += AUDIO_FRAME;
+        let audioData;
+        try {
+          audioData = new AD({ format: "f32-planar", sampleRate: AUDIO_RATE, numberOfFrames: AUDIO_FRAME, numberOfChannels: channels, timestamp, data: frame.slice() });
+        } catch {
+          continue;
+        }
+        try {
+          if (send.encoder.state === "configured") send.encoder.encode(audioData);
+        } finally {
+          audioData.close();
+        }
+      }
+    };
+    return send;
   }
   /** The source picks a parent for a joining viewer. */
   pickParent(p, viewer, links, avoid) {
@@ -6625,57 +6900,80 @@ var MediaStreams = class _MediaStreams {
     return { parent: chosen.peerId, depth: chosen.depth + 1 };
   }
   // ---------------------------------------------------------------- viewer
-  /** Watch a stream: decoded frames go to onFrame (draw them, then frame.close()). */
-  watch(id, onFrame) {
-    if (!_MediaStreams.supported()) throw new Error("This browser has no WebCodecs: it cannot show video");
+  /**
+   * Watch a stream. Video frames go to onFrame (draw them, then frame.close()); audio plays here. Call
+   * it from a click or a key press: browsers start sound only then.
+   */
+  watch(id, onFrame, options = {}) {
     if (this.watching.has(id)) return;
-    const info = this.streams.get(id);
-    if (!info) throw new Error("No such stream in this room");
-    const Decoder = globalThis.VideoDecoder;
+    const known = this.streams.get(id);
+    if (!known) throw new Error("No such stream in this room");
+    const { seen: _seen, ...info } = known;
+    if (info.video && !_MediaStreams.supported()) throw new Error("This browser has no WebCodecs: it cannot show video");
+    const quality = options.quality ?? "auto";
+    const level = info.video ? this.levelFor(info, quality === "auto" ? "high" : quality) : 0;
     const w = {
       id,
       source: info.source,
+      info,
       parent: null,
       depth: 0,
       upstream: null,
       children: /* @__PURE__ */ new Map(),
       decoder: null,
       onFrame,
-      frames: /* @__PURE__ */ new Map(),
-      lastFrame: -1,
-      needKey: true,
+      rx: /* @__PURE__ */ new Map(),
+      level,
+      target: level,
+      quality,
+      sentMask: -1,
       lastKeyRequest: 0,
       lastData: now(),
       joining: false,
       lostAt: null,
       avoid: /* @__PURE__ */ new Set(),
       stats: new Counter(),
+      audioStats: new Counter(),
+      audio: null,
+      muted: !!options.muted,
+      badWindows: 0,
+      goodWindows: 0,
+      lastDownAt: 0,
+      lastWindow: { frames: 0, dropped: 0 },
       watchdog: null,
       reportTimer: null,
       stopped: false
     };
-    w.decoder = new Decoder({
-      output: (frame) => {
-        if (w.lostAt != null) {
-          w.stats.lastRecoveryMs = now() - w.lostAt;
-          w.stats.recoveries++;
-          w.lostAt = null;
-        }
-        try {
-          w.onFrame(frame);
-        } catch {
-          try {
-            frame.close();
-          } catch {
+    if (info.video) {
+      const Decoder = globalThis.VideoDecoder;
+      w.decoder = new Decoder({
+        output: (frame) => {
+          if (w.lostAt != null) {
+            w.stats.lastRecoveryMs = now() - w.lostAt;
+            w.stats.recoveries++;
+            w.lostAt = null;
           }
+          if (!w.onFrame) {
+            frame.close();
+            return;
+          }
+          try {
+            w.onFrame(frame);
+          } catch {
+            try {
+              frame.close();
+            } catch {
+            }
+          }
+        },
+        error: () => {
+          this.levelRx(w, w.level).needKey = true;
+          this.resetDecoder(w);
         }
-      },
-      error: () => {
-        w.needKey = true;
-        this.resetDecoder(w);
-      }
-    });
-    w.decoder.configure({ codec: "vp8", optimizeForLatency: true });
+      });
+      w.decoder.configure({ codec: "vp8", optimizeForLatency: true });
+    }
+    if (info.audio && _MediaStreams.audioSupported()) w.audio = this.startAudioReceive(w);
     this.watching.set(id, w);
     w.watchdog = setInterval(() => {
       if (w.stopped || w.joining) return;
@@ -6705,6 +7003,79 @@ var MediaStreams = class _MediaStreams {
       w.decoder?.close();
     } catch {
     }
+    if (w.audio) {
+      try {
+        w.audio.decoder?.close();
+      } catch {
+      }
+      void w.audio.context.close().catch(() => {
+      });
+    }
+  }
+  /** Auto, or one level: high, medium or low (the nearest the stream has). */
+  setQuality(id, quality) {
+    const w = this.watching.get(id);
+    if (!w || !w.info.video) return;
+    w.quality = quality;
+    w.badWindows = 0;
+    w.goodWindows = 0;
+    this.switchTo(w, this.levelFor(w.info, quality === "auto" ? LEVEL_NAMES[w.level] : quality));
+  }
+  setMuted(id, muted) {
+    const w = this.watching.get(id);
+    if (!w) return;
+    w.muted = muted;
+    if (w.audio) w.audio.gain.gain.value = muted ? 0 : 1;
+    if (!muted) void w.audio?.context.resume().catch(() => {
+    });
+  }
+  /** The level nearest a quality that the stream has: the highest at or below it, else its lowest. */
+  levelFor(info, quality) {
+    const have = info.levels.map((l) => l.level).sort((a, b) => a - b);
+    if (!have.length) return 0;
+    const want = QUALITY_LEVEL[quality];
+    const below = have.filter((l) => l <= want);
+    return below.length ? below[below.length - 1] : have[0];
+  }
+  /** The stream's next level down or up from this one, or null at the end. */
+  stepLevel(info, level, by) {
+    const have = info.levels.map((l) => l.level).sort((a, b) => a - b);
+    const i = have.indexOf(level) + by;
+    return i >= 0 && i < have.length && have.indexOf(level) >= 0 ? have[i] : null;
+  }
+  /** The levels this peer needs from its parent: the one it shows, one it is switching to, its children's. */
+  neededMask(w) {
+    if (!w.info.video) return 0;
+    let mask = 1 << w.level | 1 << w.target;
+    for (const c of w.children.values()) mask |= c.mask;
+    return mask;
+  }
+  sendWanted(w, force = false) {
+    const mask = this.neededMask(w);
+    if (!force && mask === w.sentMask) return;
+    if (!w.upstream || w.upstream.readyState !== "open") return;
+    try {
+      w.upstream.send(new Uint8Array([LEVELS_WANTED, mask]));
+      w.sentMask = mask;
+    } catch {
+    }
+  }
+  switchTo(w, level) {
+    if (level === w.target) return;
+    w.target = level;
+    const rx = this.levelRx(w, level);
+    rx.needKey = true;
+    rx.frames.clear();
+    this.sendWanted(w);
+    this.requestKey(w, level, true);
+  }
+  levelRx(w, level) {
+    let rx = w.rx.get(level);
+    if (!rx) {
+      rx = { frames: /* @__PURE__ */ new Map(), lastFrame: -1, needKey: true };
+      w.rx.set(level, rx);
+    }
+    return rx;
   }
   resetDecoder(w) {
     try {
@@ -6712,6 +7083,46 @@ var MediaStreams = class _MediaStreams {
       w.decoder.configure({ codec: "vp8", optimizeForLatency: true });
     } catch {
     }
+  }
+  startAudioReceive(w) {
+    const context = new AudioContext({ sampleRate: AUDIO_RATE, latencyHint: "interactive" });
+    const gain = context.createGain();
+    gain.gain.value = w.muted ? 0 : 1;
+    gain.connect(context.destination);
+    const audio = { context, node: null, gain, decoder: null, lastFrame: -1, ready: Promise.resolve() };
+    audio.ready = loadWorklets(context).then(() => {
+      audio.node = new AudioWorkletNode(context, "pp-play", { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
+      audio.node.connect(gain);
+    }).catch(() => {
+    });
+    void context.resume().catch(() => {
+    });
+    const Decoder = globalThis.AudioDecoder;
+    audio.decoder = new Decoder({
+      output: (data) => {
+        if (w.lostAt != null && !w.info.video) {
+          w.stats.lastRecoveryMs = now() - w.lostAt;
+          w.stats.recoveries++;
+          w.lostAt = null;
+        }
+        try {
+          if (!audio.node) return;
+          const planes = [];
+          for (let c = 0; c < data.numberOfChannels; c++) {
+            const plane = new Float32Array(data.numberOfFrames);
+            data.copyTo(plane, { planeIndex: c, format: "f32-planar" });
+            planes.push(plane);
+          }
+          audio.node.port.postMessage(planes, planes.map((pl) => pl.buffer));
+        } finally {
+          data.close();
+        }
+      },
+      error: () => {
+      }
+    });
+    audio.decoder.configure({ codec: "opus", sampleRate: AUDIO_RATE, numberOfChannels: 2 });
+    return audio;
   }
   async join(w) {
     if (w.stopped || w.joining) return;
@@ -6754,14 +7165,18 @@ var MediaStreams = class _MediaStreams {
       w.upstream = channel;
       w.parent = parent;
       w.depth = attach.depth;
-      w.needKey = true;
+      for (const rx of w.rx.values()) {
+        rx.needKey = true;
+        rx.frames.clear();
+      }
       w.lastData = now();
       w.avoid.clear();
-      channel.onmessage = (event) => this.onFragment(w, channel, event.data);
+      channel.onmessage = (event) => this.onFragment(w, event.data);
       channel.onclose = () => {
         if (w.upstream === channel) this.lostParent(w, "closed");
       };
-      this.requestKey(w, true);
+      this.sendWanted(w, true);
+      if (w.info.video) this.requestKey(w, w.target, true);
       this.report(w);
     } finally {
       w.joining = false;
@@ -6788,6 +7203,7 @@ var MediaStreams = class _MediaStreams {
     const old = w.upstream;
     w.upstream = null;
     w.parent = null;
+    w.sentMask = -1;
     if (old) {
       old.onclose = null;
       try {
@@ -6797,96 +7213,157 @@ var MediaStreams = class _MediaStreams {
     }
     void this.join(w);
   }
-  onFragment(w, channel, data) {
+  onFragment(w, data) {
     if (!(data instanceof ArrayBuffer) || data.byteLength < HEADER) return;
     const arrived = performance.now();
     w.lastData = now();
     const view = new DataView(data);
-    if (view.getUint8(0) !== 80 || view.getUint8(1) !== 77) return;
-    const key = (view.getUint8(3) & 1) === 1;
-    const frameNo = view.getUint32(4);
-    const index = view.getUint16(8);
-    const count = view.getUint16(10);
-    const capturedAt = view.getFloat64(12);
-    const ts = view.getFloat64(20);
+    if (view.getUint8(0) !== 80 || view.getUint8(1) !== 77 || view.getUint8(2) !== 2) return;
+    const flags = view.getUint8(3);
+    const level = view.getUint8(4);
+    const frameNo = view.getUint32(6);
+    const index = view.getUint16(10);
+    const count = view.getUint16(12);
+    const capturedAt = view.getFloat64(14);
+    const ts = view.getFloat64(22);
+    const audio = (flags & FLAG_AUDIO) !== 0;
+    const key = (flags & FLAG_KEY) !== 0;
     if (w.children.size) {
       const frag = new Uint8Array(data);
-      for (const child of w.children.values()) sendToChild(child, [frag], key, w.stats, index === 0);
+      for (const child of w.children.values()) {
+        if (audio) sendAudio(child, [frag]);
+        else sendVideo(child, [frag], level, key, w.stats, index === 0);
+      }
       w.stats.forwardSum += performance.now() - arrived;
       w.stats.forwardCount++;
     }
-    w.stats.bytes += data.byteLength;
-    let entry = w.frames.get(frameNo);
+    if (audio) {
+      this.onAudioFragment(w, count, ts, capturedAt, new Uint8Array(data, HEADER), data.byteLength, frameNo);
+      return;
+    }
+    if (level !== w.level && level !== w.target) return;
+    const counted = level === w.level;
+    if (counted) w.stats.bytes += data.byteLength;
+    const rx = this.levelRx(w, level);
+    let entry = rx.frames.get(frameNo);
     if (!entry) {
       entry = { got: 0, count, parts: new Array(count), key, capturedAt, ts };
-      w.frames.set(frameNo, entry);
+      rx.frames.set(frameNo, entry);
     }
     if (!entry.parts[index]) {
       entry.parts[index] = new Uint8Array(data, HEADER);
       entry.got++;
     }
     if (entry.got < entry.count) {
-      for (const n of w.frames.keys()) if (n < frameNo - 3) {
-        w.frames.delete(n);
-        w.stats.dropped++;
-        if (!w.needKey) {
-          w.needKey = true;
-          this.requestKey(w);
+      for (const n of rx.frames.keys()) if (n < frameNo - 3) {
+        rx.frames.delete(n);
+        if (counted) w.stats.dropped++;
+        if (!rx.needKey) {
+          rx.needKey = true;
+          this.requestKey(w, level);
         }
       }
       return;
     }
-    w.frames.delete(frameNo);
-    for (const n of w.frames.keys()) if (n < frameNo) {
-      w.frames.delete(n);
-      w.stats.dropped++;
-      w.needKey = true;
+    rx.frames.delete(frameNo);
+    for (const n of rx.frames.keys()) if (n < frameNo) {
+      rx.frames.delete(n);
+      if (counted) w.stats.dropped++;
+      rx.needKey = true;
     }
-    if (frameNo <= w.lastFrame) return;
-    if (frameNo !== w.lastFrame + 1 && !entry.key) w.needKey = true;
-    if (w.needKey && !entry.key) {
-      this.requestKey(w);
-      w.stats.dropped++;
+    if (frameNo <= rx.lastFrame) return;
+    if (frameNo !== rx.lastFrame + 1 && !entry.key) rx.needKey = true;
+    if (rx.needKey && !entry.key) {
+      this.requestKey(w, level);
+      if (counted) w.stats.dropped++;
       return;
     }
-    w.needKey = false;
-    w.lastFrame = frameNo;
-    const size = entry.parts.reduce((n, p) => n + p.length, 0);
-    const bytes = new Uint8Array(size);
-    let at = 0;
-    for (const p of entry.parts) {
-      bytes.set(p, at);
-      at += p.length;
+    rx.needKey = false;
+    rx.lastFrame = frameNo;
+    if (level === w.target && level !== w.level) {
+      w.level = level;
+      for (const [l, other] of w.rx) if (l !== level) {
+        other.frames.clear();
+        other.needKey = true;
+      }
+      this.resetDecoder(w);
+      this.sendWanted(w);
     }
+    if (level !== w.level) return;
+    const bytes = joinParts(entry.parts);
     const Chunk = globalThis.EncodedVideoChunk;
     try {
       w.decoder.decode(new Chunk({ type: entry.key ? "key" : "delta", timestamp: ts, data: bytes }));
     } catch {
-      w.needKey = true;
+      rx.needKey = true;
       this.resetDecoder(w);
       return;
     }
     w.stats.frames++;
+    w.stats.totalFrames++;
     const offset = this.offsets.get(w.source);
     if (offset != null) {
       w.stats.delaySum += Date.now() + offset - entry.capturedAt;
       w.stats.delayCount++;
     }
-    void channel;
   }
-  requestKey(w, force = false) {
+  onAudioFragment(w, count, ts, capturedAt, part, size, frameNo) {
+    w.audioStats.bytes += size;
+    const audio = w.audio;
+    if (!audio || count !== 1 || !audio.node) return;
+    if (frameNo <= audio.lastFrame && audio.lastFrame - frameNo < 1e3) return;
+    audio.lastFrame = frameNo;
+    w.audioStats.frames++;
+    const offset = this.offsets.get(w.source);
+    if (offset != null) {
+      w.audioStats.delaySum += Date.now() + offset - capturedAt;
+      w.audioStats.delayCount++;
+    }
+    const Chunk = globalThis.EncodedAudioChunk;
+    try {
+      if (audio.decoder.state === "configured") audio.decoder.decode(new Chunk({ type: "key", timestamp: ts, data: part.slice() }));
+    } catch {
+    }
+  }
+  requestKey(w, level, force = false) {
     if (!w.upstream || w.upstream.readyState !== "open") return;
     if (!force && now() - w.lastKeyRequest < KEY_REQUEST_MIN_MS) return;
     w.lastKeyRequest = now();
     w.stats.keyRequests++;
     try {
-      w.upstream.send(new Uint8Array([KEY_REQUEST]));
+      w.upstream.send(new Uint8Array([KEY_REQUEST, level]));
     } catch {
     }
   }
   report(w) {
     if (!w.parent || w.stopped) return;
     this.host.gossip.sendDirect(w.source, { __ppType: REPORT, id: w.id, parent: w.parent, depth: w.depth, children: w.children.size, links: this.host.mesh.getConnectedPeers() });
+  }
+  /** Auto quality, once a second: down after losses, up after a clean stretch. */
+  adapt(w) {
+    if (!w.info.video || w.quality !== "auto" || !w.parent || w.target !== w.level) return;
+    const frames = w.stats.totalFrames - w.lastWindow.frames;
+    const dropped = w.stats.dropped - w.lastWindow.dropped;
+    w.lastWindow = { frames: w.stats.totalFrames, dropped: w.stats.dropped };
+    const expected = w.info.levels.find((l) => l.level === w.level)?.fps ?? w.info.fps;
+    const lossy = dropped / Math.max(1, frames + dropped) > 0.08 || expected > 0 && frames < expected * 0.5;
+    if (lossy) {
+      w.badWindows++;
+      w.goodWindows = 0;
+    } else {
+      w.goodWindows++;
+      w.badWindows = 0;
+    }
+    const down = this.stepLevel(w.info, w.level, -1);
+    const up = this.stepLevel(w.info, w.level, 1);
+    if (w.badWindows >= 2 && down != null) {
+      w.badWindows = 0;
+      w.lastDownAt = now();
+      this.switchTo(w, down);
+    } else if (w.goodWindows >= 8 && up != null && now() - w.lastDownAt > 15e3) {
+      w.goodWindows = 0;
+      this.switchTo(w, up);
+    }
   }
   // ---------------------------------------------------------------- both
   /** A child opened a side channel to this peer: feed it, if this peer has the stream. */
@@ -6903,17 +7380,30 @@ var MediaStreams = class _MediaStreams {
       }
       return;
     }
-    const child = { peerId, channel, waitingForKey: true };
+    const child = { peerId, channel, mask: 0, waiting: /* @__PURE__ */ new Set() };
     const drop = () => {
-      if (children.get(peerId)?.channel === channel) children.delete(peerId);
+      if (children.get(peerId)?.channel === channel) {
+        children.delete(peerId);
+        if (w) this.sendWanted(w);
+      }
     };
     channel.onclose = drop;
     channel.onerror = drop;
     channel.onmessage = (event) => {
       const data = event.data;
-      if (data instanceof ArrayBuffer && data.byteLength === 1 && new Uint8Array(data)[0] === KEY_REQUEST) {
-        child.waitingForKey = true;
-        this.upstreamKey(id);
+      if (!(data instanceof ArrayBuffer) || data.byteLength !== 2) return;
+      const [type, value] = new Uint8Array(data);
+      if (type === KEY_REQUEST) {
+        child.waiting.add(value);
+        this.upstreamKey(id, value);
+      } else if (type === LEVELS_WANTED) {
+        const added = value & ~child.mask;
+        child.mask = value;
+        for (let l = 0; l < 3; l++) if (added & 1 << l) {
+          child.waiting.add(l);
+          this.upstreamKey(id, l);
+        }
+        if (w) this.sendWanted(w);
       }
     };
     const old = children.get(peerId);
@@ -6925,23 +7415,24 @@ var MediaStreams = class _MediaStreams {
       }
     }
     children.set(peerId, child);
-    this.upstreamKey(id);
   }
-  /** A key frame for a child: the source makes one, a viewer asks its own parent. */
-  upstreamKey(id) {
+  /** A key frame of a level for a child: the source makes one, a viewer asks its own parent. */
+  upstreamKey(id, level) {
     const p = this.published.get(id);
     if (p) {
       p.stats.keyRequests++;
-      const wait = KEY_REQUEST_MIN_MS - (now() - p.lastKeyAt);
-      if (wait <= 0) p.forceKey = true;
-      else if (!p.keyTimer) p.keyTimer = setTimeout(() => {
-        p.keyTimer = null;
-        p.forceKey = true;
+      const l = p.levels.find((x) => x.level === level);
+      if (!l) return;
+      const wait = KEY_REQUEST_MIN_MS - (now() - l.lastKeyAt);
+      if (wait <= 0) l.forceKey = true;
+      else if (!l.keyTimer) l.keyTimer = setTimeout(() => {
+        l.keyTimer = null;
+        l.forceKey = true;
       }, wait);
       return;
     }
     const w = this.watching.get(id);
-    if (w) this.requestKey(w);
+    if (w) this.requestKey(w, level);
   }
   onPeerGone(peerId) {
     for (const p of this.published.values()) {
@@ -6949,7 +7440,7 @@ var MediaStreams = class _MediaStreams {
       p.members.delete(peerId);
     }
     for (const w of this.watching.values()) {
-      w.children.delete(peerId);
+      if (w.children.delete(peerId)) this.sendWanted(w);
       if (w.parent === peerId) this.lostParent(w, "disconnected");
     }
   }
@@ -6960,7 +7451,21 @@ var MediaStreams = class _MediaStreams {
       case ANNOUNCE: {
         if (typeof data.id !== "string") return;
         const known = this.streams.has(data.id);
-        this.streams.set(data.id, { id: data.id, source: from, name: String(data.name ?? "Camera").slice(0, 80), width: Number(data.width) || 0, height: Number(data.height) || 0, fps: Number(data.fps) || 0, live: true, seen: t });
+        const levels = Array.isArray(data.levels) ? data.levels.slice(0, 3).map((l) => ({ level: Math.max(0, Math.min(2, Number(l?.level) || 0)), width: Number(l?.width) || 0, height: Number(l?.height) || 0, fps: Number(l?.fps) || 0, kbps: Number(l?.kbps) || 0 })) : [];
+        const top = levels[levels.length - 1];
+        this.streams.set(data.id, {
+          id: data.id,
+          source: from,
+          name: String(data.name ?? "Camera").slice(0, 80),
+          video: data.video !== false && levels.length > 0,
+          audio: data.audio === true,
+          levels,
+          width: top?.width ?? 0,
+          height: top?.height ?? 0,
+          fps: top?.fps ?? 0,
+          live: true,
+          seen: t
+        });
         if (!known) this.emit("streams", this.list());
         return;
       }
@@ -7017,8 +7522,15 @@ var MediaStreams = class _MediaStreams {
   }
   tick() {
     const t = now();
-    for (const p of this.published.values()) p.stats.roll(t);
-    for (const w of this.watching.values()) w.stats.roll(t);
+    for (const p of this.published.values()) {
+      p.stats.roll(t);
+      p.audioStats.roll(t);
+    }
+    for (const w of this.watching.values()) {
+      w.stats.roll(t);
+      w.audioStats.roll(t);
+      this.adapt(w);
+    }
     let changed = false;
     for (const [id, s] of this.streams) {
       if (this.published.has(id)) {
@@ -7049,7 +7561,30 @@ var MediaStreams = class _MediaStreams {
     }
   }
 };
-function makeFragments(frameNo, key, capturedAt, ts, bytes) {
+function isTrack(value) {
+  return typeof MediaStreamTrack !== "undefined" && value instanceof MediaStreamTrack;
+}
+function announced(info) {
+  return { id: info.id, name: info.name, video: info.video, audio: info.audio, levels: info.levels };
+}
+function levelsIn(mask) {
+  return LEVEL_NAMES.filter((_, i) => mask & 1 << i);
+}
+function highestLevel(mask) {
+  for (let l = 2; l >= 0; l--) if (mask & 1 << l) return l;
+  return -1;
+}
+function joinParts(parts) {
+  const size = parts.reduce((n, p) => n + p.length, 0);
+  const bytes = new Uint8Array(size);
+  let at = 0;
+  for (const p of parts) {
+    bytes.set(p, at);
+    at += p.length;
+  }
+  return bytes;
+}
+function makeFragments(flags, level, frameNo, capturedAt, ts, bytes) {
   const count = Math.max(1, Math.ceil(bytes.length / FRAGMENT));
   const out = [];
   for (let i = 0; i < count; i++) {
@@ -7058,30 +7593,44 @@ function makeFragments(frameNo, key, capturedAt, ts, bytes) {
     const view = new DataView(frag.buffer);
     view.setUint8(0, 80);
     view.setUint8(1, 77);
-    view.setUint8(2, 1);
-    view.setUint8(3, key ? 1 : 0);
-    view.setUint32(4, frameNo >>> 0);
-    view.setUint16(8, i);
-    view.setUint16(10, count);
-    view.setFloat64(12, capturedAt);
-    view.setFloat64(20, ts);
+    view.setUint8(2, 2);
+    view.setUint8(3, flags);
+    view.setUint8(4, level);
+    view.setUint8(5, 0);
+    view.setUint32(6, frameNo >>> 0);
+    view.setUint16(10, i);
+    view.setUint16(12, count);
+    view.setFloat64(14, capturedAt);
+    view.setFloat64(22, ts);
     frag.set(slice, HEADER);
     out.push(frag);
   }
   return out;
 }
-function sendToChild(child, fragments, key, stats, frameStart = true) {
+function sendVideo(child, fragments, level, key, stats, frameStart) {
+  if (!(child.mask & 1 << level)) return;
   const ch = child.channel;
   if (ch.readyState !== "open") return;
   if (frameStart) {
     if (ch.bufferedAmount > CHILD_BACKLOG_BYTES) {
-      child.waitingForKey = true;
+      child.waiting.add(level);
       stats.dropped++;
       return;
     }
-    if (child.waitingForKey && !key) return;
-    if (key) child.waitingForKey = false;
-  } else if (child.waitingForKey) return;
+    if (child.waiting.has(level) && !key) return;
+    if (key) child.waiting.delete(level);
+  } else if (child.waiting.has(level)) return;
+  for (const f of fragments) {
+    try {
+      ch.send(f);
+    } catch {
+      return;
+    }
+  }
+}
+function sendAudio(child, fragments) {
+  const ch = child.channel;
+  if (ch.readyState !== "open" || ch.bufferedAmount > CHILD_BACKLOG_BYTES * 2) return;
   for (const f of fragments) {
     try {
       ch.send(f);
@@ -9879,7 +10428,7 @@ var PartialMesh = class {
       this.renewalForwardTimer = null;
     }
     this.renewalForwardIds.clear();
-    const announced = this.announceLeave();
+    const announced2 = this.announceLeave();
     const closingClient = this.signalingClient;
     const closingPeerIds = Array.from(this.peers.keys());
     const closeLinks = () => {
@@ -9919,7 +10468,7 @@ var PartialMesh = class {
     this.dialFailureCount.clear();
     this.dialBackoffUntilMs.clear();
     this.signalingClient = null;
-    if (announced) {
+    if (announced2) {
       const timer = setTimeout(closeLinks, LEAVE_FLUSH_MS);
       timer.unref?.();
     } else {
@@ -9928,7 +10477,7 @@ var PartialMesh = class {
     for (const handlers of this.eventHandlers.values()) {
       handlers.clear();
     }
-    return announced ? LEAVE_FLUSH_MS : 0;
+    return announced2 ? LEAVE_FLUSH_MS : 0;
   }
 };
 var RELAY_SCORES_PAYLOAD_TYPE = "pp-relay-scores";

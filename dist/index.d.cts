@@ -1511,19 +1511,41 @@ declare class PeerPigeonCryptoProtocol {
 /** Deterministic SHA-1 hex for compact, non-routing public display IDs. */
 declare function sha1Hex(value: unknown): string;
 
+type MediaQuality = 'auto' | 'high' | 'medium' | 'low';
 interface MediaPublishOptions {
     name?: string;
+    /** The high level's size; medium is half, low a quarter. */
     width?: number;
     height?: number;
     fps?: number;
+    /** The high level's bitrate, bits a second. */
     bitrate?: number;
     /** Viewers fed by the source itself; more are fed by viewers. */
     maxChildren?: number;
+    /** Encode medium and low as well (on by default). */
+    levels?: boolean;
+}
+/** What to send: a camera track, or a playing <video>; a microphone track, or a playing <audio>/<video>. */
+interface MediaPublishInput {
+    video?: MediaStreamTrack | HTMLVideoElement;
+    audio?: MediaStreamTrack | HTMLMediaElement;
+}
+/** A video level: 0 low, 1 medium, 2 high. */
+interface MediaLevel {
+    level: number;
+    width: number;
+    height: number;
+    fps: number;
+    kbps: number;
 }
 interface MediaStreamInfo {
     id: string;
     source: string;
     name: string;
+    video: boolean;
+    audio: boolean;
+    /** The video's levels, low to high. */
+    levels: MediaLevel[];
     width: number;
     height: number;
     fps: number;
@@ -1539,6 +1561,12 @@ interface MediaStats {
     depth: number;
     fps: number;
     kbps: number;
+    /** The level shown here (viewer), or the levels being encoded (source). */
+    level: string | null;
+    levels: string[];
+    quality: MediaQuality | null;
+    audio: boolean;
+    audioKbps: number;
     /** Capture to arrival, through every hop, clock-corrected (approximate). */
     delayMs: number | null;
     /** Average time a frame spends in this peer before it goes on to the children. */
@@ -1577,9 +1605,12 @@ declare class MediaStreams {
     private readonly offsetSamples;
     private readonly listeners;
     private readonly timers;
+    private readonly pendingAttach;
     constructor(host: MediaHost);
-    /** Whether this browser can send or receive (WebCodecs). */
+    /** Whether this browser can send or receive video (WebCodecs). */
     static supported(): boolean;
+    /** Whether this browser can send or receive audio (WebCodecs' AudioEncoder and AudioDecoder, and AudioWorklet). */
+    static audioSupported(): boolean;
     on(event: 'streams' | 'stats', handler: Listener): void;
     off(event: 'streams' | 'stats', handler: Listener): void;
     /** The streams announced in the room (this peer's own too). */
@@ -1591,26 +1622,55 @@ declare class MediaStreams {
         parent: string;
         depth: number;
     }[];
-    publish(track: MediaStreamTrack, options?: MediaPublishOptions): Promise<string>;
+    /**
+     * Send video, audio or both: a camera or microphone track, or a <video>/<audio> playing a file (the
+     * stream follows it: pause, seek). A track given alone is taken as video or audio by its kind.
+     */
+    publish(input: MediaStreamTrack | MediaPublishInput, options?: MediaPublishOptions): Promise<string>;
     unpublish(id: string): void;
-    private sendChunk;
+    /** The levels the source's children need, and so the ones it encodes. */
+    private wantedLevels;
+    private encodeTick;
+    private openEncoder;
+    private startAudioSend;
     /** The source picks a parent for a joining viewer. */
     private pickParent;
-    /** Watch a stream: decoded frames go to onFrame (draw them, then frame.close()). */
-    watch(id: string, onFrame: (frame: any) => void): void;
+    /**
+     * Watch a stream. Video frames go to onFrame (draw them, then frame.close()); audio plays here. Call
+     * it from a click or a key press: browsers start sound only then.
+     */
+    watch(id: string, onFrame: ((frame: any) => void) | null, options?: {
+        quality?: MediaQuality;
+        muted?: boolean;
+    }): void;
     unwatch(id: string): void;
+    /** Auto, or one level: high, medium or low (the nearest the stream has). */
+    setQuality(id: string, quality: MediaQuality): void;
+    setMuted(id: string, muted: boolean): void;
+    /** The level nearest a quality that the stream has: the highest at or below it, else its lowest. */
+    private levelFor;
+    /** The stream's next level down or up from this one, or null at the end. */
+    private stepLevel;
+    /** The levels this peer needs from its parent: the one it shows, one it is switching to, its children's. */
+    private neededMask;
+    private sendWanted;
+    private switchTo;
+    private levelRx;
     private resetDecoder;
+    private startAudioReceive;
     private join;
     /** Ask the source where to attach; null when it does not answer. */
     private ask;
-    private readonly pendingAttach;
     private lostParent;
     private onFragment;
+    private onAudioFragment;
     private requestKey;
     private report;
+    /** Auto quality, once a second: down after losses, up after a clean stretch. */
+    private adapt;
     /** A child opened a side channel to this peer: feed it, if this peer has the stream. */
     private onSideChannel;
-    /** A key frame for a child: the source makes one, a viewer asks its own parent. */
+    /** A key frame of a level for a child: the source makes one, a viewer asks its own parent. */
     private upstreamKey;
     private onPeerGone;
     private onControl;

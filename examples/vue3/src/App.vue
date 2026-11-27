@@ -331,28 +331,39 @@
           <!-- Media -->
           <div v-else-if="activeTab === 'media'" class="panel panel-media" role="tabpanel" aria-label="Media">
             <p class="note">
-              Video between peers, with viewers passing it on to other viewers: each peer forwards the
-              encoded frames as they came, and the source sends its camera only a few times however many watch.
-              No relay carries any of it.
+              Video and sound between peers, with viewers passing it on to other viewers: each peer forwards the
+              encoded frames as they came, and the source sends only a few times however many watch. No relay
+              carries any of it.
             </p>
             <p v-if="!mediaSupported" class="error">This browser can’t encode or decode video here (no WebCodecs).</p>
             <p v-else-if="!isRunning" class="empty">Join the room to share or watch.</p>
             <template v-else>
-              <div class="media-actions">
-                <button v-if="!mediaPublished" type="button" class="btn btn-go" data-testid="media-share" :disabled="mediaBusy" @click="startMediaShare">Share your camera</button>
-                <button v-else type="button" class="btn btn-stop" data-testid="media-stop" @click="stopMediaShare">Stop sharing</button>
-                <span v-if="mediaError" class="error">{{ mediaError }}</span>
+              <div v-if="!mediaPublished" class="media-share">
+                <div class="media-actions">
+                  <label class="check"><input v-model="mediaUseCamera" type="checkbox" data-testid="media-use-camera" /><span>Camera</span></label>
+                  <label class="check"><input v-model="mediaUseMic" type="checkbox" :disabled="!mediaAudioSupported" data-testid="media-use-mic" /><span>Microphone</span></label>
+                  <button type="button" class="btn btn-go" data-testid="media-share" :disabled="mediaBusy || (!mediaUseCamera && !mediaUseMic)" @click="startMediaShare">Share</button>
+                </div>
+                <div class="media-actions">
+                  <button type="button" class="btn" data-testid="media-share-file" :disabled="mediaBusy" @click="$refs.mediaFile.click()">Share a file (mp4, mp3)</button>
+                  <input ref="mediaFile" type="file" class="visually-hidden" accept="video/mp4,video/webm,audio/mpeg,audio/mp4,audio/ogg,audio/wav,.mp4,.m4v,.webm,.mp3,.m4a,.ogg,.wav" data-testid="media-file" @change="startMediaFile" />
+                </div>
               </div>
+              <div v-else class="media-actions">
+                <button type="button" class="btn btn-stop" data-testid="media-stop" @click="stopMediaShare">Stop sharing</button>
+              </div>
+              <p v-if="mediaError" class="error">{{ mediaError }}</p>
 
               <div v-if="mediaPublished" class="media-card own">
-                <video ref="mediaPreview" class="media-video" muted playsinline autoplay></video>
+                <video v-if="mediaPublished.kind !== 'audio'" ref="mediaPreview" class="media-video" playsinline autoplay :muted="mediaPublished.kind === 'camera'" :controls="mediaPublished.kind === 'file'"></video>
+                <audio v-else ref="mediaPreview" class="media-audio" controls></audio>
                 <div class="media-stats">
-                  <span class="media-title">You are sharing</span>
+                  <span class="media-title">You are sharing {{ mediaPublished.label }}</span>
                   <span>{{ mediaStatFor(mediaPublished.id)?.children.length ?? 0 }} fed by you</span>
                   <span>{{ mediaTreeSize(mediaPublished.id) }} watching</span>
-                  <span>{{ mediaStatFor(mediaPublished.id)?.fps ?? 0 }} fps</span>
-                  <span>{{ mediaStatFor(mediaPublished.id)?.kbps ?? 0 }} kbps out, each</span>
-                  <span>{{ mediaStatFor(mediaPublished.id)?.keyRequests ?? 0 }} key frames asked for</span>
+                  <span v-if="mediaStatFor(mediaPublished.id)?.levels.length">sending {{ mediaStatFor(mediaPublished.id).levels.join(', ') }}</span>
+                  <span v-if="mediaPublished.hasVideo">{{ mediaStatFor(mediaPublished.id)?.fps ?? 0 }} fps</span>
+                  <span>{{ (mediaStatFor(mediaPublished.id)?.kbps ?? 0) + (mediaStatFor(mediaPublished.id)?.audioKbps ?? 0) }} kbps out, each</span>
                 </div>
               </div>
 
@@ -361,19 +372,32 @@
                 <div class="media-head">
                   <span class="media-title">{{ s.name }}</span>
                   <span class="msg-who" :title="s.source">from {{ s.source.slice(0, 8) }}…</span>
+                  <span class="media-kind">{{ s.video && s.audio ? 'video and sound' : s.video ? 'video' : 'sound' }}</span>
                   <button v-if="!mediaWatching[s.id]" type="button" class="btn" data-testid="media-watch" @click="watchMedia(s.id)">Watch</button>
-                  <button v-else type="button" class="btn" data-testid="media-unwatch" @click="unwatchMedia(s.id)">Stop watching</button>
+                  <button v-else type="button" class="btn" data-testid="media-unwatch" @click="unwatchMedia(s.id)">Stop</button>
                 </div>
                 <template v-if="mediaWatching[s.id]">
-                  <canvas :ref="(el) => setMediaCanvas(s.id, el)" class="media-video"></canvas>
+                  <canvas v-if="s.video" :ref="(el) => setMediaCanvas(s.id, el)" class="media-video"></canvas>
+                  <div v-else class="media-sound">Sound only</div>
+                  <div class="media-controls">
+                    <label v-if="s.video && s.levels.length > 1" class="field-inline">
+                      <span>Quality</span>
+                      <select class="input" :value="mediaQuality[s.id] || 'auto'" data-testid="media-quality" @change="setMediaQuality(s.id, $event.target.value)">
+                        <option value="auto">Auto</option>
+                        <option v-for="l in [...s.levels].reverse()" :key="l.level" :value="levelName(l.level)">{{ levelLabel(l) }}</option>
+                      </select>
+                    </label>
+                    <button v-if="s.audio" type="button" class="btn" data-testid="media-mute" @click="toggleMediaMute(s.id)">{{ mediaMuted[s.id] ? 'Unmute' : 'Mute' }}</button>
+                  </div>
                   <div v-if="mediaStatFor(s.id)" class="media-stats" data-testid="media-stats">
                     <span>{{ mediaStatFor(s.id).depth ? `${mediaStatFor(s.id).depth} hop${mediaStatFor(s.id).depth === 1 ? '' : 's'} from the source` : 'Finding a peer to feed you…' }}</span>
                     <span v-if="mediaStatFor(s.id).parent">via {{ mediaStatFor(s.id).parent === s.source ? 'the source' : mediaStatFor(s.id).parent.slice(0, 8) + '…' }}</span>
-                    <span>{{ mediaStatFor(s.id).fps }} fps</span>
-                    <span>{{ mediaStatFor(s.id).kbps }} kbps</span>
-                    <span>{{ mediaStatFor(s.id).delayMs != null ? `${mediaStatFor(s.id).delayMs} ms behind the camera` : 'delay: measuring…' }}</span>
+                    <span v-if="mediaStatFor(s.id).level">{{ mediaStatFor(s.id).level }}{{ mediaStatFor(s.id).quality === 'auto' ? ' (auto)' : '' }}</span>
+                    <span v-if="s.video">{{ mediaStatFor(s.id).fps }} fps</span>
+                    <span>{{ mediaStatFor(s.id).kbps + mediaStatFor(s.id).audioKbps }} kbps</span>
+                    <span>{{ mediaStatFor(s.id).delayMs != null ? `${mediaStatFor(s.id).delayMs} ms behind the source` : 'delay: measuring…' }}</span>
                     <span v-if="mediaStatFor(s.id).children.length">forwarding to {{ mediaStatFor(s.id).children.length }} ({{ mediaStatFor(s.id).forwardMs ?? 0 }} ms each frame)</span>
-                    <span>{{ mediaStatFor(s.id).framesDropped }} frames dropped</span>
+                    <span v-if="s.video">{{ mediaStatFor(s.id).framesDropped }} frames dropped</span>
                     <span v-if="mediaStatFor(s.id).recoveries">back {{ mediaStatFor(s.id).lastRecoveryMs }} ms after losing its feed ({{ mediaStatFor(s.id).recoveries }}×)</span>
                   </div>
                 </template>
@@ -798,6 +822,11 @@ export default {
       directMode: false,
       activeTab: 'message',
       mediaSupported: MediaStreams.supported(),
+      mediaAudioSupported: MediaStreams.audioSupported(),
+      mediaUseCamera: true,
+      mediaUseMic: MediaStreams.audioSupported(),
+      mediaQuality: {},
+      mediaMuted: {},
       mediaStreams: [],
       mediaStats: [],
       mediaTrees: {},
@@ -2737,7 +2766,7 @@ export default {
     },
 
     stopMedia() {
-      if (this.mediaPublished?.track) { try { this.mediaPublished.track.stop(); } catch { /* stopped */ } }
+      if (this.mediaPublished) this.stopMediaShare();
       try { this.media?.destroy(); } catch { /* gone */ }
       this.media = null;
       this.mediaPublished = null;
@@ -2751,25 +2780,83 @@ export default {
       if (!this.media) return;
       this.mediaBusy = true;
       this.mediaError = '';
+      let stream = null;
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }, audio: false });
-        const track = stream.getVideoTracks()[0];
-        const id = await this.media.publish(track, { name: 'Camera' });
-        this.mediaPublished = markRaw({ id, track, stream });
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: this.mediaUseCamera ? { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } : false,
+          audio: this.mediaUseMic ? { echoCancellation: true, noiseSuppression: true } : false,
+        });
+        const video = stream.getVideoTracks()[0];
+        const audio = stream.getAudioTracks()[0];
+        const label = video && audio ? 'your camera and microphone' : video ? 'your camera' : 'your microphone';
+        const id = await this.media.publish({ video, audio }, { name: video ? 'Camera' : 'Microphone' });
+        this.mediaPublished = markRaw({ id, stream, kind: video ? 'camera' : 'audio', label, hasVideo: !!video });
         await this.$nextTick();
-        if (this.$refs.mediaPreview) this.$refs.mediaPreview.srcObject = stream;
+        if (this.$refs.mediaPreview && video) this.$refs.mediaPreview.srcObject = new MediaStream([video]);
       } catch (error) {
-        this.mediaError = error?.name === 'NotAllowedError' ? 'The camera was not allowed.' : String(error?.message || error);
+        stream?.getTracks().forEach((t) => t.stop());
+        this.mediaError = error?.name === 'NotAllowedError' ? 'The camera or microphone was not allowed.' : String(error?.message || error);
+      } finally {
+        this.mediaBusy = false;
+      }
+    },
+
+    async startMediaFile(event) {
+      const file = event.target.files?.[0];
+      event.target.value = '';
+      if (!file || !this.media) return;
+      this.mediaBusy = true;
+      this.mediaError = '';
+      const isVideo = file.type.startsWith('video/') || /\.(mp4|m4v|webm)$/i.test(file.name);
+      const url = URL.createObjectURL(file);
+      let element = null;
+      try {
+        this.mediaPublished = markRaw({ id: '', kind: isVideo ? 'file' : 'audio', label: file.name, hasVideo: isVideo, url });
+        await this.$nextTick();
+        element = this.$refs.mediaPreview;
+        element.src = url;
+        element.loop = true;
+        await element.play();
+        const id = await this.media.publish(isVideo ? { video: element, audio: element } : { audio: element }, { name: file.name.replace(/\.[^.]+$/, '').slice(0, 60) || 'A file' });
+        this.mediaPublished = markRaw({ ...this.mediaPublished, id });
+      } catch (error) {
+        if (element) { element.pause(); element.removeAttribute('src'); }
+        URL.revokeObjectURL(url);
+        this.mediaPublished = null;
+        this.mediaError = /decode|supported|format/i.test(String(error?.message || error)) ? 'This browser can’t play that file.' : String(error?.message || error);
       } finally {
         this.mediaBusy = false;
       }
     },
 
     stopMediaShare() {
-      if (!this.mediaPublished) return;
-      this.media?.unpublish(this.mediaPublished.id);
-      try { this.mediaPublished.track.stop(); } catch { /* stopped */ }
+      const shared = this.mediaPublished;
+      if (!shared) return;
+      if (shared.id) this.media?.unpublish(shared.id);
+      shared.stream?.getTracks().forEach((t) => t.stop());
+      const el = this.$refs.mediaPreview;
+      if (el) { el.pause?.(); el.srcObject = null; el.removeAttribute('src'); }
+      if (shared.url) URL.revokeObjectURL(shared.url);
       this.mediaPublished = null;
+    },
+
+    setMediaQuality(id, quality) {
+      this.mediaQuality = { ...this.mediaQuality, [id]: quality };
+      this.media?.setQuality(id, quality);
+    },
+
+    toggleMediaMute(id) {
+      const muted = !this.mediaMuted[id];
+      this.mediaMuted = { ...this.mediaMuted, [id]: muted };
+      this.media?.setMuted(id, muted);
+    },
+
+    levelName(level) {
+      return ['low', 'medium', 'high'][level] || 'high';
+    },
+
+    levelLabel(l) {
+      return `${['Low', 'Medium', 'High'][l.level] || 'High'} (${l.height}p)`;
     },
 
     watchMedia(id) {
@@ -2784,7 +2871,7 @@ export default {
             canvas.getContext('2d')?.drawImage(frame, 0, 0);
           }
           frame.close();
-        });
+        }, { quality: this.mediaQuality[id] || 'auto', muted: !!this.mediaMuted[id] });
       } catch (error) {
         this.mediaError = String(error?.message || error);
         this.unwatchMedia(id);
@@ -5527,6 +5614,59 @@ select.input {
   object-fit: contain;
   background: var(--night);
   border-radius: var(--radius);
+}
+
+.media-share {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.media-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.field-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+}
+
+.field-inline .input {
+  width: auto;
+}
+
+.media-kind {
+  font-size: 0.8rem;
+  color: var(--ink-2);
+}
+
+.media-audio {
+  width: 100%;
+}
+
+.media-sound {
+  display: grid;
+  place-items: center;
+  height: 64px;
+  border-radius: var(--radius);
+  background: var(--sheen-wash);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .media-stats {
