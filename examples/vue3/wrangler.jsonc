@@ -1,5 +1,7 @@
 // The PeerPigeon demo on Cloudflare: a static site, served at pigeon.peer.ooo.
 // Deploy with `npm run deploy` (builds, then uploads dist/).
+// The dev branch's demo goes to pigeon-dev.peer.ooo, a Worker of its own: `npm run deploy:dev`.
+// It is a custom domain, so the first deploy makes its DNS record.
 {
   "name": "peerpigeon-demo",
   "compatibility_date": "2026-10-01",
@@ -9,5 +11,17 @@
   },
   "routes": [
     { "pattern": "pigeon.peer.ooo/*", "zone_name": "peer.ooo" }
-  ]
+  ],
+  "env": {
+    "dev": {
+      "name": "peerpigeon-demo-dev",
+      "assets": {
+        "directory": "./dist",
+        "not_found_handling": "single-page-application"
+      },
+      "routes": [
+        { "pattern": "pigeon-dev.peer.ooo", "custom_domain": true }
+      ]
+    }
+  }
 }
