@@ -521,6 +521,12 @@
       </section>
     </main>
 
+    <footer class="foot">
+      <span>PeerPigeon demo</span>
+      <span class="build" :title="build" data-testid="build">{{ build.split(' ')[0] }}</span>
+      <a href="https://peerpigeon.io">Built on PeerPigeon</a>
+    </footer>
+
     <div
       v-if="customTopologyModalOpen"
       class="modal-backdrop"
@@ -721,6 +727,8 @@ export default {
   },
   data() {
     return {
+      // The build this page is (vite.config.js): shown in the footer.
+      build: __BUILD__,
       // True for a moment after the last link drops; see gossipBadgeSnapshot.
       noLinksHeld: false,
       // Dark unless this browser chose light (Light / Dark in the top bar).
@@ -5578,6 +5586,25 @@ select.input {
 }
 
 /* diagnostics */
+.foot {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  justify-content: center;
+  padding: 1rem;
+  font-size: 0.8rem;
+  color: var(--ink-2);
+  border-top: 1px solid var(--line);
+}
+
+.foot a {
+  color: inherit;
+}
+
+.foot .build {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 .diagnostics {
   grid-area: diag;
   border-top: 1px solid var(--line);
