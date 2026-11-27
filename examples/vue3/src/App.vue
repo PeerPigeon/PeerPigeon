@@ -898,7 +898,7 @@ export default {
       messagesSeen: 0,
       maxPeers: 5,
       minPeers: 2,
-      logoNodes: false,
+      logoNodes: true,
       tolerantPeers: 1,
       topology: DEFAULT_TOPOLOGY,
       customTopologyModalOpen: false,
@@ -4876,7 +4876,9 @@ export default {
           diagnosticsOn: this.diagnosticLoggingEnabled === true,
           storageActiveSpace: this.storageActiveSpace || 'user',
           storageLookupOwnerId: String(this.storageLookupOwnerId || '').trim(),
-          logoNodes: this.logoNodes === true,
+          // Saved as peersAsPigeons: an older logoNodes (saved off for everyone before pigeons were the
+          // default) is ignored, so only someone who turns pigeons off keeps them off.
+          peersAsPigeons: this.logoNodes === true,
         });
 
         localStorage.setItem(this.uiStateKey, serialized);
@@ -4909,8 +4911,8 @@ export default {
         if (typeof parsed.showPrivateCrypto === 'boolean') {
           this.showPrivateCrypto = parsed.showPrivateCrypto;
         }
-        if (typeof parsed.logoNodes === 'boolean') {
-          this.logoNodes = parsed.logoNodes;
+        if (typeof parsed.peersAsPigeons === 'boolean') {
+          this.logoNodes = parsed.peersAsPigeons;
         }
         this.diagnosticSyslogLevel = normalizeSyslogLevel(
           parsed.diagnosticSyslogLevel,
