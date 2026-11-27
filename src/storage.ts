@@ -37,6 +37,11 @@ export interface StoragePutOptions {
    * hundreds of megabytes that no peer had asked for.
    */
   silent?: boolean;
+  /**
+   * Wait for the room's storage servers to take it (resolves once they have, or found none): for a page
+   * that closes the room right after writing, which would otherwise drop the write on its way to them.
+   */
+  waitForServers?: boolean;
 }
 
 export interface StorageSyncOptions {
@@ -557,7 +562,10 @@ export class PeerPigeonStorage {
     if (space !== 'private' && !options.silent) {
       await this.broadcastMutation(mutation);
     }
-    if (space !== 'private') void this.pushToServers(mutation);
+    if (space !== 'private') {
+      if (options.waitForServers) { if (await this.serversLinked()) await this.pushToServers(mutation); }
+      else void this.pushToServers(mutation);
+    }
     return (await this.get(space, key)) as StorageRecord<T>;
   }
 
