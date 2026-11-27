@@ -25,7 +25,7 @@ Relays only introduce peers. After that, everything goes straight between them.
 | | |
 | --- | --- |
 | **A partial mesh** | Each peer keeps between `minPeers` and `maxPeers` links, chosen and repaired as peers come and go |
-| **Messages** | `broadcast` reaches the whole room by gossip; `sendDirect` reaches one peer, routed hop by hop |
+| **Messages** | `broadcast` reaches the whole room by gossip; `sendDirect` reaches one peer, routed hop by hop. Messages are not kept: a peer that joins later gets none sent before it arrived |
 | **Encryption** | A room cipher and per-peer keys: `broadcastEncrypted` and `sendEncryptedDirect` |
 | **Signed storage** | Records signed by their writers, synced to the room, and kept on storage servers while nobody is online |
 | **Relay choice** | Joins the room's closest healthy relays, local ones first |
@@ -60,7 +60,8 @@ node.broadcast({ text: 'hello, everyone' })        // the whole room
 node.sendDirect(peerId, { text: 'just you' })      // one peer, across the mesh
 ```
 
-Peers meet only when `networkId` and `sessionId` both match.
+Peers meet only when `networkId` and `sessionId` both match. A message reaches the peers in the room when it is
+sent; there is no message history. Anything a later peer needs goes in [storage](#storage).
 
 To try it with many peers, run a relay on your own machine that keeps to itself:
 
@@ -102,7 +103,7 @@ const record = await node.storage.get('public', 'notes/1')
 node.storage.subscribe((change) => console.log(change.op, change.key))
 ```
 
-Every change is signed with the node's keys and synced to the room. A peer that joins later is sent what it
+Every change is signed with the node's keys and synced to the room. A peer that joins later is sent the records it
 missed. When the room's [storage servers](https://docs.peerpigeon.io/blocks/pigeonfs) are up, records go to them
 too, so they are there when no peer is online. The servers hold hashes and ciphertext only.
 [Spaces, and who may write what](https://docs.peerpigeon.io/guide/storage).
