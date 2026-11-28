@@ -212,7 +212,9 @@
           </div>
         </div>
 
-        <aside class="side">
+        <!-- Only Messages scrolls inside a fixed height (its thread); every other tab's side column grows with
+             what it shows, so nothing in it is cut off. -->
+        <aside class="side" :class="{ 'side-grow': activeTab !== 'message' }">
           <dl class="facts">
             <div class="fact fact-you">
               <dt>You</dt>
@@ -326,6 +328,123 @@
                 <button type="button" class="link-btn" @click="clearLog">Clear</button>
               </div>
             </div>
+          </div>
+
+          <!-- Media -->
+          <div v-else-if="activeTab === 'media'" class="panel panel-media" role="tabpanel" aria-label="Media">
+            <p class="note">
+              Video and sound between peers, with viewers passing it on to other viewers: each peer forwards the
+              encoded frames as they came, and the source sends only a few times however many watch. No relay
+              carries any of it.
+            </p>
+            <p v-if="!mediaSupported" class="error">This browser can’t encode or decode video here (no WebCodecs).</p>
+            <p v-else-if="!isRunning" class="empty">Join the room to share or watch.</p>
+            <template v-else>
+              <div v-if="!mediaPublished" class="media-share">
+                <div class="media-actions">
+                  <label class="check"><input v-model="mediaUseCamera" type="checkbox" data-testid="media-use-camera" /><span>Camera</span></label>
+                  <label class="check"><input v-model="mediaUseMic" type="checkbox" :disabled="!mediaAudioSupported" data-testid="media-use-mic" /><span>Microphone</span></label>
+                  <button type="button" class="btn btn-go" data-testid="media-share" :disabled="mediaBusy || (!mediaUseCamera && !mediaUseMic)" @click="startMediaShare">Share</button>
+                </div>
+                <div class="media-actions">
+                  <button type="button" class="btn" data-testid="media-share-file" :disabled="mediaBusy" @click="$refs.mediaFile.click()">Share a file (mp4, mp3)</button>
+                  <input ref="mediaFile" type="file" class="visually-hidden" accept="video/mp4,video/webm,audio/mpeg,audio/mp4,audio/ogg,audio/wav,.mp4,.m4v,.webm,.mp3,.m4a,.ogg,.wav" data-testid="media-file" @change="startMediaFile" />
+                </div>
+              </div>
+              <div v-else class="media-actions">
+                <button type="button" class="btn btn-stop" data-testid="media-stop" @click="stopMediaShare">Stop sharing</button>
+              </div>
+              <p v-if="mediaError" class="error">{{ mediaError }}</p>
+
+              <div v-if="mediaPublished" class="media-card own">
+                <video v-if="mediaPublished.kind !== 'audio'" ref="mediaPreview" class="media-video" playsinline autoplay :muted="mediaPublished.kind === 'camera'" :controls="mediaPublished.kind === 'file'"></video>
+                <audio v-else ref="mediaPreview" class="media-audio" controls></audio>
+                <div class="media-stats">
+                  <span class="media-title">You are sharing {{ mediaPublished.label }}</span>
+                  <span>{{ mediaStatFor(mediaPublished.id)?.children.length ?? 0 }} fed by you</span>
+                  <span>{{ mediaTreeSize(mediaPublished.id) }} {{ mediaPublished.hasVideo ? 'watching' : 'listening' }}</span>
+                  <span v-if="mediaStatFor(mediaPublished.id)?.levels.length">sending {{ mediaStatFor(mediaPublished.id).levels.join(', ') }}</span>
+                  <span v-if="mediaPublished.hasVideo">{{ mediaStatFor(mediaPublished.id)?.fps ?? 0 }} fps</span>
+                  <span>{{ (mediaStatFor(mediaPublished.id)?.kbps ?? 0) + (mediaStatFor(mediaPublished.id)?.audioKbps ?? 0) }} kbps out, each</span>
+                </div>
+              </div>
+
+              <p v-if="!mediaOthers.length" class="empty">No one else is sharing in this room.</p>
+              <div v-for="s in mediaOthers" :key="s.id" class="media-card" :data-testid="'media-stream-' + s.id">
+                <div class="media-head">
+                  <span class="media-title">{{ s.name }}</span>
+                  <span class="msg-who" :title="s.source">from {{ s.source.slice(0, 8) }}…</span>
+                  <span class="media-kind">{{ s.video && s.audio ? 'video and sound' : s.video ? 'video' : 'sound' }}</span>
+                  <button v-if="!mediaWatching[s.id]" type="button" class="btn" data-testid="media-watch" @click="watchMedia(s.id)">{{ s.video ? 'Watch' : 'Listen' }}</button>
+                  <button v-else type="button" class="btn" data-testid="media-unwatch" @click="unwatchMedia(s.id)">Stop</button>
+                </div>
+                <template v-if="mediaWatching[s.id]">
+                  <canvas v-if="s.video" :ref="(el) => setMediaCanvas(s.id, el)" class="media-video"></canvas>
+                  <div v-else class="media-sound">Sound only</div>
+                  <div class="media-controls">
+                    <label v-if="s.video && s.levels.length > 1" class="field-inline">
+                      <span>Quality</span>
+                      <select class="input" :value="mediaQuality[s.id] || 'auto'" data-testid="media-quality" @change="setMediaQuality(s.id, $event.target.value)">
+                        <option value="auto">Auto</option>
+                        <option v-for="l in [...s.levels].reverse()" :key="l.level" :value="levelName(l.level)">{{ levelLabel(l) }}</option>
+                      </select>
+                    </label>
+                    <button v-if="s.audio" type="button" class="btn" data-testid="media-mute" @click="toggleMediaMute(s.id)">{{ mediaMuted[s.id] ? 'Unmute' : 'Mute' }}</button>
+                  </div>
+                  <div v-if="mediaStatFor(s.id)" class="media-stats" data-testid="media-stats">
+                    <span>{{ mediaStatFor(s.id).depth ? `${mediaStatFor(s.id).depth} hop${mediaStatFor(s.id).depth === 1 ? '' : 's'} from the source` : 'Finding a peer to feed you…' }}</span>
+                    <span v-if="mediaStatFor(s.id).parent">via {{ mediaStatFor(s.id).parent === s.source ? 'the source' : mediaStatFor(s.id).parent.slice(0, 8) + '…' }}</span>
+                    <span v-if="mediaStatFor(s.id).level">{{ mediaStatFor(s.id).level }}{{ mediaStatFor(s.id).quality === 'auto' ? ' (auto)' : '' }}</span>
+                    <span v-if="s.video">{{ mediaStatFor(s.id).fps }} fps</span>
+                    <span>{{ mediaStatFor(s.id).kbps + mediaStatFor(s.id).audioKbps }} kbps</span>
+                    <span>{{ mediaStatFor(s.id).delayMs != null ? `${mediaStatFor(s.id).delayMs} ms behind the source` : 'delay: measuring…' }}</span>
+                    <span v-if="mediaStatFor(s.id).children.length">forwarding to {{ mediaStatFor(s.id).children.length }} ({{ mediaStatFor(s.id).forwardMs ?? 0 }} ms each frame)</span>
+                    <span v-if="s.video">{{ mediaStatFor(s.id).framesDropped }} frames dropped</span>
+                    <span v-if="mediaStatFor(s.id).recoveries">back {{ mediaStatFor(s.id).lastRecoveryMs }} ms after losing its feed ({{ mediaStatFor(s.id).recoveries }}×)</span>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+
+          <!-- Files -->
+          <div v-else-if="activeTab === 'files'" class="panel panel-files" role="tabpanel" aria-label="Files">
+            <p class="note">
+              Files straight from the peers that have them, checked piece by piece. Everyone who downloads one
+              shares it too, so a file spreads the more it is fetched. It is here while someone who has it is online.
+            </p>
+            <p v-if="!isRunning" class="empty">Join the room to share or download.</p>
+            <template v-else>
+              <div class="media-actions">
+                <button type="button" class="btn btn-go" data-testid="files-share" :disabled="filesBusy" @click="$refs.filesInput.click()">{{ filesBusy ? 'Preparing…' : 'Share files' }}</button>
+                <input ref="filesInput" type="file" multiple class="visually-hidden" data-testid="files-input" @change="shareFiles" />
+              </div>
+              <p v-if="filesError" class="error">{{ filesError }}</p>
+              <p v-if="!roomFiles.length" class="empty">No files in this room yet.</p>
+              <ul v-else class="file-list">
+                <li v-for="f in roomFiles" :key="f.id" class="file-row" :data-testid="'file-' + f.id.slice(0, 12)">
+                  <div class="file-main">
+                    <span class="file-name" :title="f.name">{{ f.name }}</span>
+                    <span class="file-meta">
+                      {{ formatBytes(f.size) }} · {{ f.holders.length }} {{ f.holders.length === 1 ? 'peer has' : 'peers have' }} it
+                      <template v-if="f.mine"> · {{ fileDownloads[f.id] ? 'downloaded, shared by you' : 'shared by you' }}</template>
+                    </span>
+                    <div v-if="fileDownloads[f.id] && fileDownloads[f.id].state !== 'done'" class="file-progress">
+                      <div class="file-bar"><span :style="{ width: filePercent(fileDownloads[f.id]) + '%' }"></span></div>
+                      <span class="file-meta" data-testid="file-progress">
+                        {{ fileDownloads[f.id].state === 'failed' ? fileDownloads[f.id].error : `${filePercent(fileDownloads[f.id])}% · ${formatBytes(fileDownloads[f.id].rate)}/s · from ${fileDownloads[f.id].sources.length} peer${fileDownloads[f.id].sources.length === 1 ? '' : 's'}` }}
+                      </span>
+                    </div>
+                  </div>
+                  <div class="file-actions">
+                    <a v-if="fileUrls[f.id]" class="btn" :href="fileUrls[f.id]" :download="f.name" data-testid="file-save">Save</a>
+                    <button v-if="!f.mine && !fileDownloads[f.id]" type="button" class="btn" data-testid="file-download" @click="downloadFile(f)">Download</button>
+                    <button v-else-if="fileDownloads[f.id] && fileDownloads[f.id].state === 'downloading' || fileDownloads[f.id]?.state === 'starting'" type="button" class="btn" @click="cancelDownload(f.id)">Cancel</button>
+                    <button v-if="f.mine" type="button" class="btn" data-testid="file-unshare" @click="unshareFile(f.id)">Stop sharing</button>
+                  </div>
+                </li>
+              </ul>
+            </template>
           </div>
 
           <!-- Storage -->
@@ -562,7 +681,8 @@
 
 <script>
 import { DEFAULT_SIGNALING_SERVERS, PartialMesh, PeerPigeonNode, StorageServerLink } from 'peerpigeon';
-import { GossipProtocol } from 'peerpigeon';
+import { GossipProtocol, MediaStreams, FileShares } from 'peerpigeon';
+import { markRaw } from 'vue';
 // pigeon-dev.peer.ooo is built with --mode dev (npm run deploy:dev): a network of its own, so its peers
 // are not mixed with pigeon.peer.ooo's, and the console shows it as a separate app.
 const DEFAULT_NETWORK = import.meta.env.MODE === 'dev' ? 'peerpigeon-dev' : 'peerpigeon';
@@ -751,6 +871,24 @@ export default {
       messageInput: '',
       directMode: false,
       activeTab: 'message',
+      roomFiles: [],
+      fileDownloads: {},
+      fileUrls: {},
+      filesBusy: false,
+      filesError: '',
+      mediaSupported: MediaStreams.supported(),
+      mediaAudioSupported: MediaStreams.audioSupported(),
+      mediaUseCamera: true,
+      mediaUseMic: MediaStreams.audioSupported(),
+      mediaQuality: {},
+      mediaMuted: {},
+      mediaStreams: [],
+      mediaStats: [],
+      mediaTrees: {},
+      mediaPublished: null,
+      mediaWatching: {},
+      mediaBusy: false,
+      mediaError: '',
       dmTarget: '',
       showPrivateCrypto: false,
       clientId: '',
@@ -822,6 +960,8 @@ export default {
       uiTabs: [
         { id: 'message', label: 'Messages' },
         { id: 'storage', label: 'Storage' },
+        { id: 'media', label: 'Media' },
+        { id: 'files', label: 'Files' },
         { id: 'crypto', label: 'Keys' }
       ],
       topologyOptions: [
@@ -1035,6 +1175,10 @@ export default {
   computed: {
     defaultNetwork() {
       return DEFAULT_NETWORK;
+    },
+    mediaOthers() {
+      const mine = this.mediaPublished?.id;
+      return this.mediaStreams.filter((s) => s.id !== mine && s.live);
     },
     gossipBadgeSnapshot() {
       const badge = gossipBadgeState({
@@ -2602,6 +2746,8 @@ export default {
           });
         });
 
+        this.startMedia();
+        this.startFiles();
         await this.mesh.init();
         this.isRunning = true;
         this.isConnecting = false;
@@ -2620,6 +2766,8 @@ export default {
     },
 
     stopMesh() {
+      this.stopMedia();
+      this.stopFiles();
       this.stopCryptoAnnounceLoop();
       this.stopDebugMonitor();
       this.resetGraphStabilization();
@@ -2657,6 +2805,243 @@ export default {
       this.saveUiState();
       this.addLog('info', 'Mesh stopped', 'System');
       this.showStatus('Idle', 'Idle', 'info');
+    },
+
+    // ---------- files: shared peer to peer, every downloader sharing in turn ----------
+    startFiles() {
+      if (!this.mesh || !this.gossip) return;
+      const mesh = this.mesh;
+      const files = new FileShares({ mesh, gossip: this.gossip, connectToPeer: (id) => mesh.connectToPeer(id) });
+      this.files = markRaw(files);
+      files.on('files', (list) => { this.roomFiles = list; });
+      files.on('progress', (list) => {
+        const next = { ...this.fileDownloads };
+        for (const d of list) next[d.id] = { ...d, file: undefined };
+        this.fileDownloads = next;
+        this.roomFiles = files.list();
+      });
+      window.__files = files;
+    },
+
+    stopFiles() {
+      try { this.files?.destroy(); } catch { /* gone */ }
+      this.files = null;
+      for (const url of Object.values(this.fileUrls)) URL.revokeObjectURL(url);
+      this.roomFiles = [];
+      this.fileDownloads = {};
+      this.fileUrls = {};
+    },
+
+    async shareFiles(event) {
+      const picked = [...(event.target.files || [])];
+      event.target.value = '';
+      if (!picked.length || !this.files) return;
+      this.filesBusy = true;
+      this.filesError = '';
+      try {
+        for (const file of picked) {
+          const id = await this.files.share(file);
+          this.fileUrls = { ...this.fileUrls, [id]: URL.createObjectURL(file) };
+        }
+        this.roomFiles = this.files.list();
+      } catch (error) {
+        this.filesError = String(error?.message || error);
+      } finally {
+        this.filesBusy = false;
+      }
+    },
+
+    async downloadFile(f) {
+      if (!this.files) return;
+      this.filesError = '';
+      this.fileDownloads = { ...this.fileDownloads, [f.id]: { id: f.id, name: f.name, size: f.size, received: 0, sources: [], state: 'starting', rate: 0 } };
+      try {
+        const blob = await this.files.download(f.id);
+        this.fileUrls = { ...this.fileUrls, [f.id]: URL.createObjectURL(blob) };
+      } catch (error) {
+        if (String(error?.message) !== 'Cancelled') this.filesError = `${f.name}: ${String(error?.message || error)}`;
+        const next = { ...this.fileDownloads };
+        delete next[f.id];
+        this.fileDownloads = next;
+      }
+    },
+
+    unshareFile(id) {
+      this.files?.unshare(id);
+      if (this.fileUrls[id]) {
+        URL.revokeObjectURL(this.fileUrls[id]);
+        const next = { ...this.fileUrls };
+        delete next[id];
+        this.fileUrls = next;
+      }
+      const downloads = { ...this.fileDownloads };
+      delete downloads[id];
+      this.fileDownloads = downloads;
+    },
+
+    cancelDownload(id) {
+      this.files?.cancel(id);
+    },
+
+    filePercent(d) {
+      return d.size ? Math.min(100, Math.floor((d.received / d.size) * 100)) : 0;
+    },
+
+    formatBytes(n) {
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let v = Number(n) || 0;
+      let u = 0;
+      while (v >= 1000 && u < units.length - 1) { v /= 1000; u++; }
+      return `${v >= 100 || u === 0 ? Math.round(v) : v.toFixed(1)} ${units[u]}`;
+    },
+
+    // ---------- media: a camera shared through the mesh, viewers forwarding to viewers ----------
+    startMedia() {
+      if (!this.mediaSupported || !this.mesh || !this.gossip) return;
+      const mesh = this.mesh;
+      const media = new MediaStreams({ mesh, gossip: this.gossip, connectToPeer: (id) => mesh.connectToPeer(id) });
+      this.media = markRaw(media);
+      this.mediaCanvases = new Map();
+      media.on('streams', (list) => { this.mediaStreams = list; });
+      media.on('stats', (stats) => {
+        this.mediaStats = stats;
+        this.mediaStreams = media.list();
+        if (this.mediaPublished) this.mediaTrees = { [this.mediaPublished.id]: media.tree(this.mediaPublished.id) };
+      });
+      window.__media = media;
+    },
+
+    stopMedia() {
+      if (this.mediaPublished) this.stopMediaShare();
+      try { this.media?.destroy(); } catch { /* gone */ }
+      this.media = null;
+      this.mediaPublished = null;
+      this.mediaWatching = {};
+      this.mediaStreams = [];
+      this.mediaStats = [];
+      this.mediaTrees = {};
+    },
+
+    async startMediaShare() {
+      if (!this.media) return;
+      this.mediaBusy = true;
+      this.mediaError = '';
+      let stream = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: this.mediaUseCamera ? { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } : false,
+          audio: this.mediaUseMic ? { echoCancellation: true, noiseSuppression: true } : false,
+        });
+        const video = stream.getVideoTracks()[0];
+        const audio = stream.getAudioTracks()[0];
+        const label = video && audio ? 'your camera and microphone' : video ? 'your camera' : 'your microphone';
+        const id = await this.media.publish({ video, audio }, { name: video ? 'Camera' : 'Microphone' });
+        this.mediaPublished = markRaw({ id, stream, kind: video ? 'camera' : 'audio', label, hasVideo: !!video });
+        await this.$nextTick();
+        if (this.$refs.mediaPreview && video) this.$refs.mediaPreview.srcObject = new MediaStream([video]);
+      } catch (error) {
+        stream?.getTracks().forEach((t) => t.stop());
+        this.mediaError = error?.name === 'NotAllowedError' ? 'The camera or microphone was not allowed.' : String(error?.message || error);
+      } finally {
+        this.mediaBusy = false;
+      }
+    },
+
+    async startMediaFile(event) {
+      const file = event.target.files?.[0];
+      event.target.value = '';
+      if (!file || !this.media) return;
+      this.mediaBusy = true;
+      this.mediaError = '';
+      const isVideo = file.type.startsWith('video/') || /\.(mp4|m4v|webm)$/i.test(file.name);
+      const url = URL.createObjectURL(file);
+      let element = null;
+      try {
+        this.mediaPublished = markRaw({ id: '', kind: isVideo ? 'file' : 'audio', label: file.name, hasVideo: isVideo, url });
+        await this.$nextTick();
+        element = this.$refs.mediaPreview;
+        element.src = url;
+        element.loop = true;
+        await element.play();
+        const id = await this.media.publish(isVideo ? { video: element, audio: element } : { audio: element }, { name: file.name.replace(/\.[^.]+$/, '').slice(0, 60) || 'A file' });
+        this.mediaPublished = markRaw({ ...this.mediaPublished, id });
+      } catch (error) {
+        if (element) { element.pause(); element.removeAttribute('src'); }
+        URL.revokeObjectURL(url);
+        this.mediaPublished = null;
+        this.mediaError = /decode|supported|format/i.test(String(error?.message || error)) ? 'This browser can’t play that file.' : String(error?.message || error);
+      } finally {
+        this.mediaBusy = false;
+      }
+    },
+
+    stopMediaShare() {
+      const shared = this.mediaPublished;
+      if (!shared) return;
+      if (shared.id) this.media?.unpublish(shared.id);
+      shared.stream?.getTracks().forEach((t) => t.stop());
+      const el = this.$refs.mediaPreview;
+      if (el) { el.pause?.(); el.srcObject = null; el.removeAttribute('src'); }
+      if (shared.url) URL.revokeObjectURL(shared.url);
+      this.mediaPublished = null;
+    },
+
+    setMediaQuality(id, quality) {
+      this.mediaQuality = { ...this.mediaQuality, [id]: quality };
+      this.media?.setQuality(id, quality);
+    },
+
+    toggleMediaMute(id) {
+      const muted = !this.mediaMuted[id];
+      this.mediaMuted = { ...this.mediaMuted, [id]: muted };
+      this.media?.setMuted(id, muted);
+    },
+
+    levelName(level) {
+      return ['low', 'medium', 'high'][level] || 'high';
+    },
+
+    levelLabel(l) {
+      return `${['Low', 'Medium', 'High'][l.level] || 'High'} (${l.height}p)`;
+    },
+
+    watchMedia(id) {
+      if (!this.media) return;
+      this.mediaWatching = { ...this.mediaWatching, [id]: true };
+      try {
+        this.media.watch(id, (frame) => {
+          const canvas = this.mediaCanvases?.get(id);
+          if (canvas) {
+            if (canvas.width !== frame.displayWidth) canvas.width = frame.displayWidth;
+            if (canvas.height !== frame.displayHeight) canvas.height = frame.displayHeight;
+            canvas.getContext('2d')?.drawImage(frame, 0, 0);
+          }
+          frame.close();
+        }, { quality: this.mediaQuality[id] || 'auto', muted: !!this.mediaMuted[id] });
+      } catch (error) {
+        this.mediaError = String(error?.message || error);
+        this.unwatchMedia(id);
+      }
+    },
+
+    unwatchMedia(id) {
+      this.media?.unwatch(id);
+      const next = { ...this.mediaWatching };
+      delete next[id];
+      this.mediaWatching = next;
+    },
+
+    setMediaCanvas(id, el) {
+      if (!this.mediaCanvases) this.mediaCanvases = new Map();
+      if (el) this.mediaCanvases.set(id, el); else this.mediaCanvases.delete(id);
+    },
+
+    mediaStatFor(id) {
+      return this.mediaStats.find((s) => s.id === id) || null;
+    },
+
+    mediaTreeSize(id) {
+      return (this.mediaTrees[id] || []).length;
     },
 
     async sendMessage() {
@@ -2865,7 +3250,7 @@ export default {
       return !!(
         data &&
         typeof data === 'object' &&
-        data.__ppType === STORAGE_SYNC_ENVELOPE_TYPE
+        (data.__ppType === STORAGE_SYNC_ENVELOPE_TYPE || /^pp-(media|files)-/.test(String(data.__ppType || '')))
       );
     },
 
@@ -3202,6 +3587,7 @@ export default {
     async handleDirectPayload(message) {
       const from = String(message.from || 'peer');
       const payload = normalizeMessagePayload(message?.data);
+      if (this.isStorageInternalPayload(payload)) return;
 
       if (this.isCryptoPublicInfoPayload(payload)) {
         if (this.cryptoProtocol) return;
@@ -5257,6 +5643,16 @@ select.input {
   max-height: 820px;
 }
 
+.side-grow {
+  height: auto;
+  max-height: none;
+}
+
+.side-grow .panel {
+  flex: none;
+  overflow: visible;
+}
+
 .facts {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -5333,6 +5729,183 @@ select.input {
   min-height: 0;
   padding-top: 0.85rem;
   overflow-y: auto;
+}
+
+/* files */
+.file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.file-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.file-name {
+  font-weight: 700;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-meta {
+  font-size: 0.82rem;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.file-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex: none;
+}
+
+.file-actions a.btn {
+  text-decoration: none;
+}
+
+.file-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.file-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.file-bar span {
+  display: block;
+  height: 100%;
+  background: var(--sheen);
+  transition: width 0.3s;
+}
+
+/* media */
+.media-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.media-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.media-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.media-head .btn {
+  margin-left: auto;
+}
+
+.media-title {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.media-video {
+  width: 100%;
+  max-height: 360px;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  background: var(--night);
+  border-radius: var(--radius);
+}
+
+.media-share {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.media-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.field-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+}
+
+.field-inline .input {
+  width: auto;
+}
+
+.media-kind {
+  font-size: 0.8rem;
+  color: var(--ink-2);
+}
+
+.media-audio {
+  width: 100%;
+}
+
+.media-sound {
+  display: grid;
+  place-items: center;
+  height: 64px;
+  border-radius: var(--radius);
+  background: var(--sheen-wash);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.media-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 0.9rem;
+  font-size: 0.85rem;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
 }
 
 /* messages */

@@ -1516,6 +1516,253 @@ declare class PeerPigeonCryptoProtocol {
 /** Deterministic SHA-1 hex for compact, non-routing public display IDs. */
 declare function sha1Hex(value: unknown): string;
 
+type MediaQuality = 'auto' | 'high' | 'medium' | 'low';
+interface MediaPublishOptions {
+    name?: string;
+    /** The high level's size; medium is half, low a quarter. */
+    width?: number;
+    height?: number;
+    fps?: number;
+    /** The high level's bitrate, bits a second. */
+    bitrate?: number;
+    /** Viewers fed by the source itself; more are fed by viewers. */
+    maxChildren?: number;
+    /** Encode medium and low as well (on by default). */
+    levels?: boolean;
+}
+/** What to send: a camera track, or a playing <video>; a microphone track, or a playing <audio>/<video>. */
+interface MediaPublishInput {
+    video?: MediaStreamTrack | HTMLVideoElement;
+    audio?: MediaStreamTrack | HTMLMediaElement;
+}
+/** A video level: 0 low, 1 medium, 2 high. */
+interface MediaLevel {
+    level: number;
+    width: number;
+    height: number;
+    fps: number;
+    kbps: number;
+}
+interface MediaStreamInfo {
+    id: string;
+    source: string;
+    name: string;
+    video: boolean;
+    audio: boolean;
+    /** The video's levels, low to high. */
+    levels: MediaLevel[];
+    width: number;
+    height: number;
+    fps: number;
+    /** Announced in the last few seconds. */
+    live: boolean;
+}
+interface MediaStats {
+    id: string;
+    role: 'source' | 'viewer';
+    parent: string | null;
+    children: string[];
+    /** Hops from the source (1: fed by it). */
+    depth: number;
+    fps: number;
+    kbps: number;
+    /** The level shown here (viewer), or the levels being encoded (source). */
+    level: string | null;
+    levels: string[];
+    quality: MediaQuality | null;
+    audio: boolean;
+    audioKbps: number;
+    /** Capture to arrival, through every hop, clock-corrected (approximate). */
+    delayMs: number | null;
+    /** Average time a frame spends in this peer before it goes on to the children. */
+    forwardMs: number | null;
+    framesDropped: number;
+    keyRequests: number;
+    /** The last time a parent was lost and the stream came back: how long it took. */
+    lastRecoveryMs: number | null;
+    recoveries: number;
+}
+/** What MediaStreams needs of a PeerPigeonNode. */
+interface MediaHost {
+    mesh: {
+        getClientId(): string | null;
+        getConnectedPeers(): string[];
+        on(event: string, handler: (...args: any[]) => void): void;
+        openSideChannel(peerId: string, name: string, init?: any): RTCDataChannel | null;
+    };
+    gossip: {
+        broadcast(data: unknown): string;
+        sendDirect(peerId: string, data: unknown, options?: {
+            connectedOnly?: boolean;
+        }): string | null;
+        on(event: string, handler: (...args: any[]) => void): void;
+    };
+    connectToPeer(peerId: string): void;
+}
+type Listener$1 = (...args: any[]) => void;
+declare class MediaStreams {
+    private readonly host;
+    private readonly published;
+    private readonly watching;
+    private readonly streams;
+    /** Clock offsets to sources: their clock minus ours, ms, from the quickest recent exchange. */
+    private readonly offsets;
+    private readonly offsetSamples;
+    private readonly listeners;
+    private readonly timers;
+    private readonly pendingAttach;
+    constructor(host: MediaHost);
+    /** Whether this browser can send or receive video (WebCodecs). */
+    static supported(): boolean;
+    /** Whether this browser can send or receive audio (WebCodecs' AudioEncoder and AudioDecoder, and AudioWorklet). */
+    static audioSupported(): boolean;
+    on(event: 'streams' | 'stats', handler: Listener$1): void;
+    off(event: 'streams' | 'stats', handler: Listener$1): void;
+    /** The streams announced in the room (this peer's own too). */
+    list(): MediaStreamInfo[];
+    stats(): MediaStats[];
+    /** The source's tree, as it knows it: who feeds whom. */
+    tree(id: string): {
+        peerId: string;
+        parent: string;
+        depth: number;
+    }[];
+    /**
+     * Send video, audio or both: a camera or microphone track, or a <video>/<audio> playing a file (the
+     * stream follows it: pause, seek). A track given alone is taken as video or audio by its kind.
+     */
+    publish(input: MediaStreamTrack | MediaPublishInput, options?: MediaPublishOptions): Promise<string>;
+    unpublish(id: string): void;
+    /** The levels the source's children need, and so the ones it encodes. */
+    private wantedLevels;
+    private encodeTick;
+    private openEncoder;
+    private startAudioSend;
+    /** The source picks a parent for a joining viewer. */
+    private pickParent;
+    /**
+     * Watch a stream. Video frames go to onFrame (draw them, then frame.close()); audio plays here. Call
+     * it from a click or a key press: browsers start sound only then.
+     */
+    watch(id: string, onFrame: ((frame: any) => void) | null, options?: {
+        quality?: MediaQuality;
+        muted?: boolean;
+    }): void;
+    unwatch(id: string): void;
+    /** Auto, or one level: high, medium or low (the nearest the stream has). */
+    setQuality(id: string, quality: MediaQuality): void;
+    setMuted(id: string, muted: boolean): void;
+    /** The level nearest a quality that the stream has: the highest at or below it, else its lowest. */
+    private levelFor;
+    /** The stream's next level down or up from this one, or null at the end. */
+    private stepLevel;
+    /** The levels this peer needs from its parent: the one it shows, one it is switching to, its children's. */
+    private neededMask;
+    private sendWanted;
+    private switchTo;
+    private levelRx;
+    private resetDecoder;
+    private startAudioReceive;
+    private join;
+    /** Ask the source where to attach; null when it does not answer. */
+    private ask;
+    private lostParent;
+    private onFragment;
+    private onAudioFragment;
+    private requestKey;
+    private report;
+    /** Auto quality, once a second: down after losses, up after a clean stretch. */
+    private adapt;
+    /** A child opened a side channel to this peer: feed it, if this peer has the stream. */
+    private onSideChannel;
+    /** A key frame of a level for a child: the source makes one, a viewer asks its own parent. */
+    private upstreamKey;
+    private onPeerGone;
+    private onControl;
+    private pingSources;
+    private tick;
+    destroy(): void;
+    private emit;
+}
+
+interface SharedFileInfo {
+    id: string;
+    name: string;
+    size: number;
+    type: string;
+    /** Peers announcing the whole file now. */
+    holders: string[];
+    /** Shared by this peer, or downloaded and now shared by it. */
+    mine: boolean;
+}
+interface FileDownload {
+    id: string;
+    name: string;
+    size: number;
+    received: number;
+    /** Peers it is taking pieces from now. */
+    sources: string[];
+    state: 'starting' | 'downloading' | 'done' | 'failed';
+    error?: string;
+    /** Bytes a second, over the last few seconds. */
+    rate: number;
+    file?: Blob;
+}
+interface FilesHost {
+    mesh: {
+        getClientId(): string | null;
+        getConnectedPeers(): string[];
+        on(event: string, handler: (...args: any[]) => void): void;
+        openSideChannel(peerId: string, name: string, init?: any): RTCDataChannel | null;
+    };
+    gossip: {
+        broadcast(data: unknown): string;
+        on(event: string, handler: (...args: any[]) => void): void;
+    };
+    connectToPeer(peerId: string): void;
+}
+type Listener = (...args: any[]) => void;
+declare class FileShares {
+    private readonly host;
+    private readonly held;
+    private readonly known;
+    private readonly active;
+    private readonly listeners;
+    private readonly timer;
+    constructor(host: FilesHost);
+    on(event: 'files' | 'progress', handler: Listener): void;
+    off(event: 'files' | 'progress', handler: Listener): void;
+    /** The files in the room: announced by someone in the last few seconds, or this peer's own. */
+    list(): SharedFileInfo[];
+    downloads(): FileDownload[];
+    /** Share a file with the room. Resolves to its ID once it is hashed (a few seconds for a large one). */
+    share(file: Blob, name?: string): Promise<string>;
+    /** Stop sharing a file (this peer no longer announces or serves it). */
+    unshare(id: string): void;
+    /** The file, from this peer if it has it, else downloaded from the room's holders. */
+    download(id: string): Promise<Blob>;
+    /** Give up a download. */
+    cancel(id: string): void;
+    private hold;
+    private liveHolders;
+    /** Keep a download moving: sources up to MAX_SOURCES, the manifest, then pieces, a few per source. */
+    private pump;
+    private readonly openingSources;
+    private opening;
+    private addSource;
+    private dropSource;
+    private onReply;
+    private counted;
+    private finish;
+    private onSideChannel;
+    private onControl;
+    private onPeerGone;
+    private progress;
+    private tick;
+    destroy(): void;
+    private emit;
+}
+
 /** Payload type of a signaling envelope carried inside a gossip direct frame. */
 declare const MESH_SIGNAL_PAYLOAD_TYPE = "pp-signal-v1";
 declare function isMeshSignalPayload(value: unknown): value is {
@@ -1788,6 +2035,11 @@ type PartialMeshEvents = {
         meta: Record<string, unknown>;
         bytes: Uint8Array;
     }) => void;
+    'peer:sidechannel': (data: {
+        peerId: string;
+        name: string;
+        channel: RTCDataChannel;
+    }) => void;
     'peer:error': (data: {
         peerId: string;
         error: any;
@@ -2020,6 +2272,17 @@ declare class PartialMesh {
      * false when the peer is not linked or the frame is refused. The receiver must read them (it said so).
      */
     sendBytes(peerId: string, meta: Record<string, unknown>, bytes: Uint8Array): boolean;
+    /**
+     * Another data channel on the WebRTC link to a linked neighbour, for traffic with its own delivery
+     * rules (media: unordered, no retransmits, the default). Null when the peer is not linked over WebRTC.
+     * The neighbour receives it as 'peer:sidechannel'. Relays never carry these.
+     */
+    openSideChannel(peerId: string, name: string, init?: {
+        ordered?: boolean;
+        reliable?: boolean;
+        maxRetransmits?: number;
+        maxPacketLifeTime?: number;
+    }): RTCDataChannel | null;
     /**
      * Broadcast data to all connected peers
      */
@@ -2256,6 +2519,25 @@ declare class PeerPigeonNode {
         links: number;
     }[];
     getDiscoveredPeers(): string[];
+    private mediaStreams;
+    private fileShares;
+    /**
+     * Files shared in the room, peer to peer: share a file, list the room's, download one from the peers
+     * that have it (checked piece by piece against its ID). Relays never carry them. Made on first use.
+     */
+    get files(): FileShares;
+    /**
+     * Media streams in the room, with peers as forwarders (a virtual SFU): publish a camera track, watch a
+     * stream. Video goes over side channels on the peers' own links; relays never carry it. Made on first use.
+     */
+    get media(): MediaStreams;
+    /** Another data channel on the WebRTC link to a neighbour (see PartialMesh.openSideChannel). */
+    openSideChannel(peerId: string, name: string, init?: {
+        ordered?: boolean;
+        reliable?: boolean;
+        maxRetransmits?: number;
+        maxPacketLifeTime?: number;
+    }): RTCDataChannel | null;
     /** The role a relay listed this peer with, or null. */
     getPeerRole(peerId: string): string | null;
     /** Dial this peer now, whatever its role. */
@@ -2299,4 +2581,4 @@ declare class PeerPigeonNode {
     private emit;
 }
 
-export { APPS_ROOM, type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type DaySummary, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, type HourSummary, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, MemoryRoomStatsStore, MemoryServerRecordStore, type MinuteSample, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, type RoomHistory, type RoomNow, RoomStats, type RoomStatsPoint, type RoomStatsStore, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedRelayScore, type SignalingRelayCandidate, type StatsPass, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerOptions, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, grantText, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, packPoints, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayNameOf, relayScore, revokeText, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, statsText, unpackPoints, validRoom, visitorOf };
+export { APPS_ROOM, type CecrConfigSnapshot, type CecrMembershipRecordSnapshot, type CecrOverlaySnapshot, type CecrStateSnapshot, DEFAULT_CLOSE_SIGNALING_RELAY_COUNT, DEFAULT_SIGNALING_SERVERS, type DaySummary, type EncryptedBroadcastPayload, type EncryptedDirectPayload, type FileDownload, FileShares, type GossipAggregateDeliveryStatus, type GossipBroadcastOptions, type GossipDeliveryStatus, type GossipMessage, GossipProtocol, type GossipProtocolOptions, type GossipStats, type HourSummary, MAX_BLOB_BYTES, MESH_SIGNAL_PAYLOAD_TYPE, type MediaPublishOptions, type MediaStats, type MediaStreamInfo, MediaStreams, MemoryRoomStatsStore, MemoryServerRecordStore, type MinuteSample, NEGOTIATION_ACTIVE_ICE_DEADLINE_MS, NEGOTIATION_DEAD_TRANSPORT_DEADLINE_MS, NEGOTIATION_OFFER_DEADLINE_MS, PartialMesh, type PartialMeshConfig, type PartialMeshEvents, type PartialMeshRuntimeConfig, type PeerCapacityAdvertisement, type PeerCapacitySnapshot, type PeerConnection, type PeerGraphEdge, type PeerGraphNode, type PeerGraphSnapshot, type PeerPigeonCryptoEvents, type PeerPigeonCryptoOptions, PeerPigeonCryptoProtocol, type PeerPigeonKeyPair, PeerPigeonNode, type PeerPigeonNodeEvents, type PeerPigeonNodeMessage, type PeerPigeonNodeOptions, type PeerPigeonNodeStorageOptions, PeerPigeonStorage, type PeerPublicKey, RELAY_CANDIDATES, RELAY_SCORE_STORAGE_KEY, RELAY_SWITCH_MARGIN, RELAY_VIRTUAL_IDS, type RelayInfo, type RelayKind, type RelayMeasurement, RelayScoreBook, type RoomCipher, type RoomHistory, type RoomNow, RoomStats, type RoomStatsPoint, type RoomStatsStore, STORAGE_REPLICAS, STORAGE_SERVER_NETWORK, STORAGE_SERVER_ROLE, STORAGE_SERVER_ROOM, type ServerRecord, type ServerRecordStore, type SharedFileInfo, type SharedRelayScore, type SignalingRelayCandidate, type StatsPass, type StorageChangeOrigin, type StorageEvents, type StorageOptions, type StoragePutOptions, type StorageRecord, type StorageRetrieveOptions, StorageServer, StorageServerLink, type StorageServerOptions, type StorageServerStats, type StorageSpace, type StorageSyncFilterContext, type StorageSyncOptions, type StorageUnsubscribe, blobAddress, chooseRelays, PartialMesh as default, directRelaySupported, discoverClosestSignalingServer, discoverClosestSignalingServers, discoverSignalingRelays, grantText, isHealthy, isMeshSignalPayload, openBlob, ownedRoomOf, packPoints, rankSignalingServersByDistance, reachableFromThisPage, relayDisplayName, relayNameOf, relayScore, revokeText, roomRoutingKey, sealBlob, selectClosestSignalingServer, sha1Hex, statsText, unpackPoints, validRoom, visitorOf };
