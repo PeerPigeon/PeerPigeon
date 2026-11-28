@@ -586,3 +586,46 @@ test('a follow ends, and says so, when the link to its server drops', async () =
   assert.equal(ended, 1);
   await a.link.close(); await a.storage.close();
 });
+
+test('the owner clears records off its server: moved aside, old copies not taken again, and peers that trust the owner drop theirs', async () => {
+  const { generateRandomPair, signMessage } = await import('unsea');
+  const { createHash } = await import('node:crypto');
+  const sha = (t) => createHash('sha256').update(t).digest('hex');
+  const owner = await generateRandomPair();
+  const other = await generateRandomPair();
+  const scope = makeScope();
+  const s = new StorageServer(scope.node(hex('c'), STORAGE_SERVER_ROLE), undefined, { owner: owner.pub });
+  await s.start();
+  const a = await peer(scope, 'a', { replicate: ['t/'] });
+  const b = await peer(scope, 'b', { replicate: ['t/'], clearers: [owner.pub] });
+  await settle();
+  await a.storage.put('public', 't/1', 'one');
+  await a.storage.put('public', 't/2', 'two');
+  await a.storage.put('public', 'keep', 'stays');
+  await settle(100);
+  assert.equal((await b.storage.get('public', 't/1'))?.value, 'one');
+  const seed = `peerpigeon:storage-servers:v1:${options.sessionId}:${options.syncSecret}`;
+  const room = sha(`${seed}:room`);
+  const slots = ['t/1', 't/2'].map((k) => sha(`${seed}:slot:public:${k}`));
+  const listed = await a.link.listAt(hex('c'), room);
+  assert.equal(listed.length, 3);
+
+  assert.equal(await a.link.clearAt(hex('c'), room, slots, (t) => signMessage(t, other.priv)), null, 'only the owner clears');
+  assert.equal(await a.link.clearAt(hex('c'), room, slots, (t) => signMessage(t, owner.priv)), 2);
+  await settle(100);
+  assert.deepEqual((await a.link.listAt(hex('c'), room)).map((r) => r.slot), [sha(`${seed}:slot:public:keep`)]);
+
+  // b trusts the owner: its copies went, and a tombstone keeps them from coming back. a does not: it keeps its own.
+  assert.equal(await b.storage.get('public', 't/1'), null);
+  assert.equal((await b.storage.get('public', 'keep'))?.value, 'stays');
+  assert.equal((await a.storage.get('public', 't/1'))?.value, 'one');
+
+  // a still has the old copies: the server does not take them back, but takes a newer write.
+  await a.storage.put('public', 't/2', 'two again');
+  await settle(100);
+  const rec = await s.stats();
+  assert.equal(rec.records, 2, 'the newer t/2 and keep');
+  const after = (await a.link.listAt(hex('c'), room)).map((r) => r.slot).sort();
+  assert.deepEqual(after, [sha(`${seed}:slot:public:keep`), slots[1]].sort());
+  await a.link.close(); await b.link.close();
+});

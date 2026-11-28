@@ -137,6 +137,14 @@ type LinkListener = (event: {
 } | {
     type: 'changed';
     rec: Omit<ServerRecord, 'wh'>;
+} | {
+    type: 'cleared';
+    server: string;
+    room: string;
+    slots: string[];
+    at: number;
+    sig: string;
+    by: string;
 }) => void;
 /**
  * A peer's link to the storage servers: a small PeerPigeon node in the
@@ -226,6 +234,16 @@ declare class StorageServerLink {
      * Resolves true once the server has it, false if it refused or could not be reached.
      */
     revokePass(serverId: string, member: string, sign: (text: string) => Promise<string>, restore?: boolean, waitMs?: number): Promise<boolean>;
+    /** Links to a server if it is not linked yet, waiting up to `waitMs`; whether it is linked. */
+    private linkTo;
+    /** Every record one server holds for a room (links to it first if needed); null if it cannot be reached. */
+    listAt(serverId: string, room: string, waitMs?: number): Promise<Omit<ServerRecord, 'wh'>[] | null>;
+    /**
+     * The owner clears records (by slot) of a room off one of its servers; `sign` signs as the owner. The
+     * server moves them aside and takes no copy of them as old or older again, and tells the peers watching
+     * the room. Resolves with how many it moved, or null if it refused or could not be reached.
+     */
+    clearAt(serverId: string, room: string, slots: string[], sign: (text: string) => Promise<string>, waitMs?: number): Promise<number | null>;
     /** Writes a record to the room's servers; resolves with how many took it. */
     put(rec: Omit<ServerRecord, 'wh'>, write: string): Promise<number>;
     /** The newest copy of a record the room's servers hold, or null. */
@@ -258,6 +276,14 @@ interface ServerRecordStore {
         count: number;
         bytes: number;
     }>;
+    /**
+     * Clearing (asked by the server's owner): takes these slots' records out (a real server moves them aside
+     * rather than deleting them), keeps that they were cleared at `at`, and resolves with how many it had.
+     * A store without it can't be cleared.
+     */
+    remove?(room: string, slots: string[], at: number): Promise<number>;
+    /** When a slot was last cleared (0: never); a record as old or older is not taken again. */
+    clearedAt?(room: string, slot: string): Promise<number>;
 }
 declare class MemoryServerRecordStore implements ServerRecordStore {
     private readonly byRoom;
@@ -273,6 +299,9 @@ declare class MemoryServerRecordStore implements ServerRecordStore {
         count: number;
         bytes: number;
     }>;
+    private readonly clearedMap;
+    remove(room: string, slots: string[], at: number): Promise<number>;
+    clearedAt(room: string, slot: string): Promise<number>;
 }
 /**
  * What a server's owner signs to ask it for its stats: the server's peer id and the time, so the ask is
@@ -1046,6 +1075,13 @@ interface StorageOptions extends StorageSyncOptions {
      */
     owner?: string;
     /**
+     * With storage servers: the keys (an app owner's PigeonIdP `pub`, say) whose clears this node honours.
+     * When one of them clears records off a server (console.peerpigeon.io → Apps → Stored data), the server
+     * tells the room, and this node drops its own copies that are as old or older and keeps a tombstone, so
+     * no peer that still has them brings them back. Clears signed by any other key are ignored.
+     */
+    clearers?: string[];
+    /**
      * Signs every change this node makes, and accepts only signed changes from
      * others: a record's signer is who made it, and a user record's owner is
      * its signer's key (its ownerId). PeerPigeonNode passes its key pair.
@@ -1120,6 +1156,7 @@ declare class PeerPigeonStorage {
     private serversReady;
     private readonly serverWaitMs;
     private readonly owner;
+    private readonly clearers;
     private serversWait;
     private serversWaitDone;
     private migrating;
@@ -1210,6 +1247,11 @@ declare class PeerPigeonStorage {
     private slotOf;
     /** Sends one change to the room's servers; resolves with how many took it. */
     private pushToServers;
+    /**
+     * Records cleared off a server by a key this node trusts to clear (clearers): its copies of them as old
+     * or older go, each with a tombstone so a peer that still has one does not bring it back.
+     */
+    private applyServerClear;
     /** A record from a server: decrypted, checked like any change from the mesh, and kept here. */
     private applyServerRecord;
     private readFromServers;

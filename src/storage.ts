@@ -1,6 +1,6 @@
 import { signMessage, verifyMessage } from 'unsea';
 import { subtle } from './subtle.js';
-import { ownedRoomOf, ownerText, sha256Hex, visitorOf, type ServerRecord, type StorageServerLink } from './storage-servers.js';
+import { clearText, ownedRoomOf, ownerText, sha256Hex, visitorOf, type ServerRecord, type StorageServerLink } from './storage-servers.js';
 
 export type StorageSpace = 'public' | 'user' | 'frozen' | 'private' | 'epublic';
 export type StorageVersion = string | number;
@@ -110,6 +110,13 @@ export interface StorageOptions extends StorageSyncOptions {
    * (signingKeys, or signAs). Give the room a sessionId of its own too.
    */
   owner?: string;
+  /**
+   * With storage servers: the keys (an app owner's PigeonIdP `pub`, say) whose clears this node honours.
+   * When one of them clears records off a server (console.peerpigeon.io → Apps → Stored data), the server
+   * tells the room, and this node drops its own copies that are as old or older and keeps a tombstone, so
+   * no peer that still has them brings them back. Clears signed by any other key are ignored.
+   */
+  clearers?: string[];
   /**
    * Signs every change this node makes, and accepts only signed changes from
    * others: a record's signer is who made it, and a user record's owner is
@@ -427,6 +434,7 @@ export class PeerPigeonStorage {
   private serversReady = false;
   private readonly serverWaitMs: number;
   private readonly owner: string | null;
+  private readonly clearers: Set<string>;
   // Settles when the room's servers are first linked, or when the wait for them runs out.
   private serversWait: Promise<void> | null = null;
   private serversWaitDone: (() => void) | null = null;
@@ -455,6 +463,7 @@ export class PeerPigeonStorage {
     this.moveToServers = options.moveToServers !== false;
     this.serverWaitMs = Math.max(0, Number(options.serverWaitMs ?? 8000));
     this.owner = String(options.owner ?? '').trim() || null;
+    this.clearers = new Set((Array.isArray(options.clearers) ? options.clearers : []).map((k) => String(k).trim()).filter(Boolean));
     this.signingKeys = options.signingKeys?.pub && options.signingKeys?.priv ? { pub: options.signingKeys.pub, priv: options.signingKeys.priv } : null;
     this.ownSigningKeys = this.signingKeys;
     this.onGossipMessageBound = (data) => {
@@ -852,6 +861,8 @@ export class PeerPigeonStorage {
         }
       } else if (event.type === 'changed' && event.rec.room === room) {
         void this.applyServerRecord(event.rec, false).catch(() => {});
+      } else if (event.type === 'cleared' && event.room === room) {
+        void this.applyServerClear(event).catch(() => {});
       }
     });
     link.keep(room, await visitorOf(room, this.ownerIdentity()));
@@ -964,6 +975,37 @@ export class PeerPigeonStorage {
     } catch {
       return 0;
     }
+  }
+
+  /**
+   * Records cleared off a server by a key this node trusts to clear (clearers): its copies of them as old
+   * or older go, each with a tombstone so a peer that still has one does not bring it back.
+   */
+  private async applyServerClear(c: { server: string; room: string; slots: string[]; at: number; sig: string; by: string }): Promise<number> {
+    if (!this.clearers.has(c.by) || !this.serverIds) return 0;
+    if (!(await verifyMessage(clearText(c.server, c.room, c.slots, c.at), c.sig, c.by).catch(() => false))) return 0;
+    const slots = new Set(c.slots);
+    const driver = this.requireDriver();
+    let dropped = 0;
+    for (const space of ['public', 'user', 'frozen', 'epublic'] as StorageSpace[]) {
+      for (const record of await driver.listBySpace(space)) {
+        if (this.closed) return dropped;
+        if (record.updatedAt > c.at || !slots.has((await this.slotOf(space, record.key)).slot)) continue;
+        const mutation: StorageMutation = {
+          __ppType: 'pp-storage-op-v1', opId: this.makeMutationId(this.userId), op: 'delete',
+          space, key: record.key, actorId: c.by, timestamp: c.at, record: null, ownerId: null,
+        };
+        await driver.delete(record.pk);
+        await this.keepTombstone(mutation, null);
+        dropped++;
+        this.emitChange({ origin: 'remote', op: 'delete', record: null, space, key: record.key, actorId: c.by });
+        this.publishCrossTabNotice({
+          __ppType: 'pp-storage-cross-tab-v1', id: mutation.opId, source: this.instanceId, op: 'delete',
+          space, key: record.key, actorId: c.by, timestamp: c.at,
+        });
+      }
+    }
+    return dropped;
   }
 
   /** A record from a server: decrypted, checked like any change from the mesh, and kept here. */
