@@ -154,6 +154,13 @@ type Msg =
   // The owner taking a pass back (or giving it back: restore), signed: see revokeText.
   | { pp: typeof PP; t: 'revoke'; req: string; member: string; at: number; sig: string; restore?: boolean }
   | { pp: typeof PP; t: 'revoked'; req: string; ok: boolean }
+  // The owner clearing records off a server, signed (see clearText): the server moves them aside and takes
+  // no copy of them as old or older again. moved: how many it had.
+  | { pp: typeof PP; t: 'clear'; req: string; room: string; slots: string[]; at: number; sig: string }
+  | { pp: typeof PP; t: 'clearr'; req: string; ok: boolean; moved?: number; why?: string }
+  // Told to the peers watching the room once records are cleared, with the owner's signature (by: the key):
+  // a peer that trusts that key drops its own copies of them (see Storage's clearers).
+  | { pp: typeof PP; t: 'cleared'; room: string; slots: string[]; at: number; sig: string; by: string }
   // A room's history (how many were in it, over time), asked as stats are: by the owner or a pass.
   | { pp: typeof PP; t: 'roomstats'; req: string; room: string; from: number; to: number; at: number; sig: string; by?: string; until?: number; gsig?: string }
   | { pp: typeof PP; t: 'roomstatsr'; req: string; ok: boolean; step?: number; points?: unknown }
@@ -212,6 +219,10 @@ function isMsg(data: unknown): data is Msg {
 
 function validId(v: unknown, len = 64): v is string {
   return typeof v === 'string' && v.length === len && /^[0-9a-f]+$/.test(v);
+}
+
+function validSlots(v: unknown, max = CLEAR_MAX_SLOTS): v is string[] {
+  return Array.isArray(v) && v.length > 0 && v.length <= max && v.every((s) => validId(s));
 }
 
 function validRecord(rec: unknown): rec is Omit<ServerRecord, 'wh'> {
@@ -276,7 +287,8 @@ const newReq = () => `${Date.now().toString(36)}-${(reqCounter++).toString(36)}-
 // The client side: a peer's link to the servers.
 // ---------------------------------------------------------------------------
 
-type LinkListener = (event: { type: 'servers'; room: string; servers: string[] } | { type: 'changed'; rec: Omit<ServerRecord, 'wh'> }) => void;
+type LinkListener = (event: { type: 'servers'; room: string; servers: string[] } | { type: 'changed'; rec: Omit<ServerRecord, 'wh'> }
+  | { type: 'cleared'; server: string; room: string; slots: string[]; at: number; sig: string; by: string }) => void;
 
 /**
  * A peer's link to the storage servers: a small PeerPigeon node in the
@@ -439,6 +451,12 @@ export class StorageServerLink {
       if (validRecord(data.rec)) this.emit({ type: 'changed', rec: data.rec });
       return;
     }
+    if (data.t === 'cleared') {
+      if (validRoom(data.room) && validSlots(data.slots) && typeof data.at === 'number' && typeof data.sig === 'string' && typeof data.by === 'string') {
+        this.emit({ type: 'cleared', server: from, room: data.room, slots: data.slots, at: data.at, sig: data.sig, by: data.by });
+      }
+      return;
+    }
     if (data.t === 'listed') {
       const got = this.listings.get(data.req) ?? [];
       got.push(...(Array.isArray(data.recs) ? data.recs.filter(validRecord) : []));
@@ -448,7 +466,7 @@ export class StorageServerLink {
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve({ ...data, recs: got }); }
       return;
     }
-    if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot' || data.t === 'statsr' || data.t === 'revoked' || data.t === 'roomstatsr' || data.t === 'roomfollowed' || data.t === 'statsfollowed') {
+    if (data.t === 'ack' || data.t === 'got' || data.t === 'back' || data.t === 'bgot' || data.t === 'statsr' || data.t === 'revoked' || data.t === 'clearr' || data.t === 'roomstatsr' || data.t === 'roomfollowed' || data.t === 'statsfollowed') {
       if ('bytes' in data && data.bytes instanceof Uint8Array) this.readsBytes.add(from);
       const p = this.pending.get(data.req);
       if (p && p.from === from) { clearTimeout(p.timer); this.pending.delete(data.req); p.resolve(data); }
@@ -568,6 +586,45 @@ export class StorageServerLink {
     if (!sig) return false;
     const answer = await this.ask(serverId, { pp: PP, t: 'revoke', req: newReq(), member, at, sig, ...(restore ? { restore: true } : {}) });
     return answer?.t === 'revoked' && answer.ok === true;
+  }
+
+  /** Links to a server if it is not linked yet, waiting up to `waitMs`; whether it is linked. */
+  private async linkTo(serverId: string, waitMs: number): Promise<boolean> {
+    if (this.node.getConnectedPeers().includes(serverId)) return true;
+    this.node.connectToPeer(serverId);
+    const until = Date.now() + waitMs;
+    while (!this.node.getConnectedPeers().includes(serverId) && Date.now() < until && !this.closed) await new Promise((r) => setTimeout(r, 100));
+    return this.node.getConnectedPeers().includes(serverId);
+  }
+
+  /** Every record one server holds for a room (links to it first if needed); null if it cannot be reached. */
+  async listAt(serverId: string, room: string, waitMs = 6_000): Promise<Omit<ServerRecord, 'wh'>[] | null> {
+    if (!validRoom(room) || !(await this.linkTo(serverId, waitMs))) return null;
+    const req = newReq();
+    this.listings.set(req, []);
+    const answer = await this.ask(serverId, { pp: PP, t: 'list', req, room });
+    return answer?.t === 'listed' ? answer.recs.filter((r) => r.room === room) : null;
+  }
+
+  /**
+   * The owner clears records (by slot) of a room off one of its servers; `sign` signs as the owner. The
+   * server moves them aside and takes no copy of them as old or older again, and tells the peers watching
+   * the room. Resolves with how many it moved, or null if it refused or could not be reached.
+   */
+  async clearAt(serverId: string, room: string, slots: string[], sign: (text: string) => Promise<string>, waitMs = 6_000): Promise<number | null> {
+    const all = [...new Set(slots)];
+    if (!validRoom(room) || !validSlots(all, Infinity) || !(await this.linkTo(serverId, waitMs))) return null;
+    let moved = 0;
+    for (let i = 0; i < all.length; i += CLEAR_MAX_SLOTS) {
+      const part = all.slice(i, i + CLEAR_MAX_SLOTS);
+      const at = Date.now();
+      const sig = await sign(clearText(serverId, room, part, at)).catch(() => null);
+      if (!sig) return null;
+      const answer = await this.ask(serverId, { pp: PP, t: 'clear', req: newReq(), room, slots: part, at, sig });
+      if (answer?.t !== 'clearr' || !answer.ok) return null;
+      moved += answer.moved ?? 0;
+    }
+    return moved;
   }
 
   /** Writes a record to the room's servers; resolves with how many took it. */
@@ -702,6 +759,14 @@ export interface ServerRecordStore {
   putBlob?(address: string, sealed: Uint8Array): Promise<void>;
   blobs?(): Promise<string[]>;
   blobUsage?(): Promise<{ count: number; bytes: number }>;
+  /**
+   * Clearing (asked by the server's owner): takes these slots' records out (a real server moves them aside
+   * rather than deleting them), keeps that they were cleared at `at`, and resolves with how many it had.
+   * A store without it can't be cleared.
+   */
+  remove?(room: string, slots: string[], at: number): Promise<number>;
+  /** When a slot was last cleared (0: never); a record as old or older is not taken again. */
+  clearedAt?(room: string, slot: string): Promise<number>;
 }
 
 export class MemoryServerRecordStore implements ServerRecordStore {
@@ -719,6 +784,17 @@ export class MemoryServerRecordStore implements ServerRecordStore {
   async putBlob(address: string, sealed: Uint8Array) { this.blobMap.set(address, sealed); }
   async blobs() { return [...this.blobMap.keys()]; }
   async blobUsage() { let bytes = 0; for (const b of this.blobMap.values()) bytes += b.length; return { count: this.blobMap.size, bytes }; }
+  private readonly clearedMap = new Map<string, number>();
+  async remove(room: string, slots: string[], at: number) {
+    let moved = 0;
+    for (const slot of slots) {
+      if (this.byRoom.get(room)?.delete(slot)) moved++;
+      this.clearedMap.set(`${room}:${slot}`, Math.max(at, this.clearedMap.get(`${room}:${slot}`) ?? 0));
+    }
+    if (this.byRoom.get(room)?.size === 0) this.byRoom.delete(room);
+    return moved;
+  }
+  async clearedAt(room: string, slot: string) { return this.clearedMap.get(`${room}:${slot}`) ?? 0; }
 }
 
 /**
@@ -743,6 +819,17 @@ export const grantText = (owner: string, member: string, until: number): string 
 
 /** What the owner signs to take a pass back from `member` at this server (restore: to give it back). */
 export const revokeText = (serverId: string, member: string, at: number, restore: boolean): string => JSON.stringify(['pp-ss-revoke', 1, serverId, member, at, restore]);
+
+/** The most slots one clear names (a client clears more in turns). */
+export const CLEAR_MAX_SLOTS = 200;
+
+/**
+ * What the owner signs to clear records off this server: the server, the room, the slots (sorted) and
+ * the time. The same signature goes with the notice to the room's watchers, who check it against the key
+ * they trust to clear (Storage's clearers).
+ */
+export const clearText = (serverId: string, room: string, slots: string[], at: number): string =>
+  JSON.stringify(['pp-ss-clear', 1, serverId, room, [...slots].sort(), at]);
 
 /** A member's pass, sent with an ask. */
 export interface StatsPass { by: string; until: number; gsig: string }
@@ -945,6 +1032,9 @@ export class StorageServer {
       if (have.once) return { ok: have.at === rec.at, ...(have.at === rec.at ? {} : { why: 'frozen' }) };
       if (have.at >= rec.at) return { ok: true }; // as new already: nothing to do
     }
+    // Cleared by the owner: a copy as old or older (a peer, or a server, that still had it) is not taken
+    // again. Answered ok, so the one sending it does not keep trying.
+    if (this.store.clearedAt && rec.at <= await this.store.clearedAt(rec.room, rec.slot)) return { ok: true, why: 'cleared' };
     await this.store.put(rec);
     this.onChange?.(rec);
     return { ok: true };
@@ -979,7 +1069,7 @@ export class StorageServer {
         const before = await this.store.get(rec.room, rec.slot);
         const result = await this.take(rec);
         this.send(from, { pp: PP, t: 'ack', req: data.req, ...result, at: rec.at });
-        if (result.ok && (!before || before.at < rec.at)) {
+        if (result.ok && !result.why && (!before || before.at < rec.at)) {
           for (const peer of this.watchers.get(rec.room)?.keys() ?? []) if (peer !== from) this.send(peer, { pp: PP, t: 'changed', rec: strip(rec) });
           // The room's other closest servers get it at once.
           const closest = closestIds(rec.room, await this.servers(), this.hashed).filter((id) => id !== this.node.getClientId());
@@ -1085,6 +1175,21 @@ export class StorageServer {
         this.send(from, { pp: PP, t: 'revoked', req: data.req, ok });
         return;
       }
+      case 'clear': {
+        const owner = this.owner();
+        const id = this.node.getClientId() ?? '';
+        const fine = !!owner && validRoom(data.room) && validSlots(data.slots) && typeof data.sig === 'string'
+          && typeof data.at === 'number' && Math.abs(Date.now() - data.at) <= STATS_SKEW_MS
+          && await verifyMessage(clearText(id, data.room, data.slots, data.at), data.sig, owner).catch(() => false);
+        if (!fine) return void this.send(from, { pp: PP, t: 'clearr', req: data.req, ok: false, why: 'not-owner' });
+        if (!this.store.remove) return void this.send(from, { pp: PP, t: 'clearr', req: data.req, ok: false, why: 'unsupported' });
+        const moved = await this.store.remove(data.room, data.slots, data.at);
+        this.send(from, { pp: PP, t: 'clearr', req: data.req, ok: true, moved });
+        for (const peer of this.watchers.get(data.room)?.keys() ?? []) {
+          this.send(peer, { pp: PP, t: 'cleared', room: data.room, slots: data.slots, at: data.at, sig: data.sig, by: owner! });
+        }
+        return;
+      }
       case 'sync': {
         // Only from another server, of records it holds.
         if (this.node.getPeerRole(from) !== STORAGE_SERVER_ROLE || !Array.isArray(data.recs)) return;
@@ -1092,7 +1197,7 @@ export class StorageServer {
           if (!validRecord(rec) || !validId((rec as ServerRecord).wh)) continue;
           const before = await this.store.get(rec.room, rec.slot);
           const result = await this.take(rec);
-          if (result.ok && (!before || before.at < rec.at)) {
+          if (result.ok && !result.why && (!before || before.at < rec.at)) {
             for (const peer of this.watchers.get(rec.room)?.keys() ?? []) this.send(peer, { pp: PP, t: 'changed', rec: strip(rec) });
           }
         }
